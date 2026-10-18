@@ -16,7 +16,6 @@
 // POST /:id/claim action — never inferred silently from an email match.
 import { Router } from "express";
 import multer from "multer";
-import ExcelJS from "exceljs";
 import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
@@ -71,6 +70,13 @@ import Department from "../models/Department.js";
 // the DESIGNATIONS block below for why master-data's own routes don't serve.
 import Designation from "../models/Designation.js";
 import { mintTravellerProfileId } from "../utils/travelerId.js";
+import {
+  isCstepWorkspace,
+  normalizeEmployeeId,
+  employeeIdProblem,
+  findTravelerIdHolder,
+  duplicateEmployeeIdMessage,
+} from "../services/cstepTravellerIds.js";
 import { maskTailId } from "../utils/piiMask.js";
 import { normalizeEmail, normalizeName, findMatchingTraveller, applyTravellerFields } from "../utils/travellerMatch.js";
 // Self-service identity (2026-08-10). The nine-condition guard is SHARED with
@@ -106,7 +112,16 @@ import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
-import { parseCsv } from "../utils/csv.js";
+import {
+  sheetUpload,
+  MAX_SHEET_ROWS,
+  cellToString,
+  normalizeDateField,
+  readUploadedSheet,
+  forEachSheetRow,
+  sendSheet,
+  type SheetRowOutcome,
+} from "../utils/sheetImport.js";
 import { autoCaptureTravellersFromBooking } from "../services/travellerAutoCapture.js";
 import User from "../models/User.js";
 import { isCstepAdmin } from "../utils/cstepAccess.js";
@@ -510,6 +525,12 @@ function requireWorkspaceContext(req: any, res: any): boolean {
  * assigned at create time, so the same person doesn't end up with two IDs
  * across CustomerMember and TravellerProfile. Otherwise mints a new one
  * scoped to this collection's own per-workspace counter.
+ *
+ * NON-CSTEP ONLY. A CSTEP workspace never calls this: its travelerId is the
+ * employee id an admin enters (services/cstepTravellerIds.ts), and this
+ * member-reuse branch is exactly the bridge between TravellerProfile and
+ * CustomerMember ids that must not exist there — CustomerMember.travelerId
+ * is unique across EVERY tenant, so an employee id must never meet it.
  */
 async function issueTravelerId(workspaceId: any, customerId: any, linkedMemberId?: string): Promise<string> {
   if (linkedMemberId) {
@@ -2192,6 +2213,7 @@ router.get("/:id", async (req: any, res: any) => {
 /* ── POST / — create ────────────────────────────────────────────────── */
 
 router.post("/", async (req: any, res: any) => {
+  let cstepEmployeeId = ""; // for the duplicate-key message below
   try {
     const gate = await requireActiveMember(req, res);
     if (!gate) return;
@@ -2272,7 +2294,28 @@ router.post("/", async (req: any, res: any) => {
       return res.status(422).json({ error: IDENTITY_CAPTURE_DISABLED_MESSAGE });
     }
 
-    const travelerId = await issueTravelerId(workspaceId, customerId, linkedMemberId);
+    // CSTEP: Traveller ID = Employee ID. Nothing is minted and the linked
+    // member's id is never reused (see issueTravelerId) — the admin enters
+    // the employee id, stored as travelerId and mirrored into employeeId.
+    // Required, except on a REQUESTER's own self-create: the edit matrix
+    // already refuses a person stating their own employee number, so that
+    // record starts blank, like an auto-captured one, until an admin sets it.
+    let travelerId: string;
+    let employeeId: string | undefined;
+    if (await isCstepWorkspace(workspaceId)) {
+      travelerId = normalizeEmployeeId(body.employeeId);
+      if (!(isRequesterSelfCreate && !travelerId)) {
+        const problem = employeeIdProblem(travelerId);
+        if (problem) return res.status(400).json({ error: problem, field: "employeeId" });
+        const holder = await findTravelerIdHolder(workspaceId, travelerId);
+        if (holder) return res.status(409).json({ error: duplicateEmployeeIdMessage(travelerId, holder), field: "employeeId" });
+      }
+      employeeId = travelerId || undefined;
+      cstepEmployeeId = travelerId;
+    } else {
+      travelerId = await issueTravelerId(workspaceId, customerId, linkedMemberId);
+      employeeId = normStr(body.employeeId) || undefined;
+    }
 
     const mealPreference = MEAL_PREFERENCE_CODES.includes(body.mealPreference)
       ? body.mealPreference
@@ -2297,7 +2340,7 @@ router.post("/", async (req: any, res: any) => {
       passportIssueDate: normStr(body.passportIssueDate) || undefined,
       mobile: normStr(body.mobile) || undefined,
       mobileCountryCode: normStr(body.mobileCountryCode) || undefined,
-      employeeId: normStr(body.employeeId) || undefined,
+      employeeId,
       reportingManagerId: manager.value ?? undefined,
       designationId: designation.value ?? null,
       costCenterId: normStr(body.costCenterId) || undefined,
@@ -2369,7 +2412,14 @@ router.post("/", async (req: any, res: any) => {
 
     res.status(201).json({ ok: true, traveller, ...(loginNote ? { loginNote } : {}) });
   } catch (err: any) {
-    if (err?.code === 11000) return res.status(409).json({ error: "Traveler ID collision — please retry" });
+    if (err?.code === 11000) {
+      // The partial unique index is the backstop for the up-front check
+      // (two creates racing for the same employee id).
+      if (cstepEmployeeId) {
+        return res.status(409).json({ error: `Employee ID ${cstepEmployeeId} is already used in this workspace`, field: "employeeId" });
+      }
+      return res.status(409).json({ error: "Traveler ID collision — please retry" });
+    }
     console.error("[workspace.travellers POST]", err.message);
     res.status(500).json({ error: err.message });
   }
@@ -2410,6 +2460,32 @@ router.put("/:id", async (req: any, res: any) => {
       });
     }
 
+    // CSTEP: employeeId IS the travelerId. Sending it unchanged (the full
+    // form always does) is a no-op; setting one on a traveller whose id is
+    // still blank assigns both. Changing an id that is already set is not
+    // an edit — it goes through the re-map script, which validates a whole
+    // file and handles swaps — so it is refused here.
+    let cstepEmployeeId: string | null = null;
+    if ("employeeId" in body && (await isCstepWorkspace(workspaceId))) {
+      const next = normalizeEmployeeId(body.employeeId);
+      const current = normalizeEmployeeId(traveller.employeeId);
+      cstepEmployeeId = current;
+      if (next !== current) {
+        if (traveller.travelerId) {
+          return res.status(409).json({
+            error: `This traveller's employee id is ${traveller.travelerId}. Changing an employee id is done through the CSTEP re-map, not by editing the profile.`,
+            field: "employeeId",
+          });
+        }
+        const problem = employeeIdProblem(next);
+        if (problem) return res.status(400).json({ error: problem, field: "employeeId" });
+        const holder = await findTravelerIdHolder(workspaceId, next, traveller._id);
+        if (holder) return res.status(409).json({ error: duplicateEmployeeIdMessage(next, holder), field: "employeeId" });
+        traveller.travelerId = next;
+        cstepEmployeeId = next;
+      }
+    }
+
     // EMAIL IS NOT ACCEPTED HERE, for anyone. Not an allowlist omission —
     // the assignment is gone. See the SELF_EDITABLE_FIELDS block's note and
     // the design doc §2.1: writing this key provisions a login and fires a
@@ -2422,6 +2498,9 @@ router.put("/:id", async (req: any, res: any) => {
     for (const key of EDITABLE_STRING_FIELDS) {
       if (key in body) traveller[key] = normStr(body[key]) || undefined;
     }
+    // The loop above stored the raw value; CSTEP keeps the normalised one
+    // so employeeId and travelerId stay byte-identical.
+    if (cstepEmployeeId !== null) traveller.employeeId = cstepEmployeeId || undefined;
     // Only touched when the key is present, so a payload that never carries
     // departmentId (the "compact" /visa/apply preset) can never clear one.
     if ("departmentId" in body) {
@@ -2528,6 +2607,9 @@ router.put("/:id", async (req: any, res: any) => {
     await traveller.save();
     res.json({ ok: true, traveller, editableFields: allowedFields });
   } catch (err: any) {
+    if (err?.code === 11000 && err?.keyPattern?.travelerId) {
+      return res.status(409).json({ error: "That employee id is already used in this workspace", field: "employeeId" });
+    }
     console.error("[workspace.travellers PUT]", err.message);
     res.status(500).json({ error: err.message });
   }
@@ -3805,12 +3887,20 @@ router.patch("/:id/link-member", async (req: any, res: any) => {
  */
 router.post("/auto-capture", (req: any, res: any) => {
   try {
-    autoCaptureTravellersFromBooking({
-      workspaceId: req.workspaceObjectId,
-      customerId: req.workspace?.customerId,
-      createdBy: actorUserId(req),
-      passengers: req.body?.passengers,
-    }).catch((err: any) => console.error("[auto-capture]", err?.message));
+    // CSTEP captures with a blank travelerId (an admin assigns the employee
+    // id later) instead of minting one — resolved inside the same
+    // fire-and-forget chain so the response is still never delayed.
+    isCstepWorkspace(req.workspaceObjectId)
+      .then((cstep) =>
+        autoCaptureTravellersFromBooking({
+          workspaceId: req.workspaceObjectId,
+          customerId: req.workspace?.customerId,
+          createdBy: actorUserId(req),
+          passengers: req.body?.passengers,
+          cstep,
+        }),
+      )
+      .catch((err: any) => console.error("[auto-capture]", err?.message));
   } catch (err: any) {
     console.error("[auto-capture] failed synchronously", err?.message);
   }
@@ -3832,9 +3922,10 @@ router.post("/auto-capture", (req: any, res: any) => {
  * traveller list changed between preview and commit.
  * ──────────────────────────────────────────────────────────────────── */
 
-const bulkUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
-
-const MAX_BULK_ROWS = 500;
+// Parsing, header mapping, cell coercion, the upload limits and the
+// template/export writer live in utils/sheetImport.ts (shared with the CSTEP
+// vendor import). What stays here is the traveller-specific part: the
+// columns, the header map, and processBulkRows' per-row rules.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const TEMPLATE_COLUMNS = [
@@ -3843,6 +3934,10 @@ const TEMPLATE_COLUMNS = [
   "Passport Issue Date", "Mobile", "Email", "Department",
   "Frequent Flyer Airline", "Frequent Flyer Number",
 ];
+
+// CSTEP files lead with the employee id, which becomes the travelerId.
+// Every other workspace's template is unchanged.
+const CSTEP_TEMPLATE_COLUMNS = ["Employee ID", ...TEMPLATE_COLUMNS];
 
 // Normalized header (lowercase, alphanumeric-only) -> internal field name.
 // The template IS the contract — no fuzzy alias guessing beyond
@@ -3867,95 +3962,15 @@ const HEADER_FIELD_MAP: Record<string, string> = {
   department: "departmentName",
   frequentflyerairline: "ffAirline",
   frequentflyernumber: "ffNumber",
+  // Read ONLY for a CSTEP workspace (processBulkRows' `cstep`); elsewhere
+  // the column is ignored, exactly as an unknown column always was.
+  employeeid: "employeeId",
 };
 
-function normalizeHeader(h: string): string {
-  return String(h || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
-function mapRowHeaders(raw: Record<string, any>): Record<string, any> {
-  const mapped: Record<string, any> = {};
-  for (const [key, value] of Object.entries(raw || {})) {
-    const field = HEADER_FIELD_MAP[normalizeHeader(key)];
-    if (field) mapped[field] = value;
-  }
-  return mapped;
-}
-
-function cellToString(v: any): string {
-  if (v === null || v === undefined) return "";
-  if (v instanceof Date) return "";
-  if (typeof v === "object") {
-    if (Array.isArray((v as any).richText)) return (v as any).richText.map((t: any) => t.text).join("");
-    if (typeof (v as any).text === "string") return (v as any).text;
-    if ("result" in (v as any)) return String((v as any).result ?? "");
-    return "";
-  }
-  return String(v).trim();
-}
-
-function normalizeDateField(raw: any, label: string): { value?: string; error?: string } {
-  if (raw === undefined || raw === null || raw === "") return {};
-  if (raw instanceof Date) {
-    if (isNaN(raw.getTime())) return { error: `Invalid ${label}` };
-    const y = raw.getUTCFullYear();
-    const m = String(raw.getUTCMonth() + 1).padStart(2, "0");
-    const d = String(raw.getUTCDate()).padStart(2, "0");
-    return { value: `${y}-${m}-${d}` };
-  }
-  const str = cellToString(raw);
-  if (!str) return {};
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return { error: `${label} must be in YYYY-MM-DD format` };
-  return { value: str };
-}
-
-function csvEscape(v: any): string {
-  const s = String(v ?? "");
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-
-async function parseUploadedRows(file: any): Promise<Record<string, any>[]> {
-  const name = String(file?.originalname || "").toLowerCase();
-  const looksCsv = name.endsWith(".csv") || file?.mimetype === "text/csv";
-  if (looksCsv) {
-    const { rows } = parseCsv(file.buffer.toString("utf8"));
-    return rows;
-  }
-
-  const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.load(file.buffer);
-  const sheet = workbook.worksheets[0];
-  if (!sheet) return [];
-
-  const headers: string[] = [];
-  sheet.getRow(1).eachCell({ includeEmpty: false }, (cell: any, colNumber: number) => {
-    headers[colNumber - 1] = String(cell.value ?? "").trim();
-  });
-
-  const rows: Record<string, any>[] = [];
-  for (let r = 2; r <= sheet.rowCount; r++) {
-    const row = sheet.getRow(r);
-    if (row.cellCount === 0) continue;
-    const obj: Record<string, any> = {};
-    let hasValue = false;
-    headers.forEach((h, idx) => {
-      if (!h) return;
-      const v = row.getCell(idx + 1).value;
-      if (v !== null && v !== undefined && v !== "") hasValue = true;
-      obj[h] = v;
-    });
-    if (hasValue) rows.push(obj);
-  }
-  return rows;
-}
-
-interface BulkRowOutcome {
-  rowNumber: number;
+interface BulkRowOutcome extends SheetRowOutcome {
   firstName: string;
   lastName: string;
   email?: string;
-  action: "create" | "update" | "skip";
-  reason?: string;
   travelerId?: string;
   // CSTEP login auto-provisioning (additive) — set only on commit
   // (dryRun=false); a row can succeed as create/update even when no login
@@ -3980,8 +3995,11 @@ async function processBulkRows(
   rawRows: Record<string, any>[],
   dryRun: boolean,
   actorEmail?: string,
+  cstep = false,
 ): Promise<BulkRowOutcome[]> {
   const outcomes: BulkRowOutcome[] = [];
+  // CSTEP: employee id -> the row that took it, so a file can't use one twice.
+  const employeeIdRows = new Map<string, number>();
 
   // ONE query per file at most, scoped to the importing workspace, and none
   // at all for a file whose Department column is absent or entirely blank —
@@ -3994,29 +4012,27 @@ async function processBulkRows(
     return departmentsByLowerName;
   };
 
-  for (let i = 0; i < rawRows.length; i++) {
-    const rowNumber = i + 2; // header is row 1
-    const mapped = mapRowHeaders(rawRows[i]);
+  await forEachSheetRow(rawRows, HEADER_FIELD_MAP, async (mapped, rowNumber) => {
 
     const firstName = cellToString(mapped.firstName);
     const lastName = cellToString(mapped.lastName);
     if (!firstName || !lastName) {
       outcomes.push({ rowNumber, firstName, lastName, action: "skip", reason: "Missing required First Name or Last Name" });
-      continue;
+      return;
     }
 
     const email = cellToString(mapped.email).toLowerCase();
     if (email && !EMAIL_RE.test(email)) {
       outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: "Invalid email format" });
-      continue;
+      return;
     }
 
     const dob = normalizeDateField(mapped.dob, "Date of Birth");
-    if (dob.error) { outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: dob.error }); continue; }
+    if (dob.error) { outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: dob.error }); return; }
     const passportExpiry = normalizeDateField(mapped.passportExpiry, "Passport Expiry");
-    if (passportExpiry.error) { outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: passportExpiry.error }); continue; }
+    if (passportExpiry.error) { outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: passportExpiry.error }); return; }
     const passportIssueDate = normalizeDateField(mapped.passportIssueDate, "Passport Issue Date");
-    if (passportIssueDate.error) { outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: passportIssueDate.error }); continue; }
+    if (passportIssueDate.error) { outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: passportIssueDate.error }); return; }
 
     const nationality = cellToString(mapped.nationality);
     const passportIssueCountry = cellToString(mapped.passportIssueCountry);
@@ -4043,7 +4059,7 @@ async function processBulkRows(
           action: "skip",
           reason: `Unknown department "${departmentName}" — it must already exist in this workspace. Add it under Master Data first, or correct the spelling.`,
         });
-        continue;
+        return;
       }
       if (hit.ambiguous) {
         outcomes.push({
@@ -4051,7 +4067,7 @@ async function processBulkRows(
           action: "skip",
           reason: `Department "${departmentName}" matches more than one department in this workspace — rename one so the names differ by more than case.`,
         });
-        continue;
+        return;
       }
       departmentId = hit._id;
     }
@@ -4060,6 +4076,30 @@ async function processBulkRows(
       email, firstName, lastName, dob: dob.value, nationality, passportIssueCountry,
     });
 
+    // CSTEP: the Employee ID column is the travelerId and is required on
+    // every row. Same above-the-dryRun placement as Department, so preview
+    // and commit refuse identically. An import can fill a BLANK id but never
+    // rewrite one that is set — that is the re-map script's job.
+    let employeeId = "";
+    if (cstep) {
+      employeeId = normalizeEmployeeId(cellToString(mapped.employeeId));
+      const skip = (reason: string) => outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason });
+      const problem = employeeIdProblem(employeeId);
+      if (problem) { skip(problem); return; }
+      if (employeeIdRows.has(employeeId)) {
+        skip(`Employee ID ${employeeId} is also used on row ${employeeIdRows.get(employeeId)} of this file`);
+        return;
+      }
+      const existingId = match?.profile?.travelerId || "";
+      if (existingId && existingId !== employeeId) {
+        skip(`Matches ${[match!.profile.firstName, match!.profile.lastName].filter(Boolean).join(" ")}, whose employee id is ${existingId} — an import can't change it (use the CSTEP re-map)`);
+        return;
+      }
+      const holder = await findTravelerIdHolder(workspaceId, employeeId, match?.profile?._id);
+      if (holder) { skip(duplicateEmployeeIdMessage(employeeId, holder)); return; }
+      employeeIdRows.set(employeeId, rowNumber);
+    }
+
     if (dryRun) {
       outcomes.push({
         rowNumber,
@@ -4067,12 +4107,12 @@ async function processBulkRows(
         lastName,
         email,
         action: match ? "update" : "create",
-        travelerId: match?.profile?.travelerId,
+        travelerId: cstep ? employeeId : match?.profile?.travelerId,
         reason: match
           ? `Matches existing traveller ${match.profile.travelerId} by ${match.tier === 1 ? "email" : "name + date of birth"} — will update, not duplicate.`
           : undefined,
       });
-      continue;
+      return;
     }
 
     const title = cellToString(mapped.title);
@@ -4097,6 +4137,11 @@ async function processBulkRows(
       // traveller's current department alone.
       if (departmentId) doc.departmentId = departmentId;
       if (ffAirline || ffNumber) doc.frequentFlyer = [{ airline: ffAirline || undefined, number: ffNumber || undefined }];
+      // Fills a blank id (checked above: a set one is never changed here).
+      if (cstep) {
+        doc.travelerId = employeeId;
+        doc.employeeId = employeeId;
+      }
 
       let loginCreated: boolean | undefined;
       let loginNote: string | undefined;
@@ -4117,31 +4162,46 @@ async function processBulkRows(
         loginNote = "No email — login not created";
       }
 
-      await doc.save();
+      try {
+        await doc.save();
+      } catch (err: any) {
+        // The partial unique index catching a race the check above missed.
+        if (!(cstep && err?.code === 11000)) throw err;
+        outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: `Employee ID ${employeeId} is already used in this workspace` });
+        return;
+      }
       outcomes.push({ rowNumber, firstName, lastName, email, action: "update", travelerId: doc.travelerId, loginCreated, loginNote });
     } else {
-      const travelerId = await mintTravellerProfileId(workspaceId, customerId);
-      const created: any = await TravellerProfile.create({
-        workspaceId,
-        travelerId,
-        departmentId: departmentId || null,
-        title: title || undefined,
-        firstName,
-        middleName: middleName || undefined,
-        lastName,
-        gender: gender || undefined,
-        dob: dob.value || undefined,
-        nationality: nationality || undefined,
-        passportNo: passportNo || undefined,
-        passportExpiry: passportExpiry.value || undefined,
-        passportIssueCountry: passportIssueCountry || undefined,
-        passportIssueDate: passportIssueDate.value || undefined,
-        mobile: mobile || undefined,
-        email: email || undefined,
-        frequentFlyer: ffAirline || ffNumber ? [{ airline: ffAirline || undefined, number: ffNumber || undefined }] : [],
-        createdBy: uid,
-        source: "BULK_IMPORT",
-      });
+      const travelerId = cstep ? employeeId : await mintTravellerProfileId(workspaceId, customerId);
+      let created: any;
+      try {
+        created = await TravellerProfile.create({
+          workspaceId,
+          travelerId,
+          ...(cstep ? { employeeId } : {}),
+          departmentId: departmentId || null,
+          title: title || undefined,
+          firstName,
+          middleName: middleName || undefined,
+          lastName,
+          gender: gender || undefined,
+          dob: dob.value || undefined,
+          nationality: nationality || undefined,
+          passportNo: passportNo || undefined,
+          passportExpiry: passportExpiry.value || undefined,
+          passportIssueCountry: passportIssueCountry || undefined,
+          passportIssueDate: passportIssueDate.value || undefined,
+          mobile: mobile || undefined,
+          email: email || undefined,
+          frequentFlyer: ffAirline || ffNumber ? [{ airline: ffAirline || undefined, number: ffNumber || undefined }] : [],
+          createdBy: uid,
+          source: "BULK_IMPORT",
+        });
+      } catch (err: any) {
+        if (!(cstep && err?.code === 11000)) throw err;
+        outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: `Employee ID ${employeeId} is already used in this workspace` });
+        return;
+      }
 
       let loginCreated: boolean | undefined;
       let loginNote: string | undefined;
@@ -4162,7 +4222,7 @@ async function processBulkRows(
 
       outcomes.push({ rowNumber, firstName, lastName, email, action: "create", travelerId: created.travelerId, loginCreated, loginNote });
     }
-  }
+  });
 
   return outcomes;
 }
@@ -4188,24 +4248,13 @@ router.get("/template/download", async (req: any, res: any) => {
     const gate = await requireBulkAccess(req, res);
     if (!gate) return;
 
-    const format = req.query.format === "xlsx" ? "xlsx" : "csv";
-    if (format === "csv") {
-      res.setHeader("Content-Type", "text/csv");
-      res.setHeader("Content-Disposition", 'attachment; filename="travellers-template.csv"');
-      res.send(TEMPLATE_COLUMNS.map(csvEscape).join(",") + "\n");
-      return;
-    }
-
-    const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet("Travellers");
-    sheet.columns = TEMPLATE_COLUMNS.map((h) => ({ header: h, width: 20 }));
-    const headerRow = sheet.getRow(1);
-    headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF00477F" } };
-    const buffer = await workbook.xlsx.writeBuffer();
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", 'attachment; filename="travellers-template.xlsx"');
-    res.send(buffer);
+    const columns = (await isCstepWorkspace(req.workspaceObjectId)) ? CSTEP_TEMPLATE_COLUMNS : TEMPLATE_COLUMNS;
+    await sendSheet(res, {
+      format: req.query.format === "xlsx" ? "xlsx" : "csv",
+      filename: "travellers-template",
+      sheetName: "Travellers",
+      columns,
+    });
   } catch (err: any) {
     console.error("[workspace.travellers TEMPLATE]", err.message);
     res.status(500).json({ error: err.message });
@@ -4214,25 +4263,23 @@ router.get("/template/download", async (req: any, res: any) => {
 
 /* ── POST /bulk/preview — dry run, no writes ──────────────────────────── */
 
-router.post("/bulk/preview", bulkUpload.single("file"), async (req: any, res: any) => {
+router.post("/bulk/preview", sheetUpload.single("file"), async (req: any, res: any) => {
   try {
     const gate = await requireBulkAccess(req, res);
     if (!gate) return;
     if (!requireWorkspaceContext(req, res)) return;
 
-    if (!req.file?.buffer) return res.status(400).json({ error: "Missing file" });
-    const rawRows = await parseUploadedRows(req.file);
-    if (!rawRows.length) return res.status(400).json({ error: "File has no data rows" });
-    if (rawRows.length > MAX_BULK_ROWS) {
-      return res.status(400).json({ error: `File has ${rawRows.length} rows; the limit is ${MAX_BULK_ROWS} per import. Split into smaller files.` });
-    }
+    const sheet = await readUploadedSheet(req.file);
+    if (sheet.error !== undefined) return res.status(400).json({ error: sheet.error });
+    const rawRows = sheet.rows;
 
     const workspaceId = req.workspaceObjectId;
     const customerId = req.workspace?.customerId;
     const uid = actorUserId(req);
-    const results = await processBulkRows(workspaceId, customerId, uid, rawRows, true);
+    const cstep = await isCstepWorkspace(workspaceId);
+    const results = await processBulkRows(workspaceId, customerId, uid, rawRows, true, undefined, cstep);
 
-    res.json({ ok: true, totalRows: results.length, maxRows: MAX_BULK_ROWS, results });
+    res.json({ ok: true, totalRows: results.length, maxRows: MAX_SHEET_ROWS, results });
   } catch (err: any) {
     console.error("[workspace.travellers BULK PREVIEW]", err.message);
     res.status(500).json({ error: err.message });
@@ -4241,23 +4288,21 @@ router.post("/bulk/preview", bulkUpload.single("file"), async (req: any, res: an
 
 /* ── POST /bulk/commit — re-parses the re-uploaded file, writes for real */
 
-router.post("/bulk/commit", bulkUpload.single("file"), async (req: any, res: any) => {
+router.post("/bulk/commit", sheetUpload.single("file"), async (req: any, res: any) => {
   try {
     const gate = await requireBulkAccess(req, res);
     if (!gate) return;
     if (!requireWorkspaceContext(req, res)) return;
 
-    if (!req.file?.buffer) return res.status(400).json({ error: "Missing file" });
-    const rawRows = await parseUploadedRows(req.file);
-    if (!rawRows.length) return res.status(400).json({ error: "File has no data rows" });
-    if (rawRows.length > MAX_BULK_ROWS) {
-      return res.status(400).json({ error: `File has ${rawRows.length} rows; the limit is ${MAX_BULK_ROWS} per import. Split into smaller files.` });
-    }
+    const sheet = await readUploadedSheet(req.file);
+    if (sheet.error !== undefined) return res.status(400).json({ error: sheet.error });
+    const rawRows = sheet.rows;
 
     const workspaceId = req.workspaceObjectId;
     const customerId = req.workspace?.customerId;
     const uid = actorUserId(req);
-    const results = await processBulkRows(workspaceId, customerId, uid, rawRows, false, req.user?.email);
+    const cstep = await isCstepWorkspace(workspaceId);
+    const results = await processBulkRows(workspaceId, customerId, uid, rawRows, false, req.user?.email, cstep);
 
     const created = results.filter((r) => r.action === "create").length;
     const updated = results.filter((r) => r.action === "update").length;
@@ -4306,31 +4351,19 @@ router.get("/export/download", async (req: any, res: any) => {
     ]);
 
     const columns = [
-      "Traveler ID", "Title", "First Name", "Middle Name", "Last Name", "Gender", "Date of Birth",
+      (await isCstepWorkspace(workspaceId)) ? "Employee ID" : "Traveler ID", "Title", "First Name", "Middle Name", "Last Name", "Gender", "Date of Birth",
       "Nationality", "Passport", "Passport Expiry", "Passport Issue Country", "Passport Issue Date",
       "Mobile", "Email", "Frequent Flyer Airline", "Frequent Flyer Number",
     ];
 
-    const format = req.query.format === "xlsx" ? "xlsx" : "csv";
-    if (format === "csv") {
-      res.setHeader("Content-Type", "text/csv");
-      res.setHeader("Content-Disposition", 'attachment; filename="travellers-export.csv"');
-      const lines = [columns.map(csvEscape).join(","), ...rows.map((r) => r.map(csvEscape).join(","))];
-      res.send(lines.join("\n") + "\n");
-      return;
-    }
-
-    const workbook = new ExcelJS.Workbook();
-    const sheet = workbook.addWorksheet("Travellers");
-    sheet.columns = columns.map((h) => ({ header: h, width: 18 }));
-    rows.forEach((r) => sheet.addRow(r));
-    const headerRow = sheet.getRow(1);
-    headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF00477F" } };
-    const buffer = await workbook.xlsx.writeBuffer();
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", 'attachment; filename="travellers-export.xlsx"');
-    res.send(buffer);
+    await sendSheet(res, {
+      format: req.query.format === "xlsx" ? "xlsx" : "csv",
+      filename: "travellers-export",
+      sheetName: "Travellers",
+      columns,
+      rows,
+      width: 18,
+    });
   } catch (err: any) {
     console.error("[workspace.travellers EXPORT]", err.message);
     res.status(500).json({ error: err.message });

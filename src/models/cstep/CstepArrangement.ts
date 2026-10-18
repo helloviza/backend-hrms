@@ -50,6 +50,30 @@ export type CstepArrangementStatus = "PENDING" | "ARRANGED";
 // cstep.ts's computeArrangementAmountFields, which forces rate=1 there).
 export type CstepRateSource = "LIVE" | "MANUAL";
 
+// Vendor + payment addition. paymentStatus is deliberately a separate field
+// from `status` (PENDING | ARRANGED is the Official's arranging progress;
+// this is whether the vendor has been paid) so the two never read as
+// "Pending / Pending". MANUAL = set from the request page; IMPORT = a
+// Finance payment sheet (paymentBatchId names that upload).
+export const CSTEP_PAYMENT_STATUSES = ["UNPAID", "PAID"] as const;
+export type CstepPaymentStatus = (typeof CSTEP_PAYMENT_STATUSES)[number];
+export type CstepPaymentSource = "MANUAL" | "IMPORT";
+
+/** Request statuses from ARRANGING onwards — where an arrangement line's
+ * vendor can be paid (by hand on the request page — the Official at the
+ * arrange step, or Finance/Admin — or by the Finance payment import), and
+ * where the Vendor payments list and its export look. A line still needs a
+ * vendor before it can be paid. */
+export const CSTEP_VENDOR_PAYABLE_STATUSES = [
+  "ARRANGING",
+  "ARRANGED",
+  "REPORT_PENDING",
+  "REPORT_SUBMITTED",
+  "TRANSFERRED_TO_FINANCE",
+  "SETTLED",
+  "REIMBURSED",
+] as const;
+
 export interface ICstepArrangement extends Document {
   workspaceId: mongoose.Types.ObjectId;
   requestId: mongoose.Types.ObjectId; // ref CstepTravelRequest
@@ -73,6 +97,26 @@ export interface ICstepArrangement extends Document {
   rateSource?: CstepRateSource;
 
   status: CstepArrangementStatus;
+
+  // Vendor — chosen while ARRANGING; code + name are a snapshot taken at
+  // write time, so a later rename in the Vendor Master never rewrites what
+  // this row (or the Travel Register) says was booked.
+  vendorId?: mongoose.Types.ObjectId; // ref CstepVendor
+  vendorCode?: string;
+  vendorName?: string;
+
+  // Payment to that vendor — Finance/Admin, from ARRANGED onwards.
+  paymentStatus: CstepPaymentStatus;
+  paidAt?: Date;
+  paidBy?: mongoose.Types.ObjectId; // ref User
+  paymentRef?: string; // UTR / cheque no.
+  paymentSource?: CstepPaymentSource;
+  paymentBatchId?: mongoose.Types.ObjectId;
+  vendorInvoiceNo?: string; // the vendor's bill no. — optional, captured on mark-paid
+
+  // Tally journal voucher number (TALLY series), issued the first time the
+  // paid line goes out in an "Export to Tally" sheet and reused after.
+  tallyVoucherNo?: number;
 
   createdBy: mongoose.Types.ObjectId; // ref User — who created this row (seeding, or the Official who added it)
   arrangedBy?: mongoose.Types.ObjectId; // ref User — who last marked it ARRANGED
@@ -101,12 +145,28 @@ const CstepArrangementSchema = new Schema<ICstepArrangement>(
 
     status: { type: String, enum: ["PENDING", "ARRANGED"], default: "PENDING", index: true },
 
+    vendorId: { type: Schema.Types.ObjectId, ref: "CstepVendor" },
+    vendorCode: { type: String, trim: true },
+    vendorName: { type: String, trim: true },
+
+    paymentStatus: { type: String, enum: CSTEP_PAYMENT_STATUSES, default: "UNPAID" },
+    paidAt: { type: Date },
+    paidBy: { type: Schema.Types.ObjectId, ref: "User" },
+    paymentRef: { type: String, trim: true },
+    paymentSource: { type: String, enum: ["MANUAL", "IMPORT"] },
+    paymentBatchId: { type: Schema.Types.ObjectId },
+    vendorInvoiceNo: { type: String, trim: true },
+
+    tallyVoucherNo: { type: Number },
+
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     arrangedBy: { type: Schema.Types.ObjectId, ref: "User" },
     arrangedAt: { type: Date },
   },
   { timestamps: true },
 );
+
+CstepArrangementSchema.index({ workspaceId: 1, vendorId: 1, paymentStatus: 1 });
 
 CstepArrangementSchema.plugin(workspaceScopePlugin);
 

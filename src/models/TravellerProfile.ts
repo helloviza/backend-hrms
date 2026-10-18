@@ -177,7 +177,10 @@ export interface TravellerIdentityNumber {
 
 export interface TravellerProfileDocument extends Document {
   workspaceId: mongoose.Types.ObjectId; // CustomerWorkspace._id, via workspaceScopePlugin
-  travelerId: string; // "<CODE>-NNN", issued at document-create time
+  // "<CODE>-NNN", minted at create — except in a CSTEP workspace, where it
+  // is the employee id an admin enters (mirrored into employeeId), and may
+  // be blank until one is assigned. See services/cstepTravellerIds.ts.
+  travelerId: string;
 
   // Set only via the explicit "Is this you?" claim flow (POST /:id/claim) —
   // never inferred silently from an email string match. Drives REQUESTER
@@ -269,6 +272,9 @@ export interface TravellerProfileDocument extends Document {
    * Free text on purpose: every customer numbers its people differently,
    * and validating a format we do not know would reject correct data. NOT
    * unique-indexed in this skeleton — see the design doc §7.
+   *
+   * CSTEP workspaces are the exception: there this IS the travelerId
+   * (same value, trimmed + uppercased, unique through travelerId's index).
    */
   employeeId?: string;
 
@@ -473,7 +479,9 @@ const IdentityNumberSchema = new Schema<TravellerIdentityNumber>(
 
 const TravellerProfileSchema = new Schema<TravellerProfileDocument>(
   {
-    travelerId: { type: String, required: true },
+    // Not required: a CSTEP traveller auto-captured from a booking has no id
+    // until an admin assigns their employee id.
+    travelerId: { type: String, default: "" },
 
     linkedMemberId: { type: Schema.Types.ObjectId, ref: "CustomerMember" },
     claimedBy: { type: Schema.Types.ObjectId, ref: "User" },
@@ -550,7 +558,14 @@ const TravellerProfileSchema = new Schema<TravellerProfileDocument>(
 
 TravellerProfileSchema.plugin(workspaceScopePlugin);
 
-TravellerProfileSchema.index({ workspaceId: 1, travelerId: 1 }, { unique: true });
+// Unique only for a non-empty travelerId, so any number of blank (CSTEP,
+// awaiting an employee id) travellers can coexist. Existing databases are
+// moved from the old full unique index by
+// migrations/2026-10-17-traveller-id-partial-index.ts.
+TravellerProfileSchema.index(
+  { workspaceId: 1, travelerId: 1 },
+  { unique: true, partialFilterExpression: { travelerId: { $gt: "" } } },
+);
 TravellerProfileSchema.index({ workspaceId: 1, email: 1 });
 TravellerProfileSchema.index({ workspaceId: 1, firstName: 1, lastName: 1, dob: 1 }); // tier-2 dedup lookup
 TravellerProfileSchema.index({ workspaceId: 1, isActive: 1 });

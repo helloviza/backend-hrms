@@ -99,7 +99,8 @@ export function card(inner: string, opts: { bg?: string; padding?: string; cls?:
 
 /* ───────────────────────── header ───────────────────────── */
 
-function header() {
+function header(l: EmailLayout) {
+  if (l.footer === "cstep") return cstepHeader(l.orgLabel || "");
   return `<tr><td class="px bg-card" style="padding:18px 28px;background:${C.card};" bgcolor="${C.card}">
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
       <tr>
@@ -393,6 +394,29 @@ function staffFooter() {
   </td></tr>`;
 }
 
+/* CSTEP Travel & Claim Portal mail (services/cstepNotifications.ts): sent on
+   behalf of the organisation, so no Plumtrips logo and no reply-to-ops line —
+   just the organisation's label (config/cstepNotification.ts). */
+function cstepHeader(org: string) {
+  return `<tr><td class="px bg-card" style="padding:18px 28px;background:${C.card};" bgcolor="${C.card}">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+      <tr>
+        <td valign="middle" class="t-navy" style="font-family:${FONT};font-size:22px;line-height:30px;font-weight:800;letter-spacing:1px;color:${C.navy};">${escapeHtml(org)}</td>
+        <td valign="middle" align="right" class="hide-sm t-muted" style="font-family:${FONT};font-size:13px;line-height:18px;color:${C.muted};">Travel &amp; Claim Portal</td>
+      </tr>
+    </table>
+  </td></tr>`;
+}
+
+function cstepFooter(org: string) {
+  return `<tr><td class="px bg-card" style="padding:0 28px 24px 28px;background:${C.card};" bgcolor="${C.card}">
+    <div class="bd" style="border-top:1px solid ${C.line};height:0;line-height:0;font-size:0;">&nbsp;</div>
+    <div class="t-muted" style="margin-top:14px;font-family:${FONT};font-size:12px;line-height:18px;color:${C.muted};">
+      ${escapeHtml(org)} Travel &amp; Claim Portal — an automated notification. Open the request in the portal to see it or act on it.
+    </div>
+  </td></tr>`;
+}
+
 /* ───────────────────────── document ───────────────────────── */
 
 export type EmailLayout = {
@@ -402,7 +426,9 @@ export type EmailLayout = {
   hero: Hero;
   /** Body blocks in order; empty strings are skipped. Each is a full-width block. */
   blocks: string[];
-  footer: "customer" | "staff";
+  footer: "customer" | "staff" | "cstep";
+  /** footer "cstep" only: the organisation label shown in its header and footer. */
+  orgLabel?: string;
 };
 
 const STYLE = `
@@ -468,11 +494,11 @@ export function renderLayout(l: EmailLayout): string {
 <tr><td align="center" style="padding:24px 8px;">
 <!--[if mso]><table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" align="center"><tr><td><![endif]-->
 <table role="presentation" class="container bg-card" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="${C.card}" style="width:600px;max-width:600px;background:${C.card};border-radius:14px;overflow:hidden;border-collapse:separate;">
-${header()}
+${header(l)}
 ${hero(l.hero)}
 ${blocks}
 <tr><td class="bg-card" height="28" style="height:28px;font-size:0;line-height:0;background:${C.card};" bgcolor="${C.card}">&nbsp;</td></tr>
-${l.footer === "customer" ? customerFooter() : staffFooter()}
+${l.footer === "customer" ? customerFooter() : l.footer === "cstep" ? cstepFooter(l.orgLabel || "") : staffFooter()}
 </table>
 <!--[if mso]></td></tr></table><![endif]-->
 </td></tr>

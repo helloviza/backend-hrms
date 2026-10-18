@@ -27,6 +27,14 @@
 //     The personal lines are itemised, so there is no separate summary
 //     Travel-Claim row (that would count them twice).
 //
+// Local Travel Claims (claims addition) are in the register too — TYPE
+// "LOCAL", TIN = the claim's own reference, filed under the claim period's
+// start (departureDate). A claim has no arrangements; once approved it has a
+// settlement seeded from its own lines, so it renders as one row per claim
+// line (route and date from the line) + the TOTAL row ("Total claimed").
+// Expense Claims are not travel and never reach this file — the route
+// filters them out.
+//
 // Reconciliation guard: the TOTAL shown is the stored totalCostOfTour, and it
 // is re-derived here as Σ line.amountInr + perDiem.amountInr (the same sum
 // recomputeSettlementTotals stores). A gap over ₹0.01 is highlighted with a
@@ -49,6 +57,11 @@ export interface RegisterArrangement {
   amountInr?: number;
   rateSource?: string;
   status: string;
+  // Vendor + payment addition — fill Agency / Paid / Cheque & Date.
+  vendorName?: string;
+  paymentStatus?: string; // "UNPAID" | "PAID"
+  paymentRef?: string;
+  paidAt?: Date | string;
 }
 
 export interface RegisterLeg {
@@ -59,12 +72,13 @@ export interface RegisterLeg {
 }
 
 export interface RegisterSettlementLine {
-  source: string; // "ARRANGEMENT" | "REPORT_LEG"
+  source: string; // "ARRANGEMENT" | "REPORT_LEG" | "CLAIM_LINE"
   mode: string;
   description?: string;
   amountInr?: number;
   classification: string; // "OFFICIAL" | "PERSONAL"
-  leg?: RegisterLeg; // the REPORT_LEG this line came from, when there is one
+  leg?: RegisterLeg; // the REPORT_LEG (or claim line) this line came from, when there is one
+  arrangement?: RegisterArrangement; // the ARRANGEMENT this line came from — its vendor + payment
 }
 
 export interface RegisterSettlement {
@@ -85,6 +99,7 @@ export interface RegisterRequest {
   returnDate?: string;
   eventLocation?: string;
   eventVenue?: string;
+  travelLines?: Array<{ date?: string; from?: string; to?: string }>; // LOCAL_TRAVEL_CLAIM
   status: string;
   claimReference?: string;
   createdAt?: Date | string;
@@ -277,6 +292,21 @@ const STATUS_LABEL: Record<string, string> = {
   REIMBURSED: "Reimbursed",
 };
 
+// A claim reuses the request statuses but has no arrangement stage — its
+// APPROVED means "with the CSTEP Admin for verification".
+const CLAIM_STATUS_LABEL: Record<string, string> = {
+  ...STATUS_LABEL,
+  APPROVED: "Approved — awaiting verification",
+};
+
+function isLocalClaim(r: RegisterRequest): boolean {
+  return r.formType === "LOCAL_TRAVEL_CLAIM";
+}
+
+function statusLabel(r: RegisterRequest): string {
+  return (isLocalClaim(r) ? CLAIM_STATUS_LABEL : STATUS_LABEL)[r.status] || r.status;
+}
+
 /** "YYYY-MM-DD" -> the sample's day.month number (5.04 = 5 April). */
 function dayMonth(s?: string): number | null {
   if (!s || !ISO_DATE.test(s)) return null;
@@ -290,6 +320,27 @@ function dottedShort(isoInstant?: string): string {
   if (Number.isNaN(d.getTime())) return "";
   const s = istDate(d);
   return `${s.slice(8, 10)}.${s.slice(5, 7)}`;
+}
+
+/** Agency / Paid / Cheque & Date for a row booked with a vendor. Paid holds
+ * the INR figure paid, as the sample does (falls back to "Paid" when the
+ * line has no INR amount); an unpaid line leaves Paid and Cheque blank.
+ * Cheque & Date = "<UTR / cheque no.> dd.mm.yy". */
+function vendorCols(
+  a: RegisterArrangement | undefined,
+  paidInr: number,
+): Pick<RowSpec, "agency" | "paid" | "cheque"> {
+  if (!a) return {};
+  const out: Pick<RowSpec, "agency" | "paid" | "cheque"> = { agency: a.vendorName || undefined };
+  if (a.paymentStatus === "PAID") {
+    out.paid = paidInr > 0 ? round2(paidInr) : "Paid";
+    const d = a.paidAt ? new Date(a.paidAt) : null;
+    const on = d && !Number.isNaN(d.getTime()) ? istDate(d) : "";
+    out.cheque = [a.paymentRef || "", on ? `${on.slice(8, 10)}.${on.slice(5, 7)}.${on.slice(2, 4)}` : ""]
+      .filter(Boolean)
+      .join(" ") || undefined;
+  }
+  return out;
 }
 
 function inr(n: number): string {
@@ -308,13 +359,26 @@ export function tripEffectiveDate(r: RegisterRequest): string {
 }
 
 function tripType(r: RegisterRequest): string {
-  if (r.formType === "EVENT_REQUEST") return "EVENT";
-  return r.type === "INTERNATIONAL" ? "INT" : "DOM";
+  switch (r.formType) {
+    case "EVENT_REQUEST":
+      return "EVENT";
+    case "LOCAL_TRAVEL_CLAIM":
+      return "LOCAL";
+    case "TOUR_PROPOSAL":
+      return r.type === "INTERNATIONAL" ? "INT" : "DOM";
+    default:
+      return r.formType;
+  }
 }
 
 function tripRoute(r: RegisterRequest): { from: string; to: string } {
   if (r.formType === "EVENT_REQUEST") {
     return { from: "", to: r.eventLocation || r.eventVenue || "" };
+  }
+  if (isLocalClaim(r)) {
+    const lines = r.travelLines || [];
+    const to = [...new Set(lines.map((l) => (l.to || "").trim()).filter(Boolean))].join(", ");
+    return { from: (lines[0]?.from || "").trim(), to };
   }
   if (r.type === "INTERNATIONAL") {
     // The international form captures destination countries only — no origin.
@@ -368,6 +432,8 @@ interface RowSpec {
   amountFmt?: string;
   modeNote?: string;
   amountNote?: string;
+  paid?: number | string;
+  cheque?: string;
   summary?: SummaryKind;
   mismatch?: boolean;
 }
@@ -445,7 +511,10 @@ export function buildTravelRegisterWorkbook(
     const eff = tripEffectiveDate(r);
     const identity = {
       month: eff ? MONTHS_SHORT[Number(eff.slice(5, 7)) - 1] : "",
-      tin: r.formType === "EVENT_REQUEST" ? "—" : r.claimReference || "—",
+      // TIN for a Tour Proposal, the claim reference for a Local Travel
+      // Claim, the EVR reference for an Event Request (none before approval,
+      // or on one approved before EVR references existed).
+      tin: r.claimReference || "—",
       type: tripType(r),
       name: trip.travellerName,
       reason: r.purpose || "",
@@ -453,9 +522,12 @@ export function buildTravelRegisterWorkbook(
     };
     const route = tripRoute(r);
     const tripCols = { from: route.from, to: route.to, fromDate: r.departureDate, toDate: r.returnDate };
+    // The claim date: the travel report's submission — or, for a Local
+    // Travel Claim (no report), the claim's own submission.
+    const claimDateIso = isLocalClaim(r) ? trip.submittedAt : trip.reportSubmittedAt;
     const reportDm = (() => {
-      if (!trip.reportSubmittedAt) return null;
-      const d = new Date(trip.reportSubmittedAt);
+      if (!claimDateIso) return null;
+      const d = new Date(claimDateIso);
       return Number.isNaN(d.getTime()) ? null : dayMonth(istDate(d));
     })();
 
@@ -476,6 +548,7 @@ export function buildTravelRegisterWorkbook(
           amount: round2(Number(l.amountInr || 0)),
           amountFmt: INR_FMT,
           modeNote: l.description || undefined,
+          ...vendorCols(l.arrangement, Number(l.amountInr || 0)),
         });
       }
       for (const l of personal) {
@@ -487,7 +560,14 @@ export function buildTravelRegisterWorkbook(
           mode: "Travel Claim",
           agency: "Claim",
           invDate: reportDm,
-          invNo: l.description ? `${modeLabel(l.mode)} – ${l.description}` : modeLabel(l.mode),
+          // A claim line's description already names its own mode ("Metro:
+          // A → B"), which is finer than the bucketed service type.
+          invNo:
+            l.source === "CLAIM_LINE"
+              ? l.description || modeLabel(l.mode)
+              : l.description
+                ? `${modeLabel(l.mode)} – ${l.description}`
+                : modeLabel(l.mode),
           amount: round2(Number(l.amountInr || 0)),
           amountFmt: INR_FMT,
         });
@@ -553,6 +633,7 @@ export function buildTravelRegisterWorkbook(
           amountFmt: cur === "INR" ? INR_FMT : `"${cur} "#,##0.00`,
           modeNote: notes.length ? notes.join(" · ") : undefined,
           amountNote,
+          ...vendorCols(a, Number(a.amountInr || 0)),
         });
       }
       specs.push({ ...tripCols, summary: "status" });
@@ -623,14 +704,18 @@ function writeRow(
   set(C.invDate, spec.invDate);
   set(C.invNo, spec.invNo);
   set(C.project, identity.project);
+  set(C.paid, spec.paid);
+  set(C.cheque, spec.cheque);
 
   if (spec.summary === "total" || spec.summary === "provisional") {
-    const on = dottedShort(trip.reportSubmittedAt);
+    const claim = isLocalClaim(trip.request);
+    const on = dottedShort(claim ? trip.submittedAt : trip.reportSubmittedAt);
     set(C.agency, on ? `Submitted on ${on}` : "Submitted");
     set(C.invDate, spec.summary === "total" ? "TOTAL" : "TOTAL (prov.)");
-    set(C.invNo, spec.summary === "total" ? "Cost of the Tour" : "Cost of the Tour (being verified)");
+    const what = claim ? "Total claimed" : "Cost of the Tour";
+    set(C.invNo, spec.summary === "total" ? what : `${what} (being verified)`);
   } else if (spec.summary === "status") {
-    const label = STATUS_LABEL[trip.request.status] || trip.request.status;
+    const label = statusLabel(trip.request);
     const on = dottedShort(trip.submittedAt);
     // Same slots as the sample's summary row: K = "Submitted on dd.mm" (when it was),
     // L = STATUS in place of TOTAL, M (the wide column) = where the trip is now.
@@ -658,6 +743,7 @@ function writeRow(
     if (typeof row.getCell(c).value === "number") row.getCell(c).numFmt = DAY_MONTH_FMT;
   }
   row.getCell(C.amount).numFmt = spec.amountFmt || INR_FMT;
+  if (typeof spec.paid === "number") row.getCell(C.paid).numFmt = INR_FMT;
   row.height = spec.summary === "status" ? 45.1 : spec.summary ? 30.05 : 15.65;
 
   if (spec.summary) {

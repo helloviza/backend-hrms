@@ -777,7 +777,31 @@ app.use("/api/expense-activity", requireAuth, requireWorkspace, attachExpenseGra
 // CSTEP Travel & Claim Portal (Phase 3) — pre-trip travel request form.
 // Tenant-scoped via req.workspaceObjectId in-router; owner-only mutations.
 import cstepRouter from "./routes/cstep.js";
-app.use("/api/cstep", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepRouter);
+// Vendor Master — own file, same chain. Mounted first so its paths never
+// fall through to a cstep.ts route.
+import cstepVendorsRouter from "./routes/cstep.vendors.js";
+app.use("/api/cstep/vendors", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepVendorsRouter);
+// Project Master — own file, same chain.
+import cstepProjectsRouter from "./routes/cstep.projects.js";
+app.use("/api/cstep/projects", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepProjectsRouter);
+// Vendor payables + Finance payment upload — own file, same chain.
+import cstepVendorPayablesRouter from "./routes/cstep.vendorPayables.js";
+app.use("/api/cstep/vendor-payables", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepVendorPayablesRouter);
+// Finance "Export to Tally" + its Admin settings — own file, same chain.
+import cstepTallyRouter from "./routes/cstep.tally.js";
+app.use("/api/cstep/tally", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepTallyRouter);
+// Finance bulk reimbursement (export + import of the finance queue) — own file, same chain.
+import cstepReimbursementsRouter from "./routes/cstep.reimbursements.js";
+app.use("/api/cstep/reimbursements", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepReimbursementsRouter);
+// CSTEP Training — screenshot slide decks + per-user deck progress (routes/
+// cstep.training.ts) and the Team Training report for CSTEP Admin / Finance
+// (routes/cstep.trainingReport.ts, mounted first). Same chain, so both exist
+// only where the workspace has CSTEP on.
+import cstepTrainingReportRouter from "./routes/cstep.trainingReport.js";
+import cstepTrainingRouter from "./routes/cstep.training.js";
+app.use("/api/cstep/training/report", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepTrainingReportRouter);
+app.use("/api/cstep/training", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepTrainingRouter);
+app.use("/api/cstep",requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepRouter);
 
 // Visa module (Phase 2a) — read-only destination/rule/content API behind
 // the destination picker. VisaRule/VisaDestinationContent are global

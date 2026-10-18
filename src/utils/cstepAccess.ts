@@ -47,6 +47,18 @@ export function isCstepAdmin(req: any): boolean {
   );
 }
 
+/** CSTEP Finance user — mapped as some traveller's financeUserId in this
+ * workspace. The same derivation GET /cstep/my-roles reports as isFinance;
+ * a CSTEP Admin is not counted here (check isCstepAdmin separately). */
+export async function isCstepFinanceUser(req: any): Promise<boolean> {
+  const uid = ownerId(req);
+  if (!req.workspaceObjectId || !mongoose.isValidObjectId(uid)) return false;
+  return !!(await TravellerProfile.exists({
+    workspaceId: req.workspaceObjectId,
+    financeUserId: new mongoose.Types.ObjectId(uid),
+  }));
+}
+
 export type OwnTravellerResolution =
   | { status: "linked"; traveller: TravellerProfileDocument }
   | { status: "none" }

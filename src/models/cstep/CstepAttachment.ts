@@ -33,6 +33,10 @@ export interface ICstepAttachment extends Document {
   // Step 4 Travel Report addition — set when this attachment was uploaded
   // for a CstepReportLeg, alongside claimId when one exists. Optional so
   // pre-existing (future Phase 2 claim-expense) attachments are unaffected.
+  // Claims addition — a claim receipt is uploaded BEFORE the claim exists
+  // (POST /attachments/staging, during intake), so it starts with neither
+  // claimId nor travelRequestId; the claim's create/PATCH links it here
+  // once a saved line references it.
   travelRequestId?: mongoose.Types.ObjectId; // ref CstepTravelRequest
 
   s3Key: string;

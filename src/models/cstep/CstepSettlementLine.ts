@@ -28,7 +28,10 @@ import { CSTEP_SERVICE_TYPES, type CstepServiceType } from "./CstepArrangement.j
  * other CSTEP model.
  */
 
-export type CstepSettlementLineSource = "ARRANGEMENT" | "REPORT_LEG";
+// CLAIM_LINE (claims addition): seeded at a claim's approval from the claim's
+// own lines — sourceId is the travelLines/foodLines subdocument _id, or the
+// request's own _id for its single "Other expenses" line.
+export type CstepSettlementLineSource = "ARRANGEMENT" | "REPORT_LEG" | "CLAIM_LINE";
 export type CstepSettlementLineClassification = "OFFICIAL" | "PERSONAL";
 
 export interface ICstepSettlementLine extends Document {
@@ -37,7 +40,7 @@ export interface ICstepSettlementLine extends Document {
   requestId: mongoose.Types.ObjectId; // ref CstepTravelRequest
 
   source: CstepSettlementLineSource;
-  sourceId: mongoose.Types.ObjectId; // polymorphic — CstepArrangement._id or CstepReportLeg._id per `source`
+  sourceId: mongoose.Types.ObjectId; // polymorphic — CstepArrangement._id, CstepReportLeg._id or a claim line's _id per `source`
 
   description?: string;
   mode: CstepServiceType; // maps to a bucket — see SETTLEMENT_BUCKET_BY_MODE in routes/cstep.ts
@@ -64,7 +67,7 @@ const CstepSettlementLineSchema = new Schema<ICstepSettlementLine>(
     settlementId: { type: Schema.Types.ObjectId, ref: "CstepSettlement", required: true, index: true },
     requestId: { type: Schema.Types.ObjectId, ref: "CstepTravelRequest", required: true, index: true },
 
-    source: { type: String, enum: ["ARRANGEMENT", "REPORT_LEG"], required: true },
+    source: { type: String, enum: ["ARRANGEMENT", "REPORT_LEG", "CLAIM_LINE"], required: true },
     sourceId: { type: Schema.Types.ObjectId, required: true },
 
     description: { type: String, trim: true },

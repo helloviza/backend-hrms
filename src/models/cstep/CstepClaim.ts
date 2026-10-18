@@ -31,7 +31,7 @@ export interface ICstepClaim extends Document {
   travelerProfileId: mongoose.Types.ObjectId; // soft ref -> TravellerProfile._id
   travelRequestId: mongoose.Types.ObjectId; // ref CstepTravelRequest
 
-  claimReference: string; // "<travelerId>/MMYY"
+  claimReference: string; // the TIN, "NNNN/MMYY" (older TINs keep "<travelerId>/MMYY")
   type: "DOMESTIC" | "INTERNATIONAL";
   status: CstepClaimStatus;
 

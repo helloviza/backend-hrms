@@ -44,16 +44,32 @@ import {
   CstepSettlement,
   CstepSettlementLine,
   CstepPerDiemPolicy,
+  CstepVendor,
+  CstepVendorType,
+  CstepSequenceChange,
 } from "../models/cstep/index.js";
-import { CSTEP_EVENT_NATURES, type CstepFormType } from "../models/cstep/CstepTravelRequest.js";
-import { CSTEP_SERVICE_TYPES, type CstepServiceType, type CstepRateSource } from "../models/cstep/CstepArrangement.js";
+import {
+  CSTEP_EVENT_NATURES,
+  CSTEP_FORM_TYPES,
+  CSTEP_LOCAL_TRAVEL_MODES,
+  isClaimFormType,
+  type CstepFormType,
+} from "../models/cstep/CstepTravelRequest.js";
+import {
+  CSTEP_SERVICE_TYPES,
+  CSTEP_VENDOR_PAYABLE_STATUSES,
+  type CstepServiceType,
+  type CstepRateSource,
+} from "../models/cstep/CstepArrangement.js";
 import type { CstepReportDirection, CstepReportPaidBy } from "../models/cstep/CstepReportLeg.js";
 import type { CstepDocumentType } from "../models/cstep/CstepAttachment.js";
 import type {
   CstepSettlementLineClassification,
   CstepSettlementLineSource,
 } from "../models/cstep/CstepSettlementLine.js";
+import CstepProject from "../models/cstep/CstepProject.js";
 import TravellerProfile from "../models/TravellerProfile.js";
+import Counter from "../models/Counter.js";
 import { ownerId, isCstepAdmin, resolveOwnTravellerProfile } from "../utils/cstepAccess.js";
 import {
   uploadCstepTourProposalPdf,
@@ -61,16 +77,36 @@ import {
   type CstepSettlementPdfData,
 } from "../utils/cstepTourProposalPdf.js";
 import { uploadCstepEventRequestPdf } from "../utils/cstepEventRequestPdf.js";
+import {
+  localTravelClaimDeclaration,
+  uploadCstepExpenseClaimPdf,
+  uploadCstepLocalTravelClaimPdf,
+  type CstepClaimSettlementPdfData,
+} from "../utils/cstepClaimPdf.js";
 import { uploadCstepPacketPdf, type CstepPacketReportLeg } from "../utils/cstepPacketPdf.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { getLiveRate } from "../utils/exchangeRate.js";
 import {
+  nextCstepSerial,
+  seedCstepSerial,
+  peekCstepSerial,
+  cstepMMYY,
+  cstepFyStartYear,
+  formatCstepTin,
+  formatCstepClaimReference,
+  CSTEP_SERIES,
+  isFySeries,
+  type CstepSeries,
+} from "../utils/cstepSequence.js";
+import {
   buildTravelRegisterWorkbook,
+  istDate,
   resolveRegisterPeriod,
   type RegisterTrip,
 } from "../utils/cstepTravelRegister.js";
 import { env } from "../config/env.js";
+import { notifyCstep } from "../services/cstepNotifications.js";
 
 const router = Router();
 
@@ -114,16 +150,24 @@ const EDITABLE_STATUSES = new Set(["DRAFT", "RETURNED"]);
 // report is submitted or money has moved (REPORT_SUBMITTED onwards).
 const CANCELLABLE_STATUSES = new Set(["DRAFT", "SUBMITTED", "RETURNED", "APPROVED", "ARRANGING", "ARRANGED", "REPORT_PENDING"]);
 const POST_APPROVAL_CANCELLABLE = new Set(["APPROVED", "ARRANGING", "ARRANGED", "REPORT_PENDING"]);
-const FORM_TYPES = new Set<CstepFormType>(["TOUR_PROPOSAL", "EVENT_REQUEST"]);
+const FORM_TYPES = new Set<string>(CSTEP_FORM_TYPES);
 
-/** Resolves the formType for a create payload — defaults to TOUR_PROPOSAL
- * (existing/omitted clients keep behaving exactly as before Event Request
- * existed). Immutable after creation: this is only ever called from
- * POST /requests — pickFields() deliberately does NOT include formType, so
- * a PATCH body can never change it. */
-function resolveFormType(body: any): CstepFormType {
-  return FORM_TYPES.has(body?.formType) ? body.formType : "TOUR_PROPOSAL";
+/** Resolves the formType for a create payload. An OMITTED formType still
+ * defaults to TOUR_PROPOSAL (existing clients keep behaving exactly as before
+ * Event Request existed), but a value that is present and not a known form
+ * type resolves to null — the caller refuses it — instead of silently
+ * becoming a Tour Proposal (claims addition: a claim sent to a backend that
+ * didn't know its type used to be saved/validated as a Tour). Immutable
+ * after creation: pickFields() deliberately does NOT include formType, so a
+ * PATCH body can never change it. */
+function resolveFormType(body: any): CstepFormType | null {
+  const raw = body?.formType;
+  if (raw === undefined || raw === null || raw === "") return "TOUR_PROPOSAL";
+  return FORM_TYPES.has(raw) ? (raw as CstepFormType) : null;
 }
+
+/** Statuses at which a claim's settlement is open to the CSTEP Admin. */
+const CLAIM_SETTLEMENT_STATUSES = new Set(["APPROVED", "TRANSFERRED_TO_FINANCE", "SETTLED", "REIMBURSED"]);
 
 /**
  * Per-request approval authority: a CSTEP Admin (any request), or the
@@ -183,6 +227,33 @@ async function callerCanFinanceForTraveller(req: any, travelerProfileId: any): P
   return String(traveller.financeUserId) === ownerId(req);
 }
 
+/** Vendor payment on an arrangement line: the traveller's Official (who
+ * books the vendor at the arrange step), their Finance user, or a CSTEP
+ * Admin. */
+async function callerCanPayVendorsForTraveller(req: any, travelerProfileId: any): Promise<boolean> {
+  return (
+    (await callerCanArrangeForTraveller(req, travelerProfileId)) ||
+    (await callerCanFinanceForTraveller(req, travelerProfileId))
+  );
+}
+
+/**
+ * The traveller's mapped Finance user ONLY — no CSTEP Admin pass. A claim's
+ * reimbursement is Finance's act: the Admin's part ends at verify →
+ * send-to-Finance (POST /claim/verify). An Admin who is also mapped as this
+ * traveller's Finance user still qualifies, as that Finance user.
+ */
+async function callerIsTravellerFinanceUser(req: any, travelerProfileId: any): Promise<boolean> {
+  const traveller: any = await TravellerProfile.findOne({
+    _id: travelerProfileId,
+    workspaceId: req.workspaceObjectId,
+  })
+    .select("financeUserId")
+    .lean();
+  if (!traveller?.financeUserId) return false;
+  return String(traveller.financeUserId) === ownerId(req);
+}
+
 /**
  * READ authority over a traveller's case for anyone in its pipeline: a
  * CSTEP Admin, or the traveller's mapped Approver, Official or Finance
@@ -206,14 +277,16 @@ async function callerCanViewTraveller(req: any, travelerProfileId: any): Promise
   );
 }
 
-/** "<MM><YY>" for the current date, e.g. July 2026 -> "0726". Used only in
- * the TIN (claimReference); does not mint a new id — it reads the
- * traveller's existing TravellerProfile.travelerId code. */
-function currentMMYY(): string {
-  const now = new Date();
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const yy = String(now.getFullYear() % 100).padStart(2, "0");
-  return `${mm}${yy}`;
+/**
+ * Claims addition — authority over a request's SETTLEMENT (view / edit
+ * lines). A claim has no Official stage: its settlement is verified by a
+ * CSTEP Admin, so for LOCAL_TRAVEL_CLAIM / EXPENSE_CLAIM only an Admin
+ * qualifies. Every other form type keeps the Official/Admin rule
+ * (callerCanArrangeForTraveller), unchanged.
+ */
+async function callerCanSettleRequest(req: any, doc: any): Promise<boolean> {
+  if (isClaimFormType(doc.formType)) return isCstepAdmin(req);
+  return callerCanArrangeForTraveller(req, doc.travelerProfileId);
 }
 
 /** Thrown from inside an approve transaction to carry a specific HTTP status
@@ -228,53 +301,38 @@ class CstepHttpError extends Error {
 }
 
 /**
- * Picks the TIN for this approval: "<base>" ("<travelerCode>/<MMYY>") if free,
- * else "<base>-2", "-3", ... — the first free suffix. `base` alone covers the
- * common single-trip-per-month case; a suffix only appears once a traveller
- * has a second trip approved in the same month. `attemptFloor` is the 1-based
- * retry-loop counter from the caller: on attempt 1 an unclaimed base is
- * returned as-is, but on any retry (attempt >= 2, meaning a duplicate-key
- * error already happened once) a suffix is always forced, and never below
- * attemptFloor — so each retry proposes a value strictly different from every
- * prior attempt, guaranteeing forward progress under a race even if this
- * transaction's snapshot can't yet see a concurrent winner's commit.
+ * Reference numbers issued at approval — all from the CSTEP serial counter
+ * (utils/cstepSequence.ts), one running series per workspace + financial
+ * year (IST):
+ *   TOUR_PROPOSAL      → TIN  "0001/1026"
+ *   LOCAL_TRAVEL_CLAIM → LTC  "LTC0001/1026"
+ *   EXPENSE_CLAIM      → EXP  "EXP0001/1026"
+ *   EVENT_REQUEST      → EVR  "EVR0001/1026"
+ * The serial and the MMYY are read from the same instant, so a number can
+ * never pair one financial year's serial with another year's month. The
+ * counter increment runs inside the approve transaction (an abort rolls it
+ * back). References issued before this format stay as they were.
  */
-async function nextClaimReference(
+const CLAIM_REFERENCE_SERIES: Record<string, "LTC" | "EXP" | "EVR"> = {
+  LOCAL_TRAVEL_CLAIM: "LTC",
+  EXPENSE_CLAIM: "EXP",
+  EVENT_REQUEST: "EVR",
+};
+
+async function issueApprovalReference(
   workspaceId: any,
-  travelerProfileId: any,
-  base: string,
+  formType: string,
   session: any,
-  attemptFloor: number,
-): Promise<string> {
-  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const existing = await CstepClaim.find({
-    workspaceId,
-    travelerProfileId,
-    claimReference: { $regex: `^${escaped}(-\\d+)?$` },
-  })
-    .select("claimReference")
-    .session(session)
-    .lean();
-
-  let maxSuffix = 1;
-  let baseTaken = false;
-  for (const c of existing as any[]) {
-    const ref = String(c.claimReference || "");
-    if (ref === base) {
-      baseTaken = true;
-      continue;
-    }
-    const m = ref.match(/-(\d+)$/);
-    if (m) {
-      const n = parseInt(m[1], 10);
-      if (!isNaN(n) && n > maxSuffix) maxSuffix = n;
-    }
-  }
-
-  if (!baseTaken && attemptFloor <= 1) return base;
-
-  const nextSuffix = Math.max(maxSuffix + 1, attemptFloor);
-  return `${base}-${nextSuffix}`;
+): Promise<{ ref: string; key: string }> {
+  const at = new Date();
+  const claimSeries = CLAIM_REFERENCE_SERIES[formType];
+  const series = claimSeries || "TIN";
+  const { seq, key } = await nextCstepSerial(workspaceId, series, { at, session });
+  const mmyy = cstepMMYY(at);
+  return {
+    ref: claimSeries ? formatCstepClaimReference(claimSeries, seq, mmyy) : formatCstepTin(seq, mmyy),
+    key,
+  };
 }
 
 /** Load one request, workspace-scoped. */
@@ -376,15 +434,169 @@ function validateEventRequestPayload(body: any): string | null {
   return null;
 }
 
+const LOCAL_TRAVEL_MODES = new Set<string>(CSTEP_LOCAL_TRAVEL_MODES);
+
+/** A non-negative finite number, or undefined/null/"" (not set). */
+function isOptionalAmount(v: any): boolean {
+  if (v === undefined || v === null || v === "") return true;
+  const n = Number(v);
+  return isFinite(n) && n >= 0;
+}
+
 /**
- * Manual validation dispatcher — routes to the Tour Proposal or Event
- * Request validator by formType. Every lifecycle route (submit/withdraw/
- * cancel/approve/return/amend) calls this ONE function; none of them know
- * or care which formType they're validating.
+ * Manual validation for a Local Travel Claim (claims addition). The header
+ * reuses the Tour fields (purpose, project, claim period in departureDate/
+ * returnDate). Every line must fall inside the claim period. A travel line
+ * needs a receipt (attachmentId) or an explicit noBill — noBill lines are
+ * what the claim's Declaration lists. Empty rows are filtered client-side
+ * before this ever runs, so an incomplete row here is a real error.
+ */
+function validateLocalTravelClaimPayload(body: any): string | null {
+  if (!String(body?.purpose || "").trim()) return "Purpose of the claim is required";
+
+  if (!isValidDateStr(body?.departureDate)) return "Claim period start date is required";
+  if (!isValidDateStr(body?.returnDate)) return "Claim period end date is required";
+  const start = String(body.departureDate);
+  const end = String(body.returnDate);
+  if (new Date(end).getTime() < new Date(start).getTime()) {
+    return "Claim period end date must be on or after the start date";
+  }
+  const inPeriod = (d: string) => d >= start && d <= end;
+
+  const travelLines = Array.isArray(body?.travelLines) ? body.travelLines : [];
+  const foodLines = Array.isArray(body?.foodLines) ? body.foodLines : [];
+
+  for (let i = 0; i < travelLines.length; i++) {
+    const l = travelLines[i] || {};
+    const n = `Travel line ${i + 1}`;
+    if (!isValidDateStr(l.date)) return `${n}: date is required`;
+    if (!inPeriod(String(l.date))) return `${n}: date must fall within the claim period`;
+    if (!String(l.from || "").trim()) return `${n}: from is required`;
+    if (!String(l.to || "").trim()) return `${n}: to is required`;
+    if (!LOCAL_TRAVEL_MODES.has(l.mode)) return `${n}: mode of travel is required`;
+    const fare = Number(l.fare);
+    if (!isFinite(fare) || fare <= 0) return `${n}: fare must be more than zero`;
+    if (!l.attachmentId && l.noBill !== true) return `${n}: attach the bill, or mark it as having no bill`;
+  }
+
+  for (let i = 0; i < foodLines.length; i++) {
+    const l = foodLines[i] || {};
+    const n = `Food line ${i + 1}`;
+    if (!isValidDateStr(l.date)) return `${n}: date is required`;
+    if (!inPeriod(String(l.date))) return `${n}: date must fall within the claim period`;
+    const amount = Number(l.amount);
+    if (!isFinite(amount) || amount <= 0) return `${n}: amount must be more than zero`;
+  }
+
+  if (!isOptionalAmount(body?.otherExpenses)) return "Other expenses must be a non-negative amount";
+  if (!isOptionalAmount(body?.advanceTaken)) return "Advance taken must be a non-negative amount";
+
+  if (travelLines.length === 0 && foodLines.length === 0 && !(Number(body?.otherExpenses) > 0)) {
+    return "Add at least one travel or food line, or an other-expenses amount";
+  }
+
+  return null;
+}
+
+/**
+ * Manual validation for an Expense Claim (claims module 2). Same header as the
+ * Local Travel Claim (purpose, project = "bill to", claim period). At least
+ * one expense line, each inside the claim period with a description and a
+ * positive amount. One optional tax amount. No Declaration path: the tax
+ * invoice must be attached — on a line, or at claim level — and a line with
+ * no invoice of its own is covered only by a claim-level invoice.
+ */
+function validateExpenseClaimPayload(body: any): string | null {
+  if (!String(body?.purpose || "").trim()) return "Purpose of the claim is required";
+
+  if (!isValidDateStr(body?.departureDate)) return "Claim period start date is required";
+  if (!isValidDateStr(body?.returnDate)) return "Claim period end date is required";
+  const start = String(body.departureDate);
+  const end = String(body.returnDate);
+  if (new Date(end).getTime() < new Date(start).getTime()) {
+    return "Claim period end date must be on or after the start date";
+  }
+
+  const lines = Array.isArray(body?.expenseLines) ? body.expenseLines : [];
+  if (lines.length === 0) return "Add at least one expense line";
+  const hasClaimInvoice = Array.isArray(body?.invoiceAttachmentIds) && body.invoiceAttachmentIds.length > 0;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i] || {};
+    const n = `Expense line ${i + 1}`;
+    if (!isValidDateStr(l.date)) return `${n}: date is required`;
+    if (String(l.date) < start || String(l.date) > end) return `${n}: date must fall within the claim period`;
+    if (!String(l.description || "").trim()) return `${n}: description is required`;
+    const amount = Number(l.amount);
+    if (!isFinite(amount) || amount <= 0) return `${n}: amount must be more than zero`;
+    if (!l.attachmentId && !hasClaimInvoice) return `${n}: attach its invoice, or attach the tax invoice for the whole claim`;
+  }
+
+  if (!isOptionalAmount(body?.taxAmount)) return "Tax amount must be a non-negative amount";
+  if (!isOptionalAmount(body?.advanceTaken)) return "Advance taken must be a non-negative amount";
+  return null;
+}
+
+/**
+ * Manual validation dispatcher — routes to each form type's own validator.
+ * Every lifecycle route (submit/withdraw/cancel/approve/return/amend) calls
+ * this ONE function; none of them know or care which formType they're
+ * validating. An unknown form type is an error, never a Tour Proposal.
  */
 function validatePayload(body: any): string | null {
   const formType = resolveFormType(body);
-  return formType === "EVENT_REQUEST" ? validateEventRequestPayload(body) : validateTourProposalPayload(body);
+  let error: string | null;
+  switch (formType) {
+    case "TOUR_PROPOSAL":
+      error = validateTourProposalPayload(body);
+      break;
+    case "EVENT_REQUEST":
+      error = validateEventRequestPayload(body);
+      break;
+    case "LOCAL_TRAVEL_CLAIM":
+      error = validateLocalTravelClaimPayload(body);
+      break;
+    case "EXPENSE_CLAIM":
+      error = validateExpenseClaimPayload(body);
+      break;
+    default:
+      return "Unknown form type";
+  }
+  if (error) return error;
+  // Project Master — every form type needs a project picked from the master.
+  // A request made before the master keeps its free-text project, which
+  // still counts (it is never rewritten).
+  if (!body?.projectId && !String(body?.project || "").trim()) return "Choose a project";
+  return null;
+}
+
+/**
+ * Project Master — resolves a picked projectId (create / edit) into the
+ * request's snapshot: projectId, projectCode, projectName, projectTallyCC,
+ * and `project` = "CODE — Name" (the display text every existing reader —
+ * lists, PDFs, the Travel Register — already shows). The project must be in
+ * this workspace and active; an inactive one is accepted only if it is the
+ * request's own current project (an edit that leaves it alone). Mutates
+ * `fields`; returns an error message or null. No projectId in the body ->
+ * nothing changes.
+ */
+async function applyProjectSelection(req: any, fields: any, current?: any): Promise<string | null> {
+  if (fields.projectId === undefined) return null;
+  const raw = fields.projectId == null ? "" : String(fields.projectId).trim();
+  if (!raw) {
+    delete fields.projectId;
+    return "Choose a project";
+  }
+  if (!mongoose.Types.ObjectId.isValid(raw)) return "Unknown project";
+  const project: any = await CstepProject.findOne({ _id: raw, workspaceId: req.workspaceObjectId }).lean();
+  if (!project) return "Unknown project";
+  const unchanged = current?.projectId && String(current.projectId) === raw;
+  if (!project.isActive && !unchanged) return `Project ${project.projectCode} is inactive — choose another`;
+  fields.projectId = project._id;
+  fields.projectCode = project.projectCode;
+  fields.projectName = project.projectName;
+  fields.projectTallyCC = project.tallyProjectCC || undefined;
+  fields.project = `${project.projectCode} — ${project.projectName}`;
+  return null;
 }
 
 /** Fields the request/update payload may set — everything except workspaceId,
@@ -397,7 +609,10 @@ function pickFields(body: any) {
     travelerProfileId,
     type,
     purpose,
-    project,
+    // Project Master — the picked project's id; the server snapshots it
+    // (applyProjectSelection). Free-text `project` is no longer accepted —
+    // it survives only, untouched, on requests made before the master.
+    projectId,
     projectDebitable,
     stations,
     countries,
@@ -438,13 +653,21 @@ function pickFields(body: any) {
     presentingPaperDetails,
     eventFundsAvailability,
     participantMeals,
+    // Claims addition — per claim type (see scopeFieldsToFormType).
+    travelLines,
+    foodLines,
+    otherExpenses,
+    advanceTaken,
+    expenseLines,
+    taxAmount,
+    invoiceAttachmentIds,
   } = body || {};
 
   return {
     travelerProfileId,
     type,
     purpose,
-    project,
+    projectId,
     projectDebitable,
     stations,
     countries,
@@ -484,7 +707,262 @@ function pickFields(body: any) {
     presentingPaperDetails,
     eventFundsAvailability,
     participantMeals,
+    travelLines,
+    foodLines,
+    otherExpenses,
+    advanceTaken,
+    expenseLines,
+    taxAmount,
+    invoiceAttachmentIds,
   };
+}
+
+/** Claims addition — the fields each claim type may carry: the shared header
+ * plus its own line/amount fields. Nothing Tour- or Event-specific, and
+ * neither claim type carries the other's fields. */
+const CLAIM_HEADER_FIELDS = [
+  "travelerProfileId",
+  "purpose",
+  "projectId",
+  "projectDebitable",
+  "departureDate",
+  "returnDate",
+  "otherInstructions",
+  "advanceTaken",
+];
+const CLAIM_FIELDS_BY_TYPE: Record<string, Set<string>> = {
+  LOCAL_TRAVEL_CLAIM: new Set([...CLAIM_HEADER_FIELDS, "travelLines", "foodLines", "otherExpenses"]),
+  EXPENSE_CLAIM: new Set([...CLAIM_HEADER_FIELDS, "expenseLines", "taxAmount", "invoiceAttachmentIds"]),
+};
+const CLAIM_ONLY_FIELDS = [
+  "travelLines",
+  "foodLines",
+  "otherExpenses",
+  "advanceTaken",
+  "expenseLines",
+  "taxAmount",
+  "invoiceAttachmentIds",
+];
+
+const asOid = (v: any) => (v && mongoose.Types.ObjectId.isValid(String(v)) ? new mongoose.Types.ObjectId(String(v)) : undefined);
+const asAmount = (v: any) => (v === undefined || v === null || v === "" ? undefined : Number(v));
+
+/**
+ * Keeps each form type's documents to its own field set: a claim drops every
+ * Tour/Event field, and a Tour/Event payload drops the claim fields (so a
+ * stray travelLines can never land on a Tour Proposal). Claim lines are
+ * normalised here too — only the known keys survive, a line with a receipt
+ * is never also noBill, and amounts are numbers. Mutates and returns
+ * `fields`.
+ */
+function scopeFieldsToFormType(fields: any, formType: CstepFormType): any {
+  if (isClaimFormType(formType)) {
+    const allowed = CLAIM_FIELDS_BY_TYPE[formType];
+    for (const k of Object.keys(fields)) if (!allowed.has(k)) delete fields[k];
+    if (Array.isArray(fields.travelLines)) {
+      fields.travelLines = fields.travelLines.map((l: any) => {
+        const attachmentId = asOid(l?.attachmentId);
+        return {
+          ...(asOid(l?._id) ? { _id: asOid(l._id) } : {}),
+          date: l?.date || undefined,
+          from: l?.from,
+          to: l?.to,
+          mode: l?.mode || undefined,
+          fare: asAmount(l?.fare),
+          remarks: l?.remarks,
+          attachmentId,
+          noBill: !attachmentId && l?.noBill === true,
+        };
+      });
+    }
+    if (Array.isArray(fields.foodLines)) {
+      fields.foodLines = fields.foodLines.map((l: any) => ({
+        ...(asOid(l?._id) ? { _id: asOid(l._id) } : {}),
+        date: l?.date || undefined,
+        amount: asAmount(l?.amount),
+        remarks: l?.remarks,
+        attachmentId: asOid(l?.attachmentId),
+      }));
+    }
+    if (Array.isArray(fields.expenseLines)) {
+      fields.expenseLines = fields.expenseLines.map((l: any) => ({
+        ...(asOid(l?._id) ? { _id: asOid(l._id) } : {}),
+        date: l?.date || undefined,
+        description: l?.description,
+        amount: asAmount(l?.amount),
+        attachmentId: asOid(l?.attachmentId),
+      }));
+    }
+    if (Array.isArray(fields.invoiceAttachmentIds)) {
+      fields.invoiceAttachmentIds = [...new Set(fields.invoiceAttachmentIds.map((v: any) => String(v)))]
+        .map(asOid)
+        .filter(Boolean);
+    }
+    if ("otherExpenses" in fields) fields.otherExpenses = asAmount(fields.otherExpenses);
+    if ("taxAmount" in fields) fields.taxAmount = asAmount(fields.taxAmount);
+    if ("advanceTaken" in fields) fields.advanceTaken = asAmount(fields.advanceTaken);
+  } else {
+    for (const k of CLAIM_ONLY_FIELDS) delete fields[k];
+  }
+  return fields;
+}
+
+/** Every receipt/invoice id a claim references — its lines' and, for an
+ * Expense Claim, its claim-level invoices. */
+function claimAttachmentIds(doc: any): string[] {
+  return [
+    ...[...(doc?.travelLines || []), ...(doc?.foodLines || []), ...(doc?.expenseLines || [])].map((l: any) => l?.attachmentId),
+    ...(doc?.invoiceAttachmentIds || []),
+  ]
+    .filter(Boolean)
+    .map(String);
+}
+
+/**
+ * Claims addition — a claim line may only point at a receipt in this
+ * workspace that the caller staged themselves, or one already linked to this
+ * same request (an unchanged line on edit). Anything else — another user's
+ * staged upload, another request's receipt — is refused before the claim is
+ * saved. Returns an error string, or null.
+ */
+async function checkClaimAttachments(req: any, fields: any, requestId?: any): Promise<string | null> {
+  const ids = [...new Set(claimAttachmentIds(fields))];
+  if (ids.length === 0) return null;
+  const found: any[] = await CstepAttachment.find({ _id: { $in: ids }, workspaceId: req.workspaceObjectId })
+    .select("_id createdBy travelRequestId")
+    .lean();
+  const uid = ownerId(req);
+  for (const id of ids) {
+    const a = found.find((f) => String(f._id) === id);
+    if (!a) return "A claim line references a receipt that does not exist";
+    const linkedHere = requestId && a.travelRequestId && String(a.travelRequestId) === String(requestId);
+    const ownUnlinked = !a.travelRequestId && String(a.createdBy) === uid;
+    if (!linkedHere && !ownUnlinked) return "A claim line references a receipt that is not yours to attach";
+  }
+  return null;
+}
+
+/** Links every receipt a saved claim references to the claim (sets its
+ * travelRequestId). Staged uploads that ended up unreferenced stay unlinked. */
+async function linkClaimAttachments(req: any, doc: any): Promise<void> {
+  const ids = claimAttachmentIds(doc);
+  if (ids.length === 0) return;
+  await CstepAttachment.updateMany(
+    { _id: { $in: ids }, workspaceId: req.workspaceObjectId, travelRequestId: { $exists: false } },
+    { $set: { travelRequestId: doc._id } },
+  );
+}
+
+/** Claim line mode -> the settlement's service type (and so its bucket). */
+const CLAIM_MODE_TO_SERVICE_TYPE: Record<string, CstepServiceType> = {
+  CAB: "CAB",
+  LOCAL_TAXI: "CAB",
+  METRO: "TRAIN",
+  BUS: "BUS",
+  OWN_VEHICLE: "OTHER",
+};
+const CLAIM_MODE_LABEL: Record<string, string> = {
+  CAB: "Cab",
+  LOCAL_TAXI: "Local taxi",
+  METRO: "Metro",
+  BUS: "Bus",
+  OWN_VEHICLE: "Own vehicle",
+};
+
+/**
+ * Claims addition — the CLAIM_LINE settlement rows seeded at a claim's
+ * approval, one per travel line, one per food line, and one for a non-zero
+ * other-expenses amount. All PERSONAL (the claimant paid), all unverified,
+ * each carrying its line's receipt. sourceId is the line's own _id (the
+ * other-expenses row points at the request itself — it has no line).
+ */
+function buildClaimSettlementLines(doc: any): Array<{
+  source: CstepSettlementLineSource;
+  sourceId: any;
+  description: string;
+  mode: CstepServiceType;
+  amountInr: number;
+  classification: CstepSettlementLineClassification;
+  classificationOverridden: false;
+  verified: false;
+  attachmentId?: any;
+}> {
+  const base = { source: "CLAIM_LINE" as const, classification: "PERSONAL" as const, classificationOverridden: false as const, verified: false as const };
+  const rows: any[] = [];
+  for (const l of doc.travelLines || []) {
+    rows.push({
+      ...base,
+      sourceId: l._id,
+      description: `${CLAIM_MODE_LABEL[l.mode] || "Travel"}: ${[l.from, l.to].filter(Boolean).join(" → ")}${l.noBill ? " (no bill)" : ""}`,
+      mode: CLAIM_MODE_TO_SERVICE_TYPE[l.mode] || "OTHER",
+      amountInr: Math.round((Number(l.fare) || 0) * 100) / 100,
+      attachmentId: l.attachmentId || undefined,
+    });
+  }
+  for (const l of doc.foodLines || []) {
+    rows.push({
+      ...base,
+      sourceId: l._id,
+      description: `Food${l.remarks ? `: ${l.remarks}` : ""}`,
+      mode: "OTHER",
+      amountInr: Math.round((Number(l.amount) || 0) * 100) / 100,
+      attachmentId: l.attachmentId || undefined,
+    });
+  }
+  if (Number(doc.otherExpenses) > 0) {
+    rows.push({
+      ...base,
+      sourceId: doc._id,
+      description: "Other expenses",
+      mode: "OTHER",
+      amountInr: Math.round(Number(doc.otherExpenses) * 100) / 100,
+    });
+  }
+  // Expense Claim (module 2) — one row per expense line (the "other"
+  // bucket), then the single tax amount as its own verifiable row, carrying
+  // the first claim-level invoice (which is what evidences the tax).
+  for (const l of doc.expenseLines || []) {
+    rows.push({
+      ...base,
+      sourceId: l._id,
+      description: String(l.description || "Expense"),
+      mode: "OTHER",
+      amountInr: Math.round((Number(l.amount) || 0) * 100) / 100,
+      attachmentId: l.attachmentId || doc.invoiceAttachmentIds?.[0] || undefined,
+    });
+  }
+  if (Number(doc.taxAmount) > 0) {
+    rows.push({
+      ...base,
+      sourceId: doc._id,
+      description: "Tax (IGST)",
+      mode: "OTHER",
+      amountInr: Math.round(Number(doc.taxAmount) * 100) / 100,
+      attachmentId: doc.invoiceAttachmentIds?.[0] || undefined,
+    });
+  }
+  return rows;
+}
+
+/** Claims addition — net-of-advance split for a claim's settlement. */
+function claimDue(amountClaimed: number, advanceTaken: number): { amountDueByCstep: number; amountDueToCstep: number } {
+  const net = Math.round((amountClaimed - (advanceTaken || 0)) * 100) / 100;
+  return { amountDueByCstep: net > 0 ? net : 0, amountDueToCstep: net < 0 ? Math.round(-net * 100) / 100 : 0 };
+}
+
+/** Recomputes a settlement's buckets/totals from its current lines (the
+ * existing recomputeSettlementTotals) and, for a claim, its net-of-advance
+ * due figures. Assigns onto `settlement`; the caller saves. */
+function applySettlementTotals(settlement: any, lines: any[], doc: any) {
+  const { buckets, totalCostOfTour, amountClaimed } = recomputeSettlementTotals(lines, settlement.perDiem?.amountInr || 0);
+  settlement.buckets = buckets;
+  settlement.totalCostOfTour = totalCostOfTour;
+  settlement.amountClaimed = amountClaimed;
+  if (isClaimFormType(doc.formType)) {
+    const due = claimDue(amountClaimed, Number(settlement.advanceTaken) || 0);
+    settlement.amountDueByCstep = due.amountDueByCstep;
+    settlement.amountDueToCstep = due.amountDueToCstep;
+  }
 }
 
 /**
@@ -593,8 +1071,52 @@ function arrangementIsReal(a: any): boolean {
  * traveller's note as details; a seeded mode row has none). These are
  * dropped at mark-arranged rather than frozen into the case. */
 function arrangementIsUntouchedSeed(a: any): boolean {
-  return a.source === "REQUESTED" && a.status === "PENDING" && !(Number(a.amount) > 0) && !String(a.details || "").trim();
+  return (
+    a.source === "REQUESTED" &&
+    a.status === "PENDING" &&
+    !(Number(a.amount) > 0) &&
+    !String(a.details || "").trim() &&
+    !a.vendorId // choosing a vendor is a touch — the row survives mark-arranged
+  );
 }
+
+/**
+ * Vendor + payment addition — the vendor chosen on an arrangement line, for
+ * PATCH/POST /requests/:id/arrangements. Only touches the line when the body
+ * carries `vendorId` at all: null/"" clears it; an id must be an ACTIVE
+ * vendor of this workspace, and its code + name are snapshotted onto the
+ * line. Re-sending the vendor the line already has is a no-op, so a vendor
+ * deactivated after it was chosen doesn't block an unrelated edit.
+ */
+async function resolveArrangementVendor(
+  req: any,
+  body: any,
+  current?: any,
+): Promise<
+  | { ok: true; touched: false }
+  | { ok: true; touched: true; fields: { vendorId?: any; vendorCode?: string; vendorName?: string } }
+  | { ok: false; status: number; error: string }
+> {
+  if (!("vendorId" in body)) return { ok: true, touched: false };
+  const raw = body.vendorId == null ? "" : String(body.vendorId).trim();
+  if (!raw) {
+    if (!current?.vendorId) return { ok: true, touched: false };
+    return { ok: true, touched: true, fields: { vendorId: undefined, vendorCode: undefined, vendorName: undefined } };
+  }
+  if (current?.vendorId && String(current.vendorId) === raw) return { ok: true, touched: false };
+  if (!mongoose.isValidObjectId(raw)) return { ok: false, status: 400, error: "Invalid vendor id" };
+  const vendor: any = await CstepVendor.findOne({ _id: raw, workspaceId: req.workspaceObjectId })
+    .select("vendorCode name isActive")
+    .lean();
+  if (!vendor) return { ok: false, status: 404, error: "Vendor not found in this workspace" };
+  if (!vendor.isActive) return { ok: false, status: 400, error: `Vendor ${vendor.vendorCode} (${vendor.name}) is inactive` };
+  return { ok: true, touched: true, fields: { vendorId: vendor._id, vendorCode: vendor.vendorCode, vendorName: vendor.name } };
+}
+
+/** Vendor payment — the request statuses from ARRANGING onwards, where a
+ * line's vendor can be marked paid (the Official can record it at the
+ * arrange step, alongside choosing the vendor). */
+const VENDOR_PAYABLE_STATUSES = new Set<string>(CSTEP_VENDOR_PAYABLE_STATUSES);
 
 function buildSeedReportLegs(arrangements: any[]): Array<{
   direction: "ONWARD";
@@ -947,12 +1469,17 @@ router.post("/requests", async (req: any, res: any) => {
       return res.status(400).json({ error: "Missing workspace or user context" });
     }
 
-    const fields: any = pickFields(req.body);
-    // Resolved server-side (defaults to TOUR_PROPOSAL) rather than trusted
-    // from pickFields — formType is server-controlled and immutable once
-    // set, same discipline as status/claimReference below.
-    fields.formType = resolveFormType(req.body);
+    // Resolved server-side (an omitted formType defaults to TOUR_PROPOSAL)
+    // rather than trusted from pickFields — formType is server-controlled and
+    // immutable once set, same discipline as status/claimReference below. A
+    // present-but-unknown formType is refused, never coerced to a Tour.
+    const formType = resolveFormType(req.body);
+    if (!formType) return res.status(400).json({ error: "Unknown form type" });
+    const fields: any = scopeFieldsToFormType(pickFields(req.body), formType);
+    fields.formType = formType;
     const admin = isCstepAdmin(req);
+    const projectError = await applyProjectSelection(req, fields);
+    if (projectError) return res.status(400).json({ error: projectError });
 
     if (!admin) {
       const own = await resolveOwnTravellerProfile(req.workspaceObjectId, req.user);
@@ -975,6 +1502,8 @@ router.post("/requests", async (req: any, res: any) => {
 
     const validationError = validatePayload(fields);
     if (validationError) return res.status(400).json({ error: validationError });
+    const attachmentError = await checkClaimAttachments(req, fields);
+    if (attachmentError) return res.status(400).json({ error: attachmentError });
 
     const status = req.body?.saveDraft === true ? "DRAFT" : "SUBMITTED";
 
@@ -985,12 +1514,13 @@ router.post("/requests", async (req: any, res: any) => {
       status,
     });
     await doc.save();
+    if (isClaimFormType(doc.formType)) await linkClaimAttachments(req, doc);
 
     // A request created straight as SUBMITTED gets the same SUBMIT entry
     // the explicit draft → POST /submit path writes, so every submitted
     // request carries a complete trail whichever way it got there.
     if (status === "SUBMITTED") {
-      await CstepApproval.create({
+      const entry = await CstepApproval.create({
         workspaceId: req.workspaceObjectId,
         entityType: "REQUEST",
         entityId: doc._id,
@@ -999,6 +1529,7 @@ router.post("/requests", async (req: any, res: any) => {
         action: "SUBMIT",
         at: new Date().toISOString(),
       });
+      await notifyCstep("SUBMITTED", doc, { logEntryId: entry._id });
     }
 
     res.status(201).json({ ok: true, request: doc.toObject() });
@@ -1087,9 +1618,12 @@ router.get("/requests/:id", async (req: any, res: any) => {
     }
 
     const admin = isCstepAdmin(req);
+    const isClaim = isClaimFormType(doc.formType);
     const canApprove =
       doc.status === "SUBMITTED" && (admin || (await callerCanActOnTraveller(req, doc.travelerProfileId)));
+    // A claim is never arranged — it has no arrangement stage at all.
     const canArrange =
+      !isClaim &&
       (doc.status === "APPROVED" || doc.status === "ARRANGING") &&
       (admin || (await callerCanArrangeForTraveller(req, doc.travelerProfileId)));
     // Step 5 — same authority as canArrange (callerCanArrangeForTraveller):
@@ -1098,34 +1632,84 @@ router.get("/requests/:id", async (req: any, res: any) => {
     // the frontend narrows further using the settlement's own status once
     // it's fetched via GET /settlement, same pattern as canArrange narrowing
     // via request.status === "ARRANGING".
-    const canSettle =
-      (doc.status === "REPORT_SUBMITTED" ||
-        doc.status === "TRANSFERRED_TO_FINANCE" ||
-        doc.status === "SETTLED" ||
-        doc.status === "REIMBURSED") &&
-      (admin || (await callerCanArrangeForTraveller(req, doc.travelerProfileId)));
+    // Claims addition — a claim's settlement opens at APPROVED (seeded at
+    // approve) and belongs to the CSTEP Admin, not the Official.
+    const canSettle = isClaim
+      ? admin && CLAIM_SETTLEMENT_STATUSES.has(doc.status)
+      : (doc.status === "REPORT_SUBMITTED" ||
+          doc.status === "TRANSFERRED_TO_FINANCE" ||
+          doc.status === "SETTLED" ||
+          doc.status === "REIMBURSED") &&
+        (admin || (await callerCanArrangeForTraveller(req, doc.travelerProfileId)));
+    // Claims addition — may this caller run the Admin verification (APPROVED
+    // claim -> TRANSFERRED_TO_FINANCE)?
+    const canVerifyClaim = isClaim && admin && doc.status === "APPROVED";
     // Step 6 — may this caller mark the reimbursement paid? Only while the
     // case is actually with Finance; the Finance user's own queue is the
-    // usual way in (GET /finance-queue).
+    // usual way in (GET /finance-queue). A claim is reimbursed by the
+    // traveller's Finance user only — never by a CSTEP Admin as such.
     const canFinance =
-      doc.status === "TRANSFERRED_TO_FINANCE" && (await callerCanFinanceForTraveller(req, doc.travelerProfileId));
+      doc.status === "TRANSFERRED_TO_FINANCE" &&
+      (isClaim
+        ? await callerIsTravellerFinanceUser(req, doc.travelerProfileId)
+        : await callerCanFinanceForTraveller(req, doc.travelerProfileId));
+    // Vendor payment — may this caller mark arrangement lines paid? This
+    // traveller's Official or Finance user, or a CSTEP Admin, from ARRANGING
+    // onwards.
+    const canPayVendors =
+      !isClaim &&
+      VENDOR_PAYABLE_STATUSES.has(doc.status) &&
+      (await callerCanPayVendorsForTraveller(req, doc.travelerProfileId));
     // The figure Finance pays out — read off the finalized settlement so the
     // Finance user's card can show it without needing the Official-only
     // GET /settlement. Present only while the case is with Finance.
+    // For a claim, Finance pays (or collects) the NET-of-advance figure, so
+    // both directions come back alongside it.
     let financeAmountClaimed: number | undefined;
+    let financeClaimDue: { amountDueByCstep: number; amountDueToCstep: number; advanceTaken: number } | undefined;
     if (doc.status === "TRANSFERRED_TO_FINANCE") {
       const fin: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id })
-        .select("amountClaimed")
+        .select("amountClaimed advanceTaken amountDueByCstep amountDueToCstep")
         .lean();
-      if (fin) financeAmountClaimed = Number(fin.amountClaimed || 0);
+      if (fin) {
+        financeAmountClaimed = Number(fin.amountClaimed || 0);
+        if (isClaim) {
+          financeClaimDue = {
+            amountDueByCstep: Number(fin.amountDueByCstep || 0),
+            amountDueToCstep: Number(fin.amountDueToCstep || 0),
+            advanceTaken: Number(fin.advanceTaken || 0),
+          };
+        }
+      }
     }
 
-    const arrangements = await CstepArrangement.find({
-      workspaceId: req.workspaceObjectId,
-      requestId: doc._id,
-    })
-      .sort({ createdAt: 1 })
-      .lean();
+    const arrangements = isClaim
+      ? []
+      : await CstepArrangement.find({
+          workspaceId: req.workspaceObjectId,
+          requestId: doc._id,
+        })
+          .sort({ createdAt: 1 })
+          .lean();
+
+    // Claims addition — the claim lines' receipts, presigned for viewing,
+    // keyed by attachment id (the intake form shows the file name on edit;
+    // the detail view links each one).
+    const claimAttachments: Record<string, { _id: any; originalName?: string; mime?: string; url: string }> = {};
+    if (isClaim) {
+      const ids = claimAttachmentIds(doc);
+      const atts: any[] = ids.length
+        ? await CstepAttachment.find({ workspaceId: req.workspaceObjectId, _id: { $in: ids } }).lean()
+        : [];
+      for (const a of atts) {
+        claimAttachments[String(a._id)] = {
+          _id: a._id,
+          originalName: a.originalName,
+          mime: a.mime,
+          url: await presignGetObject({ bucket: env.S3_BUCKET, key: a.s3Key, filename: a.originalName, view: true, contentType: a.mime }),
+        };
+      }
+    }
 
     res.json({
       ok: true,
@@ -1135,8 +1719,14 @@ router.get("/requests/:id", async (req: any, res: any) => {
       canArrange,
       canSettle,
       canFinance,
+      canPayVendors,
+      canVerifyClaim,
       financeAmountClaimed,
+      financeClaimDue,
       arrangements,
+      claimAttachments,
+      // The Declaration (no-bill travel lines) — same derivation as the PDF.
+      claimDeclaration: doc.formType === "LOCAL_TRAVEL_CLAIM" ? localTravelClaimDeclaration(doc) : undefined,
     });
   } catch (err: any) {
     console.error("[CSTEP requests GET one]", err?.message);
@@ -1164,7 +1754,7 @@ router.patch("/requests/:id", async (req: any, res: any) => {
       return res.status(409).json({ error: "Only draft or returned travel requests can be edited" });
     }
 
-    const fields = pickFields(req.body);
+    const fields: any = scopeFieldsToFormType(pickFields(req.body), doc.formType);
 
     // Self-filing (Phase 5): a normal caller cannot redirect their own
     // request onto a different traveller by editing it, any more than they
@@ -1185,17 +1775,28 @@ router.patch("/requests/:id", async (req: any, res: any) => {
     }
 
     const before: any = doc.toObject();
+    const projectError = await applyProjectSelection(req, fields, before);
+    if (projectError) return res.status(400).json({ error: projectError });
 
-    // Merge onto the existing doc so validation sees the full, post-update shape.
-    const merged: any = { ...before, ...fields };
+    // Merge onto the existing doc so validation sees the full, post-update
+    // shape. Keys the body left out (undefined) keep their stored value —
+    // the same rule as the assignment just below — rather than validating
+    // as blank.
+    const merged: any = { ...before };
+    Object.keys(fields).forEach((k) => {
+      if ((fields as any)[k] !== undefined) merged[k] = (fields as any)[k];
+    });
     Object.keys(fields).forEach((k) => {
       if ((fields as any)[k] !== undefined) (doc as any)[k] = (fields as any)[k];
     });
 
     const validationError = validatePayload(merged);
     if (validationError) return res.status(400).json({ error: validationError });
+    const attachmentError = await checkClaimAttachments(req, merged, doc._id);
+    if (attachmentError) return res.status(400).json({ error: attachmentError });
 
     await doc.save();
+    if (isClaimFormType(doc.formType)) await linkClaimAttachments(req, doc);
 
     const changedFields = Object.keys(fields).filter((k) => {
       if ((fields as any)[k] === undefined) return false;
@@ -1365,7 +1966,7 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
     doc.status = "SUBMITTED";
     await doc.save();
 
-    await CstepApproval.create({
+    const entry = await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
@@ -1374,6 +1975,7 @@ router.post("/requests/:id/submit", async (req: any, res: any) => {
       action: hasPriorSubmit ? "RESUBMIT" : "SUBMIT",
       at: new Date().toISOString(),
     });
+    await notifyCstep("SUBMITTED", doc, { logEntryId: entry._id });
 
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
@@ -1477,11 +2079,15 @@ router.get("/approvals", async (req: any, res: any) => {
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/my-roles", async (req: any, res: any) => {
   try {
+    const uid = new mongoose.Types.ObjectId(ownerId(req));
+    // isFinanceUser — actually mapped as some traveller's Finance user. Unlike
+    // isFinance (true for every Admin, for the queues), it gates what only
+    // the Finance user may do, e.g. bulk reimbursement.
     if (isCstepAdmin(req)) {
-      return res.json({ ok: true, isAdmin: true, isApprover: true, isOfficial: true, isFinance: true });
+      const mapped = await TravellerProfile.exists({ workspaceId: req.workspaceObjectId, financeUserId: uid });
+      return res.json({ ok: true, isAdmin: true, isApprover: true, isOfficial: true, isFinance: true, isFinanceUser: !!mapped });
     }
 
-    const uid = new mongoose.Types.ObjectId(ownerId(req));
     const [isApprover, isOfficial, isFinance] = await Promise.all([
       TravellerProfile.exists({ workspaceId: req.workspaceObjectId, tourApproverId: uid }),
       TravellerProfile.exists({ workspaceId: req.workspaceObjectId, officialUserId: uid }),
@@ -1494,6 +2100,7 @@ router.get("/my-roles", async (req: any, res: any) => {
       isApprover: !!isApprover,
       isOfficial: !!isOfficial,
       isFinance: !!isFinance,
+      isFinanceUser: !!isFinance,
     });
   } catch (err: any) {
     console.error("[CSTEP my-roles GET]", err?.message);
@@ -1535,7 +2142,13 @@ const OFFICIAL_QUEUE_STAGES = [
 router.get("/official-queue", async (req: any, res: any) => {
   try {
     const admin = isCstepAdmin(req);
-    const filter: any = { workspaceId: req.workspaceObjectId, status: { $in: OFFICIAL_QUEUE_STAGES } };
+    // Claims never reach the Official — they go to the Admin's claim
+    // verification queue (GET /claim-verification-queue) instead.
+    const filter: any = {
+      workspaceId: req.workspaceObjectId,
+      status: { $in: OFFICIAL_QUEUE_STAGES },
+      formType: { $nin: ["LOCAL_TRAVEL_CLAIM", "EXPENSE_CLAIM"] },
+    };
     const emptyStageCounts = Object.fromEntries(OFFICIAL_QUEUE_STAGES.map((s) => [s, 0]));
 
     if (!admin) {
@@ -1562,6 +2175,43 @@ router.get("/official-queue", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP official-queue GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to list the processing queue" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /claim-verification-queue — claims addition. The CSTEP Admin's
+ * verification board for approved claims (LOCAL_TRAVEL_CLAIM /
+ * EXPENSE_CLAIM): APPROVED (awaiting the Admin's verification — the
+ * actionable stage), then With Finance / Settled / Reimbursed for the
+ * record. Same { requests, stageCounts } shape as GET /official-queue.
+ * Admin-only by role; anyone else gets an empty queue, not a 403 — same
+ * posture as the other queues.
+ * ───────────────────────────────────────────────────────────────────── */
+const CLAIM_VERIFICATION_STAGES = ["APPROVED", "TRANSFERRED_TO_FINANCE", "SETTLED", "REIMBURSED"] as const;
+
+router.get("/claim-verification-queue", async (req: any, res: any) => {
+  try {
+    const emptyStageCounts = Object.fromEntries(CLAIM_VERIFICATION_STAGES.map((s) => [s, 0]));
+    if (!isCstepAdmin(req)) return res.json({ ok: true, requests: [], stageCounts: emptyStageCounts });
+
+    const docs = await withTravellerNames(
+      req,
+      await CstepTravelRequest.find({
+        workspaceId: req.workspaceObjectId,
+        formType: { $in: ["LOCAL_TRAVEL_CLAIM", "EXPENSE_CLAIM"] },
+        status: { $in: CLAIM_VERIFICATION_STAGES },
+      })
+        .sort({ updatedAt: -1 })
+        .lean(),
+    );
+    const stageCounts: Record<string, number> = { ...emptyStageCounts };
+    for (const d of docs as any[]) {
+      if (stageCounts[d.status] !== undefined) stageCounts[d.status]++;
+    }
+    res.json({ ok: true, requests: docs, stageCounts });
+  } catch (err: any) {
+    console.error("[CSTEP claim-verification-queue GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to list the claim verification queue" });
   }
 });
 
@@ -1655,6 +2305,9 @@ router.get("/reports/travel-register", async (req: any, res: any) => {
     };
     if (!includeDrafts) filter.status = { $ne: "DRAFT" };
     if (scopedTravellerIds) filter.travelerProfileId = { $in: scopedTravellerIds };
+    // Claims addition — Local Travel Claims are travel and belong in the
+    // register; Expense Claims are not travel and stay out of it.
+    filter.formType = { $ne: "EXPENSE_CLAIM" };
 
     const requests: any[] = await CstepTravelRequest.find(filter).lean();
     const requestIds = requests.map((r) => r._id);
@@ -1694,12 +2347,23 @@ router.get("/reports/travel-register", async (req: any, res: any) => {
       (travellers as any[]).map((t) => [String(t._id), [t.firstName, t.lastName].filter(Boolean).join(" ").trim()]),
     );
     const legById = new Map(legs.map((l) => [String(l._id), l]));
+    // Claims addition — a CLAIM_LINE settlement row's from/to/date come from
+    // the claim line it was seeded from (travel line: route + date; food
+    // line: date only), keyed by the line's own _id.
+    const claimLegById = new Map<string, any>();
+    for (const r of requests) {
+      for (const l of r.travelLines || []) {
+        claimLegById.set(String(l._id), { fromLocation: l.from, toLocation: l.to, fromDate: l.date, toDate: l.date });
+      }
+      for (const l of r.foodLines || []) claimLegById.set(String(l._id), { fromDate: l.date, toDate: l.date });
+    }
     const group = <T,>(rows: T[], key: (r: T) => string) => {
       const m = new Map<string, T[]>();
       for (const r of rows) m.set(key(r), [...(m.get(key(r)) || []), r]);
       return m;
     };
     const arrangementsBy = group(arrangements as any[], (a) => String(a.requestId));
+    const arrangementById = new Map((arrangements as any[]).map((a) => [String(a._id), a]));
     const linesBy = group(lines as any[], (l) => String(l.requestId));
     const settlementBy = new Map((settlements as any[]).map((s) => [String(s.requestId), s]));
     const latest = (entityId: string, actions: string[]) =>
@@ -1728,7 +2392,13 @@ router.get("/reports/travel-register", async (req: any, res: any) => {
               description: l.description,
               amountInr: l.amountInr,
               classification: l.classification,
-              leg: l.source === "REPORT_LEG" ? legById.get(String(l.sourceId)) : undefined,
+              arrangement: l.source === "ARRANGEMENT" ? arrangementById.get(String(l.sourceId)) : undefined,
+              leg:
+                l.source === "REPORT_LEG"
+                  ? legById.get(String(l.sourceId))
+                  : l.source === "CLAIM_LINE"
+                    ? claimLegById.get(String(l.sourceId))
+                    : undefined,
             }))
           : [],
       };
@@ -1792,24 +2462,23 @@ router.post("/requests/:id/start-review", async (req: any, res: any) => {
 /* ─────────────────────────────────────────────────────────────────────
  * POST /requests/:id/approve — approver-only, SUBMITTED → APPROVED.
  *
- * TOUR_PROPOSAL: issues the TIN (claimReference = "<travelerCode>/<MMYY>",
- * reading the traveller's EXISTING TravellerProfile.travelerId — no new id
- * minted) and opens the claim file (CstepClaim, status CLAIM_IN_PROGRESS).
+ * TOUR_PROPOSAL: issues the TIN (claimReference = "NNNN/MMYY" from the
+ * workspace's TIN series — see issueApprovalReference) and opens the claim
+ * file (CstepClaim, status CLAIM_IN_PROGRESS).
  *
- * EVENT_REQUEST (Event Request addition): status transition ONLY — no TIN,
- * no CstepClaim. An approved event goes to fulfilment, not personal
- * settlement, so there's nothing to claim against. Everything else
- * (permission check, audit entry, response shape) is identical.
+ * EVENT_REQUEST (Event Request addition): its own EVR reference
+ * ("EVR0001/1026", the EVR series) and no CstepClaim. An approved event goes
+ * to fulfilment, not personal settlement, so there's nothing to claim
+ * against — the reference is what the Travel Register's TIN column and the
+ * vendor-payment import match it by. Everything else (permission check,
+ * audit entry, response shape) is identical.
  *
- * The base TIN is per traveller+month, so a traveller with a SECOND trip
- * approved in the same month would collide on CstepClaim's unique
- * {workspaceId, claimReference} index. Handled by nextClaimReference (a
- * "-2", "-3", ... suffix on collision) computed and written inside one
- * transaction, with an outer retry loop that catches a duplicate-key error
- * from a near-simultaneous approval and retries with the next suffix instead
- * of failing the request. (Event Request never hits this path — no unique
- * key involved — so its single pass through the loop always breaks on
- * attempt 1.)
+ * The serial is taken inside the transaction: two approvals racing on the
+ * same counter surface as a write conflict that withTransaction retries,
+ * so each gets its own number. The unique {workspaceId, claimReference}
+ * indexes stay as the backstop — a duplicate-key error (a reference that
+ * already exists although the counter never issued it) burns that number
+ * outside the transaction and the outer loop retries with the next one.
  * ───────────────────────────────────────────────────────────────────── */
 router.post("/requests/:id/approve", async (req: any, res: any) => {
   const session = await mongoose.startSession();
@@ -1817,10 +2486,13 @@ router.post("/requests/:id/approve", async (req: any, res: any) => {
   let responseRequest: any = null;
   let responseClaim: any = null;
   let claimReference = "";
+  let approveEntryId: any = null;
+  let issuedKey = "";
 
   try {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
+        issuedKey = "";
         await session.withTransaction(async () => {
           const doc = await CstepTravelRequest.findOne({
             _id: new mongoose.Types.ObjectId(req.params.id),
@@ -1837,7 +2509,11 @@ router.post("/requests/:id/approve", async (req: any, res: any) => {
           const uid = ownerId(req);
 
           if (doc.formType === "EVENT_REQUEST") {
+            const { ref, key } = await issueApprovalReference(req.workspaceObjectId, doc.formType, session);
+            issuedKey = key;
+
             doc.status = "APPROVED";
+            doc.claimReference = ref;
             await doc.save({ session });
 
             const approval = new CstepApproval({
@@ -1850,25 +2526,69 @@ router.post("/requests/:id/approve", async (req: any, res: any) => {
               at: new Date().toISOString(),
             });
             await approval.save({ session });
+            approveEntryId = approval._id;
 
             responseRequest = doc.toObject();
             responseClaim = null;
-            claimReference = "";
+            claimReference = ref;
             return;
           }
 
-          const traveller: any = await TravellerProfile.findOne({
-            _id: doc.travelerProfileId,
-            workspaceId: req.workspaceObjectId,
-          })
-            .session(session)
-            .lean();
-          if (!traveller || !traveller.travelerId) {
-            throw new CstepHttpError(400, "Traveller code could not be resolved for this request");
+          // Claims addition — no TIN and no CstepClaim. The claim gets its own
+          // reference on the request, and its settlement is seeded right here
+          // (VERIFYING, per diem 0) from the claim's own lines, for the CSTEP
+          // Admin to verify — there is no arrangement or report in between.
+          if (isClaimFormType(doc.formType)) {
+            const { ref, key } = await issueApprovalReference(req.workspaceObjectId, doc.formType, session);
+            issuedKey = key;
+
+            doc.status = "APPROVED";
+            doc.claimReference = ref;
+            await doc.save({ session });
+
+            const settlement = new CstepSettlement({
+              workspaceId: req.workspaceObjectId,
+              requestId: doc._id,
+              status: "VERIFYING",
+              perDiem: { days: 0, rate: 0, currency: "INR", amountInr: 0, computedDays: 0 },
+              buckets: { airRailBus: 0, perDiem: 0, boardingLodging: 0, cab: 0, other: 0 },
+              totalCostOfTour: 0,
+              amountClaimed: 0,
+              advanceTaken: Number(doc.advanceTaken) || 0,
+              startedBy: new mongoose.Types.ObjectId(uid),
+              startedAt: new Date(),
+            });
+            const seedRows = buildClaimSettlementLines(doc).map((row) => ({
+              ...row,
+              workspaceId: req.workspaceObjectId,
+              settlementId: settlement._id,
+              requestId: doc._id,
+              createdBy: new mongoose.Types.ObjectId(uid),
+            }));
+            applySettlementTotals(settlement, seedRows, doc);
+            await settlement.save({ session });
+            if (seedRows.length > 0) await CstepSettlementLine.insertMany(seedRows, { session });
+
+            const approval = new CstepApproval({
+              workspaceId: req.workspaceObjectId,
+              entityType: "REQUEST",
+              entityId: doc._id,
+              stage: "APPROVER",
+              actor: new mongoose.Types.ObjectId(uid),
+              action: "APPROVE",
+              at: new Date().toISOString(),
+            });
+            await approval.save({ session });
+            approveEntryId = approval._id;
+
+            claimReference = ref;
+            responseRequest = doc.toObject();
+            responseClaim = null;
+            return;
           }
 
-          const base = `${traveller.travelerId}/${currentMMYY()}`;
-          const ref = await nextClaimReference(req.workspaceObjectId, doc.travelerProfileId, base, session, attempt);
+          const { ref, key } = await issueApprovalReference(req.workspaceObjectId, doc.formType, session);
+          issuedKey = key;
 
           doc.status = "APPROVED";
           doc.claimReference = ref;
@@ -1895,6 +2615,7 @@ router.post("/requests/:id/approve", async (req: any, res: any) => {
             at: new Date().toISOString(),
           });
           await approval.save({ session });
+          approveEntryId = approval._id;
 
           claimReference = ref;
           responseRequest = doc.toObject();
@@ -1906,9 +2627,19 @@ router.post("/requests/:id/approve", async (req: any, res: any) => {
         if (err instanceof CstepHttpError) throw err;
         const isDupKey = err?.code === 11000 || /E11000/.test(String(err?.message || ""));
         if (!isDupKey || attempt === MAX_ATTEMPTS) throw err;
-        // Another approval just took this reference — loop again;
-        // nextClaimReference will see it and propose the next suffix.
+        // The reference already exists although the counter never issued
+        // it. The aborted transaction rolled the increment back, so burn
+        // that number outside it — the next attempt proposes the one after.
+        if (issuedKey) await Counter.findByIdAndUpdate(issuedKey, { $inc: { seq: 1 } });
       }
+    }
+
+    // After the commit, never inside the transaction: a retried attempt's
+    // entry was rolled back, so only the committed attempt's entry notifies.
+    // Not for a claim: the APPROVED email goes to the Official, who has no
+    // part in a claim (its next step is the CSTEP Admin's verification).
+    if (!isClaimFormType(responseRequest?.formType)) {
+      await notifyCstep("APPROVED", responseRequest, { logEntryId: approveEntryId });
     }
 
     res.json({ ok: true, request: responseRequest, claim: responseClaim, claimReference });
@@ -1920,6 +2651,129 @@ router.post("/requests/:id/approve", async (req: any, res: any) => {
     res.status(500).json({ error: err?.message || "Failed to approve travel request" });
   } finally {
     session.endSession();
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Reference series — CSTEP Admin only. utils/cstepSequence.ts owns the
+ * counters; these two routes only read them and seed a starting number.
+ * The Numbering settings screen (pages/cstep/NumberingSettings.tsx) drives
+ * both.
+ *
+ * GET /sequences — the next number each series will issue: TIN / LTC / EXP / EVR
+ * for the current IST financial year (or ?fy=<startYear>), VENDOR and
+ * TALLY (continuous). Each FY series also carries `upcoming` — the next
+ * number of the following financial year — and the response carries the
+ * 20 most recent changes (CstepSequenceChange).
+ *
+ * PUT /sequences/:series — { startNumber, fyStartYear? } makes startNumber
+ * the series' NEXT number. Forward-only: it can raise the next number,
+ * never lower it — a start below what the series would already issue is
+ * refused 409 with nothing changed; the exact current next number is a
+ * no-op success. fyStartYear (TIN/LTC/EXP/EVR only) defaults to the
+ * current IST financial year and may be a later one, so a year's start can
+ * be set before that year begins. A change that moved the counter writes
+ * one CstepSequenceChange row (who, when, series, FY, old next → new).
+ * ───────────────────────────────────────────────────────────────────── */
+const SEQUENCE_CHANGES_SHOWN = 20;
+
+router.get("/sequences", async (req: any, res: any) => {
+  try {
+    if (!isCstepAdmin(req)) return res.status(403).json({ error: "Only a CSTEP Admin can view reference series" });
+    const fyRaw = req.query?.fy;
+    const currentFy = cstepFyStartYear();
+    const fyStartYear = fyRaw === undefined ? currentFy : Number(fyRaw);
+    if (!Number.isInteger(fyStartYear) || fyStartYear < 2000 || fyStartYear > 2100) {
+      return res.status(400).json({ error: "fy must be a financial-year start year, e.g. 2026" });
+    }
+    const series = await Promise.all(
+      CSTEP_SERIES.map(async (s) => {
+        const { next } = await peekCstepSerial(req.workspaceObjectId, s, { fyStartYear });
+        if (!isFySeries(s)) return { series: s, next, fyStartYear: null };
+        const upcoming = await peekCstepSerial(req.workspaceObjectId, s, { fyStartYear: fyStartYear + 1 });
+        return { series: s, next, fyStartYear, upcoming: { fyStartYear: fyStartYear + 1, next: upcoming.next } };
+      }),
+    );
+    const changes = await CstepSequenceChange.find({ workspaceId: req.workspaceObjectId })
+      .sort({ changedAt: -1 })
+      .limit(SEQUENCE_CHANGES_SHOWN)
+      .populate("changedBy", "firstName lastName name email")
+      .lean();
+    const nameOf = (u: any): string | undefined =>
+      u && typeof u === "object"
+        ? u.name || [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.email || undefined
+        : undefined;
+    res.json({
+      ok: true,
+      currentFyStartYear: currentFy,
+      series,
+      changes: changes.map((c: any) => ({
+        _id: String(c._id),
+        series: c.series,
+        fyStartYear: c.fyStartYear ?? null,
+        oldNext: c.oldNext,
+        newNext: c.newNext,
+        changedBy: String(c.changedBy?._id || c.changedBy),
+        changedByName: nameOf(c.changedBy),
+        changedAt: c.changedAt,
+      })),
+    });
+  } catch (err: any) {
+    console.error("[CSTEP sequences GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to read reference series" });
+  }
+});
+
+router.put("/sequences/:series", async (req: any, res: any) => {
+  try {
+    if (!isCstepAdmin(req)) return res.status(403).json({ error: "Only a CSTEP Admin can set a reference series" });
+    const series = String(req.params.series || "").toUpperCase() as CstepSeries;
+    if (!CSTEP_SERIES.includes(series)) {
+      return res.status(400).json({ error: `series must be one of ${CSTEP_SERIES.join(", ")}` });
+    }
+    const startNumber = Number(req.body?.startNumber);
+    if (!Number.isInteger(startNumber) || startNumber < 1) {
+      return res.status(400).json({ error: "startNumber must be a whole number, 1 or more" });
+    }
+    let fyStartYear: number | undefined;
+    if (isFySeries(series)) {
+      const current = cstepFyStartYear();
+      fyStartYear = req.body?.fyStartYear === undefined ? current : Number(req.body.fyStartYear);
+      if (!Number.isInteger(fyStartYear) || fyStartYear < current) {
+        return res.status(400).json({ error: "fyStartYear must be the current financial year or a later one" });
+      }
+    } else if (req.body?.fyStartYear !== undefined) {
+      return res.status(400).json({ error: `The ${series} series does not reset by financial year` });
+    }
+
+    const result = await seedCstepSerial(req.workspaceObjectId, series, startNumber, { fyStartYear });
+    if (!result.ok) {
+      return res.status(409).json({
+        error: `The ${series} series already issues ${result.next} next — a start can only raise it, never lower it`,
+        next: result.next,
+      });
+    }
+
+    const changed = result.prevNext !== result.next;
+    if (changed) {
+      await CstepSequenceChange.create({
+        workspaceId: req.workspaceObjectId,
+        series,
+        fyStartYear: fyStartYear ?? null,
+        oldNext: result.prevNext,
+        newNext: result.next,
+        changedBy: ownerId(req),
+      });
+      console.info(
+        `[CSTEP sequences PUT] ws=${String(req.workspaceObjectId)} by=${ownerId(req)} ` +
+          `${series}${fyStartYear !== undefined ? ` FY${fyStartYear}` : ""} next ${result.prevNext}→${result.next}`,
+      );
+    }
+
+    res.json({ ok: true, series, next: result.next, previousNext: result.prevNext, changed, fyStartYear: fyStartYear ?? null });
+  } catch (err: any) {
+    console.error("[CSTEP sequences PUT]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to set the reference series" });
   }
 });
 
@@ -1944,7 +2798,7 @@ router.post("/requests/:id/return", async (req: any, res: any) => {
     doc.status = "RETURNED";
     await doc.save();
 
-    await CstepApproval.create({
+    const entry = await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
@@ -1954,6 +2808,7 @@ router.post("/requests/:id/return", async (req: any, res: any) => {
       comment: reason,
       at: new Date().toISOString(),
     });
+    await notifyCstep("RETURN", doc, { logEntryId: entry._id, reason });
 
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
@@ -1986,7 +2841,7 @@ router.post("/requests/:id/reject", async (req: any, res: any) => {
     doc.status = "REJECTED";
     await doc.save();
 
-    await CstepApproval.create({
+    const entry = await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
@@ -1996,6 +2851,7 @@ router.post("/requests/:id/reject", async (req: any, res: any) => {
       comment: reason,
       at: new Date().toISOString(),
     });
+    await notifyCstep("REJECTED", doc, { logEntryId: entry._id, reason });
 
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
@@ -2054,6 +2910,9 @@ router.post("/requests/:id/start-arranging", async (req: any, res: any) => {
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+    }
+    if (isClaimFormType(doc.formType)) {
+      return res.status(409).json({ error: "A claim has no arrangement stage" });
     }
     if (doc.status !== "APPROVED" && doc.status !== "ARRANGING") {
       return res.status(409).json({ error: "Only an approved (or already-arranging) travel request can be opened for arranging" });
@@ -2139,6 +2998,21 @@ router.patch("/requests/:id/arrangements/:lineId", async (req: any, res: any) =>
     const before = { arrangedType: line.arrangedType, details: line.details, status: line.status };
     const body = req.body || {};
 
+    const vendorResult = await resolveArrangementVendor(req, body, line);
+    if ("error" in vendorResult) return res.status(vendorResult.status).json({ error: vendorResult.error });
+    // A paid line is locked to the vendor and amount it was paid on — the
+    // payables, Travel Register and Tally export all read them — so changing
+    // either means marking it unpaid first.
+    const paidLocked = line.paymentStatus === "PAID";
+    if (paidLocked && vendorResult.touched) {
+      return res.status(409).json({ error: "This line's vendor is marked paid — mark it unpaid before changing the vendor" });
+    }
+    if (vendorResult.touched) {
+      line.vendorId = vendorResult.fields.vendorId;
+      line.vendorCode = vendorResult.fields.vendorCode;
+      line.vendorName = vendorResult.fields.vendorName;
+    }
+
     if ("arrangedType" in body) {
       if (!CSTEP_SERVICE_TYPES.includes(body.arrangedType)) {
         return res.status(400).json({ error: "arrangedType is not a recognized service type" });
@@ -2167,6 +3041,13 @@ router.patch("/requests/:id/arrangements/:lineId", async (req: any, res: any) =>
     // never recomputed on read.
     const amountResult = computeArrangementAmountFields(body);
     if (!amountResult.ok) return res.status(400).json({ error: amountResult.error });
+    if (
+      paidLocked &&
+      amountResult.touched &&
+      (amountResult.fields.amount !== line.amount || (amountResult.fields.currency || "INR") !== (line.currency || "INR"))
+    ) {
+      return res.status(409).json({ error: "This line's vendor is marked paid — mark it unpaid before changing the amount" });
+    }
     if (amountResult.touched) {
       line.currency = amountResult.fields.currency;
       line.amount = amountResult.fields.amount;
@@ -2195,7 +3076,12 @@ router.patch("/requests/:id/arrangements/:lineId", async (req: any, res: any) =>
         `Requested: ${requestedLabel} -> Arranged: ${before.arrangedType} => ${line.arrangedType}` +
         (line.details ? ` — ${line.details}` : "") +
         ` [${line.status}]` +
-        amountLabel,
+        amountLabel +
+        (vendorResult.touched
+          ? line.vendorId
+            ? ` | Vendor: ${line.vendorCode} ${line.vendorName}`
+            : " | Vendor: cleared"
+          : ""),
       at: new Date().toISOString(),
     });
 
@@ -2231,6 +3117,9 @@ router.post("/requests/:id/arrangements", async (req: any, res: any) => {
 
     const amountResult = computeArrangementAmountFields(req.body || {});
     if (!amountResult.ok) return res.status(400).json({ error: amountResult.error });
+    const vendorResult = await resolveArrangementVendor(req, req.body || {});
+    if ("error" in vendorResult) return res.status(vendorResult.status).json({ error: vendorResult.error });
+    const vendorFields = vendorResult.touched && vendorResult.fields.vendorId ? vendorResult.fields : {};
 
     const line = await CstepArrangement.create({
       workspaceId: req.workspaceObjectId,
@@ -2241,6 +3130,7 @@ router.post("/requests/:id/arrangements", async (req: any, res: any) => {
       status: "PENDING",
       createdBy: new mongoose.Types.ObjectId(uid),
       ...(amountResult.touched ? amountResult.fields : {}),
+      ...vendorFields,
     });
 
     const amountLabel =
@@ -2256,7 +3146,10 @@ router.post("/requests/:id/arrangements", async (req: any, res: any) => {
       stage: "OFFICIAL",
       actor: new mongoose.Types.ObjectId(uid),
       action: "ADD_SERVICE",
-      comment: `Added ${arrangedType}${details ? ` — ${details}` : ""}` + amountLabel,
+      comment:
+        `Added ${arrangedType}${details ? ` — ${details}` : ""}` +
+        amountLabel +
+        (line.vendorId ? ` | Vendor: ${line.vendorCode} ${line.vendorName}` : ""),
       at: new Date().toISOString(),
     });
 
@@ -2264,6 +3157,148 @@ router.post("/requests/:id/arrangements", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP requests arrangements POST]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to add arrangement line" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /requests/:id/vendor-options — the active vendors an arrangement line
+ * can be booked with, for the vendor select on the ledger. Same authority as
+ * the arrangement edits themselves (this traveller's Official user or a
+ * CSTEP Admin) — the Vendor Master page itself stays Admin/Finance only,
+ * this is just the pick-list. Only while ARRANGING.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/requests/:id/vendor-options", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+    }
+    if (doc.status !== "ARRANGING") {
+      return res.status(409).json({ error: "Vendors are chosen while the request is being arranged" });
+    }
+    const [vendors, types] = await Promise.all([
+      CstepVendor.find({ workspaceId: req.workspaceObjectId, isActive: true })
+        .select("_id vendorCode name city vendorTypeId")
+        .sort({ name: 1 })
+        .lean(),
+      CstepVendorType.find({ workspaceId: req.workspaceObjectId }).select("_id name").lean(),
+    ]);
+    const typeName = new Map((types as any[]).map((t) => [String(t._id), t.name]));
+    res.json({
+      ok: true,
+      vendors: (vendors as any[]).map((v) => ({
+        _id: v._id,
+        vendorCode: v.vendorCode,
+        name: v.name,
+        city: v.city || "",
+        vendorTypeName: typeName.get(String(v.vendorTypeId)) || "",
+      })),
+    });
+  } catch (err: any) {
+    console.error("[CSTEP requests vendor-options]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load vendors" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * PATCH /requests/:id/arrangements/:lineId/payment — this traveller's
+ * Official or Finance user, or a CSTEP Admin, marks an arrangement line's
+ * vendor paid (or back to unpaid). From ARRANGING onwards — the Official
+ * records it at the arrange step — and only on a line that already has a
+ * vendor. Body: { paymentStatus: "PAID" | "UNPAID",
+ * paymentRef?, vendorInvoiceNo?, paidAt? ("YYYY-MM-DD", defaults to today;
+ * never in the future) }. PAID stamps paidAt/paidBy/paymentRef/
+ * vendorInvoiceNo with paymentSource MANUAL; UNPAID clears them. Every change is logged as VENDOR_PAYMENT,
+ * the way ARRANGE_SERVICE logs a line edit.
+ * ───────────────────────────────────────────────────────────────────── */
+router.patch("/requests/:id/arrangements/:lineId/payment", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerCanPayVendorsForTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Official or Finance user, or a CSTEP Admin, can record a vendor payment" });
+    }
+    if (isClaimFormType(doc.formType) || !VENDOR_PAYABLE_STATUSES.has(doc.status)) {
+      return res.status(409).json({ error: "A vendor payment can be recorded once the request is being arranged" });
+    }
+    if (!mongoose.Types.ObjectId.isValid(req.params.lineId)) {
+      return res.status(400).json({ error: "Invalid arrangement line id" });
+    }
+    const line = await CstepArrangement.findOne({
+      _id: req.params.lineId,
+      workspaceId: req.workspaceObjectId,
+      requestId: doc._id,
+    });
+    if (!line) return res.status(404).json({ error: "Arrangement line not found" });
+    if (!line.vendorId) {
+      return res.status(409).json({ error: "Choose a vendor for this line before recording a payment" });
+    }
+
+    const body = req.body || {};
+    const next = body.paymentStatus;
+    if (next !== "PAID" && next !== "UNPAID") {
+      return res.status(400).json({ error: "paymentStatus must be PAID or UNPAID" });
+    }
+    const paymentRef = String(body.paymentRef ?? "").trim();
+    if (paymentRef.length > 100) return res.status(400).json({ error: "Payment reference is too long (100 characters max)" });
+    const vendorInvoiceNo = String(body.vendorInvoiceNo ?? "").trim();
+    if (vendorInvoiceNo.length > 100) return res.status(400).json({ error: "Vendor invoice no. is too long (100 characters max)" });
+
+    let paidAt = new Date();
+    if (next === "PAID" && body.paidAt) {
+      const s = String(body.paidAt).trim();
+      // Midday IST, so the calendar date never slips across a timezone.
+      const parsed = new Date(`${s}T12:00:00+05:30`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(parsed.getTime())) {
+        return res.status(400).json({ error: "paidAt must be a date (YYYY-MM-DD)" });
+      }
+      if (s > istDate(new Date())) {
+        return res.status(400).json({ error: "The payment date can't be in the future" });
+      }
+      paidAt = parsed;
+    }
+
+    const before = line.paymentStatus || "UNPAID";
+    if (next === "PAID") {
+      line.paymentStatus = "PAID";
+      line.paidAt = paidAt;
+      line.paidBy = new mongoose.Types.ObjectId(ownerId(req));
+      line.paymentRef = paymentRef || undefined;
+      line.vendorInvoiceNo = vendorInvoiceNo || undefined;
+    } else {
+      line.paymentStatus = "UNPAID";
+      line.paidAt = undefined;
+      line.paidBy = undefined;
+      line.paymentRef = undefined;
+      line.vendorInvoiceNo = undefined;
+    }
+    line.paymentSource = "MANUAL";
+    line.paymentBatchId = undefined;
+    await line.save();
+
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      // The Official recording it at the arrange step logs as OFFICIAL.
+      stage: (await callerCanFinanceForTraveller(req, doc.travelerProfileId)) ? "FINANCE" : "OFFICIAL",
+      actor: new mongoose.Types.ObjectId(ownerId(req)),
+      action: "VENDOR_PAYMENT",
+      comment:
+        `${line.arrangedType} — ${line.vendorCode} ${line.vendorName}: ${before} => ${line.paymentStatus}` +
+        (line.paymentStatus === "PAID"
+          ? (line.paymentRef ? ` | Ref: ${line.paymentRef}` : "") +
+            (line.vendorInvoiceNo ? ` | Invoice: ${line.vendorInvoiceNo}` : "") +
+            ` | Paid on ${istDate(line.paidAt as Date)}`
+          : ""),
+      at: new Date().toISOString(),
+    });
+
+    res.json({ ok: true, line: line.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests arrangements payment PATCH]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to record the vendor payment" });
   }
 });
 
@@ -2302,7 +3337,7 @@ router.post("/requests/:id/mark-arranged", async (req: any, res: any) => {
     doc.status = "ARRANGED";
     await doc.save();
 
-    await CstepApproval.create({
+    const entry = await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
@@ -2315,6 +3350,7 @@ router.post("/requests/:id/mark-arranged", async (req: any, res: any) => {
           : undefined,
       at: new Date().toISOString(),
     });
+    await notifyCstep("ARRANGED", doc, { logEntryId: entry._id });
 
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
@@ -2750,6 +3786,74 @@ router.post(
 );
 
 /* ─────────────────────────────────────────────────────────────────────
+ * POST /attachments/staging — claims addition. Uploads a claim receipt
+ * BEFORE the claim exists, so a line can carry it during intake: stores the
+ * file in S3 and creates a CstepAttachment with neither claimId nor
+ * travelRequestId. The returned _id goes on the line as attachmentId; the
+ * claim's create/PATCH checks the caller staged it (checkClaimAttachments)
+ * and links it to the claim (linkClaimAttachments). Any CSTEP user may
+ * stage their own receipt; it is useless to anyone else — nobody else may
+ * attach it. No OCR in this pass — attachment only.
+ * Body (multipart): file, documentType? (CstepAttachment's enum, default
+ * OTHER).
+ * ───────────────────────────────────────────────────────────────────── */
+const STAGING_DOCUMENT_TYPES = new Set<string>([
+  "BOARDING_PASS",
+  "ETICKET",
+  "HOTEL_FOLIO",
+  "CAB_RECEIPT",
+  "TAX_INVOICE",
+  "FOREX_RECEIPT",
+  "OTHER",
+]);
+
+router.post("/attachments/staging", reportAttachmentUpload.single("file"), async (req: any, res: any) => {
+  try {
+    const uid = ownerId(req);
+    if (!req.workspaceObjectId || !uid) {
+      return res.status(400).json({ error: "Missing workspace or user context" });
+    }
+    const file = req.file;
+    if (!file || !file.buffer) return res.status(400).json({ error: "File is required" });
+
+    const documentType = STAGING_DOCUMENT_TYPES.has(req.body?.documentType) ? req.body.documentType : "OTHER";
+    const uploaded = await uploadBufferToS3({
+      buffer: file.buffer,
+      mime: file.mimetype,
+      originalName: file.originalname,
+      customerId: String(req.workspaceObjectId),
+      createdBy: uid,
+      keyPrefix: `cstep/claim-receipts/${req.workspaceObjectId}/${uid}`,
+    });
+
+    const attachment = await CstepAttachment.create({
+      workspaceId: req.workspaceObjectId,
+      s3Key: uploaded.key,
+      originalName: file.originalname,
+      mime: file.mimetype,
+      documentType,
+      createdBy: new mongoose.Types.ObjectId(uid),
+    });
+
+    const url = await presignGetObject({
+      bucket: env.S3_BUCKET,
+      key: attachment.s3Key,
+      filename: attachment.originalName,
+      view: true,
+      contentType: attachment.mime,
+    });
+
+    res.status(201).json({
+      ok: true,
+      attachment: { _id: attachment._id, originalName: attachment.originalName, mime: attachment.mime, url },
+    });
+  } catch (err: any) {
+    console.error("[CSTEP attachments staging]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to upload the receipt" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * POST /requests/:id/report/submit — creator-only, REPORT_PENDING →
  * REPORT_SUBMITTED. Logs SUBMIT_REPORT. Does not build any Step 5
  * verification — the request just becomes visible to the Admin at this
@@ -2797,7 +3901,7 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
     doc.status = "REPORT_SUBMITTED";
     await doc.save();
 
-    await CstepApproval.create({
+    const entry = await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
@@ -2806,6 +3910,7 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
       action: "SUBMIT_REPORT",
       at: new Date().toISOString(),
     });
+    await notifyCstep("REPORT_SUBMITTED", doc, { logEntryId: entry._id });
 
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
@@ -2820,6 +3925,9 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
  * CstepAmendment (field, oldValue, newValue, actor, timestamp, reason).
  * ───────────────────────────────────────────────────────────────────── */
 const AMENDABLE_FIELDS = new Set(Object.keys(pickFields({})));
+// The project is a snapshot of a Project Master entry — set by the
+// traveller's create / edit (applyProjectSelection), not amended raw.
+AMENDABLE_FIELDS.delete("projectId");
 
 router.post("/requests/:id/amend", async (req: any, res: any) => {
   try {
@@ -2833,7 +3941,7 @@ router.post("/requests/:id/amend", async (req: any, res: any) => {
     }
 
     const field = String(req.body?.field || "");
-    if (!AMENDABLE_FIELDS.has(field)) {
+    if (!AMENDABLE_FIELDS.has(field) || !(field in scopeFieldsToFormType({ [field]: true }, doc.formType))) {
       return res.status(400).json({ error: "field is not a recognized, amendable field" });
     }
     if (!("newValue" in (req.body || {}))) {
@@ -3009,17 +4117,47 @@ router.get("/requests/:id/pdf", async (req: any, res: any) => {
         ? { buckets: settlement.buckets, totalCostOfTour: settlement.totalCostOfTour, amountClaimed: settlement.amountClaimed }
         : undefined;
 
-      const { key } =
-        doc.formType === "EVENT_REQUEST"
-          ? await uploadCstepEventRequestPdf(doc.toObject(), travellerInfo, trail)
-          : await uploadCstepTourProposalPdf(doc.toObject(), travellerInfo, trail, settlementPdfData);
+      let key: string;
+      switch (doc.formType) {
+        case "EVENT_REQUEST":
+          ({ key } = await uploadCstepEventRequestPdf(doc.toObject(), travellerInfo, trail));
+          break;
+        case "LOCAL_TRAVEL_CLAIM":
+        case "EXPENSE_CLAIM": {
+          const claimSettlement: CstepClaimSettlementPdfData | undefined = settlement
+            ? {
+                status: settlement.status,
+                amountClaimed: settlement.amountClaimed,
+                advanceTaken: settlement.advanceTaken,
+                amountDueByCstep: settlement.amountDueByCstep,
+                amountDueToCstep: settlement.amountDueToCstep,
+              }
+            : undefined;
+          ({ key } =
+            doc.formType === "EXPENSE_CLAIM"
+              ? await uploadCstepExpenseClaimPdf(doc.toObject(), travellerInfo, trail, claimSettlement)
+              : await uploadCstepLocalTravelClaimPdf(doc.toObject(), travellerInfo, trail, claimSettlement));
+          break;
+        }
+        case "TOUR_PROPOSAL":
+          ({ key } = await uploadCstepTourProposalPdf(doc.toObject(), travellerInfo, trail, settlementPdfData));
+          break;
+        default:
+          return res.status(409).json({ error: "No PDF is available for this form type" });
+      }
       doc.pdfS3Key = key;
       doc.pdfGeneratedAt = new Date();
       await doc.save();
     }
 
     const mode = req.query?.mode === "download" ? "download" : "view";
-    const filenamePrefix = doc.formType === "EVENT_REQUEST" ? "Event-Request" : "Tour-Proposal";
+    const PDF_FILENAME_PREFIX: Record<string, string> = {
+      TOUR_PROPOSAL: "Tour-Proposal",
+      EVENT_REQUEST: "Event-Request",
+      LOCAL_TRAVEL_CLAIM: "Local-Travel-Claim",
+      EXPENSE_CLAIM: "Expense-Claim",
+    };
+    const filenamePrefix = PDF_FILENAME_PREFIX[doc.formType] || "CSTEP-Request";
     const filename = `${filenamePrefix}-${doc.claimReference || doc._id}.pdf`;
     const url = await presignGetObject({
       bucket: env.S3_BUCKET,
@@ -3064,6 +4202,11 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
     const authorized = isOwner || (await callerCanViewTraveller(req, doc.travelerProfileId));
     if (!authorized) {
       return res.status(403).json({ error: "Not authorized to view this packet" });
+    }
+    // The packet is built from a filed travel report — a claim has none
+    // (its receipts are on its own lines, shown on the claim PDF/detail).
+    if (isClaimFormType(doc.formType)) {
+      return res.status(409).json({ error: "The travel packet applies to tour proposals and event requests only" });
     }
 
     const legs = await CstepReportLeg.find({
@@ -3186,6 +4329,10 @@ router.post("/requests/:id/settlement/start", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (isClaimFormType(doc.formType)) {
+      // A claim's settlement is seeded once, at approve — never opened here.
+      return res.status(409).json({ error: "A claim's settlement is opened when it is approved" });
+    }
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
     }
@@ -3278,8 +4425,12 @@ router.get("/requests/:id/settlement", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
-    if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can view the settlement" });
+    if (!(await callerCanSettleRequest(req, doc))) {
+      return res.status(403).json({
+        error: isClaimFormType(doc.formType)
+          ? "Only a CSTEP Admin can view a claim's settlement"
+          : "Only this traveller's Official user or a CSTEP Admin can view the settlement",
+      });
     }
 
     const settlement: any = await CstepSettlement.findOne({
@@ -3333,8 +4484,18 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
-    if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+    const isClaim = isClaimFormType(doc.formType);
+    if (!(await callerCanSettleRequest(req, doc))) {
+      return res.status(403).json({
+        error: isClaim
+          ? "Only a CSTEP Admin can verify a claim's lines"
+          : "Only this traveller's Official user or a CSTEP Admin can perform this action",
+      });
+    }
+    // A claim's lines are editable only while it awaits the Admin's
+    // verification — once it is with Finance they are frozen.
+    if (isClaim && doc.status !== "APPROVED") {
+      return res.status(409).json({ error: "This claim has already been verified" });
     }
 
     const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id });
@@ -3396,20 +4557,14 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
       workspaceId: req.workspaceObjectId,
       settlementId: settlement._id,
     }).lean();
-    const { buckets, totalCostOfTour, amountClaimed } = recomputeSettlementTotals(
-      allLines as any[],
-      settlement.perDiem.amountInr,
-    );
-    settlement.buckets = buckets;
-    settlement.totalCostOfTour = totalCostOfTour;
-    settlement.amountClaimed = amountClaimed;
+    applySettlementTotals(settlement, allLines as any[], doc);
     await settlement.save();
 
     await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
-      stage: "OFFICIAL",
+      stage: isClaim ? "ADMIN" : "OFFICIAL",
       actor: new mongoose.Types.ObjectId(ownerId(req)),
       action: "VERIFY_LINE",
       comment:
@@ -3439,6 +4594,7 @@ router.patch("/requests/:id/settlement/perdiem", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (isClaimFormType(doc.formType)) return res.status(409).json({ error: "A claim has no per diem" });
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
     }
@@ -3549,7 +4705,7 @@ router.post("/requests/:id/report/return", async (req: any, res: any) => {
     doc.status = "REPORT_PENDING";
     await doc.save();
 
-    await CstepApproval.create({
+    const entry = await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
@@ -3559,6 +4715,7 @@ router.post("/requests/:id/report/return", async (req: any, res: any) => {
       comment: reason,
       at: new Date().toISOString(),
     });
+    await notifyCstep("RETURN_REPORT", doc, { logEntryId: entry._id, reason });
 
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
@@ -3581,6 +4738,9 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (isClaimFormType(doc.formType)) {
+      return res.status(409).json({ error: "A claim is verified with POST /requests/:id/claim/verify, not finalized here" });
+    }
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
     }
@@ -3649,7 +4809,7 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
       .lean();
 
     const now = new Date().toISOString();
-    await CstepApproval.create({
+    const settleEntry = await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
@@ -3662,7 +4822,7 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
       at: now,
     });
     if (outcome === "TO_FINANCE") {
-      await CstepApproval.create({
+      const entry = await CstepApproval.create({
         workspaceId: req.workspaceObjectId,
         entityType: "REQUEST",
         entityId: doc._id,
@@ -3672,6 +4832,9 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
         comment: `₹${amountClaimed} owed to the traveller`,
         at: now,
       });
+      await notifyCstep("TRANSFERRED_TO_FINANCE", doc, { logEntryId: entry._id, amountInr: amountClaimed });
+    } else {
+      await notifyCstep("SETTLED", doc, { logEntryId: settleEntry._id });
     }
 
     res.json({ ok: true, settlement: settlement.toObject(), request: doc.toObject() });
@@ -3682,9 +4845,106 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
 });
 
 /**
+ * Claims addition — POST /requests/:id/claim/verify — the CSTEP Admin
+ * verifies an APPROVED claim's settlement (seeded at approve) and hands it
+ * on. Every line must be verified first (body { force: true } overrides,
+ * same as /settlement/finalize). Totals are recomputed from the lines, net
+ * of the advance:
+ *   - money moves either way (owed to the claimant, or the claimant owes
+ *     CSTEP back) -> TRANSFERRED_TO_FINANCE; the settlement stays VERIFYING
+ *     and Finance finalizes it when it pays (POST /finance/settle). Logs
+ *     ADMIN_VERIFY + TRANSFER_TO_FINANCE.
+ *   - net exactly zero (the advance covered it) -> nothing for Finance to
+ *     do: the settlement is FINALIZED (outcome CLOSE) and the claim SETTLED.
+ * The lines are frozen from here on (PATCH /settlement/lines refuses once
+ * the claim is no longer APPROVED).
+ */
+router.post("/requests/:id/claim/verify", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!isClaimFormType(doc.formType)) return res.status(409).json({ error: "Only a claim can be verified here" });
+    if (!isCstepAdmin(req)) return res.status(403).json({ error: "Only a CSTEP Admin can verify a claim" });
+    if (doc.status !== "APPROVED") return res.status(409).json({ error: "Only an approved claim can be verified" });
+
+    const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id });
+    if (!settlement || settlement.status !== "VERIFYING") {
+      return res.status(409).json({ error: "This claim has no settlement awaiting verification" });
+    }
+
+    const lines = await CstepSettlementLine.find({ workspaceId: req.workspaceObjectId, settlementId: settlement._id }).lean();
+    const unverified = (lines as any[]).filter((l) => !l.verified);
+    if (unverified.length > 0 && !req.body?.force) {
+      return res.status(409).json({
+        error: `${unverified.length} line(s) are not yet verified. Verify anyway to proceed.`,
+        unverifiedCount: unverified.length,
+      });
+    }
+
+    applySettlementTotals(settlement, lines as any[], doc);
+    const uid = ownerId(req);
+    const now = new Date().toISOString();
+    const toFinance = settlement.amountDueByCstep > 0 || settlement.amountDueToCstep > 0;
+    const dueLine =
+      settlement.amountDueByCstep > 0
+        ? `₹${settlement.amountDueByCstep} due by CSTEP to the claimant`
+        : settlement.amountDueToCstep > 0
+          ? `₹${settlement.amountDueToCstep} due to CSTEP from the claimant`
+          : "Nothing due either way";
+
+    if (!toFinance) {
+      settlement.outcome = "CLOSE";
+      settlement.status = "FINALIZED";
+      settlement.finalizedBy = new mongoose.Types.ObjectId(uid);
+      settlement.finalizedAt = new Date();
+    }
+    await settlement.save();
+
+    doc.status = toFinance ? "TRANSFERRED_TO_FINANCE" : "SETTLED";
+    await doc.save();
+
+    const verifyEntry = await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "ADMIN",
+      actor: new mongoose.Types.ObjectId(uid),
+      action: "ADMIN_VERIFY",
+      comment: `Claimed: ₹${settlement.amountClaimed} | Advance: ₹${settlement.advanceTaken || 0} | ${dueLine}`,
+      at: now,
+    });
+    if (toFinance) {
+      const entry = await CstepApproval.create({
+        workspaceId: req.workspaceObjectId,
+        entityType: "REQUEST",
+        entityId: doc._id,
+        stage: "ADMIN",
+        actor: new mongoose.Types.ObjectId(uid),
+        action: "TRANSFER_TO_FINANCE",
+        comment: dueLine,
+        at: now,
+      });
+      await notifyCstep("TRANSFERRED_TO_FINANCE", doc, {
+        logEntryId: entry._id,
+        amountInr: settlement.amountDueByCstep || settlement.amountDueToCstep,
+      });
+    } else {
+      await notifyCstep("SETTLED", doc, { logEntryId: verifyEntry._id });
+    }
+
+    res.json({ ok: true, settlement: settlement.toObject(), request: doc.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests claim verify]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to verify the claim" });
+  }
+});
+
+/**
  * Step 6 — POST /requests/:id/finance/settle — the Finance user (this
  * traveller's financeUserId) or a CSTEP Admin marks the reimbursement paid
- * out: TRANSFERRED_TO_FINANCE → REIMBURSED (terminal). The finalized
+ * out: TRANSFERRED_TO_FINANCE → REIMBURSED (terminal). A CLAIM is the
+ * Finance user's alone — a CSTEP Admin gets 403 (their part ends at
+ * POST /claim/verify). The finalized
  * settlement is the source of the amount; nothing on it is recomputed or
  * edited here. Optional body: { reference, note } — a payment/UTR
  * reference and a remark, both folded into the FINANCE_SETTLE audit
@@ -3695,57 +4955,184 @@ router.post("/requests/:id/finance/settle", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
-    if (!(await callerCanFinanceForTraveller(req, doc.travelerProfileId))) {
+    if (isClaimFormType(doc.formType)) {
+      if (!(await callerIsTravellerFinanceUser(req, doc.travelerProfileId))) {
+        return res.status(403).json({ error: "Only this traveller's Finance user can reimburse a claim" });
+      }
+    } else if (!(await callerCanFinanceForTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Only this traveller's Finance user or a CSTEP Admin can perform this action" });
     }
-    if (doc.status !== "TRANSFERRED_TO_FINANCE") {
-      return res.status(409).json({ error: "Only a request transferred to Finance can be marked reimbursed" });
-    }
-
-    const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id })
-      .select("status amountClaimed")
-      .lean();
-    if (!settlement || settlement.status !== "FINALIZED") {
-      return res.status(409).json({ error: "The settlement has not been finalized yet" });
-    }
-
-    const reference = String(req.body?.reference || "").trim();
-    const note = String(req.body?.note || "").trim();
-    const uid = ownerId(req);
-    const amount = Number(settlement.amountClaimed || 0);
-
-    doc.status = "REIMBURSED";
-    await doc.save();
-
-    const claim: any = await CstepClaim.findOneAndUpdate(
-      { workspaceId: req.workspaceObjectId, travelRequestId: doc._id },
-      { $set: { status: "SETTLED" } },
-      { new: true },
-    )
-      .select("claimReference status")
-      .lean();
-
-    await CstepApproval.create({
-      workspaceId: req.workspaceObjectId,
-      entityType: "REQUEST",
-      entityId: doc._id,
-      stage: "FINANCE",
-      actor: new mongoose.Types.ObjectId(uid),
-      action: "FINANCE_SETTLE",
-      comment:
-        `₹${amount} reimbursed to the traveller` +
-        (reference ? ` | Ref: ${reference}` : "") +
-        (note ? ` | ${note}` : "") +
-        (claim ? ` | Claim ${claim.claimReference}: ${claim.status}` : ""),
-      at: new Date().toISOString(),
+    const result = await settleFinanceCase(req, doc, {
+      reference: String(req.body?.reference || "").trim(),
+      note: String(req.body?.note || "").trim(),
+      source: "MANUAL",
     });
-
+    if ("error" in result) return res.status(result.status).json({ error: result.error });
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
     console.error("[CSTEP requests finance settle]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to mark the reimbursement" });
   }
 });
+
+/** What Finance pays (or collects) on a case at TRANSFERRED_TO_FINANCE —
+ * read off its settlement, never recomputed here. A claim is net of its
+ * advance (either direction); a Tour is the finalized amountClaimed. */
+export function financeCaseAmount(
+  formType: string,
+  settlement: any,
+): { direction: "PAY_OUT" | "COLLECT"; amount: number; advance: number } {
+  if (isClaimFormType(formType)) {
+    const dueBy = Number(settlement?.amountDueByCstep || 0);
+    const dueTo = Number(settlement?.amountDueToCstep || 0);
+    const advance = Number(settlement?.advanceTaken || 0);
+    return dueBy > 0 || dueTo <= 0 ? { direction: "PAY_OUT", amount: dueBy, advance } : { direction: "COLLECT", amount: dueTo, advance };
+  }
+  return { direction: "PAY_OUT", amount: Number(settlement?.amountClaimed || 0), advance: 0 };
+}
+
+export type FinanceSettleResult =
+  | { ok: true; endStatus: "REIMBURSED" | "SETTLED"; direction: "PAY_OUT" | "COLLECT"; amount: number }
+  | { ok: false; status: number; error: string; code: "NOT_WITH_FINANCE" | "SETTLEMENT_NOT_READY" | "ALREADY_SETTLED" };
+
+/**
+ * Step 6 core — Finance closes a case at TRANSFERRED_TO_FINANCE. Shared by
+ * POST /requests/:id/finance/settle and the bulk reimbursement import
+ * (routes/cstep.reimbursements.ts); the CALLER checks who may. The amount
+ * comes from the settlement, never from the caller.
+ *
+ * Claim: its Admin-verified, still-VERIFYING settlement is finalized here
+ * (outcome TO_FINANCE) and the money's direction decides the end state —
+ * paid out to the claimant → REIMBURSED, the claimant's repayment of an
+ * unspent advance received → SETTLED. Tour: the Official already finalized
+ * the settlement; the case goes REIMBURSED and its CstepClaim SETTLED.
+ *
+ * The settlement records paidOn (default now) / paymentRef / source /
+ * batch id. Every write is conditional on the case still being with
+ * Finance and runs in one transaction, so a second attempt (a re-import, a
+ * double click) settles nothing and reports ALREADY_SETTLED. Logs
+ * FINANCE_SETTLE; notifies after the commit.
+ */
+export async function settleFinanceCase(
+  req: any,
+  doc: any,
+  opts: {
+    reference?: string;
+    note?: string;
+    paidOn?: Date;
+    source: "MANUAL" | "IMPORT";
+    batchId?: mongoose.Types.ObjectId;
+  },
+): Promise<FinanceSettleResult> {
+  if (doc.status !== "TRANSFERRED_TO_FINANCE") {
+    return doc.status === "REIMBURSED" || doc.status === "SETTLED"
+      ? { ok: false, status: 409, code: "ALREADY_SETTLED", error: "Already reimbursed" }
+      : { ok: false, status: 409, code: "NOT_WITH_FINANCE", error: "Only a request transferred to Finance can be marked reimbursed" };
+  }
+  const workspaceId = req.workspaceObjectId;
+  const isClaim = isClaimFormType(doc.formType);
+  const settlement: any = await CstepSettlement.findOne({ workspaceId, requestId: doc._id }).lean();
+  const ready = isClaim ? settlement?.status === "VERIFYING" : settlement?.status === "FINALIZED";
+  if (!ready) {
+    return {
+      ok: false,
+      status: 409,
+      code: "SETTLEMENT_NOT_READY",
+      error: isClaim ? "This claim's settlement is not awaiting Finance" : "The settlement has not been finalized yet",
+    };
+  }
+
+  const { direction, amount } = financeCaseAmount(doc.formType, settlement);
+  const endStatus: "REIMBURSED" | "SETTLED" = isClaim && direction === "COLLECT" ? "SETTLED" : "REIMBURSED";
+  const uid = new mongoose.Types.ObjectId(ownerId(req));
+  const reference = opts.reference || "";
+  const note = opts.note || "";
+  const now = new Date();
+  const payment = {
+    paidOn: opts.paidOn || now,
+    paymentRef: reference || undefined,
+    paymentSource: opts.source,
+    paymentBatchId: opts.batchId,
+  };
+
+  let entryId: any = null;
+  let claim: any = null;
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const flipped = await CstepTravelRequest.updateOne(
+        { _id: doc._id, workspaceId, status: "TRANSFERRED_TO_FINANCE" },
+        { $set: { status: endStatus } },
+        { session },
+      );
+      if (flipped.modifiedCount !== 1) throw new Error("ALREADY_SETTLED");
+
+      const setSettlement = isClaim
+        ? { ...payment, outcome: "TO_FINANCE", status: "FINALIZED", finalizedBy: uid, finalizedAt: now }
+        : payment;
+      const s = await CstepSettlement.updateOne(
+        { _id: settlement._id, workspaceId, status: isClaim ? "VERIFYING" : "FINALIZED" },
+        { $set: setSettlement },
+        { session },
+      );
+      if (s.matchedCount !== 1) throw new Error("ALREADY_SETTLED");
+
+      if (!isClaim) {
+        claim = await CstepClaim.findOneAndUpdate(
+          { workspaceId, travelRequestId: doc._id },
+          { $set: { status: "SETTLED" } },
+          { new: true, session },
+        )
+          .select("claimReference status")
+          .lean();
+      }
+
+      const paidOnLabel = opts.paidOn ? ` | Paid on ${istDate(opts.paidOn)}` : "";
+      const batchLabel = opts.batchId ? ` | Import batch ${String(opts.batchId)}` : "";
+      const [entry] = await CstepApproval.create(
+        [
+          {
+            workspaceId,
+            entityType: "REQUEST",
+            entityId: doc._id,
+            stage: "FINANCE",
+            actor: uid,
+            action: "FINANCE_SETTLE",
+            comment:
+              (isClaim
+                ? direction === "PAY_OUT"
+                  ? `₹${amount} reimbursed to the claimant`
+                  : `₹${amount} received back from the claimant`
+                : `₹${amount} reimbursed to the traveller`) +
+              (reference ? ` | Ref: ${reference}` : "") +
+              paidOnLabel +
+              (note ? ` | ${note}` : "") +
+              batchLabel +
+              (claim ? ` | Claim ${claim.claimReference}: ${claim.status}` : ""),
+            at: now.toISOString(),
+          },
+        ],
+        { session },
+      );
+      entryId = entry._id;
+    });
+  } catch (err: any) {
+    if (err?.message === "ALREADY_SETTLED") {
+      return { ok: false, status: 409, code: "ALREADY_SETTLED", error: "Already reimbursed" };
+    }
+    throw err;
+  } finally {
+    session.endSession();
+  }
+
+  doc.status = endStatus;
+  if (endStatus === "REIMBURSED") {
+    await notifyCstep("REIMBURSED", doc, { logEntryId: entryId, amountInr: amount, reference });
+  } else {
+    await notifyCstep("SETTLED", doc, { logEntryId: entryId });
+  }
+  return { ok: true, endStatus, direction, amount };
+}
 
 /**
  * POST /requests/:id/finance/return — the Finance user (or a CSTEP Admin)
@@ -3774,6 +5161,27 @@ router.post("/requests/:id/finance/return", async (req: any, res: any) => {
     const reason = String(req.body?.reason || "").trim();
     if (!reason) return res.status(400).json({ error: "reason is required" });
 
+    // Claims addition — a claim goes back to the CSTEP Admin's verification
+    // (TRANSFERRED_TO_FINANCE -> APPROVED), not to an Official. Its
+    // settlement was never finalized (Finance finalizes it when it pays), so
+    // there is nothing to reopen; the lines become editable again simply
+    // because the claim is APPROVED again.
+    if (isClaimFormType(doc.formType)) {
+      doc.status = "APPROVED";
+      await doc.save();
+      await CstepApproval.create({
+        workspaceId: req.workspaceObjectId,
+        entityType: "REQUEST",
+        entityId: doc._id,
+        stage: "FINANCE",
+        actor: new mongoose.Types.ObjectId(ownerId(req)),
+        action: "RETURN_TO_ADMIN",
+        comment: reason,
+        at: new Date().toISOString(),
+      });
+      return res.json({ ok: true, request: doc.toObject() });
+    }
+
     const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id });
     if (!settlement || settlement.status !== "FINALIZED") {
       return res.status(409).json({ error: "The settlement has not been finalized yet" });
@@ -3793,7 +5201,7 @@ router.post("/requests/:id/finance/return", async (req: any, res: any) => {
       { $set: { status: "CLAIM_IN_PROGRESS" } },
     );
 
-    await CstepApproval.create({
+    const entry = await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
@@ -3803,6 +5211,7 @@ router.post("/requests/:id/finance/return", async (req: any, res: any) => {
       comment: reason,
       at: new Date().toISOString(),
     });
+    await notifyCstep("RETURN_TO_OFFICIAL", doc, { logEntryId: entry._id, reason });
 
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {

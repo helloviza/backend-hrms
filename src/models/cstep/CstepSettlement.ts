@@ -60,6 +60,23 @@ export interface ICstepSettlement extends Document {
   amountClaimed: number; // personal (reimbursable) lines + per diem owed to the traveller
   outcome?: CstepSettlementOutcome; // set only at finalize
 
+  // Claims addition — set only on a claim's settlement, recomputed with the
+  // totals. advanceTaken is copied from the claim at approve; net =
+  // amountClaimed - advanceTaken, split into amountDueByCstep (CSTEP pays
+  // the claimant) and amountDueToCstep (the claimant repays CSTEP). Never
+  // zeroed — both directions are real money.
+  advanceTaken?: number;
+  amountDueByCstep?: number;
+  amountDueToCstep?: number;
+
+  // Finance's payment of the case (POST /finance/settle, or the bulk
+  // reimbursement import): the date it was paid / received, the payment
+  // reference, and — for an import — the upload's batch id.
+  paidOn?: Date;
+  paymentRef?: string;
+  paymentSource?: "MANUAL" | "IMPORT";
+  paymentBatchId?: mongoose.Types.ObjectId;
+
   startedBy: mongoose.Types.ObjectId; // ref User — who ran /settlement/start
   startedAt: Date;
   finalizedBy?: mongoose.Types.ObjectId; // ref User — who ran /settlement/finalize
@@ -106,6 +123,15 @@ const CstepSettlementSchema = new Schema<ICstepSettlement>(
     totalCostOfTour: { type: Number, default: 0 },
     amountClaimed: { type: Number, default: 0 },
     outcome: { type: String, enum: ["CLOSE", "TO_FINANCE"] },
+
+    advanceTaken: { type: Number },
+    amountDueByCstep: { type: Number },
+    amountDueToCstep: { type: Number },
+
+    paidOn: { type: Date },
+    paymentRef: { type: String, trim: true },
+    paymentSource: { type: String, enum: ["MANUAL", "IMPORT"] },
+    paymentBatchId: { type: Schema.Types.ObjectId },
 
     startedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     startedAt: { type: Date, required: true },

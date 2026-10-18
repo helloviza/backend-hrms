@@ -105,6 +105,10 @@ export async function autoCaptureTravellersFromBooking(params: {
   customerId: any;
   createdBy: string;
   passengers: BookingPassengerForCapture[] | undefined | null;
+  // CSTEP workspace (resolved by the route): a new profile is created with a
+  // BLANK travelerId instead of a minted <CODE>-NNN — there the id is the
+  // employee id, which only an admin can assign. Absent → minted, as before.
+  cstep?: boolean;
 }): Promise<void> {
   const { workspaceId, customerId, createdBy, passengers } = params;
   if (!workspaceId || !Array.isArray(passengers) || !passengers.length) return;
@@ -141,7 +145,7 @@ export async function autoCaptureTravellersFromBooking(params: {
         continue;
       }
 
-      const travelerId = await mintTravellerProfileId(workspaceId, customerId);
+      const travelerId = params.cstep ? "" : await mintTravellerProfileId(workspaceId, customerId);
       const created: any = await TravellerProfile.create({
         workspaceId,
         travelerId,

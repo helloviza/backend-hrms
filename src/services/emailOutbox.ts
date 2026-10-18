@@ -39,6 +39,8 @@ export const SEND_FAILURE_ALERT_EVENT = "email_send_failed_alert";
 export type OutboxMessage = {
   event: string;
   kind?: MailKind;
+  /** Sender for this one email; empty = the mailer's usual FROM for `kind`. */
+  from?: string;
   to: string[];
   cc?: string[];
   replyTo?: string;
@@ -84,6 +86,7 @@ async function trySend(row: AnyObj): Promise<{ ok: boolean; error: string }> {
     const attachments = await mailAttachments(row.attachments);
     const r: any = await sendMail({
       kind: row.kind,
+      from: row.from || undefined,
       to: to.length === 1 ? to[0] : to,
       cc: row.cc?.length ? row.cc : undefined,
       replyTo: row.replyTo || undefined,
@@ -144,6 +147,7 @@ export async function enqueueEmail(msg: OutboxMessage, opts: { maxAttempts?: num
   const fields = {
     event: msg.event,
     kind: msg.kind || "DEFAULT",
+    from: msg.from || "",
     to: msg.to,
     cc: msg.cc || [],
     replyTo: msg.replyTo || "",

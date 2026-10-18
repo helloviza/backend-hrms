@@ -37,6 +37,8 @@ export type CstepApprovalAction =
   | "ARRANGE_SERVICE"
   | "ADD_SERVICE"
   | "MARK_ARRANGED"
+  // Vendor payment on an arrangement line — Finance/Admin, UNPAID <-> PAID.
+  | "VENDOR_PAYMENT"
   // Step 4 — the traveller's post-trip Travel Report.
   | "START_REPORT"
   | "SUBMIT_REPORT"
@@ -53,7 +55,11 @@ export type CstepApprovalAction =
   // Exit/bounce paths — send-backs after approval. The approval-stage
   // send-back stays RETURN; reject at that stage is REJECT (above).
   | "RETURN_REPORT" // Official → traveller: REPORT_SUBMITTED → REPORT_PENDING
-  | "RETURN_TO_OFFICIAL"; // Finance → Official: TRANSFERRED_TO_FINANCE → REPORT_SUBMITTED
+  | "RETURN_TO_OFFICIAL" // Finance → Official: TRANSFERRED_TO_FINANCE → REPORT_SUBMITTED
+  // Claims addition — a claim has no Official stage: Finance sends it back
+  // to CSTEP Admin verification (TRANSFERRED_TO_FINANCE → APPROVED). The
+  // Admin's verification itself reuses ADMIN_VERIFY above.
+  | "RETURN_TO_ADMIN";
 
 export interface ICstepApproval extends Document {
   workspaceId: mongoose.Types.ObjectId;
@@ -95,6 +101,7 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "ARRANGE_SERVICE",
       "ADD_SERVICE",
       "MARK_ARRANGED",
+      "VENDOR_PAYMENT",
       "START_REPORT",
       "SUBMIT_REPORT",
       "START_VERIFICATION",
@@ -104,6 +111,7 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "FINANCE_SETTLE",
       "RETURN_REPORT",
       "RETURN_TO_OFFICIAL",
+      "RETURN_TO_ADMIN",
     ],
     required: true,
   },

@@ -54,7 +54,72 @@ export interface ICstepPersonalDays {
 
 export type CstepTimeBand = "BEFORE_6AM" | "6AM_12PM" | "12PM_6PM" | "AFTER_6PM";
 
-export type CstepFormType = "TOUR_PROPOSAL" | "EVENT_REQUEST";
+// Claims addition — LOCAL_TRAVEL_CLAIM and EXPENSE_CLAIM are reimbursement
+// claims for money already spent, standalone (no tour behind them). They
+// share this collection and the request lifecycle up to APPROVED, then skip
+// arrangement and the travel report entirely: approve seeds a VERIFYING
+// CstepSettlement from the claim's own lines, a CSTEP Admin verifies it
+// (-> TRANSFERRED_TO_FINANCE), and Finance pays (-> REIMBURSED / SETTLED).
+export const CSTEP_FORM_TYPES = ["TOUR_PROPOSAL", "EVENT_REQUEST", "LOCAL_TRAVEL_CLAIM", "EXPENSE_CLAIM"] as const;
+export type CstepFormType = (typeof CSTEP_FORM_TYPES)[number];
+export const CSTEP_CLAIM_FORM_TYPES = ["LOCAL_TRAVEL_CLAIM", "EXPENSE_CLAIM"] as const;
+export function isClaimFormType(formType: any): boolean {
+  return (CSTEP_CLAIM_FORM_TYPES as readonly string[]).includes(formType);
+}
+
+// ── Local Travel Claim (claims addition) — additive, sibling fields ─────────
+
+export const CSTEP_LOCAL_TRAVEL_MODES = ["CAB", "LOCAL_TAXI", "METRO", "BUS", "OWN_VEHICLE"] as const;
+export type CstepLocalTravelMode = (typeof CSTEP_LOCAL_TRAVEL_MODES)[number];
+
+export interface ICstepClaimTravelLine {
+  _id?: mongoose.Types.ObjectId;
+  date?: string; // "YYYY-MM-DD"
+  from?: string;
+  to?: string;
+  mode?: CstepLocalTravelMode;
+  fare?: number; // INR, flat per line — no km x rate
+  remarks?: string;
+  attachmentId?: mongoose.Types.ObjectId; // ref CstepAttachment
+  noBill?: boolean; // no supporting document — lists the line in the claim's Declaration
+}
+
+export interface ICstepClaimFoodLine {
+  _id?: mongoose.Types.ObjectId;
+  date?: string; // "YYYY-MM-DD"
+  amount?: number; // INR
+  remarks?: string;
+  attachmentId?: mongoose.Types.ObjectId; // ref CstepAttachment, optional
+}
+
+// ── Expense Claim (claims module 2) — additive, sibling fields ──────────────
+
+export interface ICstepClaimExpenseLine {
+  _id?: mongoose.Types.ObjectId;
+  date?: string; // "YYYY-MM-DD"
+  description?: string;
+  amount?: number; // INR, before tax
+  attachmentId?: mongoose.Types.ObjectId; // ref CstepAttachment — the line's invoice, optional when a claim-level invoice exists
+}
+
+/** The claimant's own figures, STORED on every write by the pre-validate
+ * hook below (never derived at read time). The verified figures Finance
+ * pays live on the CstepSettlement, which can differ once the Admin
+ * corrects a line. net = gross - advance; dueByCstep / dueToCstep are its
+ * positive / negative halves (CSTEP owes the claimant / the claimant owes
+ * CSTEP back) — both kept, never zeroed. */
+export interface ICstepClaimTotals {
+  travel: number; // Local Travel Claim
+  food: number; // Local Travel Claim
+  other: number; // Local Travel Claim
+  subtotal?: number; // Expense Claim — sum of its lines, before tax
+  tax?: number; // Expense Claim — the single IGST/tax amount
+  gross: number; // the claim's total: travel + food + other, or subtotal + tax
+  advance: number;
+  net: number;
+  dueByCstep: number;
+  dueToCstep: number;
+}
 
 // ── Event Request (Event Request addition) — additive, sibling fields ────────
 
@@ -86,7 +151,14 @@ export interface ICstepTravelRequest extends Document {
   type?: "DOMESTIC" | "INTERNATIONAL";
 
   purpose: string; // "Purpose of tour" (Tour Proposal) / "Title of the event" (Event Request) — shared field, different on-screen label
-  project?: string;
+  project?: string; // display text: "CODE — Name" for a picked project; free text on requests made before the Project Master
+  // Project Master — the picked project (CstepProject) and a snapshot of it
+  // taken at write time, so a rename never rewrites the request and the
+  // Tally export's Project CC never breaks. Absent on older free-text requests.
+  projectId?: mongoose.Types.ObjectId;
+  projectCode?: string;
+  projectName?: string;
+  projectTallyCC?: string;
   projectDebitable?: string;
 
   stations: ICstepStationEntry[]; // domestic
@@ -136,6 +208,18 @@ export interface ICstepTravelRequest extends Document {
   eventFundsAvailability?: ICstepFundsAvailability;
   participantMeals?: ICstepParticipantMeals;
 
+  // LOCAL_TRAVEL_CLAIM-only. Never set on any other form type.
+  travelLines?: ICstepClaimTravelLine[];
+  foodLines?: ICstepClaimFoodLine[];
+  otherExpenses?: number; // INR
+  advanceTaken?: number; // INR — a claim's advance, netted off its total (both claim types)
+
+  // EXPENSE_CLAIM-only. Never set on any other form type.
+  expenseLines?: ICstepClaimExpenseLine[];
+  taxAmount?: number; // INR — one IGST/tax figure; GSTIN/HSN live on the attached invoice
+  invoiceAttachmentIds?: mongoose.Types.ObjectId[]; // claim-level tax invoice(s), ref CstepAttachment
+  claimTotals?: ICstepClaimTotals; // computed on write — see the pre-validate hook
+
   fundsConfirmedBy?: mongoose.Types.ObjectId; // ref User
   fundsConfirmedAt?: string; // ISO string, not Date — see module note
 
@@ -172,7 +256,7 @@ export interface ICstepTravelRequest extends Document {
     | "REIMBURSED"
     | "REJECTED"
     | "CANCELLED";
-  claimReference?: string; // set on approval — TOUR_PROPOSAL only, see routes/cstep.ts's approve handler
+  claimReference?: string; // set on approval — a TOUR_PROPOSAL's TIN, a claim's own reference ("LTC0001/1026", "EXP0001/1026"), or an EVENT_REQUEST's "EVR0001/1026". New ones come from utils/cstepSequence.ts; older ones keep the format they were issued in
 
   // Tour Proposal PDF cache (Step 1 Polish) — regenerated whenever stale
   // (pdfGeneratedAt older than updatedAt) by GET /requests/:id/pdf.
@@ -251,12 +335,101 @@ const CstepParticipantMealsSchema = new Schema<ICstepParticipantMeals>(
   { _id: false },
 );
 
+// ── Local Travel Claim (claims addition) sub-schemas — additive ─────────────
+// Lines keep their own _id: the settlement seeded at approve points each
+// CLAIM_LINE row back at the line it came from (CstepSettlementLine.sourceId).
+
+const CstepClaimTravelLineSchema = new Schema<ICstepClaimTravelLine>({
+  date: { type: String },
+  from: { type: String, trim: true },
+  to: { type: String, trim: true },
+  mode: { type: String, enum: CSTEP_LOCAL_TRAVEL_MODES },
+  fare: { type: Number },
+  remarks: { type: String, trim: true },
+  attachmentId: { type: Schema.Types.ObjectId, ref: "CstepAttachment" },
+  noBill: { type: Boolean, default: false },
+});
+
+const CstepClaimFoodLineSchema = new Schema<ICstepClaimFoodLine>({
+  date: { type: String },
+  amount: { type: Number },
+  remarks: { type: String, trim: true },
+  attachmentId: { type: Schema.Types.ObjectId, ref: "CstepAttachment" },
+});
+
+const CstepClaimExpenseLineSchema = new Schema<ICstepClaimExpenseLine>({
+  date: { type: String },
+  description: { type: String, trim: true },
+  amount: { type: Number },
+  attachmentId: { type: Schema.Types.ObjectId, ref: "CstepAttachment" },
+});
+
+const CstepClaimTotalsSchema = new Schema<ICstepClaimTotals>(
+  {
+    travel: { type: Number, default: 0 },
+    food: { type: Number, default: 0 },
+    other: { type: Number, default: 0 },
+    subtotal: { type: Number },
+    tax: { type: Number },
+    gross: { type: Number, default: 0 },
+    advance: { type: Number, default: 0 },
+    net: { type: Number, default: 0 },
+    dueByCstep: { type: Number, default: 0 },
+    dueToCstep: { type: Number, default: 0 },
+  },
+  { _id: false },
+);
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+/** The claimant-side totals for a Local Travel Claim, from its own lines. */
+export function computeLocalTravelClaimTotals(doc: {
+  travelLines?: Array<{ fare?: number }>;
+  foodLines?: Array<{ amount?: number }>;
+  otherExpenses?: number;
+  advanceTaken?: number;
+}): ICstepClaimTotals {
+  const travel = round2((doc.travelLines || []).reduce((s, l) => s + (Number(l?.fare) || 0), 0));
+  const food = round2((doc.foodLines || []).reduce((s, l) => s + (Number(l?.amount) || 0), 0));
+  const other = round2(Number(doc.otherExpenses) || 0);
+  const gross = round2(travel + food + other);
+  const advance = round2(Number(doc.advanceTaken) || 0);
+  const net = round2(gross - advance);
+  return { travel, food, other, gross, advance, net, dueByCstep: net > 0 ? net : 0, dueToCstep: net < 0 ? round2(-net) : 0 };
+}
+
+/** The claimant-side totals for an Expense Claim: subtotal = Σ lines, total
+ * = subtotal + tax, net = total − advance. */
+export function computeExpenseClaimTotals(doc: {
+  expenseLines?: Array<{ amount?: number }>;
+  taxAmount?: number;
+  advanceTaken?: number;
+}): ICstepClaimTotals {
+  const subtotal = round2((doc.expenseLines || []).reduce((s, l) => s + (Number(l?.amount) || 0), 0));
+  const tax = round2(Number(doc.taxAmount) || 0);
+  const gross = round2(subtotal + tax);
+  const advance = round2(Number(doc.advanceTaken) || 0);
+  const net = round2(gross - advance);
+  return {
+    travel: 0,
+    food: 0,
+    other: 0,
+    subtotal,
+    tax,
+    gross,
+    advance,
+    net,
+    dueByCstep: net > 0 ? net : 0,
+    dueToCstep: net < 0 ? round2(-net) : 0,
+  };
+}
+
 const CstepTravelRequestSchema = new Schema<ICstepTravelRequest>(
   {
     workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace", required: true, index: true },
     travelerProfileId: { type: Schema.Types.ObjectId, ref: "TravellerProfile", required: true, index: true },
 
-    formType: { type: String, enum: ["TOUR_PROPOSAL", "EVENT_REQUEST"], default: "TOUR_PROPOSAL", required: true, index: true },
+    formType: { type: String, enum: CSTEP_FORM_TYPES, default: "TOUR_PROPOSAL", required: true, index: true },
 
     // Not required at the schema level any more — TOUR_PROPOSAL-only, an
     // EVENT_REQUEST document never sets it. validatePayload (routes/cstep.ts)
@@ -267,6 +440,10 @@ const CstepTravelRequestSchema = new Schema<ICstepTravelRequest>(
 
     purpose: { type: String, required: true, trim: true },
     project: { type: String, trim: true },
+    projectId: { type: Schema.Types.ObjectId, ref: "CstepProject" },
+    projectCode: { type: String, trim: true },
+    projectName: { type: String, trim: true },
+    projectTallyCC: { type: String, trim: true },
     projectDebitable: { type: String, trim: true },
 
     stations: { type: [CstepStationSchema], default: [] },
@@ -316,6 +493,21 @@ const CstepTravelRequestSchema = new Schema<ICstepTravelRequest>(
     eventFundsAvailability: { type: CstepFundsAvailabilitySchema },
     participantMeals: { type: CstepParticipantMealsSchema },
 
+    // LOCAL_TRAVEL_CLAIM-only — never set on any other form type. No array
+    // defaults on purpose: a Tour/Event document must not grow empty
+    // travelLines/foodLines arrays just by being saved.
+    travelLines: { type: [CstepClaimTravelLineSchema], default: undefined },
+    foodLines: { type: [CstepClaimFoodLineSchema], default: undefined },
+    otherExpenses: { type: Number },
+    advanceTaken: { type: Number },
+    claimTotals: { type: CstepClaimTotalsSchema },
+
+    // EXPENSE_CLAIM-only — never set on any other form type (no defaults,
+    // same reason as the Local Travel Claim arrays above).
+    expenseLines: { type: [CstepClaimExpenseLineSchema], default: undefined },
+    taxAmount: { type: Number },
+    invoiceAttachmentIds: { type: [{ type: Schema.Types.ObjectId, ref: "CstepAttachment" }], default: undefined },
+
     fundsConfirmedBy: { type: Schema.Types.ObjectId, ref: "User" },
     fundsConfirmedAt: { type: String },
 
@@ -350,6 +542,23 @@ const CstepTravelRequestSchema = new Schema<ICstepTravelRequest>(
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   },
   { timestamps: true },
+);
+
+// Claim totals are stored on EVERY write path (create, PATCH, amend) from one
+// place, so no route can save a Local Travel Claim with stale totals.
+CstepTravelRequestSchema.pre("validate", function (next) {
+  const self: any = this;
+  if (self.formType === "LOCAL_TRAVEL_CLAIM") self.claimTotals = computeLocalTravelClaimTotals(self);
+  else if (self.formType === "EXPENSE_CLAIM") self.claimTotals = computeExpenseClaimTotals(self);
+  next();
+});
+
+// A claim's reference is unique per tenant. Partial on claimTotals (present
+// only on claim documents) so existing Tour Proposal TINs — already unique
+// through CstepClaim's own index — are not indexed here at all.
+CstepTravelRequestSchema.index(
+  { workspaceId: 1, claimReference: 1 },
+  { unique: true, partialFilterExpression: { claimTotals: { $exists: true }, claimReference: { $exists: true } } },
 );
 
 CstepTravelRequestSchema.plugin(workspaceScopePlugin);

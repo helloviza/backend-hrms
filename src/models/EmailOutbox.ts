@@ -24,6 +24,8 @@ const EmailOutboxSchema = new Schema(
     /** Email map event key (services/approvalEmails/map.ts). */
     event: { type: String, required: true, index: true },
     kind: { type: String, default: "DEFAULT" },
+    /** Sender for this email; "" = the mailer's usual FROM for `kind`. Kept so a retry sends as the same sender. */
+    from: { type: String, default: "" },
     to: { type: [String], default: [] },
     cc: { type: [String], default: [] },
     replyTo: { type: String, default: "" },

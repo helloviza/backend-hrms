@@ -430,11 +430,20 @@ export async function generateCstepPacketPdf(
   }
 
   // 3. Approval form — same generator + formType dispatch as
-  // GET /requests/:id/pdf, appended last.
-  const approvalBytes =
-    request.formType === "EVENT_REQUEST"
-      ? await generateCstepEventRequestPdf(request, traveller, trail)
-      : await generateCstepTourProposalPdf(request, traveller, trail, settlement);
+  // GET /requests/:id/pdf, appended last. A claim has no travel report, so
+  // no packet (routes/cstep.ts refuses it before this runs) — never let one
+  // fall through to the Tour Proposal form here either.
+  let approvalBytes: Buffer;
+  switch (request.formType) {
+    case "EVENT_REQUEST":
+      approvalBytes = await generateCstepEventRequestPdf(request, traveller, trail);
+      break;
+    case "TOUR_PROPOSAL":
+      approvalBytes = await generateCstepTourProposalPdf(request, traveller, trail, settlement);
+      break;
+    default:
+      throw new Error(`No travel packet for form type ${request.formType}`);
+  }
   const approvalDoc = await PdfLibDocument.load(approvalBytes);
   const approvalPages = await pdf.copyPages(approvalDoc, approvalDoc.getPageIndices());
   approvalPages.forEach((p) => pdf.addPage(p));
