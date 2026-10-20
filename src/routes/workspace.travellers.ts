@@ -813,12 +813,37 @@ async function resolveReportingManagerId(
  * (not 403) says "the server understood and will not do it", which is the
  * accurate shape — nobody's rights would change the answer.
  *
+ * Only a key that would CHANGE something counts (identityKeysChanging): an
+ * empty value over an empty stored number is a no-op and is dropped, the
+ * same "refuse a real change, not a present key" rule the field matrix
+ * follows (disallowedFieldsInBody). Without it every dossier / My Profile
+ * save 422'd while capture is off, because the full form carries both keys
+ * as "" on every edit (2026-10-21).
+ *
  * Returns an error string to send, or null when there was nothing to do.
  * See infra/design/universal-traveller-profile-2026-08-11.md §4.
  */
+const IDENTITY_NUMBER_KEYS = [
+  ["panNumber", "pan"],
+  ["aadhaarNumber", "aadhaar"],
+] as const;
+
+/** The identity keys in this body that would change the stored number.
+ * Unchanged keys (blank over blank, or the stored value resent) are DELETED
+ * from the body so nothing downstream reads them. `stored` is the existing
+ * record, or {} at create. */
+function identityKeysChanging(body: Record<string, any>, stored: any): string[] {
+  const changing: string[] = [];
+  for (const [key, path] of IDENTITY_NUMBER_KEYS) {
+    if (!(key in body)) continue;
+    if (normStr(body[key]) === normStr(stored?.[path]?.number)) delete body[key];
+    else changing.push(key);
+  }
+  return changing;
+}
+
 function applyIdentityNumbers(traveller: any, body: Record<string, any>): string | null {
-  const wants = "panNumber" in body || "aadhaarNumber" in body;
-  if (!wants) return null;
+  if (identityKeysChanging(body, traveller).length === 0) return null;
 
   if (!isIdentityNumberCaptureEnabled()) return IDENTITY_CAPTURE_DISABLED_MESSAGE;
 
@@ -2290,7 +2315,8 @@ router.post("/", async (req: any, res: any) => {
 
     // PAN/Aadhaar at create is refused by the same build-state gate as at
     // edit — checked here, before the counter, so the refusal costs nothing.
-    if (("panNumber" in body || "aadhaarNumber" in body) && !isIdentityNumberCaptureEnabled()) {
+    // A blank value sets nothing, so only a real number is refused.
+    if (identityKeysChanging(body, {}).length > 0 && !isIdentityNumberCaptureEnabled()) {
       return res.status(422).json({ error: IDENTITY_CAPTURE_DISABLED_MESSAGE });
     }
 

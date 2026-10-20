@@ -516,6 +516,50 @@ describe("tax identification — PAN / Aadhaar stay gated", () => {
     expect(stored.aadhaar?.number).toBeUndefined();
   });
 
+  // 2026-10-21: the full dossier form (Travellers tab, My Profile) carries
+  // panNumber / aadhaarNumber as "" on every edit, and the gate refused any
+  // body that merely CONTAINED them — every ordinary edit 422'd.
+  it("an ordinary dossier edit carrying BLANK PAN/Aadhaar keys saves (no 422) and stores no number", async () => {
+    const t = await seedTraveller(WORKSPACE_A, "ACME-052");
+    const res = await request(makeApp(WORKSPACE_A, CUSTOMER_A))
+      .put(`/${t._id}`)
+      .send({ workLocation: "Pune", costCenterId: "CC-7", panNumber: "", aadhaarNumber: "   " });
+
+    expect(res.status).toBe(200);
+    const stored: any = await TravellerProfile.findById(t._id).lean();
+    expect(stored).toMatchObject({ workLocation: "Pune", costCenterId: "CC-7" });
+    expect(stored.pan?.number).toBeUndefined();
+    expect(stored.aadhaar?.number).toBeUndefined();
+  });
+
+  it("a real number is still refused alongside the blank one — and nothing else on the edit is written", async () => {
+    const t = await seedTraveller(WORKSPACE_A, "ACME-053");
+    const res = await request(makeApp(WORKSPACE_A, CUSTOMER_A))
+      .put(`/${t._id}`)
+      .send({ workLocation: "Pune", panNumber: "", aadhaarNumber: "123412341234" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe(IDENTITY_CAPTURE_DISABLED_MESSAGE);
+    const stored: any = await TravellerProfile.findById(t._id).lean();
+    expect(stored.workLocation).toBeUndefined();
+    expect(stored.aadhaar?.number).toBeUndefined();
+  });
+
+  it("at create, blank PAN/Aadhaar keys pass the identity gate; a real number is still refused", async () => {
+    const app = makeApp(WORKSPACE_A, CUSTOMER_A);
+    // Blank keys get past the gate. (This harness's string customer id then
+    // trips the travelerId mint further on, so only the gate is asserted —
+    // the form never sends blanks at create anyway.)
+    const blank = await request(app).post("/").send({ firstName: "Blank", lastName: "Ids", panNumber: "", aadhaarNumber: "" });
+    expect(blank.status).not.toBe(422);
+    expect(blank.body.error).not.toBe(IDENTITY_CAPTURE_DISABLED_MESSAGE);
+
+    const refused = await request(app).post("/").send({ firstName: "Real", lastName: "Pan", panNumber: "ABCDE1234F" });
+    expect(refused.status).toBe(422);
+    expect(refused.body.error).toBe(IDENTITY_CAPTURE_DISABLED_MESSAGE);
+    expect(await TravellerProfile.countDocuments({ workspaceId: WORKSPACE_A, firstName: "Real" })).toBe(0);
+  });
+
   it("reports the gated state, with no value and no verification claim", async () => {
     const t = await seedTraveller(WORKSPACE_A, "ACME-051");
     const res = await request(makeApp(WORKSPACE_A, CUSTOMER_A)).get(`/${t._id}`);
