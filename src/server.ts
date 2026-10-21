@@ -31,7 +31,7 @@ import { requireWorkspace } from "./middleware/requireWorkspace.js";
 import { blockTravelForSaas } from "./middleware/blockTravelForSaas.js";
 import { requireAuth } from "./middleware/auth.js";
 import { requireFeature } from "./middleware/requireFeature.js";
-import { apiLimiter, authLimiter, flightSearchLimiter, hotelSearchLimiter, copilotLimiter } from "./middleware/rateLimit.js";
+import { apiLimiter, authLimiter, flightSearchLimiter, hotelSearchLimiter, hotelImagesLimiter, copilotLimiter, travelCopilotLimiter } from "./middleware/rateLimit.js";
 import { env } from "./config/env.js";
 import vouchers from "./routes/vouchers.js";
 
@@ -309,7 +309,11 @@ app.use("/api", apiLimiter);
 app.use("/api/auth", authLimiter);
 app.use("/api/sbt/flights/search", flightSearchLimiter);
 app.use("/api/sbt/hotels/search", hotelSearchLimiter);
+app.use("/api/sbt/hotels/images", hotelImagesLimiter);
 app.use("/api/copilot", copilotLimiter);
+// Same copilotRouter as /api/copilot, so it takes the same cap.
+app.use("/api/v1/copilot/manager", copilotLimiter);
+app.use("/api/v1/copilot/travel", travelCopilotLimiter);
 
 /* ────────────────────────────────────────────────────────────────
  * WORKSPACE SCOPING — runs after per-route requireAuth sets req.user.

@@ -1,57 +1,180 @@
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
+import type { Request, Response, NextFunction } from 'express';
+import { verifyToken } from '../utils/jwt.js';
 
-// General API limiter — all routes
+/* ── GLOBAL LIMITS — tune here ────────────────────────────────────────
+ * Logged-in traffic is keyed per USER, anonymous traffic per IP.
+ *
+ * The old single 500/15min per-IP bucket was shared by everyone behind one
+ * office NAT, so one tab stuck in a reconnect loop locked a whole company
+ * out. A user ID is the honest unit for signed-in traffic: two colleagues
+ * on one egress are two buckets, and one user on many IPs is still one.
+ *
+ * 1,500 is a ceiling for runaway clients, not a pacing control: an active
+ * staff session (bell + activity + chat polls, dashboards, a hotel search's
+ * image fan-out) stays well under ~100/min. Expensive routes carry their
+ * own tighter caps below.
+ */
+export const API_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+export const API_LIMIT_PER_USER = 1500;
+export const API_LIMIT_PER_IP_ANON = 500;
+
+/**
+ * The verified user ID behind the request's Bearer token, or null.
+ *
+ * Same check middleware/auth.ts runs — a signature verify against
+ * JWT_SECRET, no DB lookup — so a forged or expired token cannot claim a
+ * user's bucket; it falls back to the IP like any anonymous caller.
+ * Memoised on the request because several limiters may ask.
+ */
+export function rateLimitUserId(req: Request): string | null {
+  const r = req as any;
+  if (r.__rateLimitUserId !== undefined) return r.__rateLimitUserId;
+  let id: string | null = null;
+  const hdr = req.headers.authorization;
+  if (hdr && hdr.startsWith('Bearer ')) {
+    const token = hdr.slice('Bearer '.length).trim();
+    if (token) {
+      try {
+        const sub = (verifyToken(token) as any)?.sub;
+        if (sub) id = String(sub);
+      } catch {
+        id = null;
+      }
+    }
+  }
+  r.__rateLimitUserId = id;
+  return id;
+}
+
+const ipKey = (req: Request) => ipKeyGenerator(req.ip || 'unknown');
+
+/**
+ * Per-user key when the Bearer token verifies, else the client IP.
+ * Reads the token rather than req.user because every limiter using it is
+ * mounted in server.ts BEFORE the routers' requireAuth runs.
+ */
+export const userOrIpKey = (req: Request) => {
+  const id = rateLimitUserId(req);
+  return id ? `user:${id}` : ipKey(req);
+};
+
+/**
+ * 429 handler that also logs. Logs the FIRST block of a bucket and then
+ * every 100th, so a client hammering in a loop leaves a trail without
+ * flooding the log. Records user ID, req.ip and the raw X-Forwarded-For —
+ * the last two side by side are what settles whether req.ip is the real
+ * client or a proxy hop (see `trust proxy` in server.ts).
+ */
+function loggingHandler(name: string) {
+  return (req: Request, res: Response, _next: NextFunction, options: any) => {
+    const info = (req as any).rateLimit;
+    const over = info ? info.used - info.limit : 1;
+    if (over === 1 || over % 100 === 0) {
+      console.warn(
+        `[rate-limit] 429 limiter=${name} user=${rateLimitUserId(req) || '-'} ip=${req.ip || '-'} ` +
+          `xff=${String(req.headers['x-forwarded-for'] || '-')} ${req.method} ${req.originalUrl.split('?')[0]} ` +
+          `used=${info?.used ?? '?'}/${info?.limit ?? '?'}`
+      );
+    }
+    res.status(options.statusCode).json(options.message);
+  };
+}
+
+// General API limiter — all routes. Per user when signed in, per IP otherwise.
 export const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 500,
-  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  windowMs: API_LIMIT_WINDOW_MS,
+  max: (req) => (rateLimitUserId(req) ? API_LIMIT_PER_USER : API_LIMIT_PER_IP_ANON),
+  keyGenerator: userOrIpKey,
+  handler: loggingHandler('api'),
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later.' },
 });
 
 // Auth limiter — login, register, forgot-password
-// login and refresh are skipped here; they're still covered by apiLimiter (500/15 min)
+// login, refresh and me are skipped here; they're still covered by apiLimiter.
+// /me is session restore on every boot/tab, not a brute-force target.
 export const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
   skip: (req) =>
     req.path.includes('/login') ||
-    req.path.includes('/refresh'),
+    req.path.includes('/refresh') ||
+    req.path === '/me',
   keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  handler: loggingHandler('auth'),
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many auth attempts, please try again later.' },
 });
 
-// TBO flight search limiter — expensive external API call
+// TBO flight search limiter — expensive external API call — per user (IP when anonymous)
 export const flightSearchLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
   max: 30,
-  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  keyGenerator: userOrIpKey,
+  handler: loggingHandler('flightSearch'),
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many search requests, please slow down.' },
 });
 
-// TBO hotel search limiter
+// TBO hotel search limiter — per user (IP when anonymous)
 export const hotelSearchLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
   max: 20,
-  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  keyGenerator: userOrIpKey,
+  handler: loggingHandler('hotelSearch'),
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many hotel search requests, please slow down.' },
 });
 
-// Copilot AI limiter — Gemini API calls
+// Copilot AI limiter — Gemini API calls — per user (IP when anonymous)
 export const copilotLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
   max: 10,
-  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  keyGenerator: userOrIpKey,
+  handler: loggingHandler('copilot'),
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many AI requests, please slow down.' },
+});
+
+/* ── SBT HOTEL IMAGES — GET /api/sbt/hotels/images ───────────────────
+ * Each call can cost a TBO HotelDetails request (cache misses only). The
+ * search page fans out one call per 10 hotel codes, and a search returns
+ * at most 400 hotels (SEARCH_TOP_N in tbo.hotel.search.service.ts), so one
+ * full search costs at most 40 calls. 200 per 10 minutes covers five full
+ * searches back to back; the ~2,000x repeat seen in the logs is stopped
+ * at 200. Per user, so colleagues on one NAT don't share it.
+ */
+export const hotelImagesLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 200,
+  keyGenerator: userOrIpKey,
+  handler: loggingHandler('hotelImages'),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many image requests, please slow down.' },
+});
+
+/* ── TRAVEL CONCIERGE — /api/v1/copilot/travel ───────────────────────
+ * Every POST is a Gemini turn and/or a live TBO search, and this mount had
+ * no cap of its own. 20 POSTs a minute per user is well past a human
+ * typing or clicking Search; GETs (itinerary, conversation, watches) are
+ * plain reads and are not counted.
+ */
+export const travelCopilotLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  skip: (req) => req.method === 'GET',
+  keyGenerator: userOrIpKey,
+  handler: loggingHandler('travelCopilot'),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many concierge requests, please slow down.' },
 });
 
 // Public hotel-photo image endpoint — UNAUTHENTICATED and billable.
