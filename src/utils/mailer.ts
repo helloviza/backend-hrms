@@ -40,6 +40,25 @@ export type SendMailArgs = {
 
   // ✅ NEW: attachments passthrough
   attachments?: MailAttachment[];
+
+  // A per-sender SMTP server used INSTEAD of the env transport (CSTEP's own
+  // mailbox — services/cstepMailTransport.ts). Absent = the env transport,
+  // exactly as before. DISABLE_EMAILS still applies to it.
+  smtp?: SmtpOverride;
+};
+
+export type SmtpOverride = {
+  /** "<owner>:<version>" — a new version for the same owner replaces its transport. */
+  cacheKey: string;
+  host: string;
+  port: number;
+  secure: boolean;
+  requireTLS: boolean;
+  user: string;
+  pass: string;
+  connectionTimeout: number;
+  greetingTimeout: number;
+  socketTimeout: number;
 };
 
 /* -------------------- Env helpers -------------------- */
@@ -161,6 +180,36 @@ function getTransport() {
   return cachedTransport;
 }
 
+// Override transports, keyed by SmtpOverride.cacheKey. A new version for the
+// same owner closes and drops the old one, so a settings change never leaves
+// a stale transport (or an old password) behind.
+const overrideTransports = new Map<string, nodemailer.Transporter>();
+
+function getOverrideTransport(o: SmtpOverride) {
+  const hit = overrideTransports.get(o.cacheKey);
+  if (hit) return hit;
+  const owner = o.cacheKey.split(":")[0];
+  for (const [key, t] of overrideTransports) {
+    if (key.split(":")[0] === owner) {
+      t.close();
+      overrideTransports.delete(key);
+    }
+  }
+  const t = nodemailer.createTransport({
+    host: o.host,
+    port: o.port,
+    secure: o.secure,
+    requireTLS: o.requireTLS,
+    auth: { user: o.user, pass: o.pass },
+    tls: { rejectUnauthorized: true },
+    connectionTimeout: o.connectionTimeout,
+    greetingTimeout: o.greetingTimeout,
+    socketTimeout: o.socketTimeout,
+  });
+  overrideTransports.set(o.cacheKey, t);
+  return t;
+}
+
 /* -------------------- Public API -------------------- */
 export async function sendMail(args: SendMailArgs) {
   // 🔒 Safety: prevent blank emails
@@ -185,8 +234,8 @@ export async function sendMail(args: SendMailArgs) {
     return { ok: true, skipped: true };
   }
 
-  // 🚫 SMTP not configured
-  if (!hasSmtpConfigured()) {
+  // 🚫 SMTP not configured (the env transport only — an override is its own config)
+  if (!args.smtp && !hasSmtpConfigured()) {
     if (process.env.NODE_ENV !== "production") {
       // eslint-disable-next-line no-console
       console.log("📧 [mailer] SMTP not configured. Skipping send.", {
@@ -201,7 +250,7 @@ export async function sendMail(args: SendMailArgs) {
     return { ok: false, error: "SMTP not configured" };
   }
 
-  const transporter = getTransport();
+  const transporter = args.smtp ? getOverrideTransport(args.smtp) : getTransport();
 
   try {
     const info = await transporter.sendMail({

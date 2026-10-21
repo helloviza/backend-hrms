@@ -52,7 +52,13 @@ vi.mock("../utils/cstepPacketPdf.js", () => ({ uploadCstepPacketPdf: vi.fn(async
 
 const { default: cstepRouter } = await import("./cstep.js");
 const { notifyCstep, renderCstepEmail } = await import("../services/cstepNotifications.js");
-const { CSTEP_NOTIFICATION_FROM } = await import("../config/cstepNotification.js");
+const { encryptCstepSmtpPass } = await import("../services/cstepMailTransport.js");
+const { default: CstepNotificationSettings } = await import("../models/cstep/CstepNotificationSettings.js");
+
+// The workspace's own CSTEP sender (CstepNotificationSettings) — every CSTEP
+// email goes out as this mailbox over this server, never the env transport.
+const SENDER = { senderMailbox: "notify@cstep-qc.local", senderName: "CSTEP", smtpHost: "smtp.cstep-qc.local", smtpPort: 587 };
+const CSTEP_FROM = `"CSTEP" <${SENDER.senderMailbox}>`;
 
 const DB = "cstep_qc_notif";
 const oid = () => new mongoose.Types.ObjectId();
@@ -144,6 +150,9 @@ beforeAll(async () => {
   if (existing.length) throw new Error(`Step 0: refusing to seed — ${DB} is not empty (${existing.length} collections)`);
 
   await mongoose.connection.syncIndexes();
+  await CstepNotificationSettings.create({
+    workspaceId: WS, enabled: true, ...SENDER, smtpPassEnc: encryptCstepSmtpPass("qc-app-password", WS),
+  });
   await col("cstepprojects").insertOne({ _id: QC_PROJECT, workspaceId: WS, projectCode: "PRJ-QC", projectName: "QC Project", tallyProjectCC: "100 QC 01", isActive: true } as any);
 
   await col("customerworkspaces").insertMany([
@@ -406,36 +415,113 @@ describe("CSTEP_NOTIFICATIONS_ENABLED off (the default) — dormant", () => {
 });
 
 describe("what was sent", () => {
-  it("every CSTEP email went out from the CSTEP sender, recorded on its outbox row, with no history hooks", async () => {
+  it("every CSTEP email went out from the workspace's CSTEP sender over its own SMTP server, with no history hooks", async () => {
     const rows = await col("emailoutboxes").find({}).toArray();
     expect(rows.length).toBeGreaterThan(0);
     for (const r of rows) {
       expect(r.event).toMatch(/^cstep_/);
-      expect(r.from).toBe(CSTEP_NOTIFICATION_FROM);
+      expect(r.from).toBe(CSTEP_FROM);
+      expect(r.transport).toBe("CSTEP");
+      expect(String(r.workspaceId)).toBe(String(WS));
       expect(r.status).toBe("SENT");
       expect(r.onSent).toBeNull();
       expect(r.onFailed).toBeNull();
     }
     expect(sent).toHaveLength(rows.length);
-    for (const s of sent) expect(s.from).toBe(CSTEP_NOTIFICATION_FROM);
+    for (const r of rows) expect(r.text).toMatch(/^CSTEP Travel & Claim Portal\n/);
+    for (const s of sent) {
+      // Multipart: the plain-text alternative travels with the HTML.
+      expect(s.html).toMatch(/^<!doctype html>/);
+      expect(s.text).toMatch(/Open request: http/);
+      expect(s.from).toBe(CSTEP_FROM);
+      expect(s.smtp).toMatchObject({ host: SENDER.smtpHost, port: 587, secure: false, requireTLS: true, user: SENDER.senderMailbox, pass: "qc-app-password" });
+      // No reply-to configured → the footer shows the sender mailbox.
+      expect(s.html).toContain(`href="mailto:${SENDER.senderMailbox}"`);
+      expect(s.text).toContain(`\n${SENDER.senderMailbox} | `);
+      expect(s.html + s.text).not.toMatch(/travelnotification@cstep\.in/);
+    }
     // Every claim row points at the outbox row it produced.
     const claims = await col("cstepnotifications").find({ outboxId: { $exists: true } }).toArray();
     expect(claims).toHaveLength(rows.length);
   });
 
-  it("the CSTEP layout carries no Plumtrips branding", async () => {
+  const tourReq = () => ({ _id: oid(), formType: "TOUR_PROPOSAL", purpose: "QC workshop", departureDate: "2026-11-02", returnDate: "2026-11-04", stations: TOUR.stations, claimReference: "0001/1026" });
+
+  it("the CSTEP layout carries no Plumtrips branding — only the infrastructure URLs (asset host, portal link) mention it", async () => {
     const tp: any = await col("travellerprofiles").findOne({ _id: TP.main });
-    const { subject, html } = renderCstepEmail(
-      "RETURN",
-      { _id: oid(), formType: "TOUR_PROPOSAL", purpose: "QC workshop", departureDate: "2026-11-02", returnDate: "2026-11-04", stations: TOUR.stations, claimReference: "" },
-      tp,
-      { logEntryId: oid(), reason: "Please attach the workshop agenda." },
-    );
-    expect(subject).toBe("[CSTEP] Your tour proposal was returned");
-    expect(html).not.toMatch(/logo\.png/);
-    expect(html).not.toMatch(/ops@plumtrips\.com/);
-    expect(html).not.toMatch(/PLUMTRIPS/);
-    expect(html).toMatch(/CSTEP Travel &amp; Claim Portal/);
-    if (process.env.CSTEP_QC_RENDER_OUT) fs.writeFileSync(process.env.CSTEP_QC_RENDER_OUT, html);
+    for (const [event, ctx] of [["RETURN", { reason: "Please attach the workshop agenda." }], ["APPROVED", {}]] as const) {
+      const { subject, html, text } = renderCstepEmail(event, tourReq(), tp, { logEntryId: oid(), ...ctx });
+      if (event === "RETURN") expect(subject).toBe("[CSTEP] Your tour proposal was returned");
+      for (const part of [html, text]) {
+        expect(part).not.toMatch(/logo\.png/);
+        expect(part).not.toMatch(/ops@plumtrips\.com/);
+        expect(part).not.toMatch(/PLUMTRIPS/);
+        // Strip the two allowed URL kinds; nothing Plumtrips may remain.
+        const rest = part.replace(/https?:\/\/[^\s"'<)]*plumtrips\.com[^\s"'<)]*/gi, "");
+        expect(rest).not.toMatch(/plumtrips|plumbox|helloviza/i);
+      }
+      expect(html).toMatch(/CSTEP Travel &amp; Claim Portal/);
+      if (event === "RETURN" && process.env.CSTEP_QC_RENDER_OUT) fs.writeFileSync(process.env.CSTEP_QC_RENDER_OUT, html);
+    }
+  });
+
+  it("the CSTEP skin: logo, photo band on positive events, plain band on corrective ones, VML button, no mock-up image", async () => {
+    const tp: any = await col("travellerprofiles").findOne({ _id: TP.main });
+    const approved = renderCstepEmail("APPROVED", tourReq(), tp, { logEntryId: oid() }).html;
+    const returned = renderCstepEmail("RETURN", tourReq(), tp, { logEntryId: oid(), reason: "x" }).html;
+    const collect = renderCstepEmail("TRANSFERRED_TO_FINANCE", tourReq(), tp, { logEntryId: oid(), amountInr: 300, direction: "COLLECT" }).html;
+    const payout = renderCstepEmail("TRANSFERRED_TO_FINANCE", tourReq(), tp, { logEntryId: oid(), amountInr: 300, direction: "PAY_OUT" }).html;
+    for (const html of [approved, returned, collect, payout]) {
+      expect(html).toMatch(/\/CSTEP-Logo_Color\.png"[^>]*alt="CSTEP"/);
+      expect(html).toMatch(/<v:roundrect [^>]*href="[^"]*\/cstep\/requests\//);
+      expect(html).toMatch(/<!--\[if mso\]><table role="presentation" width="600"/);
+      expect(html).not.toMatch(/hero-map\.png/);
+      expect(html).not.toMatch(/Email_Layout/);
+    }
+    expect(approved).toMatch(/\/Airport_Hero\.jpg"/);
+    expect(payout).toMatch(/\/Airport_Hero\.jpg"/);
+    // The web-optimised JPG, never the 1.8 MB source PNG.
+    expect(approved).not.toMatch(/Airport_Hero\.png/);
+    expect(returned).not.toMatch(/Airport_Hero/);
+    expect(collect).not.toMatch(/Airport_Hero/);
+    // Every image the skin references is a real file in the served folder.
+    const { CSTEP_EMAIL_ASSETS } = await import("../services/cstepEmailLayout.js");
+    for (const f of CSTEP_EMAIL_ASSETS) expect(fs.existsSync(new URL(`../../../frontend/public/email-assets/${f}`, import.meta.url))).toBe(true);
+  });
+
+  it("a multi-line reason keeps its line breaks (escaped first, then <br />) in HTML and in the text part", async () => {
+    const tp: any = await col("travellerprofiles").findOne({ _id: TP.main });
+    const { html, text } = renderCstepEmail("RETURN", tourReq(), tp, { logEntryId: oid(), reason: "Attach the <agenda>.\r\nFix the dates & resubmit." });
+    expect(html).toContain("Attach the &lt;agenda&gt;.<br />Fix the dates &amp; resubmit.");
+    expect(html).not.toContain("<agenda>");
+    expect(text).toContain("Reason:\nAttach the <agenda>.\nFix the dates & resubmit.");
+  });
+
+  it("the footer's contact email follows the settings: reply-to, else the sender mailbox, else none", async () => {
+    const { cstepContactEmail } = await import("../services/cstepMailTransport.js");
+    expect(cstepContactEmail({ replyTo: "travel@cstep-qc.local", senderMailbox: "notify@cstep-qc.local" })).toBe("travel@cstep-qc.local");
+    expect(cstepContactEmail({ replyTo: "", senderMailbox: "notify@cstep-qc.local" })).toBe("notify@cstep-qc.local");
+    expect(cstepContactEmail(null)).toBe("");
+
+    const tp: any = await col("travellerprofiles").findOne({ _id: TP.main });
+    const withContact = renderCstepEmail("APPROVED", tourReq(), tp, { logEntryId: oid() }, "CSTEP", "travel@cstep-qc.local");
+    expect(withContact.html).toContain('href="mailto:travel@cstep-qc.local"');
+    expect(withContact.text).toContain("\ntravel@cstep-qc.local | +91 11 4063 4300 | www.cstep.in\n");
+
+    // No address configured: the footer drops the email rather than inventing one.
+    const without = renderCstepEmail("APPROVED", tourReq(), tp, { logEntryId: oid() });
+    expect(without.html).not.toContain("mailto:");
+    expect(without.text).toContain("\n--\n+91 11 4063 4300 | www.cstep.in\n");
+  });
+
+  it("the text part carries the same facts and link as the HTML", async () => {
+    const tp: any = await col("travellerprofiles").findOne({ _id: TP.main });
+    const req = tourReq();
+    const { html, text } = renderCstepEmail("APPROVED", req, tp, { logEntryId: oid() });
+    expect(text).toContain("TIN: 0001/1026");
+    expect(text).toContain("Destination: ");
+    expect(text).toMatch(new RegExp(`Open request: https?://\\S+/cstep/requests/${String(req._id)}\\n`));
+    expect(html).toContain(`/cstep/requests/${String(req._id)}`);
+    expect(text).not.toMatch(/<[a-z]/i);
   });
 });

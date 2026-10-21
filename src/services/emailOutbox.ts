@@ -15,7 +15,8 @@
 // succeeds; `onFailed` is pushed when the row finally fails.
 import EmailOutbox from "../models/EmailOutbox.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
-import { sendMail, type MailKind, type MailAttachment } from "../utils/mailer.js";
+import { sendMail, type MailKind, type MailAttachment, type SmtpOverride } from "../utils/mailer.js";
+import { cstepNotificationsEnabled, resolveCstepTransport } from "./cstepMailTransport.js";
 import logger from "../utils/logger.js";
 import { DESK_EMAIL } from "./actorNames.js";
 import { buildSendFailureAlertHtml } from "./approvalEmails/templates.js";
@@ -46,6 +47,8 @@ export type OutboxMessage = {
   replyTo?: string;
   subject: string;
   html: string;
+  /** Plain-text alternative; set = the message goes out multipart (text + HTML). */
+  text?: string;
   /** `s3Key`: a file in S3 (booking documents), fetched on every try so retries re-read it. */
   attachments?: Array<MailAttachment & { s3Key?: string }>;
   requestId?: any;
@@ -54,6 +57,9 @@ export type OutboxMessage = {
   customerName?: string;
   onSent?: AnyObj | null;
   onFailed?: AnyObj | null;
+  /** "CSTEP" sends via `workspaceId`'s CSTEP mailbox (services/cstepMailTransport.ts). Default "DEFAULT". */
+  transport?: "DEFAULT" | "CSTEP";
+  workspaceId?: any;
 };
 
 export type OutboxResult = { ok: boolean; id: string; status: "SENT" | "PENDING" | "FAILED"; error?: string };
@@ -79,20 +85,41 @@ async function mailAttachments(list: AnyObj[] | undefined) {
   );
 }
 
-async function trySend(row: AnyObj): Promise<{ ok: boolean; error: string }> {
+/**
+ * A CSTEP row goes out over that workspace's own mailbox, resolved now (so a
+ * retry uses the current settings), or not at all. `terminal`: no retry can
+ * help — CSTEP mail is switched off or the workspace has no usable sender —
+ * so the row fails at once rather than waiting out the backoff.
+ */
+async function cstepRoute(row: AnyObj): Promise<{ ok: true; smtp: SmtpOverride; from: string; replyTo: string } | { ok: false; error: string }> {
+  if (!cstepNotificationsEnabled()) return { ok: false, error: "CSTEP_NOTIFICATIONS_ENABLED is off" };
+  const t = await resolveCstepTransport(row.workspaceId);
+  if (t.ok === false) return { ok: false, error: t.reason };
+  return { ok: true, smtp: t.smtp, from: t.from, replyTo: t.replyTo };
+}
+
+async function trySend(row: AnyObj): Promise<{ ok: boolean; error: string; terminal?: boolean }> {
   try {
     const to: string[] = row.to || [];
+    let route: { smtp?: SmtpOverride; from?: string; replyTo?: string } = {};
+    if (row.transport === "CSTEP") {
+      const c = await cstepRoute(row);
+      if (c.ok === false) return { ok: false, error: c.error, terminal: true };
+      route = c;
+    }
     // An unreadable S3 file fails this try (and is retried), never sends without it.
     const attachments = await mailAttachments(row.attachments);
     const r: any = await sendMail({
       kind: row.kind,
-      from: row.from || undefined,
+      from: route.from || row.from || undefined,
       to: to.length === 1 ? to[0] : to,
       cc: row.cc?.length ? row.cc : undefined,
-      replyTo: row.replyTo || undefined,
+      replyTo: (route.smtp ? route.replyTo : row.replyTo) || undefined,
       subject: row.subject,
       html: row.html,
+      text: row.text || undefined,
       attachments,
+      smtp: route.smtp,
     });
     // utils/mailer.ts reports SMTP errors as { ok: false } rather than throwing.
     if (r && r.ok === false) return { ok: false, error: String(r.error || "send failed") };
@@ -106,7 +133,7 @@ async function attempt(row: AnyObj, now = new Date()): Promise<OutboxResult> {
   const id = String(row._id);
   const attempts = Number(row.attempts || 0) + 1;
   const max = Number(row.maxAttempts || MAX_ATTEMPTS);
-  const { ok, error } = await trySend(row);
+  const { ok, error, terminal } = await trySend(row);
 
   if (ok) {
     await EmailOutbox.updateOne(
@@ -117,14 +144,14 @@ async function attempt(row: AnyObj, now = new Date()): Promise<OutboxResult> {
     return { ok: true, id, status: "SENT" };
   }
 
-  if (attempts >= max) {
+  if (attempts >= max || terminal) {
     await EmailOutbox.updateOne(
       { _id: row._id },
       { $set: { status: "FAILED", attempts, failedAt: new Date(), lockedUntil: null, lastError: error } },
     ).exec();
     logger.error("[EmailOutbox] permanently failed", { id, event: row.event, to: row.to, attempts, error });
     await pushHistory(row.requestId, row.onFailed, { comment: `${row.onFailed?.comment || "Email failed"} (${error})` });
-    if (row.event !== SEND_FAILURE_ALERT_EVENT) await alertDesk({ ...row, attempts, lastError: error });
+    if (shouldAlertDesk(row)) await alertDesk({ ...row, attempts, lastError: error });
     return { ok: false, id, status: "FAILED", error };
   }
 
@@ -153,6 +180,7 @@ export async function enqueueEmail(msg: OutboxMessage, opts: { maxAttempts?: num
     replyTo: msg.replyTo || "",
     subject: msg.subject,
     html: msg.html,
+    text: msg.text || "",
     attachments: (msg.attachments || []).map((a) => ({ filename: a.filename || "", path: a.path || "", s3Key: a.s3Key || "", contentType: a.contentType || "" })),
     maxAttempts,
     requestId: msg.requestId || null,
@@ -161,6 +189,8 @@ export async function enqueueEmail(msg: OutboxMessage, opts: { maxAttempts?: num
     customerName: msg.customerName || "",
     onSent: msg.onSent || null,
     onFailed: msg.onFailed || null,
+    transport: msg.transport || "DEFAULT",
+    workspaceId: msg.workspaceId || null,
   };
 
   // Try 1 happens before the row is written, so the row is written once with
@@ -171,11 +201,11 @@ export async function enqueueEmail(msg: OutboxMessage, opts: { maxAttempts?: num
     await pushHistory(msg.requestId, msg.onSent);
     return { ok: true, id: String(row._id), status: "SENT" };
   }
-  if (maxAttempts <= 1) {
+  if (maxAttempts <= 1 || first.terminal) {
     const row: any = await EmailOutbox.create({ ...fields, status: "FAILED", attempts: 1, failedAt: new Date(), lastError: first.error });
     logger.error("[EmailOutbox] permanently failed", { id: String(row._id), event: msg.event, to: msg.to, attempts: 1, error: first.error });
     await pushHistory(msg.requestId, msg.onFailed, { comment: `${msg.onFailed?.comment || "Email failed"} (${first.error})` });
-    if (msg.event !== SEND_FAILURE_ALERT_EVENT) await alertDesk({ ...fields, _id: row._id, attempts: 1, lastError: first.error });
+    if (shouldAlertDesk(fields)) await alertDesk({ ...fields, _id: row._id, attempts: 1, lastError: first.error });
     return { ok: false, id: String(row._id), status: "FAILED", error: first.error };
   }
   const row: any = await EmailOutbox.create({
@@ -187,6 +217,16 @@ export async function enqueueEmail(msg: OutboxMessage, opts: { maxAttempts?: num
   });
   logger.warn("[EmailOutbox] send failed, will retry", { id: String(row._id), event: msg.event, attempts: 1, error: first.error });
   return { ok: false, id: String(row._id), status: "PENDING", error: first.error };
+}
+
+/**
+ * Not for an alert (never alerts about itself) and not for CSTEP mail: that
+ * is a client's own mail on its own server, so its failures stay on the
+ * outbox row (GET /approvals/admin/email-failures) rather than going to the
+ * Plumtrips desk over Plumtrips' mailer.
+ */
+function shouldAlertDesk(row: AnyObj): boolean {
+  return row.event !== SEND_FAILURE_ALERT_EVENT && row.transport !== "CSTEP";
 }
 
 /** The ops desk hears about a permanent failure (one try, never re-alerted). */

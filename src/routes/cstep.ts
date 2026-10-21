@@ -2636,10 +2636,13 @@ router.post("/requests/:id/approve", async (req: any, res: any) => {
 
     // After the commit, never inside the transaction: a retried attempt's
     // entry was rolled back, so only the committed attempt's entry notifies.
-    // Not for a claim: the APPROVED email goes to the Official, who has no
-    // part in a claim (its next step is the CSTEP Admin's verification).
+    // A claim's APPROVED email does not go to the Official, who has no part
+    // in a claim: its next step is the CSTEP Admin's verification, so the
+    // Admin addresses (notification settings) hear CLAIM_APPROVED instead.
     if (!isClaimFormType(responseRequest?.formType)) {
       await notifyCstep("APPROVED", responseRequest, { logEntryId: approveEntryId });
+    } else {
+      await notifyCstep("CLAIM_APPROVED", responseRequest, { logEntryId: approveEntryId });
     }
 
     res.json({ ok: true, request: responseRequest, claim: responseClaim, claimReference });
@@ -4924,10 +4927,10 @@ router.post("/requests/:id/claim/verify", async (req: any, res: any) => {
         comment: dueLine,
         at: now,
       });
-      await notifyCstep("TRANSFERRED_TO_FINANCE", doc, {
-        logEntryId: entry._id,
-        amountInr: settlement.amountDueByCstep || settlement.amountDueToCstep,
-      });
+      // Which way the money moves decides the wording: payable to the
+      // claimant, or to be recovered from them (an unspent advance).
+      const { direction, amount } = financeCaseAmount(doc.formType, settlement);
+      await notifyCstep("TRANSFERRED_TO_FINANCE", doc, { logEntryId: entry._id, amountInr: amount, direction });
     } else {
       await notifyCstep("SETTLED", doc, { logEntryId: verifyEntry._id });
     }
@@ -5129,7 +5132,9 @@ export async function settleFinanceCase(
   if (endStatus === "REIMBURSED") {
     await notifyCstep("REIMBURSED", doc, { logEntryId: entryId, amountInr: amount, reference });
   } else {
-    await notifyCstep("SETTLED", doc, { logEntryId: entryId });
+    // SETTLED here is a claimant's repayment received (COLLECT), never
+    // "nothing owed" — the copy says so from the direction.
+    await notifyCstep("SETTLED", doc, { logEntryId: entryId, amountInr: amount, direction, reference });
   }
   return { ok: true, endStatus, direction, amount };
 }
@@ -5169,7 +5174,7 @@ router.post("/requests/:id/finance/return", async (req: any, res: any) => {
     if (isClaimFormType(doc.formType)) {
       doc.status = "APPROVED";
       await doc.save();
-      await CstepApproval.create({
+      const entry = await CstepApproval.create({
         workspaceId: req.workspaceObjectId,
         entityType: "REQUEST",
         entityId: doc._id,
@@ -5179,6 +5184,7 @@ router.post("/requests/:id/finance/return", async (req: any, res: any) => {
         comment: reason,
         at: new Date().toISOString(),
       });
+      await notifyCstep("RETURN_TO_ADMIN", doc, { logEntryId: entry._id, reason });
       return res.json({ ok: true, request: doc.toObject() });
     }
 

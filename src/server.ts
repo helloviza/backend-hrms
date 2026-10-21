@@ -790,6 +790,9 @@ app.use("/api/cstep/vendor-payables", requireAuth, requireWorkspace, requireFeat
 // Finance "Export to Tally" + its Admin settings — own file, same chain.
 import cstepTallyRouter from "./routes/cstep.tally.js";
 app.use("/api/cstep/tally", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepTallyRouter);
+// Notification settings (CSTEP's own sender mailbox + Admin recipients) — own file, same chain.
+import cstepNotificationSettingsRouter from "./routes/cstep.notificationSettings.js";
+app.use("/api/cstep/notifications", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepNotificationSettingsRouter);
 // Finance bulk reimbursement (export + import of the finance queue) — own file, same chain.
 import cstepReimbursementsRouter from "./routes/cstep.reimbursements.js";
 app.use("/api/cstep/reimbursements", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepReimbursementsRouter);

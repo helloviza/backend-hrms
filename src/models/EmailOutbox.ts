@@ -31,6 +31,8 @@ const EmailOutboxSchema = new Schema(
     replyTo: { type: String, default: "" },
     subject: { type: String, required: true },
     html: { type: String, default: "" },
+    /** Plain-text alternative ("" = HTML only). Absent on older rows. */
+    text: { type: String, default: "" },
     attachments: { type: [AttachmentSchema], default: [] },
 
     /** PENDING (waiting for a try) → SENDING (claimed) → SENT | FAILED. */
@@ -55,6 +57,15 @@ const EmailOutboxSchema = new Schema(
      */
     onSent: { type: Schema.Types.Mixed, default: null },
     onFailed: { type: Schema.Types.Mixed, default: null },
+
+    /**
+     * Which mail server sends it. DEFAULT = the env transport (utils/mailer).
+     * CSTEP = that workspace's own mailbox (CstepNotificationSettings), read
+     * at send time — never the env transport, not even as a fallback.
+     * Absent on older rows = DEFAULT.
+     */
+    transport: { type: String, enum: ["DEFAULT", "CSTEP"], default: "DEFAULT" },
+    workspaceId: { type: Schema.Types.ObjectId, default: null },
   },
   { timestamps: true },
 );
