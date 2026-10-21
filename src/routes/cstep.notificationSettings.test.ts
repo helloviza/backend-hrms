@@ -310,7 +310,7 @@ describe("POST /settings/test", () => {
     expect(mail.to).toBe("me@qc.local");
     expect(mail.subject).toBe("[CSTEP Travel Desk] Test email — CSTEP notifications");
     // The CSTEP skin, multipart: no button (nothing to open), the sender's details in both parts.
-    expect(mail.html).toMatch(/\/CSTEP-Logo_Color\.png"/);
+    expect(mail.html).toMatch(/\/CSTEP-Logo_New\.png"/);
     expect(mail.html).not.toMatch(/logo\.png|hero-map|PLUMTRIPS|ops@plumtrips/);
     expect(mail.html).not.toMatch(/v:roundrect/);
     // The footer's contact address is the configured reply-to, never a hardcoded one.

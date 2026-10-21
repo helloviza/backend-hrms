@@ -39,7 +39,7 @@ const CLAIMS = ["LOCAL_TRAVEL_CLAIM", "EXPENSE_CLAIM"];
 const ALL = [...TRIP, ...CLAIMS];
 const MONEY = ["TOUR_PROPOSAL", ...CLAIMS];
 // Stands in for the workspace's configured reply-to (real emails: cstepContactEmail(settings)).
-const contactEmail = "travelnotification@cstep.in";
+const contactEmail = "travel@cstep.in";
 const reason = "Please attach the hotel invoice.\nThe return date should be 7 Nov, not 8 Nov.";
 
 // [event, form types it fires on, ctx, variant name]

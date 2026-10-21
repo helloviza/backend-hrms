@@ -472,7 +472,9 @@ describe("what was sent", () => {
     const collect = renderCstepEmail("TRANSFERRED_TO_FINANCE", tourReq(), tp, { logEntryId: oid(), amountInr: 300, direction: "COLLECT" }).html;
     const payout = renderCstepEmail("TRANSFERRED_TO_FINANCE", tourReq(), tp, { logEntryId: oid(), amountInr: 300, direction: "PAY_OUT" }).html;
     for (const html of [approved, returned, collect, payout]) {
-      expect(html).toMatch(/\/CSTEP-Logo_Color\.png"[^>]*alt="CSTEP"/);
+      expect(html).toMatch(/\/CSTEP-Logo_New\.png" width="150" height="67" alt="CSTEP"/);
+      expect(html).toMatch(/\/CSTEP-Logo_New\.png" width="104" height="46" alt="CSTEP"/);
+      expect(html).not.toMatch(/CSTEP-Logo_Color/);
       expect(html).toMatch(/<v:roundrect [^>]*href="[^"]*\/cstep\/requests\//);
       expect(html).toMatch(/<!--\[if mso\]><table role="presentation" width="600"/);
       expect(html).not.toMatch(/hero-map\.png/);
@@ -506,12 +508,20 @@ describe("what was sent", () => {
     const tp: any = await col("travellerprofiles").findOne({ _id: TP.main });
     const withContact = renderCstepEmail("APPROVED", tourReq(), tp, { logEntryId: oid() }, "CSTEP", "travel@cstep-qc.local");
     expect(withContact.html).toContain('href="mailto:travel@cstep-qc.local"');
-    expect(withContact.text).toContain("\ntravel@cstep-qc.local | +91 11 4063 4300 | www.cstep.in\n");
+    expect(withContact.text).toContain("\ntravel@cstep-qc.local | www.cstep.in\n");
 
     // No address configured: the footer drops the email rather than inventing one.
     const without = renderCstepEmail("APPROVED", tourReq(), tp, { logEntryId: oid() });
     expect(without.html).not.toContain("mailto:");
-    expect(without.text).toContain("\n--\n+91 11 4063 4300 | www.cstep.in\n");
+    expect(without.text).toContain("\n--\nwww.cstep.in\n");
+    // No phone number anywhere, in either part.
+    for (const part of [withContact.html, withContact.text, without.html, without.text]) {
+      expect(part).not.toMatch(/tel:|\+91|4063/);
+    }
+    // The copyright year is computed at send time, not hard-coded.
+    const year = String(new Date().getFullYear());
+    expect(withContact.html).toContain(`&copy; ${year} `);
+    expect(withContact.text).toContain(`© ${year} `);
   });
 
   it("the text part carries the same facts and link as the HTML", async () => {

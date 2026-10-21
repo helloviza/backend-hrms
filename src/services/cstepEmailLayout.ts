@@ -61,21 +61,23 @@ const CONTENT_W = W - 2 * PAD; // 536
 /**
  * The fixed part of the footer's contact line. The email address is not here:
  * it comes from the workspace's notification settings (input.contactEmail).
+ * No phone number, by CSTEP's choice.
  */
 export const CSTEP_CONTACT = {
-  phone: "+91 11 4063 4300",
   website: "www.cstep.in",
   websiteHref: "https://www.cstep.in",
 };
 const CSTEP_LEGAL_NAME = "Center for Study of Science, Technology & Policy (CSTEP)";
 
 /** Every image this skin references — served from assetBase(), like the approval emails. */
-export const CSTEP_EMAIL_ASSETS = ["CSTEP-Logo_Color.png", "Airport_Hero.jpg"] as const;
+export const CSTEP_EMAIL_ASSETS = ["CSTEP-Logo_New.png", "Airport_Hero.jpg"] as const;
 const asset = (file: (typeof CSTEP_EMAIL_ASSETS)[number]) => `${assetBase()}/${file}`;
 
-// Intrinsic sizes: logo 2963×1313; hero photo 1200×450 (2× the 600px band,
-// JPG ~70 KB — the 2048px source PNG was 1.8 MB).
-const LOGO = { header: { w: 150, h: 66 }, footer: { w: 104, h: 46 } };
+// Intrinsic sizes: logo 800×355 (RGBA PNG, ~15 KB); hero photo 1200×450 (2×
+// the 600px band, JPG ~70 KB — the 2048px source PNG was 1.8 MB). The logo
+// boxes keep the 800:355 ratio (h = round(w × 355 / 800)) so Outlook, which
+// honours width/height attributes literally, never stretches it.
+const LOGO = { header: { w: 150, h: 67 }, footer: { w: 104, h: 46 } };
 const PHOTO_H = Math.round((W * 450) / 1200); // 225
 
 /* ───────────────────────── input ───────────────────────── */
@@ -136,7 +138,7 @@ function header() {
   return `<tr><td class="px keep-white" style="padding:22px ${PAD}px 20px ${PAD}px;background:#ffffff;" bgcolor="#ffffff">
     <table ${T} width="100%"><tr>
       <td class="stack" width="${LOGO.header.w}" valign="middle" style="width:${LOGO.header.w}px;">
-        <img src="${asset("CSTEP-Logo_Color.png")}" width="${LOGO.header.w}" height="${LOGO.header.h}" alt="CSTEP" style="display:block;width:${LOGO.header.w}px;height:${LOGO.header.h}px;border:0;outline:none;text-decoration:none;font-family:${FONT};font-size:28px;line-height:${LOGO.header.h}px;font-weight:800;color:${C.blue};" />
+        <img src="${asset("CSTEP-Logo_New.png")}" width="${LOGO.header.w}" height="${LOGO.header.h}" alt="CSTEP" style="display:block;width:${LOGO.header.w}px;height:${LOGO.header.h}px;border:0;outline:none;text-decoration:none;font-family:${FONT};font-size:28px;line-height:${LOGO.header.h}px;font-weight:800;color:${C.blue};" />
       </td>
       <td class="stack head-mid" valign="middle" align="center" style="padding:0 12px;font-family:${FONT};">
         <div style="font-family:${SERIF};font-size:16px;line-height:22px;font-weight:700;color:${C.blue};">CSTEP Travel &amp; Claim Portal</div>
@@ -278,7 +280,6 @@ function footer(contactEmail: string) {
     `<a href="${esc(href)}" style="color:${C.blue};text-decoration:none;">${esc(text)}</a>`;
   const contacts = [
     ...(contactEmail ? [link(`mailto:${contactEmail}`, contactEmail)] : []),
-    link(`tel:${c.phone.replace(/\s+/g, "")}`, c.phone),
     link(c.websiteHref, c.website),
   ].join(`<span style="color:${C.line};">&nbsp;&nbsp;|&nbsp;&nbsp;</span>`);
   const year = new Date().getFullYear();
@@ -286,7 +287,7 @@ function footer(contactEmail: string) {
     ${hairline()}
     <table ${T} width="100%" style="margin-top:18px;"><tr>
       <td class="stack" width="${LOGO.footer.w + 16}" valign="middle" style="width:${LOGO.footer.w + 16}px;padding-right:16px;">
-        <img src="${asset("CSTEP-Logo_Color.png")}" width="${LOGO.footer.w}" height="${LOGO.footer.h}" alt="CSTEP" style="display:block;width:${LOGO.footer.w}px;height:${LOGO.footer.h}px;border:0;outline:none;text-decoration:none;font-family:${FONT};font-size:18px;line-height:${LOGO.footer.h}px;font-weight:800;color:${C.blue};" />
+        <img src="${asset("CSTEP-Logo_New.png")}" width="${LOGO.footer.w}" height="${LOGO.footer.h}" alt="CSTEP" style="display:block;width:${LOGO.footer.w}px;height:${LOGO.footer.h}px;border:0;outline:none;text-decoration:none;font-family:${FONT};font-size:18px;line-height:${LOGO.footer.h}px;font-weight:800;color:${C.blue};" />
       </td>
       <td class="stack foot-contacts" valign="middle" align="right" style="font-family:${FONT};font-size:13px;line-height:22px;color:${C.blue};">
         ${contacts}
@@ -398,7 +399,7 @@ export function renderCstepEmailText(m: CstepEmailInput): string {
   const contactEmail = String(m.contactEmail || "").trim();
   out.push(
     "--",
-    [...(contactEmail ? [contactEmail] : []), c.phone, c.website].join(" | "),
+    [...(contactEmail ? [contactEmail] : []), c.website].join(" | "),
     "This is an automated email from the CSTEP Travel & Claim Portal.",
     `© ${new Date().getFullYear()} ${CSTEP_LEGAL_NAME}. All rights reserved.`,
   );
