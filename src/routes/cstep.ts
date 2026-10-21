@@ -637,6 +637,7 @@ function pickFields(body: any) {
     expectedOutcome,
     extendedBeyondDates,
     personalDays,
+    perDiemEligible,
     contactWhileTravelling,
     otherInstructions,
     estimatedCost,
@@ -692,6 +693,7 @@ function pickFields(body: any) {
     expectedOutcome,
     extendedBeyondDates,
     personalDays,
+    perDiemEligible,
     contactWhileTravelling,
     otherInstructions,
     estimatedCost,
@@ -803,6 +805,7 @@ function scopeFieldsToFormType(fields: any, formType: CstepFormType): any {
     if ("advanceTaken" in fields) fields.advanceTaken = asAmount(fields.advanceTaken);
   } else {
     for (const k of CLAIM_ONLY_FIELDS) delete fields[k];
+    if (fields.perDiemEligible !== undefined) fields.perDiemEligible = isPerDiemEligible(fields);
   }
   return fields;
 }
@@ -1275,18 +1278,53 @@ function computeTripDays(departureDate?: string, returnDate?: string): number {
   return Math.round((d2 - d1) / 86400000) + 1;
 }
 
-/** Workspace's default per-diem rate for this request's trip type (and, for
- * INTERNATIONAL, its first listed country) — see CstepPerDiemPolicy.ts.
- * Returns null when no policy row exists; the Official then keys in a rate
- * manually via the perdiem PATCH (per the task's "else Admin enters"
- * fallback) rather than this route inventing a number. Not date-filtered
- * against effectiveFrom/To beyond preferring the most recent — a full
- * date-effective-range resolver is out of scope for this pass. */
-async function findDefaultPerDiemRate(
+/** How many personal / non-CSTEP days the proposer declared — the count
+ * field, or the listed dates when no count was typed. */
+function personalDayCount(personalDays?: { count?: number; dates?: string[] }): number {
+  const count = Number(personalDays?.count);
+  if (isFinite(count) && count > 0) return Math.floor(count);
+  return Array.isArray(personalDays?.dates) ? personalDays!.dates.filter(Boolean).length : 0;
+}
+
+/** Per Diem Eligible — only an explicit No turns it off; a request made
+ * before the field existed (missing / null) counts as Yes. */
+export function isPerDiemEligible(request: { perDiemEligible?: unknown }): boolean {
+  return request?.perDiemEligible !== false && request?.perDiemEligible !== "false";
+}
+
+/** Per-diem days for a request: the trip's inclusive day count less the
+ * personal days the proposal form labels "excluded from per-diem
+ * eligibility", floored at 0. An Event Request uses its event start/end
+ * dates the same way. */
+export function computePerDiemDays(request: {
+  departureDate?: string;
+  returnDate?: string;
+  personalDays?: { count?: number; dates?: string[] };
+}): number {
+  return Math.max(0, computeTripDays(request.departureDate, request.returnDate) - personalDayCount(request.personalDays));
+}
+
+/** The default per-diem rate for this request, in order:
+ *   1. the traveller's own rate for the trip type
+ *      (TravellerProfile.perDiemRateDomesticInr / perDiemRateInternationalInr);
+ *   2. the workspace's CstepPerDiemPolicy for the trip type (and, for
+ *      INTERNATIONAL, its first listed country) — see CstepPerDiemPolicy.ts;
+ *   3. null — the caller seeds 0 and the Official keys in a rate manually via
+ *      the perdiem PATCH (per the task's "else Admin enters" fallback) rather
+ *      than this route inventing a number.
+ * The policy step is not date-filtered against effectiveFrom/To beyond
+ * preferring the most recent — a full date-effective-range resolver is out
+ * of scope for this pass. */
+export async function findDefaultPerDiemRate(
   workspaceId: any,
   request: any,
+  traveller?: { perDiemRateDomesticInr?: number | null; perDiemRateInternationalInr?: number | null } | null,
 ): Promise<{ rate: number; currency: string } | null> {
   const tripType = request.type === "INTERNATIONAL" ? "INTERNATIONAL" : "DOMESTIC";
+  const ownRate =
+    tripType === "INTERNATIONAL" ? traveller?.perDiemRateInternationalInr : traveller?.perDiemRateDomesticInr;
+  if (typeof ownRate === "number" && isFinite(ownRate) && ownRate >= 0) return { rate: ownRate, currency: "INR" };
+
   const country = tripType === "INTERNATIONAL" ? request.countries?.[0]?.country : undefined;
 
   const query: any = { workspaceId, tripType };
@@ -4347,8 +4385,15 @@ router.post("/requests/:id/settlement/start", async (req: any, res: any) => {
     let settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id });
 
     if (!settlement) {
-      const computedDays = computeTripDays(doc.departureDate, doc.returnDate);
-      const defaultRate = await findDefaultPerDiemRate(req.workspaceObjectId, doc);
+      // Per Diem Eligible = No: a zero per diem, no rate/day lookup at all.
+      const eligible = isPerDiemEligible(doc);
+      const computedDays = eligible ? computePerDiemDays(doc) : 0;
+      const traveller: any = eligible
+        ? await TravellerProfile.findOne({ _id: doc.travelerProfileId, workspaceId: req.workspaceObjectId })
+            .select("perDiemRateDomesticInr perDiemRateInternationalInr")
+            .lean()
+        : null;
+      const defaultRate = eligible ? await findDefaultPerDiemRate(req.workspaceObjectId, doc, traveller) : null;
 
       settlement = await CstepSettlement.create({
         workspaceId: req.workspaceObjectId,

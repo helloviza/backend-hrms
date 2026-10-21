@@ -190,6 +190,10 @@ export interface ICstepTravelRequest extends Document {
   expectedOutcome?: string;
   extendedBeyondDates?: boolean;
   personalDays?: ICstepPersonalDays;
+  /** Per Diem Eligible (Yes/No), set by the creator on every Tour Proposal /
+   * Event Request. No → settlement seeds a zero per diem and skips the
+   * rate/day lookup. A missing field (requests made before it) reads as Yes. */
+  perDiemEligible?: boolean;
   contactWhileTravelling?: string;
   otherInstructions?: string;
   estimatedCost?: number;
@@ -475,6 +479,7 @@ const CstepTravelRequestSchema = new Schema<ICstepTravelRequest>(
     expectedOutcome: { type: String, trim: true },
     extendedBeyondDates: { type: Boolean },
     personalDays: { type: CstepPersonalDaysSchema },
+    perDiemEligible: { type: Boolean, default: true },
     contactWhileTravelling: { type: String, trim: true },
     otherInstructions: { type: String, trim: true },
     estimatedCost: { type: Number },

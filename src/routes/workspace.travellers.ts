@@ -778,6 +778,85 @@ const EDITABLE_STRING_FIELDS = [
   "passportPlaceOfIssue",
 ] as const;
 
+/* ── CSTEP per-diem rates (2026-10-21) ─────────────────────────────────
+ *
+ * The traveller's own ₹/day per-diem rate, one per trip type — read by
+ * routes/cstep.ts's findDefaultPerDiemRate ahead of CstepPerDiemPolicy.
+ * Deliberately OUTSIDE the role matrix above: who may set a money figure
+ * is the CSTEP Admin gate (isCstepAdmin, the same one the
+ * Approver/Official/Finance mapping uses), not the workspace member role,
+ * and the fields mean nothing outside a CSTEP workspace.
+ *
+ * Same "judged on a real change" rule as disallowedFieldsInBody: a key
+ * carrying the stored value is a no-op for anyone; only a change is gated.
+ * A blank value clears the rate (back to "use the policy").
+ * ─────────────────────────────────────────────────────────────────────── */
+export const PER_DIEM_RATE_FIELDS = ["perDiemRateDomesticInr", "perDiemRateInternationalInr"] as const;
+export type PerDiemRateField = (typeof PER_DIEM_RATE_FIELDS)[number];
+
+const PER_DIEM_RATE_LABELS: Record<PerDiemRateField, string> = {
+  perDiemRateDomesticInr: "Per Diem Domestic (₹/day)",
+  perDiemRateInternationalInr: "Per Diem International (₹/day)",
+};
+
+/** A body/cell value → a non-negative rupee amount, or blank. Tolerates a
+ * typed "₹" and thousands separators ("1,500"); anything else that is not
+ * a finite number >= 0 is an error, never silently dropped. */
+export function parsePerDiemRate(raw: any, label: string): { blank: boolean; value?: number; error?: string } {
+  if (raw === null || raw === undefined) return { blank: true };
+  if (typeof raw === "number") {
+    return isFinite(raw) && raw >= 0
+      ? { blank: false, value: Math.round(raw * 100) / 100 }
+      : { blank: false, error: `${label} must be a non-negative number of rupees per day` };
+  }
+  const text = String(raw).replace(/[₹,\s]/g, "");
+  if (!text) return { blank: true };
+  const n = Number(text);
+  if (!/^\d*\.?\d+$|^\d+\.$/.test(text) || !isFinite(n) || n < 0) {
+    return { blank: false, error: `${label} must be a non-negative number of rupees per day (got "${String(raw).trim()}")` };
+  }
+  return { blank: false, value: Math.round(n * 100) / 100 };
+}
+
+/**
+ * The per-diem keys in a create/edit body, validated and gated. `stored` is
+ * the existing record ({} at create). Returns the CHANGED fields only
+ * (undefined = clear), or the status + error to refuse the whole request
+ * with — checked before anything is written, like the field matrix.
+ */
+async function resolvePerDiemRateBody(
+  req: any,
+  workspaceId: any,
+  body: Record<string, any>,
+  stored: Record<string, any>,
+): Promise<{ status?: number; error?: string; set: Partial<Record<PerDiemRateField, number | undefined>> }> {
+  const set: Partial<Record<PerDiemRateField, number | undefined>> = {};
+  for (const field of PER_DIEM_RATE_FIELDS) {
+    if (!(field in body)) continue;
+    const parsed = parsePerDiemRate(body[field], PER_DIEM_RATE_LABELS[field]);
+    if (parsed.error) return { status: 400, error: parsed.error, set: {} };
+    const next = parsed.blank ? undefined : parsed.value;
+    const current = typeof stored?.[field] === "number" ? stored[field] : undefined;
+    if (next === current) continue;
+    set[field] = next;
+  }
+  if (Object.keys(set).length === 0) return { set };
+  if (!(await isCstepWorkspace(workspaceId))) {
+    return { status: 400, error: "Per-diem rates apply only to CSTEP workspaces", set: {} };
+  }
+  if (!isCstepAdmin(req)) {
+    return { status: 403, error: "Only a CSTEP Admin can set a traveller's per-diem rates", set: {} };
+  }
+  return { set };
+}
+
+/** The per-diem keys this actor may edit, appended to editableFields so the
+ * form locks them for everyone else — the server's own answer, as for the
+ * rest of the matrix. */
+async function perDiemEditableFields(req: any, workspaceId: any): Promise<PerDiemRateField[]> {
+  return isCstepAdmin(req) && (await isCstepWorkspace(workspaceId)) ? [...PER_DIEM_RATE_FIELDS] : [];
+}
+
 /**
  * Resolve a reportingManagerId from the body: an id must be a User in THIS
  * workspace. Same tenant-safety shape as resolveDepartmentId below — the
@@ -2216,8 +2295,11 @@ router.get("/:id", async (req: any, res: any) => {
       // exactly the fields the server would refuse — one source of truth for
       // the matrix instead of a client copy that drifts. Empty when the row
       // gate already said no, so a read-only viewer never renders an
-      // editable field it could not save.
-      editableFields: canManage ? editableFieldsForRole(member, approverCanManage) : [],
+      // editable field it could not save. The per-diem keys ride along for a
+      // CSTEP Admin only (see PER_DIEM_RATE_FIELDS).
+      editableFields: canManage
+        ? [...editableFieldsForRole(member, approverCanManage), ...(await perDiemEditableFields(req, workspaceId))]
+        : [],
       lastEditedBy: await describeLastEditor(traveller),
       reportingManagerName: await describeReportingManager(traveller, workspaceId),
       designation: await describeDesignation(traveller, workspaceId),
@@ -2343,6 +2425,9 @@ router.post("/", async (req: any, res: any) => {
       employeeId = normStr(body.employeeId) || undefined;
     }
 
+    const perDiem = await resolvePerDiemRateBody(req, workspaceId, body, {});
+    if (perDiem.error) return res.status(perDiem.status!).json({ error: perDiem.error });
+
     const mealPreference = MEAL_PREFERENCE_CODES.includes(body.mealPreference)
       ? body.mealPreference
       : undefined;
@@ -2388,6 +2473,7 @@ router.post("/", async (req: any, res: any) => {
       // closed off (PUT /:id). See the design doc §2.1.
       email: normalizeEmail(body.email) || undefined,
       frequentFlyer: applyFrequentFlyer(body.frequentFlyer),
+      ...perDiem.set,
       createdBy: uid,
       updatedBy: uid,
       source: "MANUAL",
@@ -2485,6 +2571,8 @@ router.put("/:id", async (req: any, res: any) => {
         fields: disallowed,
       });
     }
+    const perDiem = await resolvePerDiemRateBody(req, workspaceId, body, traveller);
+    if (perDiem.error) return res.status(perDiem.status!).json({ error: perDiem.error });
 
     // CSTEP: employeeId IS the travelerId. Sending it unchanged (the full
     // form always does) is a no-op; setting one on a traveller whose id is
@@ -2625,13 +2713,14 @@ router.put("/:id", async (req: any, res: any) => {
     }
     const identityError = applyIdentityNumbers(traveller, body);
     if (identityError) return res.status(422).json({ error: identityError });
+    for (const [field, value] of Object.entries(perDiem.set)) traveller[field] = value;
 
     // "Last edited by X at Y" — updatedAt is already maintained by
     // timestamps; this is the half that was missing everywhere.
     traveller.updatedBy = uid;
 
     await traveller.save();
-    res.json({ ok: true, traveller, editableFields: allowedFields });
+    res.json({ ok: true, traveller, editableFields: [...allowedFields, ...(await perDiemEditableFields(req, workspaceId))] });
   } catch (err: any) {
     if (err?.code === 11000 && err?.keyPattern?.travelerId) {
       return res.status(409).json({ error: "That employee id is already used in this workspace", field: "employeeId" });
@@ -3961,9 +4050,14 @@ const TEMPLATE_COLUMNS = [
   "Frequent Flyer Airline", "Frequent Flyer Number",
 ];
 
-// CSTEP files lead with the employee id, which becomes the travelerId.
-// Every other workspace's template is unchanged.
-const CSTEP_TEMPLATE_COLUMNS = ["Employee ID", ...TEMPLATE_COLUMNS];
+// CSTEP files lead with the employee id, which becomes the travelerId, and
+// end with the traveller's two per-diem rates (₹/day, honoured only for a
+// CSTEP Admin importer — see processBulkRows). Every other workspace's
+// template is unchanged.
+const CSTEP_TEMPLATE_COLUMNS = [
+  "Employee ID", ...TEMPLATE_COLUMNS,
+  PER_DIEM_RATE_LABELS.perDiemRateDomesticInr, PER_DIEM_RATE_LABELS.perDiemRateInternationalInr,
+];
 
 // Normalized header (lowercase, alphanumeric-only) -> internal field name.
 // The template IS the contract — no fuzzy alias guessing beyond
@@ -3991,6 +4085,13 @@ const HEADER_FIELD_MAP: Record<string, string> = {
   // Read ONLY for a CSTEP workspace (processBulkRows' `cstep`); elsewhere
   // the column is ignored, exactly as an unknown column always was.
   employeeid: "employeeId",
+  // CSTEP only, and only for a CSTEP Admin importer (processBulkRows'
+  // `perDiemAdmin`). "Per Diem Domestic (₹/day)" normalises to
+  // "perdiemdomesticday"; the bare "Per Diem Domestic" is accepted too.
+  perdiemdomesticday: "perDiemRateDomesticInr",
+  perdiemdomestic: "perDiemRateDomesticInr",
+  perdieminternationalday: "perDiemRateInternationalInr",
+  perdieminternational: "perDiemRateInternationalInr",
 };
 
 interface BulkRowOutcome extends SheetRowOutcome {
@@ -4004,6 +4105,12 @@ interface BulkRowOutcome extends SheetRowOutcome {
   // fails the row itself — see ensureCstepTravellerLogin's doc comment.
   loginCreated?: boolean;
   loginNote?: string;
+}
+
+/** A per-diem cell, raw: an xlsx number stays a number, everything else is
+ * read as text. */
+function perDiemCell(v: any): any {
+  return typeof v === "number" ? v : cellToString(v);
 }
 
 /**
@@ -4022,6 +4129,10 @@ async function processBulkRows(
   dryRun: boolean,
   actorEmail?: string,
   cstep = false,
+  // The importer is a CSTEP Admin: only then are the per-diem columns read.
+  // For anyone else they are ignored (the row still imports) and the
+  // outcome says so.
+  perDiemAdmin = false,
 ): Promise<BulkRowOutcome[]> {
   const outcomes: BulkRowOutcome[] = [];
   // CSTEP: employee id -> the row that took it, so a file can't use one twice.
@@ -4126,6 +4237,27 @@ async function processBulkRows(
       employeeIdRows.set(employeeId, rowNumber);
     }
 
+    // CSTEP per-diem rates — same above-the-dryRun placement, so a bad
+    // value shows in the preview. Blank = leave the existing rate alone.
+    const perDiemRates: Partial<Record<PerDiemRateField, number>> = {};
+    let perDiemNote: string | undefined;
+    if (cstep) {
+      const supplied = PER_DIEM_RATE_FIELDS.filter((f) => perDiemCell(mapped[f]) !== "");
+      if (supplied.length && !perDiemAdmin) {
+        perDiemNote = "Per-diem columns ignored — only a CSTEP Admin can set per-diem rates.";
+      } else {
+        for (const field of supplied) {
+          const parsed = parsePerDiemRate(perDiemCell(mapped[field]), PER_DIEM_RATE_LABELS[field]);
+          if (parsed.error) {
+            outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: parsed.error });
+            return;
+          }
+          if (!parsed.blank) perDiemRates[field] = parsed.value;
+        }
+      }
+    }
+    const withPerDiemNote = (reason?: string) => [reason, perDiemNote].filter(Boolean).join(" ") || undefined;
+
     if (dryRun) {
       outcomes.push({
         rowNumber,
@@ -4134,9 +4266,11 @@ async function processBulkRows(
         email,
         action: match ? "update" : "create",
         travelerId: cstep ? employeeId : match?.profile?.travelerId,
-        reason: match
-          ? `Matches existing traveller ${match.profile.travelerId} by ${match.tier === 1 ? "email" : "name + date of birth"} — will update, not duplicate.`
-          : undefined,
+        reason: withPerDiemNote(
+          match
+            ? `Matches existing traveller ${match.profile.travelerId} by ${match.tier === 1 ? "email" : "name + date of birth"} — will update, not duplicate.`
+            : undefined,
+        ),
       });
       return;
     }
@@ -4168,6 +4302,8 @@ async function processBulkRows(
         doc.travelerId = employeeId;
         doc.employeeId = employeeId;
       }
+      // Only the rates the row supplied — a blank cell keeps the stored one.
+      for (const [field, value] of Object.entries(perDiemRates)) doc[field] = value;
 
       let loginCreated: boolean | undefined;
       let loginNote: string | undefined;
@@ -4196,7 +4332,7 @@ async function processBulkRows(
         outcomes.push({ rowNumber, firstName, lastName, email, action: "skip", reason: `Employee ID ${employeeId} is already used in this workspace` });
         return;
       }
-      outcomes.push({ rowNumber, firstName, lastName, email, action: "update", travelerId: doc.travelerId, loginCreated, loginNote });
+      outcomes.push({ rowNumber, firstName, lastName, email, action: "update", travelerId: doc.travelerId, loginCreated, loginNote, reason: withPerDiemNote() });
     } else {
       const travelerId = cstep ? employeeId : await mintTravellerProfileId(workspaceId, customerId);
       let created: any;
@@ -4220,6 +4356,7 @@ async function processBulkRows(
           mobile: mobile || undefined,
           email: email || undefined,
           frequentFlyer: ffAirline || ffNumber ? [{ airline: ffAirline || undefined, number: ffNumber || undefined }] : [],
+          ...perDiemRates,
           createdBy: uid,
           source: "BULK_IMPORT",
         });
@@ -4246,7 +4383,7 @@ async function processBulkRows(
         loginNote = "No email — login not created";
       }
 
-      outcomes.push({ rowNumber, firstName, lastName, email, action: "create", travelerId: created.travelerId, loginCreated, loginNote });
+      outcomes.push({ rowNumber, firstName, lastName, email, action: "create", travelerId: created.travelerId, loginCreated, loginNote, reason: withPerDiemNote() });
     }
   });
 
@@ -4303,7 +4440,7 @@ router.post("/bulk/preview", sheetUpload.single("file"), async (req: any, res: a
     const customerId = req.workspace?.customerId;
     const uid = actorUserId(req);
     const cstep = await isCstepWorkspace(workspaceId);
-    const results = await processBulkRows(workspaceId, customerId, uid, rawRows, true, undefined, cstep);
+    const results = await processBulkRows(workspaceId, customerId, uid, rawRows, true, undefined, cstep, cstep && isCstepAdmin(req));
 
     res.json({ ok: true, totalRows: results.length, maxRows: MAX_SHEET_ROWS, results });
   } catch (err: any) {
@@ -4328,7 +4465,7 @@ router.post("/bulk/commit", sheetUpload.single("file"), async (req: any, res: an
     const customerId = req.workspace?.customerId;
     const uid = actorUserId(req);
     const cstep = await isCstepWorkspace(workspaceId);
-    const results = await processBulkRows(workspaceId, customerId, uid, rawRows, false, req.user?.email, cstep);
+    const results = await processBulkRows(workspaceId, customerId, uid, rawRows, false, req.user?.email, cstep, cstep && isCstepAdmin(req));
 
     const created = results.filter((r) => r.action === "create").length;
     const updated = results.filter((r) => r.action === "update").length;
@@ -4351,8 +4488,9 @@ router.get("/export/download", async (req: any, res: any) => {
     if (!requireWorkspaceContext(req, res)) return;
 
     const workspaceId = req.workspaceObjectId;
+    const cstep = await isCstepWorkspace(workspaceId);
     const docs = await TravellerProfile.find({ workspaceId, isActive: true })
-      .select("travelerId title firstName middleName lastName gender dob nationality passportNo passportExpiry passportIssueCountry passportIssueDate mobile email frequentFlyer")
+      .select("travelerId title firstName middleName lastName gender dob nationality passportNo passportExpiry passportIssueCountry passportIssueDate mobile email frequentFlyer perDiemRateDomesticInr perDiemRateInternationalInr")
       .sort({ firstName: 1, lastName: 1 })
       .lean();
 
@@ -4374,12 +4512,16 @@ router.get("/export/download", async (req: any, res: any) => {
       d.email || "",
       d.frequentFlyer?.[0]?.airline || "",
       d.frequentFlyer?.[0]?.number || "",
+      // CSTEP: the per-diem rates, blank when the traveller has none of
+      // their own (settlement then uses the policy).
+      ...(cstep ? PER_DIEM_RATE_FIELDS.map((f) => (typeof d[f] === "number" ? d[f] : "")) : []),
     ]);
 
     const columns = [
-      (await isCstepWorkspace(workspaceId)) ? "Employee ID" : "Traveler ID", "Title", "First Name", "Middle Name", "Last Name", "Gender", "Date of Birth",
+      cstep ? "Employee ID" : "Traveler ID", "Title", "First Name", "Middle Name", "Last Name", "Gender", "Date of Birth",
       "Nationality", "Passport", "Passport Expiry", "Passport Issue Country", "Passport Issue Date",
       "Mobile", "Email", "Frequent Flyer Airline", "Frequent Flyer Number",
+      ...(cstep ? PER_DIEM_RATE_FIELDS.map((f) => PER_DIEM_RATE_LABELS[f]) : []),
     ];
 
     await sendSheet(res, {

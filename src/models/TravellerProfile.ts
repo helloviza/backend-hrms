@@ -403,6 +403,16 @@ export interface TravellerProfileDocument extends Document {
   officialUserId?: mongoose.Types.ObjectId; // ref User
   financeUserId?: mongoose.Types.ObjectId; // ref User
 
+  // CSTEP per diem (2026-10-21) — this traveller's own ₹/day rate, one per
+  // trip type. Rupees whatever the destination: there is no FX step, so an
+  // international rate is entered already converted. Unset means "no rate of
+  // their own" and settlement falls back to CstepPerDiemPolicy, then 0 — see
+  // findDefaultPerDiemRate in routes/cstep.ts. CSTEP-Admin-set only (the
+  // same isCstepAdmin gate as the mapping slots above), via the traveller
+  // create/edit routes and the CSTEP bulk import.
+  perDiemRateDomesticInr?: number;
+  perDiemRateInternationalInr?: number;
+
   frequentFlyer: FrequentFlyerEntry[];
 
   createdBy: mongoose.Types.ObjectId; // ref User — who created this record
@@ -544,6 +554,10 @@ const TravellerProfileSchema = new Schema<TravellerProfileDocument>(
     tourApproverId: { type: Schema.Types.ObjectId, ref: "User", index: true },
     officialUserId: { type: Schema.Types.ObjectId, ref: "User", index: true },
     financeUserId: { type: Schema.Types.ObjectId, ref: "User", index: true },
+
+    // No default: an absent rate must stay absent, not read as ₹0/day.
+    perDiemRateDomesticInr: { type: Number, min: 0 },
+    perDiemRateInternationalInr: { type: Number, min: 0 },
 
     frequentFlyer: { type: [FrequentFlyerSchema], default: [] },
 
