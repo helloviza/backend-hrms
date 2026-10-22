@@ -226,7 +226,9 @@ export async function clearPartnerShareSafe(bookingIds: unknown[], context: stri
  * routes/creditNotes.ts uses to pair them (bookingRef|rowType|description),
  * so several credit notes on one line add up and are capped at that line.
  * A booking on no line of its invoice (invoiced 0) is skipped and logged —
- * it is not reduced. Credit notes on any other invoice never count.
+ * it is not reduced. Credit notes on any other invoice never count, and the
+ * readers (routes/myBookings.revenue.ts) load only the company's own invoices,
+ * credit notes and bookings (companyDocIds / combinedLineTotals below).
  */
 export function refsOfLine(bookingRef: unknown): string[] {
   return String(bookingRef ?? "")
@@ -319,8 +321,25 @@ export function netOfCredit(
   };
 }
 
-/** Grand totals of every booking named on a COMBINED line of these invoices. */
-export async function combinedLineTotals(invoices: AnyObj[]): Promise<Map<string, number>> {
+/**
+ * The ids one company's invoices and credit notes carry in `workspaceId`: its
+ * CustomerWorkspace._id (the norm) or its Customer._id (the invoice fallback,
+ * copied verbatim onto the credit note). Every read below is filtered by these,
+ * so another company's document can never enter the credit maths — even when
+ * an id or a typed bookingRef points at it.
+ */
+export function companyDocIds(workspaceId: unknown, customerId: unknown): mongoose.Types.ObjectId[] {
+  return [...new Set([workspaceId, customerId].filter(Boolean).map(String))]
+    .filter((id) => mongoose.isValidObjectId(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+}
+
+/**
+ * Grand totals of every booking named on a COMBINED line of these invoices —
+ * only the company's own bookings (ManualBooking.workspaceId = Customer._id).
+ * A ref typed onto a line that names another company's booking weighs 0.
+ */
+export async function combinedLineTotals(invoices: AnyObj[], customerId: unknown): Promise<Map<string, number>> {
   const refs = new Set<string>();
   for (const inv of invoices) {
     for (const li of Array.isArray(inv?.lineItems) ? inv.lineItems : []) {
@@ -328,20 +347,20 @@ export async function combinedLineTotals(invoices: AnyObj[]): Promise<Map<string
       if (r.length > 1) r.forEach((x) => refs.add(x));
     }
   }
-  if (!refs.size) return new Map();
-  const rows = (await ManualBooking.find({ bookingRef: { $in: [...refs] } })
+  if (!refs.size || !mongoose.isValidObjectId(String(customerId ?? ""))) return new Map();
+  const rows = (await ManualBooking.find({ bookingRef: { $in: [...refs] }, workspaceId: new mongoose.Types.ObjectId(String(customerId)) })
     .select("bookingRef pricing.grandTotal pricing.totalWithGST pricing.quotedPrice")
     .lean()) as AnyObj[];
   return new Map(rows.map((r) => [String(r.bookingRef), bookingGrandTotal(r)]));
 }
 
-/** ISSUED credit notes on any of these invoices (one query for a page of bookings). */
-export async function issuedCreditNotesFor(invoiceIds: unknown[]): Promise<AnyObj[]> {
+/** ISSUED credit notes of this company on any of these invoices (one query for a page of bookings). */
+export async function issuedCreditNotesFor(invoiceIds: unknown[], companyIds: mongoose.Types.ObjectId[]): Promise<AnyObj[]> {
   const ids = [...new Set(invoiceIds.filter(Boolean).map((id) => String((id as any)?._id ?? id)))]
     .filter((id) => mongoose.isValidObjectId(id))
     .map((id) => new mongoose.Types.ObjectId(id));
-  if (!ids.length) return [];
-  return (await CreditNote.find({ originalInvoiceId: { $in: ids }, status: "ISSUED" })
+  if (!ids.length || !companyIds.length) return [];
+  return (await CreditNote.find({ originalInvoiceId: { $in: ids }, workspaceId: { $in: companyIds }, status: "ISSUED" })
     .select("creditNoteNo originalInvoiceId status lineItems.bookingRef lineItems.rowType lineItems.description lineItems.creditedAmount")
     .lean()) as AnyObj[];
 }

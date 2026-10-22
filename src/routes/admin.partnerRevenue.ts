@@ -1,9 +1,11 @@
 /* ───────────────────────── partner revenue share (SUPERADMIN only) ─────────────────────────
  * One config row per partner workspace (visible margin % and partner share %),
  * plus an append-only change log. Same shape and guards as the SBT margins in
- * routes/admin.sbt.ts. Saving a config also sets the workspace's
- * config.features.revenueShareEnabled to the config's `enabled`, which gates
- * the partner's own /api/my-bookings/revenue endpoints.
+ * routes/admin.sbt.ts. A config's `enabled` (On / Paused) controls EARNING
+ * only — whether new invoices snapshot a share. It never touches
+ * config.features.revenueShareEnabled: the partner's VIEW (the Revenue tab and
+ * /api/my-bookings/revenue) is switched on and off from Workspace Manager
+ * (PUT /api/superadmin/workspaces/:id/features), and nowhere else.
  *
  * Changing a config never rewrites past bookings: the amounts are frozen onto
  * each booking when it is invoiced (services/partnerRevenue.ts).
@@ -53,13 +55,6 @@ async function logChange(req: any, entry: {
 
 const wsName = (w: any) => String(w?.companyName || "").trim() || String(w?.customerId || "") || "Unnamed company";
 const termsOf = (r: any) => (r ? { enabled: r.enabled !== false, visiblePct: r.visiblePct, sharePct: r.sharePct, version: r.version ?? 1 } : null);
-
-async function setFeatureFlag(workspaceId: string, enabled: boolean) {
-  await CustomerWorkspace.updateOne(
-    { _id: new mongoose.Types.ObjectId(workspaceId) },
-    { $set: { "config.features.revenueShareEnabled": enabled } },
-  );
-}
 
 // GET /api/admin/partner-revenue — every partner config with its company name
 router.get("/", async (_req: any, res: any) => {
@@ -185,7 +180,6 @@ router.put("/:workspaceId", async (req: any, res: any) => {
       },
       { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true },
     ).lean();
-    await setFeatureFlag(wsId, enabled);
     await logChange(req, {
       action: prev ? "UPDATE" : "CREATE", workspaceId: wsId, workspaceName: wsName(ws),
       before: termsOf(prev),
@@ -200,7 +194,8 @@ router.put("/:workspaceId", async (req: any, res: any) => {
 });
 
 // DELETE /api/admin/partner-revenue/:workspaceId — the company stops being a
-// partner (feature flag off). Bookings already invoiced keep their snapshot.
+// partner: new invoices earn nothing. Bookings already invoiced keep their
+// snapshot; the partner's view stays as Workspace Manager left it.
 // Reason required; logged.
 router.delete("/:workspaceId", async (req: any, res: any) => {
   try {
@@ -210,7 +205,6 @@ router.delete("/:workspaceId", async (req: any, res: any) => {
     if (!reason) return res.status(400).json({ ok: false, error: "A reason is required" });
     const prev = (await PartnerRevenueConfig.findOneAndDelete({ workspaceId: wsId }).lean()) as any;
     if (!prev) return res.status(404).json({ ok: false, error: "This company has no partner revenue config" });
-    await setFeatureFlag(wsId, false);
     const ws = (await CustomerWorkspace.findById(wsId).select("companyName customerId").lean()) as any;
     await logChange(req, {
       action: "REMOVE", workspaceId: wsId, workspaceName: wsName(ws),

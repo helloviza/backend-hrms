@@ -1,15 +1,23 @@
 /* ═════════════════════════════════════════════════════════════════════
  * /api/my-bookings/revenue — the partner's own revenue-share dashboard.
  *
- * GATE: requireFeature("revenueShareEnabled") + requireInvoiceAccess (workspace
+ * GATE: requireRevenueShareView (below) + requireInvoiceAccess (workspace
  * leader, or canViewBilling on the caller's own customer — the invoice
  * domain's rule, middleware/requireInvoiceAccess.ts, also used by the Rewards
  * router). requireAuth/requireWorkspace are applied
  * at the mount (server.ts), same as /api/my-bookings.
  *
+ * The flag is the caller's own workspace's config.features.revenueShareEnabled,
+ * set ONLY from Workspace Manager. Unlike requireFeature there is NO SuperAdmin,
+ * HOUSE or tbocert bypass: the Client Portal's Revenue tab
+ * (components/clientPortal/RevenueTab.tsx canSeeRevenueTab) shows on the flag
+ * alone, and the server must say the same thing.
+ *
  * SCOPE: req.workspace.customerId — the Customer._id that
  * ManualBooking.workspaceId holds. Never req.workspaceObjectId (that is the
- * CustomerWorkspace._id the partner config is keyed on).
+ * CustomerWorkspace._id the partner config is keyed on). The invoices, credit
+ * notes and combined-line bookings read for the credit maths are filtered to
+ * the same company too (companyDocIds: CustomerWorkspace._id or Customer._id).
  *
  * MONEY SOURCE: the snapshot frozen on each booking at invoicing
  * (ManualBooking.partnerShare, services/partnerRevenue.ts), minus ISSUED credit
@@ -37,7 +45,6 @@ import ManualBooking from "../models/ManualBooking.js";
 import Invoice from "../models/Invoice.js";
 import Customer from "../models/Customer.js";
 import CustomerMember from "../models/CustomerMember.js";
-import { requireFeature } from "../middleware/requireFeature.js";
 import { requireInvoiceAccess } from "../middleware/requireInvoiceAccess.js";
 import ExcelJS from "exceljs";
 import {
@@ -52,12 +59,22 @@ import {
   parseDayStart,
   parseDayEnd,
 } from "./myBookings.js";
-import { creditRatioForBooking, combinedLineTotals, issuedCreditNotesFor, netOfCredit } from "../services/partnerRevenue.js";
+import { companyDocIds, creditRatioForBooking, combinedLineTotals, issuedCreditNotesFor, netOfCredit } from "../services/partnerRevenue.js";
 import logger from "../utils/logger.js";
 
 const router = Router();
 
-router.use(requireFeature("revenueShareEnabled"));
+/** The caller's own ACTIVE workspace has revenueShareEnabled === true. No bypass. */
+function requireRevenueShareView(req: Request, res: Response, next: () => void) {
+  const ws = (req as any).workspace;
+  if (!ws || ws.status !== "ACTIVE" || ws.config?.features?.revenueShareEnabled !== true) {
+    res.status(403).json({ success: false, error: "Feature 'revenueShareEnabled' not enabled for this workspace" });
+    return;
+  }
+  next();
+}
+
+router.use(requireRevenueShareView);
 router.use(requireInvoiceAccess);
 
 type AnyObj = Record<string, any>;
@@ -96,13 +113,17 @@ interface CreditCtx {
   totals: Map<string, number>;
 }
 
-async function creditContext(ids: unknown[]): Promise<CreditCtx> {
+async function creditContext(req: Request, customerId: string, ids: unknown[]): Promise<CreditCtx> {
   const valid = [...new Set(ids.filter(Boolean).map(String))].filter((id) => mongoose.isValidObjectId(id));
-  if (!valid.length) return { invoices: new Map(), creditNotes: [], totals: new Map() };
-  const rows = (await Invoice.find({ _id: { $in: valid.map((id) => new mongoose.Types.ObjectId(id)) } })
+  const company = companyDocIds((req as any).workspace?._id, customerId);
+  if (!valid.length || !company.length) return { invoices: new Map(), creditNotes: [], totals: new Map() };
+  // Only this company's invoices — a booking whose invoiceId points elsewhere
+  // reads as "invoice missing" (earns 0, no invoice number), never as another's.
+  const rows = (await Invoice.find({ _id: { $in: valid.map((id) => new mongoose.Types.ObjectId(id)) }, workspaceId: { $in: company } })
     .select("invoiceNo invoiceDate status lineItems.bookingRef lineItems.rowType lineItems.description lineItems.amount")
     .lean()) as AnyObj[];
-  const [creditNotes, totals] = await Promise.all([issuedCreditNotesFor(valid), combinedLineTotals(rows)]);
+  const own = rows.map((r) => r._id);
+  const [creditNotes, totals] = await Promise.all([issuedCreditNotesFor(own, company), combinedLineTotals(rows, customerId)]);
   return { invoices: new Map(rows.map((r) => [String(r._id), r])), creditNotes, totals };
 }
 
@@ -118,7 +139,7 @@ function netFor(b: AnyObj, ctx: CreditCtx): { bakedIn: number; share: number } |
   return netOfCredit(snap, creditRatioForBooking(b, inv, ctx.creditNotes, ctx.totals));
 }
 
-async function periodStats(match: AnyObj, from: Date, to: Date) {
+async function periodStats(req: Request, customerId: string, match: AnyObj, from: Date, to: Date) {
   const pipeline = [
     { $match: { ...match, bookingDate: { $gte: from, $lte: to } } },
     {
@@ -162,7 +183,7 @@ async function periodStats(match: AnyObj, from: Date, to: Date) {
 
   const earning: AnyObj[] = result?.earning || [];
   const invoiceIds = earning.map((b) => b.invoiceId);
-  const ctx = await creditContext(invoiceIds);
+  const ctx = await creditContext(req, customerId, invoiceIds);
   let totalBakedIn = 0;
   let totalShare = 0;
   for (const b of earning) {
@@ -202,8 +223,8 @@ router.get("/stats", async (req: Request, res: Response) => {
     const compareTo = parseDayEnd(req.query.compareTo);
     const match = baseMatch(req, customerId);
     const [primary, compare] = await Promise.all([
-      periodStats(match, from, to),
-      compareFrom && compareTo ? periodStats(match, compareFrom, compareTo) : Promise.resolve(null),
+      periodStats(req, customerId, match, from, to),
+      compareFrom && compareTo ? periodStats(req, customerId, match, compareFrom, compareTo) : Promise.resolve(null),
     ]);
     res.json({ ok: true, primary, compare });
   } catch (err: any) {
@@ -262,7 +283,7 @@ async function loadPartnerBookings(
 
   const invoiceIds = docs.map((b) => b.invoiceId);
   const [ctx, customer] = await Promise.all([
-    creditContext(invoiceIds),
+    creditContext(req, customerId, invoiceIds),
     Customer.findById(customerId).select("legalName companyName name").lean().catch(() => null),
   ]);
   const wsName = (customer as any)?.legalName || (customer as any)?.companyName || (customer as any)?.name || "";

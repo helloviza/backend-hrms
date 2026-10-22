@@ -1,15 +1,19 @@
 // Partner revenue share, end to end on a real (in-memory, replica-set) database:
 //   - admin config endpoints: SUPERADMIN only, 0–100 validation, reason, version,
-//     feature flag, append-only change log;
+//     append-only change log — and they never touch the view flag;
+//   - the view flag (config.features.revenueShareEnabled) is written only by
+//     Workspace Manager's toggle (PUT /api/superadmin/workspaces/:id/features);
 //   - snapshot written when a booking becomes INVOICED (generation service,
 //     POST /:id/add-bookings, PATCH add) and cleared when it is un-invoiced
 //     (POST /:id/cancel, PATCH remove); frozen against later config changes;
 //   - the ID-space bridge (ManualBooking.workspaceId = Customer._id, config on
 //     CustomerWorkspace._id) — a decoy config whose workspace _id EQUALS a
 //     customer id must never match that customer's bookings;
-//   - partner endpoints: 403 when the flag is off / caller has no billing
-//     access, CANCELLED / deleted / cost-0 excluded, credit notes reduce the
-//     share, and no cost field ever appears in a response.
+//   - partner endpoints: 403 when the flag is off (no SuperAdmin / HOUSE
+//     bypass) / caller has no billing access, CANCELLED / deleted / cost-0
+//     excluded, credit notes reduce the share — only the company's own credit
+//     notes, invoices and combined-line bookings count — and no cost field ever
+//     appears in a response.
 //
 // Real: the four routers, every model, mongodb-memory-server (replica set, for
 // the PATCH transaction). Stubbed: requireAuth / requireWorkspace (user and
@@ -52,6 +56,7 @@ const { default: adminRouter } = await import("./admin.partnerRevenue.js");
 const { default: invoicesRouter } = await import("./invoices.js");
 const { default: revenueRouter } = await import("./myBookings.revenue.js");
 const { default: workspaceRouter } = await import("./workspace.js");
+const { default: superadminRouter } = await import("./superadmin.workspaces.js");
 const { requireWorkspace } = await import("../middleware/requireWorkspace.js");
 const { requireAuth } = await import("../middleware/auth.js");
 const { createInvoiceFromBookings } = await import("../services/invoiceGeneration.service.js");
@@ -67,6 +72,7 @@ app.use("/api/admin/partner-revenue", requireAuth, requireWorkspace, adminRouter
 app.use("/api/admin/invoices", requireAuth, requireWorkspace, invoicesRouter);
 app.use("/api/my-bookings/revenue", requireAuth, requireWorkspace, revenueRouter);
 app.use("/api/v1/workspace", requireAuth, workspaceRouter);
+app.use("/api/superadmin", requireAuth, superadminRouter);
 
 let mongod: MongoMemoryReplSet;
 const col = (n: string) => mongoose.connection.db!.collection(n);
@@ -144,6 +150,12 @@ async function putConfig(wsId: any, body: Record<string, unknown>, as = SA) {
   return request(app).put(`/api/admin/partner-revenue/${wsId}`).set("x-test-user", as).set("x-test-ws", String(WS_P)).send(body);
 }
 
+/** Workspace Manager's feature toggle — the one writer of the partner's view. */
+async function setView(wsId: any, enabled: boolean, as = SA) {
+  return request(app).put(`/api/superadmin/workspaces/${wsId}/features`).set("x-test-user", as).send({ feature: "revenueShareEnabled", enabled });
+}
+const viewFlag = async (wsId: any) => ((await col("customerworkspaces").findOne({ _id: wsId })) as any).config.features.revenueShareEnabled;
+
 async function generate(ids: any[], lineItemStyle: "SEPARATE" | "COMBINED" = "SEPARATE") {
   const [inv] = await createInvoiceFromBookings(ids.map(String), { format: "COMBINED", lineItemStyle, createdBy: SA_ID } as any);
   return inv;
@@ -198,18 +210,18 @@ describe("admin config — SUPERADMIN only", () => {
     expect(await col("partnerrevenuechanges").countDocuments()).toBe(0);
   });
 
-  it("create → update → disable → delete: version, feature flag and log follow", async () => {
+  it("create → update → disable → delete: version and log follow; the view flag is never touched", async () => {
     let res = await putConfig(WS_P, { visiblePct: 50, sharePct: 40, reason: "Signed partner agreement" });
     expect(res.status).toBe(200);
     expect(res.body.config).toMatchObject({ enabled: true, visiblePct: 50, sharePct: 40, version: 1 });
-    expect(((await col("customerworkspaces").findOne({ _id: WS_P })) as any).config.features.revenueShareEnabled).toBe(true);
+    expect(await viewFlag(WS_P)).toBe(false);
 
     res = await putConfig(WS_P, { visiblePct: 60, sharePct: 40, reason: "Renegotiated" });
     expect(res.body.config.version).toBe(2);
 
     res = await putConfig(WS_P, { visiblePct: 60, sharePct: 40, enabled: false, reason: "Paused" });
     expect(res.body.config).toMatchObject({ enabled: false, version: 3 });
-    expect(((await col("customerworkspaces").findOne({ _id: WS_P })) as any).config.features.revenueShareEnabled).toBe(false);
+    expect(await viewFlag(WS_P)).toBe(false);
 
     const list = await request(app).get("/api/admin/partner-revenue").set("x-test-user", SA).set("x-test-ws", String(WS_P));
     expect(list.body.configs).toHaveLength(1);
@@ -222,7 +234,7 @@ describe("admin config — SUPERADMIN only", () => {
     const del = await request(app).delete(`/api/admin/partner-revenue/${WS_P}`).set("x-test-user", SA).set("x-test-ws", String(WS_P)).send({ reason: "Agreement ended" });
     expect(del.status).toBe(200);
     expect(await col("partnerrevenueconfigs").countDocuments()).toBe(0);
-    expect(((await col("customerworkspaces").findOne({ _id: WS_P })) as any).config.features.revenueShareEnabled).toBe(false);
+    expect(await viewFlag(WS_P)).toBe(false);
 
     const hist = await request(app).get(`/api/admin/partner-revenue/history?workspaceId=${WS_P}`).set("x-test-user", SA).set("x-test-ws", String(WS_P));
     expect(hist.body.changes.map((c: any) => c.action)).toEqual(["REMOVE", "UPDATE", "UPDATE", "CREATE"]);
@@ -230,6 +242,27 @@ describe("admin config — SUPERADMIN only", () => {
     expect(update.before).toMatchObject({ visiblePct: 50, version: 1 });
     expect(update.after).toMatchObject({ visiblePct: 60, version: 2 });
     expect(update.reason).toBe("Renegotiated");
+  });
+
+  it("a view switched on in Workspace Manager survives pausing, re-enabling and removing the config", async () => {
+    expect((await setView(WS_P, true)).status).toBe(200);
+    await putConfig(WS_P, { visiblePct: 50, sharePct: 40, reason: "on" });
+    expect(await viewFlag(WS_P)).toBe(true);
+    await putConfig(WS_P, { visiblePct: 50, sharePct: 40, enabled: false, reason: "paused" });
+    expect(await viewFlag(WS_P)).toBe(true);
+    await putConfig(WS_P, { visiblePct: 50, sharePct: 40, enabled: true, reason: "on again" });
+    expect(await viewFlag(WS_P)).toBe(true);
+    await request(app).delete(`/api/admin/partner-revenue/${WS_P}`).set("x-test-user", SA).set("x-test-ws", String(WS_P)).send({ reason: "ended" });
+    expect(await viewFlag(WS_P)).toBe(true);
+    // Only Workspace Manager turns it off again.
+    expect((await setView(WS_P, false)).status).toBe(200);
+    expect(await viewFlag(WS_P)).toBe(false);
+  });
+
+  it("Workspace Manager's toggle is SUPERADMIN only", async () => {
+    expect((await setView(WS_P, true, WL)).status).toBe(403);
+    expect((await setView(WS_P, true, user(oid(), ["ADMIN"]))).status).toBe(403);
+    expect(await viewFlag(WS_P)).toBe(false);
   });
 
   it("the change log is append-only", async () => {
@@ -339,9 +372,31 @@ describe("partner endpoints — /api/my-bookings/revenue", () => {
     expect((await get("/bookings")).status).toBe(403);
   });
 
+  it("403 with the flag off even while the partner is EARNING (config on) — the view is Workspace Manager's", async () => {
+    await putConfig(WS_P, { visiblePct: 50, sharePct: 40, reason: "earning" });
+    for (const path of ["/stats", "/bookings", "/bookings/export"]) expect((await get(path)).status).toBe(403);
+    await setView(WS_P, true);
+    expect((await get("/stats")).status).toBe(200);
+  });
+
+  it("no SuperAdmin or HOUSE bypass: both get 403 when their workspace's flag is off", async () => {
+    await putConfig(WS_P, { visiblePct: 50, sharePct: 40, reason: "earning" });
+    for (const path of ["/stats", "/bookings", "/bookings/export"]) {
+      expect((await get(path, SA)).status).toBe(403);
+      // A SuperAdmin with no resolved workspace (requireWorkspace's bypass) too.
+      expect((await request(app).get(`/api/my-bookings/revenue${path}?workspaceId=${WS_P}`).set("x-test-user", SA).set("x-workspace-id", String(WS_P))).status).toBe(403);
+    }
+    const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
+    await col("customerworkspaces").insertOne({ _id: HOUSE, customerId: String(oid()), companyName: "Plumtrips", status: "ACTIVE", config: { features: { revenueShareEnabled: false } } } as any);
+    for (const who of [user(oid(), ["ADMIN"]), user(oid(), ["EMPLOYEE"]), SA]) {
+      for (const path of ["/stats", "/bookings", "/bookings/export"]) expect((await get(path, who, HOUSE as any)).status).toBe(403);
+    }
+  });
+
   describe("with an enabled partner", () => {
     beforeEach(async () => {
       await putConfig(WS_P, { visiblePct: 50, sharePct: 40, reason: "r" });
+      await setView(WS_P, true);
     });
 
     it("403 for a member without billing access; 200 for canViewBilling and the leader", async () => {
@@ -433,6 +488,54 @@ describe("partner endpoints — /api/my-bookings/revenue", () => {
       expect((await get("/stats")).body.primary).toMatchObject({ totalBakedIn: 1460.42, totalShare: 584.17 });
     });
 
+    it("CROSS-COMPANY: another company's credit note on the partner's invoice never reduces the share", async () => {
+      const b = await makeBooking(CUST_P);
+      const inv = await generate([b._id]);
+      const lines = ((await col("invoices").findOne({ _id: inv._id })) as any).lineItems as any[];
+      // Same invoice, same lines, fully credited — but filed under the other company.
+      await col("creditnotes").insertOne({
+        creditNoteNo: "CN-X", workspaceId: WS_N, originalInvoiceId: inv._id, status: "ISSUED", isFullCredit: true,
+        lineItems: lines.map((l) => ({ ...l, originalAmount: l.amount, creditedAmount: l.amount })),
+      } as any);
+      expect((await get("/stats")).body.primary.totalShare).toBe(200);
+      expect((await get("/bookings")).body.bookings[0].revenueEarned).toBe(200);
+      // The same note under the partner's own Customer._id (the invoice-fallback form) does count.
+      await col("creditnotes").updateOne({ creditNoteNo: "CN-X" }, { $set: { workspaceId: CUST_P } });
+      expect((await get("/stats")).body.primary.totalShare).toBe(0);
+    });
+
+    it("CROSS-COMPANY: a combined line naming another company's booking weighs only the partner's own bookings", async () => {
+      const x = await makeBooking(CUST_P); // 11180 total, share 200
+      const z = await makeBooking(CUST_N); // another company, also 11180
+      const inv = await generate([x._id]);
+      const doc: any = await col("invoices").findOne({ _id: inv._id });
+      const fee = doc.lineItems.find((l: any) => l.rowType === "SERVICE_FEE");
+      // Staff typed z's ref onto x's fee line (invoice PATCH accepts free-text refs).
+      const combinedRef = `${(x as any).bookingRef}, ${(z as any).bookingRef}`;
+      await col("invoices").updateOne({ _id: inv._id, "lineItems.rowType": "SERVICE_FEE" }, { $set: { "lineItems.$.bookingRef": combinedRef } });
+      await col("creditnotes").insertOne({
+        creditNoteNo: "CN-Y", workspaceId: WS_P, originalInvoiceId: inv._id, status: "ISSUED", isFullCredit: false,
+        lineItems: [{ ...fee, bookingRef: combinedRef, originalAmount: fee.amount, creditedAmount: 590, amount: 590 }],
+      } as any);
+      // z's total is not read, so x carries the whole line: 590 of 11180 credited.
+      // (Reading z's 11180 would halve x's portion: 200 × (1 − 295/10590) = 194.43.)
+      expect((await get("/bookings")).body.bookings.find((r: any) => r.refNo === (x as any).bookingRef).revenueEarned).toBe(189.45);
+    });
+
+    it("CROSS-COMPANY: a booking whose invoiceId points at another company's invoice shows no invoice and earns 0", async () => {
+      const other = await makeBooking(CUST_N);
+      const otherInv: any = await generate([other._id]);
+      const b = await makeBooking(CUST_P);
+      await col("manualbookings").updateOne({ _id: b._id }, {
+        $set: { status: "INVOICED", invoiceId: otherInv._id, partnerShare: { visiblePct: 50, sharePct: 40, configVersion: 1, marginBase: 1000, bakedIn: 500, share: 200, at: new Date() } },
+      });
+      const res = await get("/bookings");
+      const row = res.body.bookings.find((r: any) => r.refNo === (b as any).bookingRef);
+      expect(row.revenueEarned).toBe(0);
+      expect(JSON.stringify(res.body)).not.toContain(otherInv.invoiceNo);
+      expect((await get("/stats")).body.primary.totalShare).toBe(0);
+    });
+
     it("a snapshot on an invoice cancelled WITHOUT unlinking earns nothing", async () => {
       const b = await makeBooking(CUST_P);
       const inv = await generate([b._id]);
@@ -486,7 +589,8 @@ describe("backfill — POST /api/admin/partner-revenue/:workspaceId/backfill", (
   });
 
   it("works on a PAUSED partner — dry run and apply — while live invoicing still snapshots nothing", async () => {
-    // Post-deploy order: add (paused) → dry run → compare → apply → switch on.
+    // Post-deploy order: add (paused) → dry run → compare → apply → switch
+    // earning on → enable the view in Workspace Manager.
     await putConfig(WS_P, { visiblePct: 50, sharePct: 40, enabled: false, reason: "added paused for checking" });
     const a = await makeBooking(CUST_P);
     const b = await makeBooking(CUST_P);
@@ -511,9 +615,11 @@ describe("backfill — POST /api/admin/partner-revenue/:workspaceId/backfill", (
     expect(log).toHaveLength(1);
     expect(log[0].after).toMatchObject({ count: 2, totalShare: 400, partnerEnabled: false });
 
-    // Still paused: the partner's own endpoints stay closed until it is switched on.
+    // Switching earning on does not open the partner's view — Workspace Manager does.
     expect((await request(app).get("/api/my-bookings/revenue/stats").set("x-test-user", WL).set("x-test-ws", String(WS_P))).status).toBe(403);
     await putConfig(WS_P, { visiblePct: 50, sharePct: 40, enabled: true, reason: "switched on" });
+    expect((await request(app).get("/api/my-bookings/revenue/stats").set("x-test-user", WL).set("x-test-ws", String(WS_P))).status).toBe(403);
+    await setView(WS_P, true);
     const stats = await request(app).get("/api/my-bookings/revenue/stats").set("x-test-user", WL).set("x-test-ws", String(WS_P));
     expect(stats.status).toBe(200);
     expect(stats.body.primary.totalShare).toBe(400);
@@ -607,6 +713,7 @@ describe("partner export — GET /api/my-bookings/revenue/bookings/export", () =
   it("403 when the flag is off, and for a member without billing access", async () => {
     expect((await exportReq("?format=csv")).status).toBe(403);
     await putConfig(WS_P, { visiblePct: 50, sharePct: 40, reason: "r" });
+    await setView(WS_P, true);
     expect((await exportReq("?format=csv", MEMBER)).status).toBe(403);
   });
 
@@ -614,6 +721,7 @@ describe("partner export — GET /api/my-bookings/revenue/bookings/export", () =
     let refs: Record<string, string> = {};
     beforeEach(async () => {
       await putConfig(WS_P, { visiblePct: 50, sharePct: 40, reason: "r" });
+      await setView(WS_P, true);
       const invoiced = await makeBooking(CUST_P);
       await generate([invoiced._id]);
       const pending = await makeBooking(CUST_P);
@@ -674,19 +782,21 @@ describe("GET /api/v1/workspace/config carries revenueShareEnabled", () => {
   const cfg = () =>
     request(app).get("/api/v1/workspace/config").set("x-test-user", user(WL_ID, ["WORKSPACE_LEADER"], { customerId: String(CUST_P) }));
 
-  it("for a workspace without config.travelFlow (the legacy-derived path) — off, then on after the admin saves", async () => {
+  it("for a workspace without config.travelFlow (the legacy-derived path) — a partner config alone leaves it off; Workspace Manager turns it on and off", async () => {
     const before = await cfg();
     expect(before.status).toBe(200);
     expect(before.body.config.features.revenueShareEnabled).toBe(false);
     await putConfig(WS_P, { visiblePct: 50, sharePct: 40, reason: "r" });
+    expect((await cfg()).body.config.features.revenueShareEnabled).toBe(false);
+    await setView(WS_P, true);
     expect((await cfg()).body.config.features.revenueShareEnabled).toBe(true);
-    await putConfig(WS_P, { visiblePct: 50, sharePct: 40, enabled: false, reason: "paused" });
+    await setView(WS_P, false);
     expect((await cfg()).body.config.features.revenueShareEnabled).toBe(false);
   });
 
   it("for a workspace with config.travelFlow", async () => {
     await col("customerworkspaces").updateOne({ _id: WS_P }, { $set: { "config.travelFlow": "APPROVAL_FLOW" } });
-    await putConfig(WS_P, { visiblePct: 50, sharePct: 40, reason: "r" });
+    await setView(WS_P, true);
     expect((await cfg()).body.config.features.revenueShareEnabled).toBe(true);
   });
 });
