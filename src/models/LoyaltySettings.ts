@@ -17,6 +17,9 @@ import { Schema, model, type Document } from "mongoose";
  *   thresholdInr         cumulative business that makes an account eligible
  *   minRedemption, defaultCapPct, validityMonths — stored for later phases
  *   enrolBusinessesOnly  true = only registered businesses earn (services/loyalty.ts isEnrolled)
+ *   redemptionOpen       true = clients are told they can use points (the Rewards card and
+ *                        tab show the usage cap); false = "Using points opens soon". Wording
+ *                        only — redemption itself is not built. Super Admin + reason.
  *
  * changeLog is append-only: every field change, who, when, old → new, reason.
  */
@@ -49,6 +52,7 @@ export interface ILoyaltySettings extends Document {
   defaultCapPct: number;
   validityMonths: number;
   enrolBusinessesOnly: boolean;
+  redemptionOpen: boolean;
   changeLog: LoyaltyChange[];
 }
 
@@ -66,6 +70,7 @@ export const LOYALTY_SETTINGS_DEFAULTS = {
   defaultCapPct: 25,
   validityMonths: 24,
   enrolBusinessesOnly: true,
+  redemptionOpen: false,
 } as const;
 
 export const loyaltyChangeSchema = new Schema<LoyaltyChange>(
@@ -104,6 +109,7 @@ const LoyaltySettingsSchema = new Schema<ILoyaltySettings>(
     defaultCapPct: { type: Number, default: LOYALTY_SETTINGS_DEFAULTS.defaultCapPct, min: 0, max: 100 },
     validityMonths: { type: Number, default: LOYALTY_SETTINGS_DEFAULTS.validityMonths, min: 1 },
     enrolBusinessesOnly: { type: Boolean, default: LOYALTY_SETTINGS_DEFAULTS.enrolBusinessesOnly },
+    redemptionOpen: { type: Boolean, default: LOYALTY_SETTINGS_DEFAULTS.redemptionOpen },
     changeLog: { type: [loyaltyChangeSchema], default: [] },
   },
   { timestamps: true },

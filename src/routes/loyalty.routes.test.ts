@@ -342,7 +342,7 @@ describe("admin API — settings", () => {
     const g = await loy.get(READ, "/settings");
     expect(g.body.settings).toMatchObject({
       programmeEnabled: true, thresholdInr: 2_000_000, minRedemption: 1000,
-      defaultCapPct: 25, validityMonths: 24, enrolBusinessesOnly: true,
+      defaultCapPct: 25, validityMonths: 24, enrolBusinessesOnly: true, redemptionOpen: false,
     });
     expect(new Date(g.body.settings.launchDate).toISOString()).toBe("2026-10-31T18:30:00.000Z"); // 2026-11-01 00:00 IST
     expect(g.body.settings.rateHistory).toEqual([expect.objectContaining({ pointsPer100: 1, effectiveFrom: "2026-10-31T18:30:00.000Z" })]);
@@ -383,6 +383,18 @@ describe("admin API — settings", () => {
     expect(ok.body.changed).toEqual(["enrolBusinessesOnly"]);
     const entry = (await loy.get(SA, "/settings")).body.changeLog[0];
     expect(entry).toMatchObject({ field: "enrolBusinessesOnly", old: true, new: false, reason: "Agents join the programme" });
+  });
+
+  it("redemptionOpen (clients can use points) is Super Admin + reason, and logged", async () => {
+    expect((await loy.put(FULL, "/settings", { redemptionOpen: true, reason: "x" })).status).toBe(403);
+    expect((await loy.put(SA, "/settings", { redemptionOpen: true })).status).toBe(400);
+    expect((await loy.put(SA, "/settings", { redemptionOpen: "yes", reason: "x" })).status).toBe(400);
+    const ok = await loy.put(SA, "/settings", { redemptionOpen: true, reason: "Redemption goes live" });
+    expect(ok.body.changed).toEqual(["redemptionOpen"]);
+    expect(ok.body.settings.redemptionOpen).toBe(true);
+    const entry = (await loy.get(SA, "/settings")).body.changeLog[0];
+    expect(entry).toMatchObject({ field: "redemptionOpen", old: false, new: true, reason: "Redemption goes live", by: SA._id });
+    await LoyaltySettings.updateOne({ key: "global" }, { $set: { redemptionOpen: false } });
   });
 
   it("earn rates: Super Admin + reason, never back-dated, and never re-price existing invoices", async () => {

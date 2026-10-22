@@ -39,6 +39,11 @@ export interface WorkspaceFeatures {
   // PlumConnect WhatsApp inbox (Slice 4b). SCHEMA DEFAULT false; not in any
   // plan preset; HOUSE is entitled by the requireFeature bypass.
   plumconnectEnabled?: boolean;
+
+  // Plumtrips Rewards client view (loyalty Phase 2). VISIBILITY only: points
+  // are earned whatever this says (services/loyalty.ts never reads it).
+  // SCHEMA DEFAULT false; not in any plan preset — superadmin toggle only.
+  loyaltyRewardsEnabled?: boolean;
 }
 
 export type WorkspacePlan = "trial" | "starter" | "growth" | "enterprise";
@@ -339,6 +344,8 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         // tenant plan preset (see getDefaultFeaturesForPlan below).
         cstepEnabled: { type: Boolean, default: false },
         plumconnectEnabled: { type: Boolean, default: false },
+        // Plumtrips Rewards client view — visibility only, see the interface.
+        loyaltyRewardsEnabled: { type: Boolean, default: false },
       },
     },
 

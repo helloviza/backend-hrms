@@ -1033,6 +1033,8 @@ import manualBookingsRouter from "./routes/manualBookings.js";
 import invoicesRouter, { workspaceRouter as invoicesWorkspaceRouter } from "./routes/invoices.js";
 import creditNotesAdminRouter, { workspaceRouter as creditNotesWorkspaceRouter } from "./routes/creditNotes.js";
 import adminLoyaltyRouter from "./routes/admin.loyalty.js";
+import myRewardsRouter from "./routes/myRewards.js";
+import { requireInvoiceAccess } from "./middleware/requireInvoiceAccess.js";
 import notificationsRouter from "./routes/notifications.js";
 import { requireBillingStaff } from "./middleware/requireBillingStaff.js";
 import adminTravellersRouter from "./routes/admin.travellers.js";
@@ -1075,6 +1077,10 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // requires the per-person `loyalty` capability — see its header. Before the
   // broad /api/admin routers for the same interception reason as above.
   app.use("/api/admin/loyalty", requireAuth, requireWorkspace, requireHouse, adminLoyaltyRouter);
+  // Plumtrips Rewards client view (loyalty Phase 2): the workspace switch
+  // (visibility only), then the client invoice pages' access rule. Scoped by
+  // req.workspace.customerId inside — see routes/myRewards.ts.
+  app.use("/api/my-rewards", requireAuth, requireWorkspace, requireFeature("loyaltyRewardsEnabled"), requireInvoiceAccess, myRewardsRouter);
   // KEEP_IN_PLUMBOX — Tasks & task automations (Plumtrips Travel ops). Mounted
   // before the broad /api/admin routers for the same interception reason as
   // manual-bookings above: tasksRouter gates per route on requirePermission

@@ -19,6 +19,10 @@ import { loyaltyChangeSchema, type LoyaltyChange } from "./LoyaltySettings.js";
  *   balances       Σ LoyaltyLedger.points per bucket, moved in the same
  *                  transaction as each ledger insert
  *
+ * unlockNotice records the one "You've unlocked" email of an unlock (Phase 2,
+ * services/loyaltyUnlockEmail.ts): claimed once per eligibleAt, whether or
+ * not any member workspace had the client view switched on at that moment.
+ *
  * lockedUntil / lockOwner are the per-account reconcile lease;
  * rerunRequested is set by a touch that found the lease taken, so the holder
  * runs once more before releasing it.
@@ -27,6 +31,16 @@ export interface LoyaltyBalances {
   onTheWay: number;
   locked: number;
   ready: number;
+}
+
+export interface LoyaltyUnlockNotice {
+  /** The eligibleAt this notice is for — one notice per unlock, ever. */
+  eligibleAt: Date;
+  claimedAt: Date;
+  /** Member workspaces that had loyaltyRewardsEnabled on when the notice was claimed. */
+  workspaceIds: string[];
+  /** Addresses queued (0 when every member workspace had the switch off). */
+  recipients: number;
 }
 
 export interface ILoyaltyAccount extends Document {
@@ -39,6 +53,7 @@ export interface ILoyaltyAccount extends Document {
   cumulativeInr: number;
   balances: LoyaltyBalances;
   lastReconciledAt: Date | null;
+  unlockNotice: LoyaltyUnlockNotice | null;
   lockedUntil: Date | null;
   lockOwner: string | null;
   rerunRequested: boolean;
@@ -68,6 +83,18 @@ const LoyaltyAccountSchema = new Schema<ILoyaltyAccount>(
       default: () => ({ onTheWay: 0, locked: 0, ready: 0 }),
     },
     lastReconciledAt: { type: Date, default: null },
+    unlockNotice: {
+      type: new Schema<LoyaltyUnlockNotice>(
+        {
+          eligibleAt: { type: Date, required: true },
+          claimedAt: { type: Date, required: true },
+          workspaceIds: { type: [String], default: [] },
+          recipients: { type: Number, default: 0 },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
     lockedUntil: { type: Date, default: null },
     lockOwner: { type: String, default: null },
     rerunRequested: { type: Boolean, default: false },

@@ -8,10 +8,12 @@
 // customers, reconcile or adjust. SUPERADMIN bypasses (holdsCapability).
 //
 //   GET    /settings                       settings + change log
-//   PUT    /settings                       change settings (FULL; enrolment rule Super Admin + reason)
+//   PUT    /settings                       change settings (FULL; enrolment rule and redemptionOpen Super Admin + reason)
 //   POST   /settings/rates                 add an earn rate (Super Admin, reason, effectiveFrom >= now)
 //   GET    /accounts?eligible=yes|no&q=    accounts list
-//   GET    /accounts/:id                   account, members, ledger, PAN suggestions
+//   GET    /accounts/:id                   account, members (with each member workspace's
+//                                          loyaltyRewardsEnabled client-view switch, read-only), ledger,
+//                                          PAN suggestions
 //   PATCH  /accounts/:id                   name / enabled / startDateOverride / capPctOverride (FULL;
 //                                          disabling needs a reason and logs the points it removes)
 //   GET    /accounts/:id/disable-preview   points a disable would remove, per bucket
@@ -37,6 +39,7 @@ import LoyaltySettings from "../models/LoyaltySettings.js";
 import LoyaltyAccount from "../models/LoyaltyAccount.js";
 import LoyaltyLedger from "../models/LoyaltyLedger.js";
 import Invoice from "../models/Invoice.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { holdsCapability } from "../services/capabilityProbe.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import {
@@ -135,7 +138,7 @@ const NUMBER_FIELDS: Record<string, { min: number; max?: number; integer?: boole
   defaultCapPct: { min: 0, max: 100 },
   validityMonths: { min: 1, integer: true },
 };
-const BOOL_FIELDS = ["programmeEnabled", "enrolBusinessesOnly"];
+const BOOL_FIELDS = ["programmeEnabled", "enrolBusinessesOnly", "redemptionOpen"];
 /** Fields whose change alters points, so every account is reconciled after it. */
 const RECOMPUTE_FIELDS = new Set(["programmeEnabled", "launchDate", "thresholdInr", "enrolBusinessesOnly"]);
 
@@ -159,6 +162,11 @@ router.put("/settings", requireFull, async (req: any, res) => {
     }
     if (set.enrolBusinessesOnly !== undefined) {
       const lock = superAdminReasonError(req, "the enrolment rule (it applies to invoices back to the start date)", reason);
+      if (lock) return res.status(lock[0]).json({ error: lock[1] });
+    }
+    if (set.redemptionOpen !== undefined) {
+      // Tells every client whether they can use points — Super Admin + reason.
+      const lock = superAdminReasonError(req, "whether clients can use points", reason);
       if (lock) return res.status(lock[0]).json({ error: lock[1] });
     }
     for (const [f, rule] of Object.entries(NUMBER_FIELDS)) {
@@ -258,10 +266,13 @@ router.get("/accounts/:id", async (req, res) => {
     const account: any = await LoyaltyAccount.findById(req.params.id).select("-lockOwner").lean();
     if (!account) return res.status(404).json({ error: "Account not found" });
     const settings = await getLoyaltySettings();
-    const [names, ledger, suggestions] = await Promise.all([
+    const [names, ledger, suggestions, workspaces] = await Promise.all([
       customerNames(account.memberCustomerIds),
       LoyaltyLedger.find({ accountId: String(account._id) }).sort({ createdAt: -1, _id: -1 }).limit(500).lean(),
       panSuggestions(account.memberCustomerIds),
+      // Phase 2: the client-view switch of every member workspace (shown, not changed, here).
+      CustomerWorkspace.find({ customerId: { $in: account.memberCustomerIds } })
+        .select("_id customerId companyName status config.features.loyaltyRewardsEnabled").lean(),
     ]);
     // Current invoice numbers for linked rows (the row's own invoiceNo is a snapshot).
     const invIds = [...new Set(ledger.map((l: any) => l.invoiceId).filter(isOid))];
@@ -283,6 +294,10 @@ router.get("/accounts/:id", async (req, res) => {
             customerId: c, name: displayName(cust, c), customerCode: cust?.customerCode ?? null,
             gstin: cust?.gstNumber || cust?.gstin || "", gstStatus: cust?.gstStatus || "NOT_SET",
             enrolled: isEnrolled(cust, settings),
+            workspaces: (workspaces as any[]).filter((w) => String(w.customerId) === c).map((w) => ({
+              workspaceId: String(w._id), name: w.companyName || "", status: w.status || "",
+              loyaltyRewardsEnabled: w.config?.features?.loyaltyRewardsEnabled === true,
+            })),
           };
         }),
       },

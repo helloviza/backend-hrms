@@ -53,6 +53,7 @@ import LoyaltyLedger, {
   LOYALTY_BUCKETS, type LoyaltyBucket, type LoyaltyReason, type LoyaltySnapshot,
 } from "../models/LoyaltyLedger.js";
 import LoyaltySweepRun from "../models/LoyaltySweepRun.js";
+import { notifyLoyaltyUnlock } from "./loyaltyUnlockEmail.js";
 import { normalizeGstStatus } from "../utils/customerGst.js";
 import { todayIST } from "../utils/dateIST.js";
 import logger from "../utils/logger.js";
@@ -74,6 +75,7 @@ export interface LoyaltySettingsValues {
   defaultCapPct: number;
   validityMonths: number;
   enrolBusinessesOnly: boolean;
+  redemptionOpen: boolean;
 }
 
 const BALANCE_FIELD: Record<LoyaltyBucket, keyof LoyaltyBalances> = {
@@ -513,7 +515,8 @@ function deltaReason(x: {
 
 /* ── Applying ──────────────────────────────────────────────────────── */
 
-export interface ApplyResult { rowsWritten: number; conflicts: number }
+/** unlocked: this call is the one that set the account's eligibleAt. */
+export interface ApplyResult { rowsWritten: number; conflicts: number; unlocked: boolean }
 
 /**
  * Writes a plan: per invoice, its delta rows and the cached balance move in
@@ -523,9 +526,11 @@ export interface ApplyResult { rowsWritten: number; conflicts: number }
  */
 export async function applyPlan(plan: AccountPlan, actor = SYSTEM): Promise<ApplyResult> {
   const accountOid = new mongoose.Types.ObjectId(plan.accountId);
+  let unlocked = false;
   if (plan.becameEligible && plan.eligibleAt) {
     // Sticky: only ever set when it is still empty.
-    await LoyaltyAccount.updateOne({ _id: accountOid, eligibleAt: null }, { $set: { eligibleAt: plan.eligibleAt } });
+    const r = await LoyaltyAccount.updateOne({ _id: accountOid, eligibleAt: null }, { $set: { eligibleAt: plan.eligibleAt } });
+    unlocked = r.modifiedCount === 1;
   }
 
   const byInvoice = new Map<string, LedgerDelta[]>();
@@ -569,7 +574,7 @@ export async function applyPlan(plan: AccountPlan, actor = SYSTEM): Promise<Appl
     { _id: accountOid },
     { $set: { cumulativeInr: plan.cumulativeInr, lastReconciledAt: new Date() } },
   );
-  return { rowsWritten, conflicts };
+  return { rowsWritten, conflicts, unlocked };
 }
 
 /* ── Reconcile (lease-guarded) ─────────────────────────────────────── */
@@ -619,6 +624,7 @@ export async function reconcileAccount(
   let passes = 0;
   let rowsWritten = 0;
   let conflicts = 0;
+  let unlocked = false;
   let plan: AccountPlan | null = null;
   try {
     for (;;) {
@@ -629,6 +635,7 @@ export async function reconcileAccount(
       const r = await applyPlan(plan, opts.actor ?? SYSTEM);
       rowsWritten += r.rowsWritten;
       conflicts += r.conflicts;
+      unlocked ||= r.unlocked;
       // Someone touched the account mid-run, or a pass lost a race: go again.
       const again = await LoyaltyAccount.findOneAndUpdate(
         { _id: oid, lockOwner: owner, rerunRequested: true },
@@ -639,6 +646,9 @@ export async function reconcileAccount(
   } finally {
     await LoyaltyAccount.updateOne({ _id: oid, lockOwner: owner }, { $set: { lockedUntil: null, lockOwner: null } });
   }
+  // Phase 2: this run crossed the threshold — tell the client, once
+  // (services/loyaltyUnlockEmail.ts claims the notice; never blocks the run).
+  if (unlocked) inBackground("unlock-email", () => notifyLoyaltyUnlock(id, settings), { accountId: id });
 
   const after: any = await LoyaltyAccount.findById(oid).select("balances eligibleAt cumulativeInr").lean();
   return {
