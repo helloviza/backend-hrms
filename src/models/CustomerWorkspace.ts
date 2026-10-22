@@ -44,6 +44,10 @@ export interface WorkspaceFeatures {
   // are earned whatever this says (services/loyalty.ts never reads it).
   // SCHEMA DEFAULT false; not in any plan preset — superadmin toggle only.
   loyaltyRewardsEnabled?: boolean;
+  // Partner revenue share dashboard (/api/my-bookings/revenue). SCHEMA
+  // DEFAULT false; set only by routes/admin.partnerRevenue.ts when a partner
+  // config is saved (= its `enabled`) or removed (false).
+  revenueShareEnabled?: boolean;
 }
 
 export type WorkspacePlan = "trial" | "starter" | "growth" | "enterprise";
@@ -346,6 +350,7 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         plumconnectEnabled: { type: Boolean, default: false },
         // Plumtrips Rewards client view — visibility only, see the interface.
         loyaltyRewardsEnabled: { type: Boolean, default: false },
+        revenueShareEnabled: { type: Boolean, default: false },
       },
     },
 

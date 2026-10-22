@@ -201,6 +201,18 @@ export interface IManualBooking extends Document {
   bookedBy: Schema.Types.ObjectId;
   notes?: string;
   invoiceId?: Schema.Types.ObjectId;
+  // Partner revenue share, frozen when the booking is invoiced (see
+  // services/partnerRevenue.ts). Absent = not invoiced, no enabled partner
+  // config, or no cost price. Never recomputed from the current config.
+  partnerShare?: {
+    visiblePct: number;
+    sharePct: number;
+    configVersion: number;
+    marginBase: number;
+    bakedIn: number;
+    share: number;
+    at: Date;
+  };
   isActive?: boolean;
   cancelledAt?: Date;
   cancelledBy?: Schema.Types.ObjectId;
@@ -269,6 +281,22 @@ export interface IManualBooking extends Document {
 // leaf defaults would materialise `{ city: null, … }` on every row the bulk
 // importer writes, which reads as "we looked and found nothing" for rows where
 // we never looked at all. See IManualBooking.bookedFromCity.
+// Sub-schema + `default: undefined` on the path, same reason as
+// BookedFromCitySchema below: the block is ABSENT until a booking is
+// invoiced for an enabled partner, never a materialised `{ share: 0 }`.
+const PartnerShareSchema = new Schema(
+  {
+    visiblePct: { type: Number, required: true },
+    sharePct: { type: Number, required: true },
+    configVersion: { type: Number, required: true },
+    marginBase: { type: Number, required: true },
+    bakedIn: { type: Number, required: true },
+    share: { type: Number, required: true },
+    at: { type: Date, required: true },
+  },
+  { _id: false },
+);
+
 const BookedFromCitySchema = new Schema(
   {
     city: { type: String, default: null },
@@ -432,6 +460,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     bookedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     notes: String,
     invoiceId: { type: Schema.Types.ObjectId, ref: "Invoice" },
+    partnerShare: { type: PartnerShareSchema, default: undefined },
     isActive: { type: Boolean, default: true, index: true },
     cancelledAt: { type: Date },
     cancelledBy: { type: Schema.Types.ObjectId, ref: 'User' },

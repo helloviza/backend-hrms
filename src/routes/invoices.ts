@@ -213,6 +213,7 @@ import { resolveCustomerState, buildAddressStr } from "../utils/invoiceClient.js
 import {
   createInvoiceFromBookings, InvoiceGenerationError, claimBookingsForInvoice,
 } from "../services/invoiceGeneration.service.js";
+import { snapshotPartnerShareSafe, clearPartnerShareSafe } from "../services/partnerRevenue.js";
 import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { isHouseCallerContext } from "../utils/bookingAccess.js";
@@ -1241,6 +1242,8 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
     });
 
     loyaltyTouch({ invoiceId: invoiceObjectId });
+    // Partner revenue share for the claimed bookings — after the commit, never inside it.
+    await snapshotPartnerShareSafe(addedIds, "invoice.add-bookings");
     const updatedInvoice = await Invoice.collection.findOne({ _id: invoiceObjectId });
 
     res.json({ ok: true, invoice: updatedInvoice });
@@ -1447,6 +1450,7 @@ router.post("/:id/cancel", requirePermission("invoices", "FULL"), async (req: an
         { _id: { $in: invoice.bookingIds } },
         { $set: { status: "CONFIRMED", invoiceId: null, invoiceRaisedDate: null } },
       );
+      await clearPartnerShareSafe(invoice.bookingIds, "invoice.cancel");
     }
     loyaltyTouch({ invoiceId: invoice._id });
 
@@ -1550,8 +1554,14 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
     const hasStructuralEdit = hasLineEdit || addIds.length > 0 || removeIds.length > 0;
 
     let responseInvoice: any = null;
+    // Bookings this edit invoiced / un-invoiced — their partner share is
+    // snapshotted / cleared AFTER the commit, never inside the transaction.
+    let partnerAdded: unknown[] = [];
+    let partnerRemoved: unknown[] = [];
 
     await session.withTransaction(async () => {
+      partnerAdded = [];
+      partnerRemoved = [];
       const invoice = await Invoice.findById(req.params.id).session(session);
       if (!invoice || !(await invoiceInCallerScope(req, invoice))) throw new HttpError(404, "Invoice not found");
       if (invoice.status !== "DRAFT") {
@@ -1642,6 +1652,7 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
             { $set: { status: "CONFIRMED", invoiceId: null, invoiceRaisedDate: null } },
             { session },
           );
+          partnerRemoved = (toRemove as any[]).map((b) => b._id);
 
           fieldsChanged.push("bookingsRemoved");
           newValues.bookingsRemoved = removedRefs;
@@ -1699,6 +1710,7 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
             { $set: { status: "INVOICED", invoiceId: invoice._id, invoiceRaisedDate: new Date() } },
             { session },
           );
+          partnerAdded = (toAdd as any[]).map((b) => b._id);
 
           fieldsChanged.push("bookingsAdded");
           newValues.bookingsAdded = (toAdd as any[]).map((b) => b.bookingRef);
@@ -1782,6 +1794,9 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
       responseInvoice = invoice.toObject();
     });
     if (responseInvoice) loyaltyTouch({ invoiceId: responseInvoice._id });
+
+    if (partnerRemoved.length) await clearPartnerShareSafe(partnerRemoved, "invoice.edit.remove");
+    if (partnerAdded.length) await snapshotPartnerShareSafe(partnerAdded, "invoice.edit.add");
 
     res.json({ ok: true, invoice: responseInvoice });
   } catch (err: any) {

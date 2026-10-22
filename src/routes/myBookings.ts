@@ -317,7 +317,7 @@ function fmtDateDMY(d: Date | string | null | undefined): string {
   return `${dd}/${mm}/${dt.getFullYear()}`;
 }
 
-function csvRow(values: (string | number | undefined | null)[]) {
+export function csvRow(values: (string | number | undefined | null)[]) {
   return (
     values
       .map((v) => {
@@ -425,7 +425,7 @@ async function loadManualBookingsForCustomer(
   }));
 }
 
-const CUSTOMER_BOOKING_COLUMNS = [
+export const CUSTOMER_BOOKING_COLUMNS = [
   // Original 11 (Given By removed 2026-07-24 — see decision note below) —
   // positions stable for anyone's saved template.
   "S. No",
@@ -481,7 +481,7 @@ const CUSTOMER_BOOKING_COLUMNS = [
 ];
 
 /** The 40 customer-safe fields, keyed — shared by the JSON list and the export row builder. */
-function customerBookingFields(b: any) {
+export function customerBookingFields(b: any) {
   const paxName = (b.passengers || [])
     .map((p: any) => String(p?.name ?? "").trim())
     .filter(Boolean)
@@ -537,7 +537,7 @@ function customerBookingFields(b: any) {
   };
 }
 
-function customerBookingRow(b: any, srNo: number): (string | number)[] {
+export function customerBookingRow(b: any, srNo: number): (string | number)[] {
   const f = customerBookingFields(b);
   return [
     srNo,
@@ -693,14 +693,14 @@ router.get("/manual/export", async (req: Request, res: Response) => {
  * this $expr must change with it.
  * ═════════════════════════════════════════════════════════════════════ */
 
-const STATS_SERVICE_BUCKETS = ["FLIGHT", "HOTEL", "VISA", "CAB", "FOREX", "MICE", "OTHER"] as const;
+export const STATS_SERVICE_BUCKETS = ["FLIGHT", "HOTEL", "VISA", "CAB", "FOREX", "MICE", "OTHER"] as const;
 
 // Mirrors ManualBooking.ts:457-480's manualTypeToService grouping, collapsed
 // to the 7 buckets the Overview breaks out (TRANSFER/ESIM/HOLIDAYS/TRAIN and
 // the OTHER-collapsed types all fall into OTHER here — a display
 // simplification, not a change to what manualTypeToService itself does for
 // the mirror). Keep this switch in sync with that function if either changes.
-const SERVICE_BUCKET_EXPR = {
+export const SERVICE_BUCKET_EXPR = {
   $switch: {
     branches: [
       { case: { $in: ["$type", ["FLIGHT", "FLIGHT_RESCHEDULE", "DUMMY_FLIGHT"]] }, then: "FLIGHT" },
@@ -716,7 +716,7 @@ const SERVICE_BUCKET_EXPR = {
 
 // Customer-facing sell price only — identical fallback chain to the mirror
 // sync (ManualBooking.ts:528-529) and the /manual export (myBookings.ts:428).
-const STATS_AMOUNT_EXPR = {
+export const STATS_AMOUNT_EXPR = {
   $ifNull: [
     "$pricing.grandTotal",
     { $ifNull: ["$pricing.totalWithGST", { $ifNull: ["$pricing.quotedPrice", 0] }] },
@@ -727,7 +727,7 @@ const STATS_AMOUNT_EXPR = {
 // counting the staff booker. Keys on normalized name (trim + lowercase) since
 // that's the field ops staff actually fill in; falls back to email only when
 // name is blank. A passenger with neither is excluded (has no usable identity).
-const TRAVELLER_KEY_EXPR = {
+export const TRAVELLER_KEY_EXPR = {
   $let: {
     vars: {
       nm: { $trim: { input: { $toLower: { $ifNull: ["$passengers.name", ""] } } } },
@@ -804,12 +804,12 @@ function periodAvgAdvanceBranch(from: Date, to: Date) {
   ];
 }
 
-function parseDayStart(v: unknown): Date | null {
+export function parseDayStart(v: unknown): Date | null {
   if (!v) return null;
   const d = new Date(String(v));
   return isNaN(d.getTime()) ? null : d;
 }
-function parseDayEnd(v: unknown): Date | null {
+export function parseDayEnd(v: unknown): Date | null {
   if (!v) return null;
   const d = new Date(`${String(v)}T23:59:59.999Z`);
   return isNaN(d.getTime()) ? null : d;

@@ -30,6 +30,7 @@ import { resolveCustomerState, buildAddressStr } from "../utils/invoiceClient.js
 import { detectGSTType, calculateGSTAmounts, GST_STATE_CODES, UNION_TERRITORIES, type GSTType } from "../utils/gstDetection.js";
 import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
 import { triggerTaskAutomation } from "./taskAutomation.js";
+import { snapshotPartnerShareSafe } from "./partnerRevenue.js";
 
 /* ── Error type so route wrappers can reproduce the exact HTTP responses ── */
 
@@ -508,6 +509,11 @@ async function createOneInvoice(
   }
 
   const completeInvoice = await Invoice.collection.findOne({ _id: invoice._id });
+
+  // Freeze the partner revenue share (no-op unless the client is an enabled
+  // partner). AFTER the claim's transaction has committed, never inside it —
+  // a snapshot failure must not roll back an invoice.
+  await snapshotPartnerShareSafe(bookingsForInvoice.map((b: any) => b._id), "invoice.generate");
 
   // Task automation hook (fire-and-forget).
   triggerTaskAutomation("invoice.created", {

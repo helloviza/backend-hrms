@@ -578,6 +578,11 @@ router.get("/config", async (req: AnyObj, res) => {
       if (ws.config.features.payrollEnabled !== undefined) {
         config.features.payrollEnabled = ws.config.features.payrollEnabled;
       }
+      // Set by routes/admin.partnerRevenue.ts on config.features; a legacy
+      // workspace (no config.travelFlow) would otherwise never surface it.
+      if (ws.config.features.revenueShareEnabled !== undefined) {
+        config.features.revenueShareEnabled = ws.config.features.revenueShareEnabled;
+      }
     }
 
     // Attach per-user formTier and travelerId from CustomerMember

@@ -970,6 +970,7 @@ import sbtCityImageRouter from "./routes/sbt.cityImage.js";
 import travelFormRouter from "./routes/travelForm.js";
 // Customer-facing READ-ONLY booking history (TravelBooking mirror, no feature gate)
 import myBookingsRouter from "./routes/myBookings.js";
+import myBookingsRevenueRouter from "./routes/myBookings.revenue.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // SHARED_API — SBT (Self-Booking Tool) routes (will be exposed via tenant API in Phase 4)
@@ -980,12 +981,18 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/sbt/config", sbtConfigRouter);
   app.use("/api/sbt/city-image", sbtCityImageRouter);
   app.use("/api/travel-forms", requireAuth, requireWorkspace, requireFeature("travelFormEnabled"), travelFormRouter);
+  // Partner revenue share dashboard — mounted BEFORE /api/my-bookings so it is
+  // matched first. Its own requireFeature("revenueShareEnabled") +
+  // requireInvoiceAccess live inside the router.
+  app.use("/api/my-bookings/revenue", requireAuth, requireWorkspace, myBookingsRevenueRouter);
   // Read-only booking history for any authenticated workspace member — NO requireFeature
   app.use("/api/my-bookings", requireAuth, requireWorkspace, myBookingsRouter);
 }
 
 // SBT Admin (offer config)
 import adminSBTRouter from "./routes/admin.sbt.js";
+// Partner revenue share config (SUPERADMIN only)
+import adminPartnerRevenueRouter from "./routes/admin.partnerRevenue.js";
 // Admin Billing Console
 import adminBillingRouter from "./routes/admin.billing.js";
 // Unified Billing (TravelBooking — all services)
@@ -996,6 +1003,8 @@ import adminBusinessWalletsRouter from "./routes/admin.businessWallets.js";
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Travel admin (SBT config, billing console, unified billing)
   app.use("/api/admin/sbt", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), adminSBTRouter);
+  // requireAuth + requireAdmin + requireSuperAdmin inside the router, same as /api/admin/sbt/margins.
+  app.use("/api/admin/partner-revenue", requireAuth, requireWorkspace, adminPartnerRevenueRouter);
   app.use("/api/admin/business-wallets", adminBusinessWalletsRouter);
   app.use("/api/admin/billing", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), adminBillingRouter);
   // NO requireFeature — same reasoning as /api/my-bookings. These are READ-ONLY
