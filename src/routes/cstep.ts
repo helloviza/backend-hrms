@@ -58,10 +58,12 @@ import {
 import {
   CSTEP_SERVICE_TYPES,
   CSTEP_VENDOR_PAYABLE_STATUSES,
+  arrangementAmountGap,
   type CstepServiceType,
   type CstepRateSource,
 } from "../models/cstep/CstepArrangement.js";
 import type { CstepReportDirection, CstepReportPaidBy } from "../models/cstep/CstepReportLeg.js";
+import { SERVICE_LABEL } from "./cstep.vendorPayables.js";
 import type { CstepDocumentType } from "../models/cstep/CstepAttachment.js";
 import type {
   CstepSettlementLineClassification,
@@ -1698,6 +1700,10 @@ router.get("/requests/:id", async (req: any, res: any) => {
       !isClaim &&
       VENDOR_PAYABLE_STATUSES.has(doc.status) &&
       (await callerCanPayVendorsForTraveller(req, doc.travelerProfileId));
+    // ...and put the amount on a vendor line that has none (PATCH
+    // /arrangements/:lineId/missing-amount) — Finance or Admin only.
+    const canSetMissingAmounts =
+      canPayVendors && (await callerCanFinanceForTraveller(req, doc.travelerProfileId));
     // The figure Finance pays out — read off the finalized settlement so the
     // Finance user's card can show it without needing the Official-only
     // GET /settlement. Present only while the case is with Finance.
@@ -1758,6 +1764,7 @@ router.get("/requests/:id", async (req: any, res: any) => {
       canSettle,
       canFinance,
       canPayVendors,
+      canSetMissingAmounts,
       canVerifyClaim,
       financeAmountClaimed,
       financeClaimDue,
@@ -3281,6 +3288,16 @@ router.patch("/requests/:id/arrangements/:lineId/payment", async (req: any, res:
     if (next !== "PAID" && next !== "UNPAID") {
       return res.status(400).json({ error: "paymentStatus must be PAID or UNPAID" });
     }
+    // A payment is recorded against a real figure — the payables, Travel
+    // Register and Tally export all read amountInr off the line.
+    const amountGap = next === "PAID" ? arrangementAmountGap(line) : null;
+    if (amountGap) {
+      return res.status(409).json({
+        error: `${SERVICE_LABEL[line.arrangedType] || line.arrangedType} — ${line.vendorName || line.vendorCode} on ${
+          doc.claimReference || "this request"
+        } ${amountGap} — enter the amount before marking it paid`,
+      });
+    }
     const paymentRef = String(body.paymentRef ?? "").trim();
     if (paymentRef.length > 100) return res.status(400).json({ error: "Payment reference is too long (100 characters max)" });
     const vendorInvoiceNo = String(body.vendorInvoiceNo ?? "").trim();
@@ -3340,6 +3357,77 @@ router.patch("/requests/:id/arrangements/:lineId/payment", async (req: any, res:
   } catch (err: any) {
     console.error("[CSTEP requests arrangements payment PATCH]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to record the vendor payment" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * PATCH /requests/:id/arrangements/:lineId/missing-amount — this
+ * traveller's Finance user or a CSTEP Admin puts the amount on a
+ * vendor-bearing line that has none, from ARRANGING onwards and whether or
+ * not it is paid yet. The arrangement PATCH only works while ARRANGING and
+ * refuses a paid line, so without this a line paid (or left unpaid past
+ * the arrange step) with no amount could never get one — and can't be paid
+ * or exported to Tally without it. Narrow on purpose: a line that already
+ * has an amount is refused (correct it the normal way, unpaid while
+ * ARRANGING). Body: the arrangement PATCH's amount fields (currency,
+ * amount, exchangeRate, rateDate, rateSource); the result must be a
+ * positive INR amount. Logged as VENDOR_PAYMENT.
+ * ───────────────────────────────────────────────────────────────────── */
+router.patch("/requests/:id/arrangements/:lineId/missing-amount", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerCanFinanceForTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Finance user or a CSTEP Admin can set a missing amount" });
+    }
+    if (isClaimFormType(doc.formType) || !VENDOR_PAYABLE_STATUSES.has(doc.status)) {
+      return res.status(409).json({ error: "A missing amount can be set once the request is being arranged" });
+    }
+    if (!mongoose.Types.ObjectId.isValid(req.params.lineId)) {
+      return res.status(400).json({ error: "Invalid arrangement line id" });
+    }
+    const line = await CstepArrangement.findOne({
+      _id: req.params.lineId,
+      workspaceId: req.workspaceObjectId,
+      requestId: doc._id,
+    });
+    if (!line) return res.status(404).json({ error: "Arrangement line not found" });
+    if (!line.vendorId) return res.status(409).json({ error: "Choose a vendor for this line first" });
+    if (!arrangementAmountGap(line)) {
+      return res.status(409).json({ error: "This line already has an amount — only a missing amount can be set here" });
+    }
+
+    const amountResult = computeArrangementAmountFields(req.body || {});
+    if (!amountResult.ok) return res.status(400).json({ error: amountResult.error });
+    if (!amountResult.touched || !(Number(amountResult.fields.amountInr) > 0)) {
+      return res.status(400).json({ error: "Enter an amount above zero (and an exchange rate for a foreign currency)" });
+    }
+    line.currency = amountResult.fields.currency;
+    line.amount = amountResult.fields.amount;
+    line.exchangeRate = amountResult.fields.exchangeRate;
+    line.rateDate = amountResult.fields.rateDate;
+    line.rateSource = amountResult.fields.rateSource;
+    line.amountInr = amountResult.fields.amountInr;
+    await line.save();
+
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "FINANCE",
+      actor: new mongoose.Types.ObjectId(ownerId(req)),
+      action: "VENDOR_PAYMENT",
+      comment:
+        `${line.arrangedType} — ${line.vendorCode} ${line.vendorName}: missing amount set` +
+        ` | Amount: ${line.amount} ${line.currency}${line.currency !== "INR" ? ` (₹${line.amountInr})` : ""}` +
+        ` | ${line.paymentStatus === "PAID" ? "already paid" : "unpaid"}`,
+      at: new Date().toISOString(),
+    });
+
+    res.json({ ok: true, line: line.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests arrangements missing-amount PATCH]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to set the amount" });
   }
 });
 

@@ -476,6 +476,34 @@ describe("payment at the arrange step — one source of truth per line", () => {
   });
 });
 
+describe("import — every line the row pays needs its amount", () => {
+  it("a row whose lines include one with no amount is refused whole, naming it; once set, the row pays both", async () => {
+    const ref = `0096/${MMYY}`;
+    const id = await plantRequest(ref, TP.a, "ARRANGED", [
+      { type: "FLIGHT", vendor: "sky", amount: 7200 },
+      { type: "CAB", vendor: "sky", amount: 0 },
+    ]);
+    const cab: any = await col("csteparrangements").findOne({ requestId: new mongoose.Types.ObjectId(id), arrangedType: "CAB" });
+    await col("csteparrangements").updateOne({ _id: cab._id }, { $unset: { amount: "", exchangeRate: "", amountInr: "" } });
+
+    // The same row twice: the refusal doesn't make the second "paid there".
+    const row = `CSTEPVEN0001,${ref},2026-10-17,UTR-NOAMT`;
+    const csv = Buffer.from(["Vendor Code,Reference,Paid On,Payment Ref", row, row].join("\n") + "\n");
+    for (const step of ["preview", "commit"] as const) {
+      const r = ok(await upload(step, ACT.finA, csv, "noamount.csv")).body;
+      expect(r.paidLines).toBe(0);
+      for (const res of r.results) {
+        expect(res).toMatchObject({ outcome: "INVALID", reason: `Cab has no amount — enter the amount on ${ref} before importing its payment` });
+      }
+    }
+    expect(await col("csteparrangements").countDocuments({ requestId: new mongoose.Types.ObjectId(id), paymentStatus: "PAID" })).toBe(0);
+
+    ok(await patch(ACT.finA, `/requests/${id}/arrangements/${cab._id}/missing-amount`, { currency: "INR", amount: 950 }));
+    const r = ok(await upload("commit", ACT.finA, Buffer.from(["Vendor Code,Reference,Paid On,Payment Ref", row].join("\n") + "\n"), "noamount.csv")).body;
+    expect(r.results[0]).toMatchObject({ outcome: "PAID", paidLines: 2 });
+  });
+});
+
 describe("Option A — the register's TIN column carries the EVR reference", () => {
   it("Event row shows EVR0001/MMYY", async () => {
     const r = await binary(

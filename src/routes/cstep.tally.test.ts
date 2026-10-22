@@ -1,12 +1,17 @@
 // apps/backend/src/routes/cstep.tally.test.ts
 //
 // CSTEP Finance "Export to Tally" — routes/cstep.tally.ts, plus the vendor
-// invoice no. now captured on mark-paid (routes/cstep.ts) and the TALLY
-// series (utils/cstepSequence.ts). Paid vendor lines across vendor types →
-// Dr/Cr pairs sharing one voucher number, the mapped expense ledger (or the
-// default for an unmapped type), amounts / narration / bill-wise fields, the
-// "Upload" sheet with its 25 headers in order and real date cells, a paidAt
-// range, stable voucher numbers on re-export, and Finance/Admin-only access.
+// invoice no. captured on mark-paid and the amount a line must carry before
+// it is paid (routes/cstep.ts), and the TALLY series (utils/cstepSequence.ts).
+// Paid vendor lines across vendor types → Dr/Cr pairs sharing one voucher
+// number, the mapped expense ledger (or the default for an unmapped type),
+// amounts / narration / bill-wise fields, the Dr row's cost centres
+// (department, employee, the Locations label + the mapped code or the raw
+// location, from the traveller's base or the trip's destination), no
+// instrument columns, the "Upload" sheet with its 25 headers in order and
+// real date cells, a paidAt range, stable voucher numbers on re-export,
+// Finance/Admin-only access, and the 409s — no company name, an unmapped
+// type, a paid line with no amount — that number nothing.
 //
 // Real: cstep + tally routers, models, sheetImport, sequence engine,
 //   in-memory Mongo REPLICA SET (voucher numbers are taken in a
@@ -61,10 +66,11 @@ const col = (n: string) => mongoose.connection.db!.collection(n);
 const WS = oid();
 const U = { travA: oid(), travB: oid(), finA: oid(), finB: oid(), admin: oid(), plain: oid() };
 const TP = { a: oid(), b: oid() };
+const DEPT = oid();
 const VT = { air: oid(), hotel: oid(), venue: oid() };
 const V = { sky: oid(), lake: oid(), hall: oid() };
 const R = { tour: oid(), event: oid(), tourB: oid() };
-const L = { flight: oid(), hotel: oid(), hotelSept: oid(), hall: oid(), hotelB: oid() };
+const L = { flight: oid(), hotel: oid(), hotelSept: oid(), hall: oid(), hotelB: oid(), cabNoAmount: oid(), usdNoRate: oid(), legacy: oid() };
 
 const fakeAuth = (req: any, _res: any, next: any) => {
   req.user = JSON.parse(String(req.headers["x-test-user"] || "{}"));
@@ -99,6 +105,10 @@ const exportSheet = (as: any, from: string, to: string) =>
       res.on("data", (c: Buffer) => chunks.push(c));
       res.on("end", () => cb(null, Buffer.concat(chunks)));
     });
+const exportJson = async (as: any, from: string, to: string) => {
+  const r = await exportSheet(as, from, to);
+  return { status: r.status, body: JSON.parse(r.body.toString()) };
+};
 async function readSheet(buf: Buffer) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buf as any);
@@ -108,6 +118,7 @@ async function readSheet(buf: Buffer) {
   return { wb, ws, rows };
 }
 const pay = (as: any, req: any, line: any, body: any) => send("patch", as, `/requests/${req}/arrangements/${line}/payment`, body);
+const setMissingAmount = (as: any, req: any, line: any, body: any) => send("patch", as, `/requests/${req}/arrangements/${line}/missing-amount`, body);
 
 const MMYY = (() => {
   const d = new Date(Date.now() + 330 * 60 * 1000);
@@ -115,6 +126,16 @@ const MMYY = (() => {
 })();
 const REF = { tour: `0001/${MMYY}`, event: `EVR0001/${MMYY}`, tourB: `0002/${MMYY}` };
 const ymd = (d: any) => (d instanceof Date ? d.toISOString().slice(0, 10) : d);
+
+const SETTINGS = {
+  companyName: "CSTEP",
+  defaultLedger: "Travel Expenses - Misc",
+  ledgerMap: [
+    { vendorTypeId: String(VT.air), ledger: "Air Travel Expenses" },
+    { vendorTypeId: String(VT.hotel), ledger: "Hotel & Lodging" },
+  ],
+  locationMap: [{ location: "bengaluru ", code: "BLR-HQ" }],
+};
 
 let replSet: MongoMemoryReplSet;
 
@@ -135,9 +156,10 @@ beforeAll(async () => {
   const now = new Date();
   await col("customerworkspaces").insertOne({ _id: WS, customerId: String(oid()), companyName: "QC CSTEP", config: { features: { cstepEnabled: true } } } as any);
   await col("users").insertMany((Object.keys(U) as Array<keyof typeof U>).map((k) => ({ _id: U[k], email: `${U[k]}@qc.local`, roles: ["REQUESTER"], workspaceId: WS })) as any[]);
+  await col("departments").insertOne({ _id: DEPT, workspaceId: WS, name: "Energy Research", isActive: true } as any);
   await col("travellerprofiles").insertMany([
-    { _id: TP.a, workspaceId: WS, travelerId: "E-001", firstName: "Asha", lastName: "Rao", isActive: true, claimedBy: U.travA, financeUserId: U.finA },
-    { _id: TP.b, workspaceId: WS, travelerId: "E-002", firstName: "Ravi", lastName: "Kumar", isActive: true, claimedBy: U.travB, financeUserId: U.finB },
+    { _id: TP.a, workspaceId: WS, travelerId: "E-001", firstName: "Asha", lastName: "Rao", isActive: true, claimedBy: U.travA, financeUserId: U.finA, departmentId: DEPT, workLocation: "Bengaluru" },
+    { _id: TP.b, workspaceId: WS, travelerId: "E-002", firstName: "Ravi", lastName: "Kumar", isActive: true, claimedBy: U.travB, financeUserId: U.finB, workLocation: "New Delhi" },
   ] as any[]);
   await col("cstepvendortypes").insertMany([
     { _id: VT.air, workspaceId: WS, name: "Airline", isActive: true },
@@ -151,15 +173,15 @@ beforeAll(async () => {
     vendor(V.hall, "CSTEPVEN0003", "Lakeside Convention Hall", VT.venue),
   ] as any[]);
 
-  const reqDoc = (_id: any, formType: string, ref: string, tp: any, project?: string) => ({
+  const reqDoc = (_id: any, formType: string, ref: string, tp: any, extra: any = {}) => ({
     _id, workspaceId: WS, travelerProfileId: tp, createdBy: U.travA, formType, purpose: `QC ${ref}`,
     departureDate: "2026-11-10", returnDate: "2026-11-12", status: "ARRANGED", claimReference: ref,
-    ...(project ? { project } : {}), createdAt: now, updatedAt: now,
+    ...extra, createdAt: now, updatedAt: now,
   });
   await col("csteptravelrequests").insertMany([
-    reqDoc(R.tour, "TOUR_PROPOSAL", REF.tour, TP.a, "PRJ-ENERGY"),
-    reqDoc(R.event, "EVENT_REQUEST", REF.event, TP.a),
-    reqDoc(R.tourB, "TOUR_PROPOSAL", REF.tourB, TP.b, "PRJ-SOLAR"),
+    reqDoc(R.tour, "TOUR_PROPOSAL", REF.tour, TP.a, { project: "PRJ-ENERGY", type: "DOMESTIC", stations: [{ from: "Bengaluru", to: "Mumbai" }, { from: "Mumbai", to: "Pune" }] }),
+    reqDoc(R.event, "EVENT_REQUEST", REF.event, TP.a, { eventLocation: "Goa" }),
+    reqDoc(R.tourB, "TOUR_PROPOSAL", REF.tourB, TP.b, { project: "PRJ-SOLAR", type: "INTERNATIONAL", countries: [{ country: "Germany" }] }),
   ] as any[]);
   const vendors: any[] = await col("cstepvendors").find({}).toArray();
   const line = (_id: any, requestId: any, arrangedType: string, vendorId: any, amount: number) => {
@@ -170,12 +192,20 @@ beforeAll(async () => {
       createdBy: U.admin, createdAt: now, updatedAt: now,
     };
   };
+  const noAmount = (l: any) => {
+    const { amount, exchangeRate, amountInr, ...rest } = l;
+    void amount; void exchangeRate; void amountInr;
+    return rest;
+  };
   await col("csteparrangements").insertMany([
     line(L.flight, R.tour, "FLIGHT", V.sky, 11850),
     line(L.hotel, R.tour, "HOTEL", V.lake, 9600),
     line(L.hotelSept, R.tour, "HOTEL", V.lake, 1200),
     line(L.hall, R.event, "OTHER", V.hall, 24000),
     line(L.hotelB, R.tourB, "HOTEL", V.lake, 5000),
+    // A seeded line nobody priced, and a foreign one with no rate.
+    noAmount(line(L.cabNoAmount, R.tour, "CAB", V.sky, 0)),
+    { ...noAmount(line(L.usdNoRate, R.tour, "HOTEL", V.lake, 0)), currency: "USD", amount: 300 },
   ] as any[]);
 
   // Payments through the real mark-paid route.
@@ -205,39 +235,55 @@ describe("vendor invoice no. on mark-paid", () => {
 });
 
 describe("Tally settings — CSTEP Admin only", () => {
-  it("Finance and plain users are refused; Admin reads the defaults and the next voucher no.", async () => {
+  it("Finance and plain users are refused; Admin reads the defaults, the locations seen and the next voucher no.", async () => {
     expect((await send("get", ACT.finA, "/tally/settings")).status).toBe(403);
     expect((await send("put", ACT.finA, "/tally/settings", { companyName: "X" })).status).toBe(403);
     expect((await send("get", ACT.plain, "/tally/settings")).status).toBe(403);
     const r = ok(await send("get", ACT.admin, "/tally/settings")).body;
-    expect(r.settings).toEqual({ companyName: "", voucherType: "Journal", defaultLedger: "", ledgerMap: [] });
+    expect(r.settings).toEqual({
+      companyName: "", voucherType: "Journal", defaultLedger: "", ledgerMap: [],
+      locationLabel: "Locations", locationSource: "BASE", locationMap: [],
+    });
     expect(r.vendorTypes.map((t: any) => t.name)).toEqual(["Airline", "Hotel", "Venue"]);
+    // Base = travellers' work locations; destination = event location, an
+    // international tour's first country, a domestic tour's first station.
+    expect(r.locations).toEqual({ base: ["Bengaluru", "New Delhi"], destination: ["Germany", "Goa", "Mumbai"] });
     expect(r.nextVoucherNo).toBe(1);
   });
 
-  it("an unmapped type with no default ledger blocks the export, and no voucher no. is taken", async () => {
-    ok(await send("put", ACT.admin, "/tally/settings", {
-      companyName: "CSTEP", ledgerMap: [{ vendorTypeId: String(VT.air), ledger: "Air Travel Expenses" }, { vendorTypeId: String(VT.hotel), ledger: "Hotel & Lodging" }],
-    }));
-    const r = await exportSheet(ACT.admin, "2026-10-01", "2026-10-31");
+  it("no company name blocks the export, and no voucher no. is taken", async () => {
+    const r = await exportJson(ACT.admin, "2026-10-01", "2026-10-31");
     expect(r.status).toBe(409);
-    expect(JSON.parse(r.body.toString()).unmappedTypes).toEqual(["Venue"]);
+    expect(r.body).toMatchObject({ missingSettings: ["companyName"] });
+    expect(r.body.error).toMatch(/Tally settings/);
+    expect(await col("csteparrangements").countDocuments({ tallyVoucherNo: { $exists: true } })).toBe(0);
+  });
+
+  it("an unmapped type with no default ledger blocks the export, and no voucher no. is taken", async () => {
+    ok(await send("put", ACT.admin, "/tally/settings", { companyName: "CSTEP", ledgerMap: SETTINGS.ledgerMap }));
+    const r = await exportJson(ACT.admin, "2026-10-01", "2026-10-31");
+    expect(r.status).toBe(409);
+    expect(r.body.unmappedTypes).toEqual(["Venue"]);
     expect(await col("csteparrangements").countDocuments({ tallyVoucherNo: { $exists: true } })).toBe(0);
     expect(await col("counters").countDocuments({ _id: `cstep:${WS}:TALLY` } as any)).toBe(0);
   });
 
-  it("saves the default ledger; a bad vendor type is 400; TALLY start is settable", async () => {
+  it("saves the default ledger and the location map; bad input is 400; TALLY start is settable", async () => {
     expect((await send("put", ACT.admin, "/tally/settings", { ledgerMap: [{ vendorTypeId: String(oid()), ledger: "X" }] })).status).toBe(400);
+    expect((await send("put", ACT.admin, "/tally/settings", { locationSource: "OFFICE" })).status).toBe(400);
+    expect((await send("put", ACT.admin, "/tally/settings", { locationMap: "BLR" })).status).toBe(400);
     const saved = ok(await send("put", ACT.admin, "/tally/settings", {
-      companyName: "  CSTEP  ", voucherType: "", defaultLedger: "Travel Expenses - Misc",
-      ledgerMap: [
-        { vendorTypeId: String(VT.air), ledger: "Air Travel Expenses" },
-        { vendorTypeId: String(VT.hotel), ledger: "Hotel & Lodging" },
-        { vendorTypeId: String(VT.venue), ledger: "  " }, // blank = unmapped
+      companyName: "  CSTEP  ", voucherType: "", defaultLedger: "Travel Expenses - Misc", locationLabel: "",
+      ledgerMap: [...SETTINGS.ledgerMap, { vendorTypeId: String(VT.venue), ledger: "  " }], // blank = unmapped
+      locationMap: [
+        { location: " Bengaluru ", code: " BLR-HQ " },
+        { location: "BENGALURU", code: "DUPLICATE" }, // same key — the first one wins
+        { location: "New Delhi", code: "  " }, // blank = unmapped
       ],
     })).body.settings;
-    expect(saved).toMatchObject({ companyName: "CSTEP", voucherType: "Journal", defaultLedger: "Travel Expenses - Misc" });
+    expect(saved).toMatchObject({ companyName: "CSTEP", voucherType: "Journal", defaultLedger: "Travel Expenses - Misc", locationLabel: "Locations", locationSource: "BASE" });
     expect(saved.ledgerMap).toHaveLength(2);
+    expect(saved.locationMap).toEqual([{ location: "Bengaluru", code: "BLR-HQ" }]);
 
     expect(ok(await send("put", ACT.admin, "/sequences/TALLY", { startNumber: 101 })).body).toMatchObject({ series: "TALLY", next: 101, fyStartYear: null });
     const seq = ok(await send("get", ACT.admin, "/sequences")).body.series.find((s: any) => s.series === "TALLY");
@@ -278,7 +324,14 @@ describe("GET /tally/export", () => {
       expect(x[0]).toBe("CSTEP");
       expect(x[1]).toBe("Journal");
       expect(x[3]).toBeInstanceOf(Date); // a real date cell
-      for (const i of [8, 9, 10, 11, 12, 13, 23, 24]) expect(x[i]).toBe("");
+      // Test Department / CC, Inst No / Date, transfer type / mode: always blank.
+      for (const i of [10, 11, 21, 22, 23, 24]) expect(x[i]).toBe("");
+    }
+    // The Dr row carries the cost centres — department, employee, location
+    // (Bengaluru mapped to its code); the Cr row none of them.
+    for (const [dr, cr] of [[rows[0], rows[1]], [rows[2], rows[3]], [rows[4], rows[5]]]) {
+      expect(dr.slice(8, 14)).toEqual(["Energy Research", "Asha Rao", "", "", "Locations", "BLR-HQ"]);
+      expect(cr.slice(8, 14)).toEqual(["", "", "", "", "", ""]);
     }
 
     const [fDr, fCr, hDr, hCr, vDr, vCr] = rows;
@@ -291,28 +344,27 @@ describe("GET /tally/export", () => {
     expect(fCr.slice(4, 8)).toEqual(["Skyline Travels", "Cr", "Projects", "PRJ-ENERGY"]);
     expect(fCr[14]).toBe(11850);
     expect(fCr[15]).toBe("");
-    expect(fCr.slice(16, 22)).toEqual(["New ref", "INV-AIR-9", "", 11850, "Cr", "UTR111"]);
-    expect(ymd(fCr[22])).toBe("2026-10-10");
+    // Bill-wise New ref with the invoice no.; no instrument (Inst No / Date).
+    expect(fCr.slice(16, 23)).toEqual(["New ref", "INV-AIR-9", "", 11850, "Cr", "", ""]);
 
-    // Hotel — mapped ledger; no invoice no. → the payment ref is the bill no.
+    // Hotel — mapped ledger; no invoice no. → a blank bill no. (never the UTR).
     expect(hDr.slice(4, 6)).toEqual(["Hotel & Lodging", "Dr"]);
     expect(hDr[14]).toBe(9600);
     expect(hDr[15]).toBe(`Being Hotel for Asha Rao ${REF.tour}`);
-    expect(hCr.slice(16, 22)).toEqual(["New ref", "UTR222", "", 9600, "Cr", "UTR222"]);
+    expect(hCr.slice(16, 23)).toEqual(["New ref", "", "", 9600, "Cr", "", ""]);
 
     // Venue (Event) — unmapped type → default ledger; no project → blank cost centre.
     expect(vDr.slice(4, 8)).toEqual(["Travel Expenses - Misc", "Dr", "", ""]);
     expect(vDr[14]).toBe(24000);
     expect(vDr[15]).toBe(`Being Venue for Asha Rao ${REF.event}`);
     expect(vCr.slice(4, 6)).toEqual(["Lakeside Convention Hall", "Cr"]);
-    expect(ymd(vCr[22])).toBe("2026-10-14");
+    expect(vCr[19]).toBe(24000);
   });
 
-  it("formats: dates dd-mm-yyyy, reference / bill columns text", async () => {
+  it("formats: dates dd-mm-yyyy, reference / bill / cost-centre columns text", async () => {
     const { ws } = await readSheet((await exportSheet(ACT.finA, "2026-10-01", "2026-10-31")).body);
     expect(ws.getCell("D2").numFmt).toBe("dd-mm-yyyy");
-    expect(ws.getCell("W3").numFmt).toBe("dd-mm-yyyy");
-    for (const c of ["C2", "H2", "R3", "V3"]) expect(ws.getCell(c).numFmt).toBe("@");
+    for (const c of ["C2", "H2", "I2", "J2", "M2", "N2", "R3", "V3"]) expect(ws.getCell(c).numFmt).toBe("@");
   });
 
   it("re-export keeps the voucher numbers; Admin sees everyone and B's line takes the next one", async () => {
@@ -324,6 +376,8 @@ describe("GET /tally/export", () => {
     expect(all.map((x) => x[2])).toEqual(["101", "101", "102", "102", "103", "103", "104", "104"]);
     expect(all[6].slice(4, 8)).toEqual(["Hotel & Lodging", "Dr", "Projects", "PRJ-SOLAR"]);
     expect(all[6][15]).toBe(`Being Hotel for Ravi Kumar ${REF.tourB}`);
+    // No department; New Delhi has no code → its own text, still labelled.
+    expect(all[6].slice(8, 14)).toEqual(["", "Ravi Kumar", "", "", "Locations", "New Delhi"]);
     expect(await col("csteparrangements").countDocuments({ tallyVoucherNo: { $exists: true } })).toBe(4);
     expect(ok(await send("get", ACT.admin, "/tally/settings")).body.nextVoucherNo).toBe(105);
   });
@@ -331,5 +385,85 @@ describe("GET /tally/export", () => {
   it("the paid-on range is by IST date and inclusive", async () => {
     const r = (await readSheet((await exportSheet(ACT.finA, "2026-10-12", "2026-10-12")).body)).rows;
     expect(r.map((x) => x[2])).toEqual(["102", "102"]);
+  });
+
+  it("Location CC from the trip's destination when the settings say so; a label of their own", async () => {
+    ok(await send("put", ACT.admin, "/tally/settings", {
+      ...SETTINGS, locationSource: "DESTINATION", locationLabel: "Site",
+      locationMap: [{ location: "Mumbai", code: "BOM-02" }, { location: "Bengaluru", code: "BLR-HQ" }],
+    }));
+    const all = (await readSheet((await exportSheet(ACT.admin, "2026-10-01", "2026-10-31")).body)).rows;
+    const dr = all.filter((x) => x[5] === "Dr");
+    // Tour → first station travelled to (mapped); event → its location and
+    // the international tour → its country (both unmapped → their text).
+    expect(dr.map((x) => [x[12], x[13]])).toEqual([["Site", "BOM-02"], ["Site", "BOM-02"], ["Site", "Goa"], ["Site", "Germany"]]);
+    ok(await send("put", ACT.admin, "/tally/settings", SETTINGS));
+  });
+});
+
+describe("a line needs its amount before it is paid", () => {
+  it("mark-paid refuses a line with no amount, and a foreign amount with no rate, naming the line", async () => {
+    const none = await pay(ACT.finA, R.tour, L.cabNoAmount, { paymentStatus: "PAID", paymentRef: "UTR555", paidAt: "2026-09-05" });
+    expect(none.status).toBe(409);
+    expect(none.body.error).toBe(`Cab — Skyline Travels on ${REF.tour} has no amount — enter the amount before marking it paid`);
+    const usd = await pay(ACT.finA, R.tour, L.usdNoRate, { paymentStatus: "PAID", paymentRef: "UTR556", paidAt: "2026-09-05" });
+    expect(usd.status).toBe(409);
+    expect(usd.body.error).toBe(`Hotel — Hotel Lakeview on ${REF.tour} has an amount in USD but no exchange rate — enter the amount before marking it paid`);
+    expect(await col("csteparrangements").countDocuments({ _id: { $in: [L.cabNoAmount, L.usdNoRate] }, paymentStatus: "PAID" })).toBe(0);
+  });
+
+  it("GET /requests/:id tells Finance and Admin they may set a missing amount — no one else", async () => {
+    expect(ok(await send("get", ACT.finA, `/requests/${R.tour}`)).body.canSetMissingAmounts).toBe(true);
+    expect(ok(await send("get", ACT.admin, `/requests/${R.tour}`)).body.canSetMissingAmounts).toBe(true);
+    expect((await send("get", ACT.finB, `/requests/${R.tour}`)).body.canSetMissingAmounts).not.toBe(true);
+  });
+
+  it("Finance sets the missing amount past the arrange step; then the line pays", async () => {
+    // Another traveller's Finance user, or a plain user, may not.
+    for (const as of [ACT.finB, ACT.plain]) {
+      expect((await setMissingAmount(as, R.tour, L.cabNoAmount, { currency: "INR", amount: 1800 })).status).toBe(403);
+    }
+    expect((await setMissingAmount(ACT.finA, R.tour, L.cabNoAmount, { currency: "INR", amount: 0 })).status).toBe(400);
+    expect((await setMissingAmount(ACT.finA, R.tour, L.cabNoAmount, {})).status).toBe(400);
+    const set = ok(await setMissingAmount(ACT.finA, R.tour, L.cabNoAmount, { currency: "INR", amount: 1800 })).body.line;
+    expect(set).toMatchObject({ currency: "INR", amount: 1800, exchangeRate: 1, amountInr: 1800, paymentStatus: "UNPAID" });
+    const log: any = await col("cstepapprovals").findOne({ entityId: R.tour, action: "VENDOR_PAYMENT", comment: /missing amount set/ });
+    expect(log).toMatchObject({ stage: "FINANCE", actor: U.finA });
+    expect(log.comment).toBe("CAB — CSTEPVEN0001 Skyline Travels: missing amount set | Amount: 1800 INR | unpaid");
+    // Narrow: a line that has an amount is refused here.
+    expect((await setMissingAmount(ACT.finA, R.tour, L.cabNoAmount, { currency: "INR", amount: 1 })).status).toBe(409);
+    expect((await setMissingAmount(ACT.finA, R.tour, L.flight, { currency: "INR", amount: 1 })).status).toBe(409);
+    ok(await pay(ACT.finA, R.tour, L.cabNoAmount, { paymentStatus: "PAID", paymentRef: "UTR555", paidAt: "2026-09-05" }));
+
+    // A foreign amount takes its rate here too.
+    expect((await setMissingAmount(ACT.admin, R.tour, L.usdNoRate, { currency: "USD", amount: 300 })).status).toBe(400);
+    const usd = ok(await setMissingAmount(ACT.admin, R.tour, L.usdNoRate, { currency: "USD", amount: 300, exchangeRate: 83.5 })).body.line;
+    expect(usd).toMatchObject({ currency: "USD", amount: 300, exchangeRate: 83.5, amountInr: 25050, rateSource: "MANUAL" });
+    ok(await pay(ACT.admin, R.tour, L.usdNoRate, { paymentStatus: "PAID", paymentRef: "UTR556", paidAt: "2026-09-05" }));
+  });
+});
+
+describe("the export refuses a paid line with no amount", () => {
+  it("409 naming the claim references; nothing numbered; Finance sets the amount and it exports", async () => {
+    // A line paid before amounts were enforced (as the import used to allow).
+    const hall: any = await col("csteparrangements").findOne({ _id: L.hall });
+    const { _id, amount, exchangeRate, amountInr, tallyVoucherNo, ...rest } = hall;
+    void _id; void amount; void exchangeRate; void amountInr; void tallyVoucherNo;
+    await col("csteparrangements").insertOne({ ...rest, _id: L.legacy, paidAt: new Date("2026-10-20T06:30:00Z"), paymentSource: "IMPORT" });
+    const counterBefore: any = await col("counters").findOne({ _id: `cstep:${WS}:TALLY` } as any);
+
+    const r = await exportJson(ACT.admin, "2026-10-01", "2026-10-31");
+    expect(r.status).toBe(409);
+    expect(r.body.missingAmountReferences).toEqual([REF.event]);
+    expect(r.body.error).toBe(`1 paid vendor line has no amount, on ${REF.event} — Finance or a CSTEP Admin sets it on the request, then export again`);
+    expect(((await col("csteparrangements").findOne({ _id: L.legacy })) as any).tallyVoucherNo).toBeUndefined();
+    expect(await col("counters").findOne({ _id: `cstep:${WS}:TALLY` } as any)).toEqual(counterBefore);
+    // A range without it still exports.
+    expect((await exportSheet(ACT.admin, "2026-10-01", "2026-10-15")).status).toBe(200);
+
+    ok(await setMissingAmount(ACT.finA, R.event, L.legacy, { currency: "INR", amount: 6500 }));
+    const all = (await readSheet((await exportSheet(ACT.admin, "2026-10-01", "2026-10-31")).body)).rows;
+    expect(all.at(-2)!.slice(14, 16)).toEqual([6500, `Being Venue for Asha Rao ${REF.event}`]);
+    expect(all.at(-1)![19]).toBe(6500);
   });
 });

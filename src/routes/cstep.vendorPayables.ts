@@ -31,7 +31,7 @@
 
 import { Router } from "express";
 import mongoose from "mongoose";
-import CstepArrangement, { CSTEP_VENDOR_PAYABLE_STATUSES } from "../models/cstep/CstepArrangement.js";
+import CstepArrangement, { CSTEP_VENDOR_PAYABLE_STATUSES, arrangementAmountGap } from "../models/cstep/CstepArrangement.js";
 import CstepApproval from "../models/cstep/CstepApproval.js";
 import CstepTravelRequest from "../models/cstep/CstepTravelRequest.js";
 import CstepVendor from "../models/cstep/CstepVendor.js";
@@ -454,6 +454,18 @@ async function processPaymentRows(
     if (!lines.length) return out("NO_UNPAID_LINES", `No arrangement line on ${reference} is booked with ${vendorCode}`);
     const unpaid = lines.filter((l) => l.paymentStatus !== "PAID");
     if (!unpaid.length) return out("ALREADY_PAID", `All ${lines.length} line(s) for ${vendorCode} on ${reference} are already paid`);
+    // Every line the row would pay needs its amount first (as a manual
+    // mark-paid does) — the whole row is refused, naming the lines, rather
+    // than paying some of them.
+    const noAmount = unpaid.filter((l) => arrangementAmountGap(l));
+    if (noAmount.length) {
+      pairRows.delete(pairKey);
+      return out(
+        "INVALID",
+        noAmount.map((l) => `${SERVICE_LABEL[l.arrangedType] || l.arrangedType} ${arrangementAmountGap(l)}`).join("; ") +
+          ` — enter the amount on ${reference} before importing its payment`,
+      );
+    }
 
     if (dryRun) return out("PAID", undefined, unpaid.length);
 

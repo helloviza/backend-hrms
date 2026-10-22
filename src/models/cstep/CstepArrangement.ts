@@ -74,6 +74,16 @@ export const CSTEP_VENDOR_PAYABLE_STATUSES = [
   "REIMBURSED",
 ] as const;
 
+/** Why a line can't be paid or go out to Tally yet — it carries no usable
+ * INR amount — or null when amountInr is a positive number. A foreign
+ * amount with no exchange rate never computed one, so it says that. */
+export function arrangementAmountGap(line: { amountInr?: number | null; amount?: number | null; currency?: string | null }): string | null {
+  if (Number(line.amountInr) > 0) return null;
+  const currency = String(line.currency || "INR").toUpperCase();
+  if (currency !== "INR" && Number(line.amount) > 0) return `has an amount in ${currency} but no exchange rate`;
+  return "has no amount";
+}
+
 export interface ICstepArrangement extends Document {
   workspaceId: mongoose.Types.ObjectId;
   requestId: mongoose.Types.ObjectId; // ref CstepTravelRequest

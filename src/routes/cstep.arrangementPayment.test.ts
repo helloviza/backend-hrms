@@ -224,6 +224,12 @@ describe("Tour Proposal — vendor on the ledger row", () => {
     expect(ok(await get(ACT.official, `/requests/${id}`)).body.canPayVendors).toBe(true);
     expect(ok(await get(ACT.traveller, `/requests/${id}`)).body.canPayVendors).toBe(false);
 
+    // No amount yet → it can't be paid; the message names the line.
+    const unpriced = await patch(ACT.official, `/requests/${id}/arrangements/${flight._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-ARR-1", paidAt: "2026-10-13" });
+    expect(unpriced.status).toBe(409);
+    expect(unpriced.body.error).toMatch(/^Flight — Skyline Travels on .+ has no amount — enter the amount before marking it paid$/);
+    ok(await patch(ACT.official, `/requests/${id}/arrangements/${flight._id}`, { amount: 8400, currency: "INR" }));
+
     const r = ok(await patch(ACT.official, `/requests/${id}/arrangements/${flight._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-ARR-1", paidAt: "2026-10-13" })).body.line;
     expect(r).toMatchObject({ paymentStatus: "PAID", paymentRef: "UTR-ARR-1", paymentSource: "MANUAL", paidBy: String(U.official) });
     const log = (await trail(id, "VENDOR_PAYMENT")).pop()!;
@@ -326,9 +332,10 @@ describe("Tour Proposal — vendor on the ledger row", () => {
         rows.push({ mode: row.getCell(10).value, agency: row.getCell(11).value, paid: row.getCell(16).value, cheque: row.getCell(18).value });
       }
     });
-    // The FLIGHT row is PENDING with no amount — not a real arrangement, so
-    // it isn't on the register (same rule as before this change).
+    // The FLIGHT row is still PENDING but carries the amount it had to have
+    // before it could be paid — a real arrangement, so it is on the register.
     expect(rows.filter((x) => x.mode)).toEqual([
+      { mode: "Air", agency: "Skyline Travels", paid: 8400, cheque: "UTR77 15.10.26" },
       { mode: "Rail", agency: null, paid: null, cheque: null },
       { mode: "CAB", agency: "U K Cabs", paid: 1485, cheque: "CHQ 004512 14.10.26" },
     ]);
