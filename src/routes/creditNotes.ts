@@ -14,6 +14,8 @@ import { calculateGSTAmounts, type GSTType } from "../utils/gstDetection.js";
 import { uploadAndPresign } from "../utils/s3Upload.js";
 import { generateCreditNotePdf } from "../utils/creditNotePdf.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
+// Loyalty: one non-throwing, non-awaited call after each committed CN write.
+import { loyaltyTouch } from "../services/loyalty.js";
 import { istDateString, todayIST } from "../utils/dateIST.js";
 import { invoiceTenantClause } from "./invoices.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
@@ -978,6 +980,7 @@ router.post("/:id/issue", requirePermission("creditnotes", "FULL"), async (req: 
         { _id: new mongoose.Types.ObjectId(String(cn.originalInvoiceId)) },
         { $inc: { creditedAmount: -(cn.grandTotal ?? 0) } },
       );
+      loyaltyTouch({ creditNoteId: cn._id });
       console.error("[CreditNotes issue] PDF generation failed, rolled back to DRAFT:", err?.message);
       return res.status(500).json({
         error: "CREDIT_NOTE_ISSUE_PDF_FAILED",
@@ -986,6 +989,7 @@ router.post("/:id/issue", requirePermission("creditnotes", "FULL"), async (req: 
       });
     }
 
+    loyaltyTouch({ creditNoteId: cn._id });
     triggerTaskAutomation("creditnote.issued", {
       workspaceId: String(cn.workspaceId),
       entityType: "CREDIT_NOTE",
@@ -1057,6 +1061,7 @@ router.post("/:id/cancel", requirePermission("creditnotes", "FULL"), async (req:
       { $inc: { creditedAmount: -(cn.grandTotal ?? 0) } },
     );
 
+    loyaltyTouch({ creditNoteId: cn._id });
     triggerTaskAutomation("creditnote.cancelled", {
       workspaceId: String(cn.workspaceId),
       entityType: "CREDIT_NOTE",
@@ -1437,6 +1442,7 @@ router.post("/:id/override", async (req: any, res: any) => {
 
     // Invoice credited total = sum of its ISSUED notes, recomputed.
     await Invoice.collection.updateOne({ _id: invoice._id }, { $set: { creditedAmount: credited } });
+    loyaltyTouch({ creditNoteId: cn._id });
 
     // PDF re-rendered with the new figures / status. The override itself is
     // already saved; a render failure is reported, and GET /:id/pdf re-renders

@@ -1032,6 +1032,7 @@ import manualBookingsRouter from "./routes/manualBookings.js";
 // (chirag@, 2026-10-07). Their own gates decide; see server.adminMount.test.ts.
 import invoicesRouter, { workspaceRouter as invoicesWorkspaceRouter } from "./routes/invoices.js";
 import creditNotesAdminRouter, { workspaceRouter as creditNotesWorkspaceRouter } from "./routes/creditNotes.js";
+import adminLoyaltyRouter from "./routes/admin.loyalty.js";
 import notificationsRouter from "./routes/notifications.js";
 import { requireBillingStaff } from "./middleware/requireBillingStaff.js";
 import adminTravellersRouter from "./routes/admin.travellers.js";
@@ -1070,6 +1071,10 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // vendor accounts; requirePermission per route then applies the grant.
   app.use("/api/admin/invoices", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), invoicesRouter);
   app.use("/api/admin/credit-notes", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), creditNotesAdminRouter);
+  // Loyalty Points admin (staff only): HOUSE here, and the router itself
+  // requires the per-person `loyalty` capability — see its header. Before the
+  // broad /api/admin routers for the same interception reason as above.
+  app.use("/api/admin/loyalty", requireAuth, requireWorkspace, requireHouse, adminLoyaltyRouter);
   // KEEP_IN_PLUMBOX — Tasks & task automations (Plumtrips Travel ops). Mounted
   // before the broad /api/admin routers for the same interception reason as
   // manual-bookings above: tasksRouter gates per route on requirePermission
@@ -1407,6 +1412,11 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
         // VOUCHER_RETENTION_ENABLED=true (shipped off)
         const { startVoucherRetentionCron } = await import("./jobs/voucherRetentionCron.js");
         startVoucherRetentionCron();
+
+        // LOYALTY: daily sweep at 02:30 IST — reconciles every loyalty account;
+        // the run is claimed per IST date, so only one instance sweeps
+        const { startLoyaltySweepCron } = await import("./jobs/loyaltySweepCron.js");
+        startLoyaltySweepCron();
       } else {
         logger.info("[WA-HOST] WA_HOST=true — running EOD + Sales Pulse crons only; all other crons/workers skipped on this host");
       }

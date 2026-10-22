@@ -183,6 +183,10 @@
     "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L2": {
@@ -367,6 +371,10 @@
       "scope": "NONE"
     },
     "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "loyalty": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -555,6 +563,10 @@
     "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L4": {
@@ -739,6 +751,10 @@
       "scope": "NONE"
     },
     "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "loyalty": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -927,6 +943,10 @@
     "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L6": {
@@ -1111,6 +1131,10 @@
       "scope": "NONE"
     },
     "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "loyalty": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1299,6 +1323,10 @@
     "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L8": {
@@ -1483,6 +1511,10 @@
       "scope": "NONE"
     },
     "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "loyalty": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1671,6 +1703,10 @@
     "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_SBT": {
@@ -1857,6 +1893,10 @@
     "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_APPROVAL": {
@@ -2041,6 +2081,10 @@
       "scope": "NONE"
     },
     "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "loyalty": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -2233,6 +2277,10 @@
     "trainingReports": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L0": {
@@ -2421,6 +2469,10 @@
       "scope": "NONE"
     },
     "trainingReports": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "loyalty": {
       "access": "NONE",
       "scope": "NONE"
     }

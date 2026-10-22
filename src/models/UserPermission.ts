@@ -224,6 +224,13 @@ export interface UserPermissionDoc extends Document {
      * explicitly. READ is the whole grant; there is no write path.
      */
     trainingReports: ModulePermission
+    /**
+     * loyalty — Loyalty Points admin (routes/admin.loyalty.ts, HOUSE only):
+     * READ views settings, accounts and ledgers; FULL changes settings, links
+     * customers, reconciles and makes manual adjustments. Granted to NO level
+     * template — per-user, on the trainingReports precedent.
+     */
+    loyalty: ModulePermission
   }
 
   grantedBy: string
@@ -308,6 +315,7 @@ const modulesSchema = new Schema(
     consumerContactPII: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     travellerIdentityPII: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     trainingReports: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    loyalty: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
   },
   { _id: false }
 )

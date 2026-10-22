@@ -15,6 +15,9 @@ import User from "../models/User.js";
 import {
   assertInvoiceTransition, InvoiceTransitionError, type InvoiceTransitionRoute,
 } from "../utils/invoiceLifecycle.js";
+// Loyalty: one non-throwing, non-awaited call after each committed invoice
+// write; the reconciler derives points from the invoice's current state.
+import { loyaltyTouch } from "../services/loyalty.js";
 
 /** Runs the invoice state machine; on refusal answers 400 with its message and
  *  returns true so the caller can `return`. Non-lifecycle errors propagate. */
@@ -236,6 +239,7 @@ workspaceRouter.put("/:id/declare-payment", async (req: any, res: any) => {
     });
 
     await invoice.save();
+    loyaltyTouch({ invoiceId: invoice._id });
     res.json({ ok: true, invoice });
   } catch (err: any) {
     console.error("[Invoices workspace/declare-payment]", err.message);
@@ -812,6 +816,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       isDemoUser: req.user?.isDemoUser === true,
       workspaceScope: req.workspaceObjectId ?? null,
     });
+    for (const inv of created) loyaltyTouch({ invoiceId: (inv as any)._id });
 
     res.status(201).json({ ok: true, invoice: created[0] });
   } catch (err: any) {
@@ -905,6 +910,7 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       isDemoUser,
       workspaceScope: req.workspaceObjectId ?? null,
     });
+    for (const inv of created) loyaltyTouch({ invoiceId: (inv as any)._id });
 
     const generated = created.map((inv: any) => ({
       bookingId: String(inv.bookingIds?.[0]),
@@ -1281,6 +1287,7 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
       }
     });
 
+    loyaltyTouch({ invoiceId: invoiceObjectId });
     const updatedInvoice = await Invoice.collection.findOne({ _id: invoiceObjectId });
 
     res.json({ ok: true, invoice: updatedInvoice });
@@ -1488,6 +1495,7 @@ router.post("/:id/cancel", requirePermission("invoices", "FULL"), async (req: an
         { $set: { status: "CONFIRMED", invoiceId: null, invoiceRaisedDate: null } },
       );
     }
+    loyaltyTouch({ invoiceId: invoice._id });
 
     const updated = await Invoice.findById(req.params.id).lean();
     res.json({ ok: true, invoice: updated });
@@ -1820,6 +1828,7 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
       await invoice.save({ session });
       responseInvoice = invoice.toObject();
     });
+    if (responseInvoice) loyaltyTouch({ invoiceId: responseInvoice._id });
 
     res.json({ ok: true, invoice: responseInvoice });
   } catch (err: any) {
@@ -1971,6 +1980,7 @@ router.put("/:id/status", requirePermission("invoices", "WRITE"), async (req: an
     iv.editHistory.push({ editedAt: now, editedBy: req.user._id, fieldsChanged: ["status"], oldValues, newValues });
 
     await invoice.save();
+    loyaltyTouch({ invoiceId: invoice._id });
     res.json({ ok: true, invoice });
   } catch (err: any) {
     console.error("[Invoices PUT status]", err.message);
@@ -2048,6 +2058,7 @@ router.post("/bulk-mark-sent", requirePermission("invoices", "WRITE"), async (re
       }
     }
 
+    for (const id of updated) loyaltyTouch({ invoiceId: id });
     res.json({ updated, skipped, blocked });
   } catch (err: any) {
     console.error("[Invoices bulk-mark-sent]", err.message);
@@ -2114,6 +2125,7 @@ router.post("/bulk-mark-paid", requirePermission("invoices", "WRITE"), async (re
       }
     }
 
+    for (const id of updated) loyaltyTouch({ invoiceId: id });
     res.json({ updated, skipped, blocked });
   } catch (err: any) {
     console.error("[Invoices bulk-mark-paid]", err.message);
@@ -2166,6 +2178,7 @@ router.post("/:id/revert-to-sent", requirePermission("invoices", "WRITE"), async
       oldValues, newValues: { status: "SENT", reason: String(reason).trim() },
     });
     await invoice.save();
+    loyaltyTouch({ invoiceId: invoice._id });
     res.json({ ok: true, invoice });
   } catch (err: any) {
     console.error("[Invoices revert-to-sent]", err.message);
@@ -2207,6 +2220,7 @@ router.post("/:id/revert-to-draft", requirePermission("invoices", "WRITE"), asyn
       oldValues: { status: "SENT", sentAt: oldSentAt }, newValues: { status: "DRAFT", reason: String(reason).trim() },
     });
     await invoice.save();
+    loyaltyTouch({ invoiceId: invoice._id });
     res.json({ ok: true, invoice });
   } catch (err: any) {
     console.error("[Invoices revert-to-draft]", err.message);

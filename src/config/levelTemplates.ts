@@ -101,6 +101,9 @@ type ModulesTemplate = {
   // HR/people access. NONE everywhere, per-user only — same posture as the
   // three above; off-boarding revokes it explicitly.
   trainingReports: ModulePermission
+  // Loyalty Points admin (2026-10-20) — per-user only, NONE everywhere below
+  // (routes/admin.loyalty.ts: READ = view, FULL = edit / link / adjust).
+  loyalty:           ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -155,6 +158,7 @@ const L1: ModulesTemplate = {
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
   trainingReports: NONE,
+  loyalty:         NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -244,6 +248,7 @@ const L6: ModulesTemplate = {
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
   trainingReports: NONE,
+  loyalty:         NONE,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -263,6 +268,7 @@ const L7: ModulesTemplate = {
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
   trainingReports: NONE,
+  loyalty:         NONE,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -317,6 +323,7 @@ const L8: ModulesTemplate = {
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
   trainingReports: NONE,
+  loyalty:         NONE,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -371,6 +378,7 @@ const VENDOR: ModulesTemplate = {
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
   trainingReports: NONE,
+  loyalty:         NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -425,6 +433,7 @@ const CUSTOMER_SBT: ModulesTemplate = {
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
   trainingReports: NONE,
+  loyalty:         NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -479,6 +488,7 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
   trainingReports: NONE,
+  loyalty:         NONE,
 }
 
 // ── TENANT_ADMIN template ─────────────────────────────────────────────────────
@@ -580,6 +590,7 @@ const TENANT_ADMIN: ModulesTemplate = {
   consumerContactPII: NONE,
   travellerIdentityPII: NONE,
   trainingReports: NONE,
+  loyalty:         NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

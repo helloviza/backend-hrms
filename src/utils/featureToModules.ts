@@ -81,6 +81,8 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   // surfaces gate on requireHouse alone, with no workspace feature, so the
   // report does too. Unmapped = grantable everywhere; a grant outside HOUSE
   // opens nothing because the route is HOUSE-only.
+  // loyalty is deliberately UNMAPPED for the same reason: the Loyalty Points
+  // admin (routes/admin.loyalty.ts) gates on requireHouse + the grant alone.
 };
 
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
