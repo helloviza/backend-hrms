@@ -1379,6 +1379,14 @@ router.post("/:id/override", async (req: any, res: any) => {
         return res.status(400).json({ error: "status must be DRAFT, ISSUED or CANCELLED" });
       }
       const from = cn.status;
+      // A note can only stand ISSUED against an issued, live invoice: a DRAFT
+      // invoice can still be re-priced under it, a CANCELLED one is already
+      // reversed in full — issuing against either reverses value twice.
+      if (to === "ISSUED" && (invoice.status === "DRAFT" || invoice.status === "CANCELLED")) {
+        return res.status(400).json({
+          error: `Refused: invoice ${invoice.invoiceNo} is ${invoice.status}; a credit note can only be issued against a SENT or PAID invoice.`,
+        });
+      }
       note("status", from, to);
       if (to === "ISSUED") {
         if (!cn.issuedAt) { cn.issuedAt = now; cn.issuedBy = req.user._id; }

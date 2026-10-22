@@ -20,7 +20,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vites
 import express from "express";
 import request from "supertest";
 import mongoose from "mongoose";
-import { MongoMemoryServer } from "mongodb-memory-server";
+import { MongoMemoryReplSet } from "mongodb-memory-server";
 
 process.env.NODE_ENV = "test";
 
@@ -69,7 +69,7 @@ app.use("/api/customers", customersRouter);
 app.use("/api/admin/invoices", invoicesRouter);
 app.use("/api/workspace/settings", wsSettingsRouter);
 
-let mongod: MongoMemoryServer;
+let mongod: MongoMemoryReplSet;
 const oid = () => new mongoose.Types.ObjectId();
 const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
 const STAFF = oid();
@@ -82,7 +82,7 @@ const GSTIN_HR = "06AAHCM5991L1ZU";
 const PAN = "AAHCM5991L";
 
 beforeAll(async () => {
-  mongod = await MongoMemoryServer.create();
+  mongod = await MongoMemoryReplSet.create({ replSet: { count: 1 } }); // generation runs in a transaction
   await mongoose.connect(mongod.getUri("customer-gst-status-test"));
 }, 120_000);
 afterAll(async () => { await mongoose.disconnect(); await mongod?.stop(); });

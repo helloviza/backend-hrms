@@ -368,6 +368,33 @@ function applyClientDetailsOverride(ctx: InvoiceContext, override: NonNullable<C
   return { ...ctx, clientDetails: { ...ctx.clientDetails, ...patch } };
 }
 
+/* ── Atomic booking claim ─────────────────────────────────────────────────
+ * Two concurrent requests used to be able to invoice the same booking: both
+ * read it as not-yet-invoiced, both created a (numbered) invoice, and the
+ * unconditional booking update ran last-writer-wins. Now the booking claim
+ * and the invoice write run in ONE transaction: a conditional updateMany
+ * moves only rows still un-invoiced, the caller checks every row moved, and
+ * any shortfall (or any later failure) aborts the lot — no duplicate
+ * invoice, and no booking left "invoiced" against an invoice that was never
+ * written. Needs a replica set: Atlas in prod; scripts/dev-mongo.mjs runs a
+ * single-node one locally. */
+
+/** Inside `session`'s transaction, claims `bookings` for `invoiceId`. True
+ *  when every one was claimed; on false the caller must abort. */
+export async function claimBookingsForInvoice(
+  bookings: any[],
+  invoiceId: mongoose.Types.ObjectId,
+  session: mongoose.ClientSession,
+): Promise<boolean> {
+  const ids = bookings.map((b: any) => b._id);
+  const claim = await ManualBooking.updateMany(
+    { _id: { $in: ids }, status: { $ne: "INVOICED" }, invoiceId: null },
+    { $set: { status: "INVOICED", invoiceId, invoiceRaisedDate: new Date() } },
+    { session },
+  );
+  return claim.modifiedCount === ids.length;
+}
+
 /** Create ONE invoice from the given bookings. Used for both COMBINED (all
  *  bookings, line presentation per lineItemStyle) and SEPARATE (a single
  *  booking). Returns the freshly-refetched raw invoice doc (includes the
@@ -424,51 +451,63 @@ async function createOneInvoice(
   const rawTotalGST = parseFloat(totalGST.toFixed(2));
   const gstAmounts = calculateGSTAmounts(rawTotalGST, ctx.resolvedGstType);
 
-  const invoice = await Invoice.create({
-    workspaceId: ctx.invoiceWorkspaceId,
-    billingPeriod: opts.billingPeriod,
-    bookingIds: bookingsForInvoice.map((b: any) => b._id),
-    subtotal: parseFloat(subtotal.toFixed(2)),
-    totalGST: rawTotalGST,
-    grandTotal,
-    supplyType: ctx.resolvedGstType,
-    cgstAmount: gstAmounts.cgst,
-    sgstAmount: gstAmounts.sgst,
-    utgstAmount: gstAmounts.utgst,
-    igstAmount: gstAmounts.igst,
-    gstTypeAutoDetected: ctx.detection.gstType,
-    gstTypeOverridden: ctx.useOverride ? true : false,
-    gstOverrideReason: ctx.useOverride ? opts.gstOverrideReason : undefined,
-    gstOverrideBy: ctx.useOverride ? opts.createdBy : undefined,
-    gstBypass: opts.gstBypass === true,
-    gstBypassType: opts.gstBypass === true ? (ctx.bypassGstType as "CGST_SGST" | "CGST_UTGST") : null,
-    gstBypassReason: opts.gstBypass === true ? (opts.gstBypassReason || "").trim() : "",
-    placeOfSupply: ctx.detection.placeOfSupply,
-    issuerState: ctx.issuerState,
-    clientState: ctx.clientState,
-    issuerDetails: ctx.issuerDetails,
-    clientDetails: ctx.clientDetails,
-    terms: opts.terms,
-    notes: opts.notes,
-    showInclusiveTaxNote: opts.showInclusiveTaxNote === true,
-    invoiceDate: resolvedInvoiceDate,
-    dueDate: opts.dueDate ? new Date(opts.dueDate) : undefined,
-    createdBy: opts.createdBy,
-  } as any);
+  // Claim + invoice in one transaction. The claim runs first, so a lost race
+  // aborts before the invoice's number is drawn (the counter in
+  // Invoice.ts's pre-save hook is outside the transaction).
+  const invoiceId = new mongoose.Types.ObjectId();
+  let invoice: any;
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      if (!(await claimBookingsForInvoice(bookingsForInvoice, invoiceId, session))) {
+        throw new InvoiceGenerationError(409, {
+          error: "One or more bookings were invoiced by another request. Refresh and try again.",
+          code: "BOOKINGS_ALREADY_INVOICED",
+          refs: bookingsForInvoice.map((b: any) => b.bookingRef),
+        });
+      }
 
-  // Store lineItems bypassing mongoose validation (lineItems schema is Mixed).
-  await Invoice.collection.updateOne(
-    { _id: invoice._id },
-    { $set: { lineItems } },
-  );
+      [invoice] = await Invoice.create([{
+        _id: invoiceId,
+        workspaceId: ctx.invoiceWorkspaceId,
+        billingPeriod: opts.billingPeriod,
+        bookingIds: bookingsForInvoice.map((b: any) => b._id),
+        subtotal: parseFloat(subtotal.toFixed(2)),
+        totalGST: rawTotalGST,
+        grandTotal,
+        supplyType: ctx.resolvedGstType,
+        cgstAmount: gstAmounts.cgst,
+        sgstAmount: gstAmounts.sgst,
+        utgstAmount: gstAmounts.utgst,
+        igstAmount: gstAmounts.igst,
+        gstTypeAutoDetected: ctx.detection.gstType,
+        gstTypeOverridden: ctx.useOverride ? true : false,
+        gstOverrideReason: ctx.useOverride ? opts.gstOverrideReason : undefined,
+        gstOverrideBy: ctx.useOverride ? opts.createdBy : undefined,
+        gstBypass: opts.gstBypass === true,
+        gstBypassType: opts.gstBypass === true ? (ctx.bypassGstType as "CGST_SGST" | "CGST_UTGST") : null,
+        gstBypassReason: opts.gstBypass === true ? (opts.gstBypassReason || "").trim() : "",
+        placeOfSupply: ctx.detection.placeOfSupply,
+        issuerState: ctx.issuerState,
+        clientState: ctx.clientState,
+        issuerDetails: ctx.issuerDetails,
+        clientDetails: ctx.clientDetails,
+        terms: opts.terms,
+        notes: opts.notes,
+        showInclusiveTaxNote: opts.showInclusiveTaxNote === true,
+        invoiceDate: resolvedInvoiceDate,
+        dueDate: opts.dueDate ? new Date(opts.dueDate) : undefined,
+        createdBy: opts.createdBy,
+      } as any], { session });
+
+      // Store lineItems bypassing mongoose validation (lineItems schema is Mixed).
+      await Invoice.collection.updateOne({ _id: invoiceId }, { $set: { lineItems } }, { session });
+    });
+  } finally {
+    await session.endSession();
+  }
 
   const completeInvoice = await Invoice.collection.findOne({ _id: invoice._id });
-
-  // Mark bookings INVOICED and record invoice raised date.
-  await ManualBooking.updateMany(
-    { _id: { $in: bookingsForInvoice.map((b: any) => b._id) } },
-    { $set: { status: "INVOICED", invoiceId: invoice._id, invoiceRaisedDate: new Date() } },
-  );
 
   // Task automation hook (fire-and-forget).
   triggerTaskAutomation("invoice.created", {

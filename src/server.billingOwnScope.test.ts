@@ -8,13 +8,14 @@
 // Scope ALL and Super Admin are unchanged.
 //
 // Through the REAL app (server.ts) with REAL login tokens, as in
-// server.adminMount.test.ts. Only Mongo is in-memory; PDF render + S3 upload of
+// server.adminMount.test.ts. Only Mongo is in-memory (a one-node replica set:
+// generate and add-bookings write in a transaction); PDF render + S3 upload of
 // credit notes are stubbed (no egress).
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import request from "supertest";
 import mongoose from "mongoose";
 import bcrypt from "bcryptjs";
-import { MongoMemoryServer } from "mongodb-memory-server";
+import { MongoMemoryReplSet } from "mongodb-memory-server";
 
 Object.assign(process.env, {
   NODE_ENV: "test",
@@ -45,7 +46,7 @@ const PASSWORD = "Correct-Horse-9";
 const oid = () => new mongoose.Types.ObjectId();
 const O = (id: string) => new mongoose.Types.ObjectId(id);
 
-let mongod: MongoMemoryServer;
+let mongod: MongoMemoryReplSet;
 let app: any;
 let UserPermission: any;
 const col = (n: string) => mongoose.connection.db!.collection(n);
@@ -134,10 +135,10 @@ function creditNote(_id: any, no: string, inv: any, invNo: string, lineRef: stri
 }
 
 beforeAll(async () => {
-  mongod = await MongoMemoryServer.create();
+  mongod = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   ({ default: app } = await import("./server.js"));
   ({ UserPermission } = await import("./models/UserPermission.js"));
-  await mongoose.connect(mongod.getUri());
+  await mongoose.connect(mongod.getUri("billing-own-scope-test"));
 
   await col("customerworkspaces").insertMany([
     { _id: O(HOUSE), customerId: "6a4e0d2ea90c293c9e129f48", companyName: "Plumtrips", status: "ACTIVE", config: { features: {} } },
@@ -249,9 +250,36 @@ describe("Invoices — generating from others' bookings is refused", () => {
     expect((await col("manualbookings").findOne({ _id: B.freeMine }))!.status).toBe("CONFIRMED");
   });
   it("adding someone else's booking to an invoice → 403", async () => {
-    const res = await post(chirag, `/api/admin/invoices/${INV.mixed}/add-bookings`, { bookingIds: [String(B.freeOther)] });
+    // A DRAFT he generated from his own booking, so the status rule passes and
+    // the ownership check is what refuses. Seeded here, not in beforeAll, so
+    // the exact-set list assertions above stay as they are.
+    const draftBooking = oid();
+    const draft = oid();
+    await col("manualbookings").insertOne(booking(draftBooking, "MB-DRAFT", chirag, chirag) as any);
+    await col("invoices").insertOne({
+      ...invoice(draft, "INV-TEST-DRAFT", [draftBooking], [line("MB-DRAFT", "Flight on my draft", 7000)], chirag),
+      status: "DRAFT",
+    } as any);
+    const invBefore = await col("invoices").findOne({ _id: draft });
+    const bookingBefore = await col("manualbookings").findOne({ _id: B.freeOther });
+
+    const res = await post(chirag, `/api/admin/invoices/${draft}/add-bookings`, { bookingIds: [String(B.freeOther)] });
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.code).toBe("NOT_YOUR_BOOKINGS");
+    expect(res.body.error).toContain("MB-FREE2");
+
+    expect(await col("invoices").findOne({ _id: draft })).toEqual(invBefore);
+    expect(await col("manualbookings").findOne({ _id: B.freeOther })).toEqual(bookingBefore);
+  });
+  it("adding someone else's booking to a SENT invoice is refused and writes nothing", async () => {
+    const invBefore = await col("invoices").findOne({ _id: INV.generatedByMe });
+    const bookingBefore = await col("manualbookings").findOne({ _id: B.freeOther });
+
+    const res = await post(chirag, `/api/admin/invoices/${INV.generatedByMe}/add-bookings`, { bookingIds: [String(B.freeOther)] });
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+
+    expect(await col("invoices").findOne({ _id: INV.generatedByMe })).toEqual(invBefore);
+    expect(await col("manualbookings").findOne({ _id: B.freeOther })).toEqual(bookingBefore);
   });
   it("generate from their own booking goes through", async () => {
     const res = await post(chirag, "/api/admin/invoices/generate", { bookingIds: [String(B.freeMine2)], invoiceDate: "2026-10-01" });

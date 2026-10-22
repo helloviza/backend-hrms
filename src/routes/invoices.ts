@@ -12,6 +12,29 @@ import { requirePermission, requireAnyPermission } from "../middleware/requirePe
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import Invoice from "../models/Invoice.js";
 import User from "../models/User.js";
+import {
+  assertInvoiceTransition, InvoiceTransitionError, type InvoiceTransitionRoute,
+} from "../utils/invoiceLifecycle.js";
+
+/** Runs the invoice state machine; on refusal answers 400 with its message and
+ *  returns true so the caller can `return`. Non-lifecycle errors propagate. */
+function refuseTransition(
+  res: Response,
+  from: string,
+  to: string,
+  opts: { via: InvoiceTransitionRoute; reason?: string | null },
+): boolean {
+  try {
+    assertInvoiceTransition(from, to, opts);
+    return false;
+  } catch (e) {
+    if (e instanceof InvoiceTransitionError) {
+      res.status(e.httpStatus).json({ error: e.message });
+      return true;
+    }
+    throw e;
+  }
+}
 
 /* ── Workspace router (no requireAdmin — separate mount) ──────────── */
 // Mounted at: /api/invoices/workspace
@@ -191,6 +214,7 @@ workspaceRouter.put("/:id/declare-payment", async (req: any, res: any) => {
         error: `Only a SENT invoice can be marked as paid (current status: ${invoice.status}).`,
       });
     }
+    if (refuseTransition(res, invoice.status, "PAYMENT_DECLARED", { via: "declare-payment" })) return;
 
     const now = new Date();
     const oldValues = { status: "SENT" };
@@ -229,7 +253,9 @@ import { buildLineItemsForBooking } from "../utils/invoiceLineItems.js";
 import { detectGSTType, calculateGSTAmounts, type GSTType } from "../utils/gstDetection.js";
 import { env } from "../config/env.js";
 import { resolveCustomerState, buildAddressStr } from "../utils/invoiceClient.js";
-import { createInvoiceFromBookings, InvoiceGenerationError } from "../services/invoiceGeneration.service.js";
+import {
+  createInvoiceFromBookings, InvoiceGenerationError, claimBookingsForInvoice,
+} from "../services/invoiceGeneration.service.js";
 import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { isHouseCallerContext } from "../utils/bookingAccess.js";
@@ -1126,6 +1152,7 @@ router.get("/bulk-pdf", requirePermission("invoices", "READ"), async (req: any, 
 
 // POST /api/admin/invoices/:id/add-bookings
 router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  const session = await mongoose.startSession();
   try {
     const { bookingIds } = req.body as { bookingIds: string[] };
 
@@ -1138,8 +1165,15 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
       : null;
     if (!invoice || !(await invoiceInCallerScope(req, invoice))) return res.status(404).json({ error: "Invoice not found" });
 
-    if (invoice.status === "PAID" || invoice.status === "CANCELLED" || invoice.status === "PAYMENT_DECLARED") {
-      return res.status(400).json({ error: "Cannot add bookings to a PAID, PAYMENT_DECLARED, or CANCELLED invoice" });
+    // DRAFT only. A SENT invoice is an issued document — adding bookings would
+    // change its value after the client has it; revert it to DRAFT first
+    // (POST /:id/revert-to-draft, reason required), then add.
+    if (invoice.status !== "DRAFT") {
+      return res.status(400).json({
+        error: invoice.status === "SENT"
+          ? "Bookings can only be added to a DRAFT invoice. Revert this invoice to DRAFT first (POST /api/admin/invoices/:id/revert-to-draft, reason required)."
+          : `Bookings can only be added to a DRAFT invoice (this one is ${invoice.status}).`,
+      });
     }
 
     const notTheirs = await bookingsNotTheirs(req, bookingIds);
@@ -1156,18 +1190,20 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
       return res.status(400).json({ error: "One or more booking IDs not found" });
     }
 
-    // All must belong to same workspaceId as invoice
-    const badWs = (newBookings as any[]).filter(
-      (b) => b.workspaceId?.toString() !== invoice.workspaceId?.toString(),
-    );
+    // All must belong to the invoice's client. ManualBooking.workspaceId is a
+    // Customer._id; Invoice.workspaceId is normally the CustomerWorkspace._id
+    // (Customer._id fallback) — resolve both forms, exactly as PATCH does.
+    const customerIds = await invoiceCustomerIds(invoice, null);
+    const badWs = (newBookings as any[]).filter((b) => !customerIds.has(String(b.workspaceId)));
     if (badWs.length) {
       return res.status(400).json({
         error: "All bookings must belong to the same workspace as the invoice",
+        refs: badWs.map((b: any) => b.bookingRef),
       });
     }
 
     // None already INVOICED
-    const alreadyInvoiced = (newBookings as any[]).filter((b) => b.status === "INVOICED");
+    const alreadyInvoiced = (newBookings as any[]).filter((b) => b.status === "INVOICED" || b.invoiceId);
     if (alreadyInvoiced.length) {
       return res.status(400).json({
         error: `${alreadyInvoiced.length} booking(s) are already invoiced`,
@@ -1178,74 +1214,82 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
     // Build new line items (same two-row pattern as /generate)
     const newLineItems: any[] = [];
     for (const b of newBookings as any[]) {
-      newLineItems.push(...buildLineItemsForBooking(b));
+      newLineItems.push(...buildLineItemsForBooking(b).map(sanitizeLineItem));
     }
 
-    // Recalculate totals
-    const newSubtotal = newLineItems.reduce((s, li) => s + (li.amount ?? 0), 0);
-    const newTotalGST = newLineItems.reduce((s, li) => s + (li.igst ?? 0), 0);
-    let newGrandTotal = 0;
-    for (const b of newBookings as any[]) {
-      // Group Booking with lineItems[]: pricing.grandTotal is always the
-      // authoritative Σ line-amount total regardless of gstMode — see
-      // services/invoiceGeneration.service.ts's identical guard and
-      // infra/audit/events-line-items-audit.md.
-      if (Array.isArray(b.lineItems) && b.lineItems.length > 0) {
-        newGrandTotal += b.pricing?.grandTotal ?? 0;
-        continue;
-      }
-      const gstMode = b.pricing?.gstMode || "ON_MARKUP";
-      if (gstMode === "ON_MARKUP") {
-        newGrandTotal += b.pricing?.quotedPrice ?? 0;
-      } else {
-        newGrandTotal +=
-          b.pricing?.grandTotal ??
-          (b.pricing?.quotedPrice ?? 0) + (b.pricing?.gstAmount ?? 0);
-      }
-    }
+    // Authoritative totals re-derived from the resulting lines — the same
+    // formula PATCH /:id uses: grandTotal = Σ amount (GST-inclusive),
+    // totalGST = Σ igst, subtotal = grandTotal − totalGST, GST split rebuilt.
+    const workingLines = [...((invoice.lineItems ?? []) as any[]).map((li: any) => sanitizeLineItem(li)), ...newLineItems];
+    const totalAmount = parseFloat(workingLines.reduce((s, li) => s + (li.amount ?? 0), 0).toFixed(2));
+    const totalGST = parseFloat(workingLines.reduce((s, li) => s + (li.igst ?? 0), 0).toFixed(2));
+    const subtotal = parseFloat((totalAmount - totalGST).toFixed(2));
+    const grandTotal = totalAmount;
+    const gstAmounts = calculateGSTAmounts(totalGST, invoice.supplyType as GSTType);
 
-    const updatedSubtotal  = parseFloat(((invoice.subtotal  ?? 0) + newSubtotal).toFixed(2));
-    const updatedTotalGST  = parseFloat(((invoice.totalGST  ?? 0) + newTotalGST).toFixed(2));
-    const updatedGrandTotal = parseFloat(((invoice.grandTotal ?? 0) + newGrandTotal).toFixed(2));
-
-    await Invoice.collection.updateOne(
-      { _id: new mongoose.Types.ObjectId(req.params.id) },
-      {
-        $push: { lineItems: { $each: newLineItems } },
-        $addToSet: {
-          bookingIds: {
-            $each: bookingIds.map((id) => new mongoose.Types.ObjectId(id)),
-          },
-        },
-        $set: {
-          subtotal:   updatedSubtotal,
-          totalGST:   updatedTotalGST,
-          grandTotal: updatedGrandTotal,
-        },
-      } as any,
-    );
-
-    // Mark new bookings as INVOICED
+    const invoiceObjectId = new mongoose.Types.ObjectId(req.params.id);
+    const addedIds = (newBookings as any[]).map((b) => b._id);
     const now = new Date();
-    await ManualBooking.updateMany(
-      { _id: { $in: (newBookings as any[]).map((b) => b._id) } },
-      {
-        $set: {
-          status: "INVOICED",
-          invoiceId: new mongoose.Types.ObjectId(req.params.id),
-          invoiceRaisedDate: now,
-        },
-      },
-    );
 
-    const updatedInvoice = await Invoice.collection.findOne({
-      _id: new mongoose.Types.ObjectId(req.params.id),
+    // Claim + invoice write in ONE transaction: only rows not yet invoiced are
+    // claimed, and the invoice is written only onto the exact DRAFT we read
+    // (same bookings, same last edit), so neither a concurrent generate/add
+    // nor a concurrent edit is lost. Any shortfall aborts both writes.
+    await session.withTransaction(async () => {
+      if (!(await claimBookingsForInvoice(newBookings as any[], invoiceObjectId, session))) {
+        throw new HttpError(409, "One or more bookings were invoiced by another request. Refresh and try again.");
+      }
+
+      const updated = await Invoice.collection.updateOne(
+        {
+          _id: invoiceObjectId,
+          status: "DRAFT",
+          bookingIds: invoice.bookingIds ?? [],
+          editedAt: invoice.editedAt ?? null,
+        },
+        {
+          $set: {
+            lineItems: workingLines,
+            bookingIds: [...(invoice.bookingIds ?? []), ...addedIds],
+            subtotal,
+            totalGST,
+            grandTotal,
+            cgstAmount: gstAmounts.cgst,
+            sgstAmount: gstAmounts.sgst,
+            utgstAmount: gstAmounts.utgst,
+            igstAmount: gstAmounts.igst,
+            editedAt: now,
+            editedBy: req.user?._id,
+          },
+          $push: {
+            editHistory: {
+              editedAt: now,
+              editedBy: req.user?._id,
+              fieldsChanged: ["bookingsAdded", "totals"],
+              oldValues: { totals: { subtotal: invoice.subtotal, totalGST: invoice.totalGST, grandTotal: invoice.grandTotal } },
+              newValues: {
+                bookingsAdded: (newBookings as any[]).map((b) => b.bookingRef),
+                totals: { subtotal, totalGST, grandTotal },
+              },
+            },
+          },
+        } as any,
+        { session },
+      );
+      if (updated.matchedCount !== 1) {
+        throw new HttpError(409, "The invoice changed while you were adding bookings (or is no longer a DRAFT). Refresh and try again.");
+      }
     });
+
+    const updatedInvoice = await Invoice.collection.findOne({ _id: invoiceObjectId });
 
     res.json({ ok: true, invoice: updatedInvoice });
   } catch (err: any) {
+    if (err instanceof HttpError) return res.status(err.httpStatus).json({ error: err.message });
     console.error("[Invoices add-bookings]", err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    session.endSession();
   }
 });
 
@@ -1417,6 +1461,17 @@ router.post("/:id/cancel", requirePermission("invoices", "FULL"), async (req: an
       });
     }
 
+    if (refuseTransition(res, invoice.status, "CANCELLED", { via: "cancel", reason })) return;
+
+    // An invoice that already carries an ISSUED credit note has been partly
+    // (or wholly) reversed on the books; cancelling it too would reverse it
+    // twice. The rest of the value goes through a credit note as well.
+    if (await issuedCreditNoteCount(invoice._id)) {
+      return res.status(400).json({
+        error: "This invoice has an issued credit note, so cancelling it would reverse it twice. Raise a full credit note instead (or a credit note for the remaining amount).",
+      });
+    }
+
     invoice.status = "CANCELLED";
     (invoice as any).cancelledAt = new Date();
     (invoice as any).cancelledBy = req.user._id;
@@ -1441,6 +1496,11 @@ router.post("/:id/cancel", requirePermission("invoices", "FULL"), async (req: an
     res.status(500).json({ error: err.message });
   }
 });
+
+/** ISSUED credit notes raised against an invoice. */
+function issuedCreditNoteCount(invoiceId: unknown): Promise<number> {
+  return CreditNote.countDocuments({ originalInvoiceId: invoiceId, status: "ISSUED" });
+}
 
 /* ── Edit Draft Invoice ───────────────────────────────────────────── */
 
@@ -1863,22 +1923,18 @@ router.get("/:id", requirePermission("invoices", "READ"), async (req: any, res: 
 /* ── Update Status ────────────────────────────────────────────────── */
 
 // PUT /api/admin/invoices/:id/status
-// Single-invoice forward mark (DRAFT->SENT->PAID). Lifecycle is strict:
-// DRAFT->PAID is rejected (must go via SENT). CANCELLED is immutable here.
+// Single-invoice FORWARD mark only: DRAFT->SENT, and SENT|PAYMENT_DECLARED->PAID
+// (finance confirming receipt, incl. a customer's portal claim). Every other
+// move is refused by the state machine (utils/invoiceLifecycle.ts) with the
+// route that owns it: cancelling -> /:id/cancel, SENT->DRAFT ->
+// /:id/revert-to-draft, PAID->SENT -> /:id/revert-to-sent (each needs a
+// reason), SENT->PAYMENT_DECLARED -> the customer's own declare-payment.
 // sentAt/paidAt accept an explicit date (no silent auto-stamp); paymentRef is
 // recorded in the editHistory entry.
-//
-// PAYMENT_DECLARED->PAID (finance confirming a customer's portal claim) goes
-// through this SAME route with zero logic changes — the only guards above
-// are "no re-marking CANCELLED" and "no DRAFT->PAID", neither of which
-// blocks this transition. Staff can also set PAYMENT_DECLARED directly here
-// (e.g. recording a phone-reported payment on the customer's behalf) since
-// this route has staff's normal "invoices:WRITE" permission, not the
-// customer-only SENT-only guard the portal's own declare-payment route has.
 router.put("/:id/status", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
   try {
     const { status, sentAt, paidAt, paymentRef } = req.body as {
-      status: "SENT" | "PAYMENT_DECLARED" | "PAID" | "CANCELLED";
+      status: "SENT" | "PAID";
       sentAt?: string;
       paidAt?: string;
       paymentRef?: string;
@@ -1889,15 +1945,7 @@ router.put("/:id/status", requirePermission("invoices", "WRITE"), async (req: an
 
     const prev = invoice.status;
 
-    if (prev === "CANCELLED") {
-      return res.status(400).json({ error: "Cancelled invoices cannot be re-marked." });
-    }
-    if (status === prev) {
-      return res.status(400).json({ error: `Already in ${status}.` });
-    }
-    if (status === "PAID" && prev === "DRAFT") {
-      return res.status(400).json({ error: "Cannot mark as PAID directly. Mark as SENT first." });
-    }
+    if (refuseTransition(res, prev, String(status ?? ""), { via: "status" })) return;
 
     const now = new Date();
     const oldValues: Record<string, unknown> = { status: prev };
@@ -1939,6 +1987,8 @@ const BULK_MARK_CAP = 200;
 // already filtered+selected, so we trust the explicit ids (no list-filter
 // re-derivation) but validate each invoice's lifecycle. Each save is single-doc
 // atomic; one failure does not fail the batch. Returns { updated, skipped, blocked }.
+// PAYMENT_DECLARED rows are skipped, never pushed back to SENT: rejecting a
+// customer's payment claim is POST /:id/revert-to-sent, which needs a reason.
 router.post("/bulk-mark-sent", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
   try {
     const { ids, sentAt, paymentRef } = req.body as { ids?: string[]; sentAt?: string; paymentRef?: string };
@@ -1967,7 +2017,18 @@ router.post("/bulk-mark-sent", requirePermission("invoices", "WRITE"), async (re
       try {
         if (invoice.status === "CANCELLED") { skipped.push({ id, reason: "cancelled" }); continue; }
         if (invoice.status === "SENT")      { skipped.push({ id, reason: "already sent" }); continue; }
+        if (invoice.status === "PAYMENT_DECLARED") {
+          skipped.push({ id, reason: "customer has declared payment; confirm it (Mark as Paid) or reject it (revert to SENT, reason required)" });
+          continue;
+        }
         if (invoice.status === "PAID")      { blocked.push({ id, reason: "already paid; cannot revert via bulk" }); continue; }
+        try {
+          assertInvoiceTransition(invoice.status, "SENT", { via: "bulk-mark-sent" });
+        } catch (e: any) {
+          if (!(e instanceof InvoiceTransitionError)) throw e;
+          blocked.push({ id, reason: e.message });
+          continue;
+        }
 
         const now = new Date();
         const prev = invoice.status;
@@ -2027,6 +2088,13 @@ router.post("/bulk-mark-paid", requirePermission("invoices", "WRITE"), async (re
         if (invoice.status === "CANCELLED") { skipped.push({ id, reason: "cancelled" }); continue; }
         if (invoice.status === "PAID")      { skipped.push({ id, reason: "already paid" }); continue; }
         if (invoice.status === "DRAFT")     { blocked.push({ id, reason: "lifecycle violation: mark as SENT first" }); continue; }
+        try {
+          assertInvoiceTransition(invoice.status, "PAID", { via: "bulk-mark-paid" });
+        } catch (e: any) {
+          if (!(e instanceof InvoiceTransitionError)) throw e;
+          blocked.push({ id, reason: e.message });
+          continue;
+        }
 
         const now = new Date();
         const prev = invoice.status;
@@ -2067,6 +2135,7 @@ router.post("/:id/revert-to-sent", requirePermission("invoices", "WRITE"), async
     if (invoice.status !== "PAID" && invoice.status !== "PAYMENT_DECLARED") {
       return res.status(400).json({ error: "Only PAID or PAYMENT_DECLARED invoices can be reverted to SENT." });
     }
+    if (refuseTransition(res, invoice.status, "SENT", { via: "revert-to-sent", reason })) return;
 
     const now = new Date();
     const prevStatus = invoice.status;
@@ -2115,6 +2184,14 @@ router.post("/:id/revert-to-draft", requirePermission("invoices", "WRITE"), asyn
     if (!invoice || !(await invoiceInCallerScope(req, invoice))) return res.status(404).json({ error: "Invoice not found" });
     if (invoice.status !== "SENT") {
       return res.status(400).json({ error: "Only SENT invoices can be reverted to DRAFT." });
+    }
+    if (refuseTransition(res, invoice.status, "DRAFT", { via: "revert-to-draft", reason })) return;
+    // A DRAFT is editable; an invoice already reversed in part by an ISSUED
+    // credit note must not be re-opened and re-priced underneath that note.
+    if (await issuedCreditNoteCount(invoice._id)) {
+      return res.status(400).json({
+        error: "This invoice has an issued credit note and cannot be reverted to DRAFT. Correct it with a further credit note instead.",
+      });
     }
 
     const now = new Date();
