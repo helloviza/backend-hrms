@@ -464,7 +464,7 @@ describe("Local Travel Claim — end to end: submit → return → resubmit → 
     expect(ok(await get(ACT.admin, `/requests/${id}`)).body.canFinance).toBe(false);
     const r = await post(ACT.admin, `/requests/${id}/finance/settle`, { reference: "UTR-ADMIN" });
     expect(r.status).toBe(403);
-    expect(r.body.error).toBe("Only this traveller's Finance user can reimburse a claim");
+    expect(r.body.error).toBe("Only the assigned finance user can record payments");
     const doc = (await col("csteptravelrequests").findOne({ _id: new mongoose.Types.ObjectId(id) }))!;
     expect(doc.status).toBe("TRANSFERRED_TO_FINANCE");
     expect((await col("cstepsettlements").findOne({ requestId: doc._id }))!.status).toBe("VERIFYING");

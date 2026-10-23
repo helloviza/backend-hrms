@@ -219,21 +219,26 @@ describe("Tour Proposal — vendor on the ledger row", () => {
     expect((await trail(id, "ADD_SERVICE")).pop()!.comment).toContain("| Vendor: CSTEPVEN0002 U K Cabs");
   });
 
-  it("at the arrange step the Official records a payment; the paid line's vendor + amount lock", async () => {
-    // GET /requests/:id offers it while ARRANGING — to the Official, not the traveller.
-    expect(ok(await get(ACT.official, `/requests/${id}`)).body.canPayVendors).toBe(true);
+  it("at the arrange step Finance records a payment (not the Official); the paid line's vendor + amount lock", async () => {
+    // GET /requests/:id: the Official keeps the ledger but can't pay; Finance can.
+    const o = ok(await get(ACT.official, `/requests/${id}`)).body;
+    expect(o).toMatchObject({ canPayVendors: false, hasVendorLedger: true, paymentBlockedReason: "Only the assigned finance user can record payments" });
+    expect(ok(await get(ACT.finance, `/requests/${id}`)).body.canPayVendors).toBe(true);
     expect(ok(await get(ACT.traveller, `/requests/${id}`)).body.canPayVendors).toBe(false);
+    const byOfficial = await patch(ACT.official, `/requests/${id}/arrangements/${flight._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-ARR-1", paidAt: "2026-10-13" });
+    expect(byOfficial.status).toBe(403);
+    expect(byOfficial.body.error).toBe("Only the assigned finance user can record payments");
 
     // No amount yet → it can't be paid; the message names the line.
-    const unpriced = await patch(ACT.official, `/requests/${id}/arrangements/${flight._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-ARR-1", paidAt: "2026-10-13" });
+    const unpriced = await patch(ACT.finance, `/requests/${id}/arrangements/${flight._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-ARR-1", paidAt: "2026-10-13" });
     expect(unpriced.status).toBe(409);
     expect(unpriced.body.error).toMatch(/^Flight — Skyline Travels on .+ has no amount — enter the amount before marking it paid$/);
     ok(await patch(ACT.official, `/requests/${id}/arrangements/${flight._id}`, { amount: 8400, currency: "INR" }));
 
-    const r = ok(await patch(ACT.official, `/requests/${id}/arrangements/${flight._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-ARR-1", paidAt: "2026-10-13" })).body.line;
-    expect(r).toMatchObject({ paymentStatus: "PAID", paymentRef: "UTR-ARR-1", paymentSource: "MANUAL", paidBy: String(U.official) });
+    const r = ok(await patch(ACT.finance, `/requests/${id}/arrangements/${flight._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-ARR-1", paidAt: "2026-10-13" })).body.line;
+    expect(r).toMatchObject({ paymentStatus: "PAID", paymentRef: "UTR-ARR-1", paymentSource: "MANUAL", paidBy: String(U.finance) });
     const log = (await trail(id, "VENDOR_PAYMENT")).pop()!;
-    expect(log).toMatchObject({ stage: "OFFICIAL", actor: U.official });
+    expect(log).toMatchObject({ stage: "FINANCE", actor: U.finance });
     expect(log.comment).toBe("FLIGHT — CSTEPVEN0001 Skyline Travels: UNPAID => PAID | Ref: UTR-ARR-1 | Paid on 2026-10-13");
 
     // Locked while paid: another vendor, clearing it, or a new amount → 409.
@@ -245,7 +250,9 @@ describe("Tour Proposal — vendor on the ledger row", () => {
     // …but the same vendor resent, and details, still save.
     ok(await patch(ACT.official, `/requests/${id}/arrangements/${flight._id}`, { vendorId: String(V.sky), details: "BLR-DEL" }));
 
-    ok(await patch(ACT.official, `/requests/${id}/arrangements/${flight._id}/payment`, { paymentStatus: "UNPAID" }));
+    // Only Finance can unmark it, too.
+    expect((await patch(ACT.official, `/requests/${id}/arrangements/${flight._id}/payment`, { paymentStatus: "UNPAID" })).status).toBe(403);
+    ok(await patch(ACT.finance, `/requests/${id}/arrangements/${flight._id}/payment`, { paymentStatus: "UNPAID" }));
     expect((await lines(id))[0]).toMatchObject({ paymentStatus: "UNPAID", vendorCode: "CSTEPVEN0001" });
   });
 
@@ -266,17 +273,17 @@ describe("Tour Proposal — vendor on the ledger row", () => {
     expect(r.body.error).toBe("Choose a vendor for this line before recording a payment");
   });
 
-  it("only this traveller's Official or Finance user, or a CSTEP Admin, can record a payment", async () => {
+  it("only this traveller's assigned Finance user can record a payment — not the Official, not an Admin", async () => {
     const cab = (await lines(id))[2];
-    for (const as of [ACT.traveller, ACT.approver, ACT.other, ACT.otherFinance]) {
+    for (const as of [ACT.traveller, ACT.approver, ACT.other, ACT.otherFinance, ACT.official, ACT.admin]) {
       expect((await patch(as, `/requests/${id}/arrangements/${cab._id}/payment`, { paymentStatus: "PAID", paymentRef: "X" })).status).toBe(403);
     }
     expect((await lines(id))[2].paymentStatus).toBe("UNPAID");
-    // GET /requests/:id tells the UI who may.
+    // GET /requests/:id tells the UI who may — and the Official / Admin keep the ledger.
     expect(ok(await get(ACT.finance, `/requests/${id}`)).body.canPayVendors).toBe(true);
-    expect(ok(await get(ACT.admin, `/requests/${id}`)).body.canPayVendors).toBe(true);
-    expect(ok(await get(ACT.official, `/requests/${id}`)).body.canPayVendors).toBe(true);
-    expect(ok(await get(ACT.traveller, `/requests/${id}`)).body.canPayVendors).toBe(false);
+    expect(ok(await get(ACT.admin, `/requests/${id}`)).body).toMatchObject({ canPayVendors: false, hasVendorLedger: true });
+    expect(ok(await get(ACT.official, `/requests/${id}`)).body).toMatchObject({ canPayVendors: false, hasVendorLedger: true });
+    expect(ok(await get(ACT.traveller, `/requests/${id}`)).body).toMatchObject({ canPayVendors: false, hasVendorLedger: false });
   });
 
   it("Finance marks paid with a ref + date; logged as VENDOR_PAYMENT", async () => {
@@ -289,13 +296,13 @@ describe("Tour Proposal — vendor on the ledger row", () => {
     expect(log.comment).toBe("CAB — CSTEPVEN0002 U K Cabs: UNPAID => PAID | Ref: CHQ 004512 | Paid on 2026-10-14");
   });
 
-  it("Admin can too; a future date or bad status is refused; UNPAID clears the payment", async () => {
+  it("a future date or bad status is refused; UNPAID clears the payment", async () => {
     const fl = (await lines(id))[0];
-    expect((await patch(ACT.admin, `/requests/${id}/arrangements/${fl._id}/payment`, { paymentStatus: "PAID", paidAt: "2099-01-01" })).status).toBe(400);
-    expect((await patch(ACT.admin, `/requests/${id}/arrangements/${fl._id}/payment`, { paymentStatus: "DONE" })).status).toBe(400);
-    ok(await patch(ACT.admin, `/requests/${id}/arrangements/${fl._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR9" }));
-    expect((await lines(id))[0]).toMatchObject({ paymentStatus: "PAID", paymentRef: "UTR9", paidBy: U.admin });
-    ok(await patch(ACT.admin, `/requests/${id}/arrangements/${fl._id}/payment`, { paymentStatus: "UNPAID" }));
+    expect((await patch(ACT.finance, `/requests/${id}/arrangements/${fl._id}/payment`, { paymentStatus: "PAID", paidAt: "2099-01-01" })).status).toBe(400);
+    expect((await patch(ACT.finance, `/requests/${id}/arrangements/${fl._id}/payment`, { paymentStatus: "DONE" })).status).toBe(400);
+    ok(await patch(ACT.finance, `/requests/${id}/arrangements/${fl._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR9" }));
+    expect((await lines(id))[0]).toMatchObject({ paymentStatus: "PAID", paymentRef: "UTR9", paidBy: U.finance });
+    ok(await patch(ACT.finance, `/requests/${id}/arrangements/${fl._id}/payment`, { paymentStatus: "UNPAID" }));
     const back = (await lines(id))[0];
     expect(back.paymentStatus).toBe("UNPAID");
     expect(back.paidAt).toBeUndefined();
@@ -358,15 +365,16 @@ describe("Event Request — vendor + manual payment work the same way", () => {
     expect((await trail(id, "VENDOR_PAYMENT")).length).toBe(1);
   });
 
-  it("the Official pays at the arrange step; it survives mark-arranged and Finance still sees and changes it", async () => {
+  it("Finance pays at the arrange step (the Official can't); it survives mark-arranged and Finance still changes it", async () => {
     const id = await arrangingRequest({
       formType: "EVENT_REQUEST", purpose: "QC workshop 2", departureDate: "2026-11-05", returnDate: "2026-11-06",
       hostInstitution: "QC Institute", eventNature: "WORKSHOP", eventLocation: "Bengaluru",
       eventParticipants: [{ organisation: "CSTEP" }],
     });
     const added = ok(await post(ACT.official, `/requests/${id}/arrangements`, { arrangedType: "OTHER", details: "Hall hire", amount: 42000, currency: "INR", vendorId: String(V.hall) })).body.line;
-    const paid = ok(await patch(ACT.official, `/requests/${id}/arrangements/${added._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-EV-ARR", paidAt: "2026-10-12" })).body.line;
-    expect(paid).toMatchObject({ paymentStatus: "PAID", paymentRef: "UTR-EV-ARR", paidBy: String(U.official) });
+    expect((await patch(ACT.official, `/requests/${id}/arrangements/${added._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-EV-ARR", paidAt: "2026-10-12" })).status).toBe(403);
+    const paid = ok(await patch(ACT.finance, `/requests/${id}/arrangements/${added._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-EV-ARR", paidAt: "2026-10-12" })).body.line;
+    expect(paid).toMatchObject({ paymentStatus: "PAID", paymentRef: "UTR-EV-ARR", paidBy: String(U.finance) });
 
     ok(await patch(ACT.official, `/requests/${id}/arrangements/${added._id}`, { status: "ARRANGED" }));
     ok(await post(ACT.official, `/requests/${id}/mark-arranged`));
@@ -379,7 +387,7 @@ describe("Event Request — vendor + manual payment work the same way", () => {
     expect(g.arrangements.find((l: any) => l._id === String(added._id)).paymentRef).toBe("UTR-EV-ARR");
     ok(await patch(ACT.finance, `/requests/${id}/arrangements/${added._id}/payment`, { paymentStatus: "UNPAID" }));
     ok(await patch(ACT.finance, `/requests/${id}/arrangements/${added._id}/payment`, { paymentStatus: "PAID", paymentRef: "UTR-EV-FIN" }));
-    expect((await trail(id, "VENDOR_PAYMENT")).map((e) => e.stage)).toEqual(["OFFICIAL", "FINANCE", "FINANCE"]);
+    expect((await trail(id, "VENDOR_PAYMENT")).map((e) => e.stage)).toEqual(["FINANCE", "FINANCE", "FINANCE"]);
   });
 });
 

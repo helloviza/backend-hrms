@@ -439,7 +439,12 @@ describe("a line needs its amount before it is paid", () => {
     expect((await setMissingAmount(ACT.admin, R.tour, L.usdNoRate, { currency: "USD", amount: 300 })).status).toBe(400);
     const usd = ok(await setMissingAmount(ACT.admin, R.tour, L.usdNoRate, { currency: "USD", amount: 300, exchangeRate: 83.5 })).body.line;
     expect(usd).toMatchObject({ currency: "USD", amount: 300, exchangeRate: 83.5, amountInr: 25050, rateSource: "MANUAL" });
-    ok(await pay(ACT.admin, R.tour, L.usdNoRate, { paymentStatus: "PAID", paymentRef: "UTR556", paidAt: "2026-09-05" }));
+    // Setting the amount is Finance-or-Admin; recording the payment is the
+    // assigned Finance user's alone — the Admin who set it can't pay it.
+    const adminPay = await pay(ACT.admin, R.tour, L.usdNoRate, { paymentStatus: "PAID", paymentRef: "UTR556", paidAt: "2026-09-05" });
+    expect(adminPay.status).toBe(403);
+    expect(adminPay.body.error).toBe("Only the assigned finance user can record payments");
+    ok(await pay(ACT.finA, R.tour, L.usdNoRate, { paymentStatus: "PAID", paymentRef: "UTR556", paidAt: "2026-09-05" }));
   });
 });
 

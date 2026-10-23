@@ -22,6 +22,12 @@ import mongoose from "mongoose";
 import TravellerProfile, { type TravellerProfileDocument } from "../models/TravellerProfile.js";
 import { normalizeEmail } from "./travellerMatch.js";
 
+/** Recording a payment is the traveller's assigned Finance user's alone —
+ * the refusals routes/cstep.ts (callerPaymentRefusal) and
+ * cstep.vendorPayables.ts (the import) answer with. */
+export const ONLY_ASSIGNED_FINANCE = "Only the assigned finance user can record payments";
+export const NO_FINANCE_ASSIGNED = "No finance user is assigned to this traveller — assign a finance user first";
+
 export function ownerId(req: any): string {
   return String(req.user?.id || req.user?._id || req.user?.sub || "");
 }

@@ -14,9 +14,12 @@
 //   POST /import/preview  — dry run, no writes, one outcome per row.
 //   POST /import/commit   — the same file re-run against live data.
 //
-// Scope: a CSTEP Admin sees and pays everything in the workspace; a Finance
-// user only the travellers they are mapped to (TravellerProfile.
-// financeUserId) — the same split as the Travel Register. Anyone else 403.
+// Scope: a CSTEP Admin SEES everything in the workspace (list, export, the
+// Tally export); a Finance user only the travellers they are mapped to
+// (TravellerProfile.financeUserId) — the same split as the Travel Register.
+// Anyone else 403. PAYING (the import) is the assigned Finance user's alone
+// (requirePaymentScope): only their own travellers' lines, never an Admin as
+// such — the rule routes/cstep.ts applies to every payment.
 //
 // Import matching, per row: the vendor by Vendor Code; the request by
 // Reference = its claimReference (a Tour's TIN or an Event Request's EVR
@@ -36,7 +39,7 @@ import CstepApproval from "../models/cstep/CstepApproval.js";
 import CstepTravelRequest from "../models/cstep/CstepTravelRequest.js";
 import CstepVendor from "../models/cstep/CstepVendor.js";
 import TravellerProfile from "../models/TravellerProfile.js";
-import { ownerId, isCstepAdmin } from "../utils/cstepAccess.js";
+import { ownerId, isCstepAdmin, ONLY_ASSIGNED_FINANCE } from "../utils/cstepAccess.js";
 import { istDate } from "../utils/cstepTravelRegister.js";
 import {
   sheetUpload,
@@ -90,6 +93,23 @@ export async function requireScope(req: any, res: any): Promise<Scope | null> {
   const scope = await resolveScope(req);
   if (!scope) res.status(403).json({ error: "Vendor payments are open to CSTEP Admin and Finance users" });
   return scope;
+}
+
+/** The import — recording payments: the caller's own Finance travellers
+ * only, never the Admin's whole-workspace view. An Admin who is some
+ * traveller's Finance user pays those travellers' lines, as that user. */
+async function requirePaymentScope(req: any, res: any): Promise<Scope | null> {
+  const uid = ownerId(req);
+  const mine = mongoose.isValidObjectId(uid)
+    ? await TravellerProfile.find({ workspaceId: req.workspaceObjectId, financeUserId: new mongoose.Types.ObjectId(uid) })
+        .select("_id")
+        .lean()
+    : [];
+  if (!mine.length) {
+    res.status(403).json({ error: `${ONLY_ASSIGNED_FINANCE} — the import pays the lines of the travellers you are the Finance user of` });
+    return null;
+  }
+  return { all: false, travellerIds: mine.map((t: any) => t._id) };
 }
 
 export const inScope = (scope: Scope, travelerProfileId: any) =>
@@ -512,7 +532,7 @@ async function processPaymentRows(
 }
 
 async function importStep(req: any, res: any, dryRun: boolean) {
-  const scope = await requireScope(req, res);
+  const scope = await requirePaymentScope(req, res);
   if (!scope) return;
   const sheet = await readUploadedSheet(req.file);
   if (sheet.error !== undefined) return res.status(400).json({ error: sheet.error });

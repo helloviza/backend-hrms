@@ -78,7 +78,7 @@ import type {
 import CstepProject from "../models/cstep/CstepProject.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import Counter from "../models/Counter.js";
-import { ownerId, isCstepAdmin, resolveOwnTravellerProfile } from "../utils/cstepAccess.js";
+import { ownerId, isCstepAdmin, resolveOwnTravellerProfile, ONLY_ASSIGNED_FINANCE, NO_FINANCE_ASSIGNED } from "../utils/cstepAccess.js";
 import {
   uploadCstepTourProposalPdf,
   type CstepApprovalTrailEntry,
@@ -260,10 +260,35 @@ async function callerCanFinanceForTraveller(req: any, travelerProfileId: any): P
   return String(traveller.financeUserId) === ownerId(req);
 }
 
-/** Vendor payment on an arrangement line: the traveller's Official (who
- * books the vendor at the arrange step), their Finance user, or a CSTEP
- * Admin. */
-async function callerCanPayVendorsForTraveller(req: any, travelerProfileId: any): Promise<boolean> {
+/**
+ * Recording a PAYMENT — every payment-recording action: the reimbursement
+ * (POST /requests/:id/finance/settle, Tour / Event and claim alike), a
+ * vendor line marked paid or unpaid (PATCH /arrangements/:lineId/payment)
+ * and the vendor-payables import (cstep.vendorPayables.ts, per row). Only
+ * the traveller's assigned Finance user (TravellerProfile.financeUserId) —
+ * no CSTEP Admin, no Official, and no fallback: with no Finance user
+ * assigned the payment is blocked for everyone until an Admin assigns one
+ * (a mapping action, workspace.travellers.ts). An Admin who IS the assigned
+ * Finance user records it as that user. Setting a missing amount
+ * (missing-amount) is not a payment and stays Finance-or-Admin; so does
+ * Finance's send-back (finance/return). Returns the refusal, or null.
+ */
+async function callerPaymentRefusal(req: any, travelerProfileId: any): Promise<string | null> {
+  const traveller: any = await TravellerProfile.findOne({
+    _id: travelerProfileId,
+    workspaceId: req.workspaceObjectId,
+  })
+    .select("financeUserId")
+    .lean();
+  if (!traveller?.financeUserId) return NO_FINANCE_ASSIGNED;
+  return String(traveller.financeUserId) === ownerId(req) ? null : ONLY_ASSIGNED_FINANCE;
+}
+
+/** Who has the vendor ledger past the arrange step (the "What was arranged"
+ * section, its payment badges): the traveller's Official, their Finance
+ * user, or a CSTEP Admin. Seeing it only — marking a line paid is the
+ * assigned Finance user's alone (callerPaymentRefusal). */
+async function callerHasVendorLedger(req: any, travelerProfileId: any): Promise<boolean> {
   return (
     (await callerCanArrangeForTraveller(req, travelerProfileId)) ||
     (await callerCanFinanceForTraveller(req, travelerProfileId))
@@ -1726,26 +1751,33 @@ router.get("/requests/:id", async (req: any, res: any) => {
     // Claims addition — may this caller run the Admin verification (APPROVED
     // claim -> TRANSFERRED_TO_FINANCE)?
     const canVerifyClaim = isClaim && admin && doc.status === "APPROVED";
-    // Step 6 — may this caller mark the reimbursement paid? Only while the
-    // case is actually with Finance; the Finance user's own queue is the
-    // usual way in (GET /finance-queue). A claim is reimbursed by the
-    // traveller's Finance user only — never by a CSTEP Admin as such.
-    const canFinance =
+    // Step 6 — the Finance card, while the case is with Finance (the Finance
+    // user's own queue is the usual way in, GET /finance-queue).
+    // canFinanceDecide is the card and its send-back: the Finance user, or
+    // for a Tour also an Admin (a claim's card is the Finance user's only).
+    // canFinance — recording the reimbursement — is below.
+    const canFinanceDecide =
       doc.status === "TRANSFERRED_TO_FINANCE" &&
       (isClaim
         ? await callerIsTravellerFinanceUser(req, doc.travelerProfileId)
         : await callerCanFinanceForTraveller(req, doc.travelerProfileId));
-    // Vendor payment — may this caller mark arrangement lines paid? This
-    // traveller's Official or Finance user, or a CSTEP Admin, from ARRANGING
-    // onwards.
-    const canPayVendors =
-      !isClaim &&
-      VENDOR_PAYABLE_STATUSES.has(doc.status) &&
-      (await callerCanPayVendorsForTraveller(req, doc.travelerProfileId));
+    // Recording any payment is the assigned Finance user's alone
+    // (callerPaymentRefusal) — one answer for the reimbursement and the
+    // vendor lines. paymentBlockedReason says why not to a caller who has
+    // the Finance card or the vendor ledger but can't pay.
+    const vendorStage = !isClaim && VENDOR_PAYABLE_STATUSES.has(doc.status);
+    const hasVendorLedger = vendorStage && (await callerHasVendorLedger(req, doc.travelerProfileId));
+    const paymentRefusal = canFinanceDecide || hasVendorLedger ? await callerPaymentRefusal(req, doc.travelerProfileId) : null;
+    const canFinance = canFinanceDecide && !paymentRefusal;
+    // Vendor payment — mark arrangement lines paid / unpaid, from ARRANGING
+    // onwards: the assigned Finance user only. hasVendorLedger (Official,
+    // Finance, Admin) keeps the ledger on the page past ARRANGED.
+    const canPayVendors = hasVendorLedger && !paymentRefusal;
+    const paymentBlockedReason = paymentRefusal || undefined;
     // ...and put the amount on a vendor line that has none (PATCH
-    // /arrangements/:lineId/missing-amount) — Finance or Admin only.
-    const canSetMissingAmounts =
-      canPayVendors && (await callerCanFinanceForTraveller(req, doc.travelerProfileId));
+    // /arrangements/:lineId/missing-amount) — Finance or Admin. Setting an
+    // amount, not a payment, so it keeps its own rule.
+    const canSetMissingAmounts = vendorStage && (await callerCanFinanceForTraveller(req, doc.travelerProfileId));
     // The figure Finance pays out — read off the finalized settlement so the
     // Finance user's card can show it without needing the Official-only
     // GET /settlement. Present only while the case is with Finance.
@@ -1835,7 +1867,10 @@ router.get("/requests/:id", async (req: any, res: any) => {
       canArrange,
       canSettle,
       canFinance,
+      canFinanceDecide,
+      paymentBlockedReason,
       canPayVendors,
+      hasVendorLedger,
       canSetMissingAmounts,
       canVerifyClaim,
       financeAmountClaimed,
@@ -3611,9 +3646,8 @@ router.patch("/requests/:id/arrangements/:lineId/payment", async (req: any, res:
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
-    if (!(await callerCanPayVendorsForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official or Finance user, or a CSTEP Admin, can record a vendor payment" });
-    }
+    const refusal = await callerPaymentRefusal(req, doc.travelerProfileId);
+    if (refusal) return res.status(403).json({ error: refusal });
     if (isClaimFormType(doc.formType) || !VENDOR_PAYABLE_STATUSES.has(doc.status)) {
       return res.status(409).json({ error: "A vendor payment can be recorded once the request is being arranged" });
     }
@@ -3686,8 +3720,7 @@ router.patch("/requests/:id/arrangements/:lineId/payment", async (req: any, res:
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
-      // The Official recording it at the arrange step logs as OFFICIAL.
-      stage: (await callerCanFinanceForTraveller(req, doc.travelerProfileId)) ? "FINANCE" : "OFFICIAL",
+      stage: "FINANCE",
       actor: new mongoose.Types.ObjectId(ownerId(req)),
       action: "VENDOR_PAYMENT",
       comment:
@@ -5995,13 +6028,8 @@ router.post("/requests/:id/finance/settle", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
-    if (isClaimFormType(doc.formType)) {
-      if (!(await callerIsTravellerFinanceUser(req, doc.travelerProfileId))) {
-        return res.status(403).json({ error: "Only this traveller's Finance user can reimburse a claim" });
-      }
-    } else if (!(await callerCanFinanceForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Finance user or a CSTEP Admin can perform this action" });
-    }
+    const refusal = await callerPaymentRefusal(req, doc.travelerProfileId);
+    if (refusal) return res.status(403).json({ error: refusal });
     const result = await settleFinanceCase(req, doc, {
       reference: String(req.body?.reference || "").trim(),
       note: String(req.body?.note || "").trim(),

@@ -435,25 +435,37 @@ describe("export = import template", () => {
   });
 });
 
-describe("Admin pays any traveller; CSV works too", () => {
-  it("the row Finance A was refused, Admin pays (CSV, reference as text)", async () => {
+describe("only the assigned Finance user imports payments; CSV works too", () => {
+  it("the row Finance A is refused, the Admin is refused outright, Finance B (its own) pays (CSV, reference as text)", async () => {
     const csv = Buffer.from(
-      ["Vendor Code,Vendor Name,Reference,Traveller,Service,Amount INR,Payment Status,Paid On,Payment Ref", `CSTEPVEN0001,Skyline,0099/${MMYY},,,,Paid,${TODAY},UTR-ADMIN`].join("\n") + "\n",
+      ["Vendor Code,Vendor Name,Reference,Traveller,Service,Amount INR,Payment Status,Paid On,Payment Ref", `CSTEPVEN0001,Skyline,0099/${MMYY},,,,Paid,${TODAY},UTR-FINB`].join("\n") + "\n",
     );
     expect(ok(await upload("commit", ACT.finA, csv, "p.csv")).body.counts.OUT_OF_SCOPE).toBe(1);
-    const r = ok(await upload("commit", ACT.admin, csv, "p.csv")).body;
+    // Recording payments is the assigned Finance user's alone — the Admin's
+    // whole-workspace view doesn't extend to paying (preview or commit).
+    for (const step of ["preview", "commit"] as const) {
+      const a = await upload(step, ACT.admin, csv, "p.csv");
+      expect(a.status).toBe(403);
+      expect(a.body.error).toMatch(/^Only the assigned finance user can record payments/);
+    }
+    expect(await col("csteparrangements").findOne({ requestId: new mongoose.Types.ObjectId(ids.other) })).toMatchObject({ paymentStatus: "UNPAID" });
+    const r = ok(await upload("commit", ACT.finB, csv, "p.csv")).body;
     expect(r.results[0]).toMatchObject({ outcome: "PAID", paidLines: 1 });
     expect(await col("csteparrangements").findOne({ requestId: new mongoose.Types.ObjectId(ids.other) })).toMatchObject({
-      paymentStatus: "PAID", paymentRef: "UTR-ADMIN", paymentSource: "IMPORT", paidBy: U.admin,
+      paymentStatus: "PAID", paymentRef: "UTR-FINB", paymentSource: "IMPORT", paidBy: U.finB,
     });
   });
 
-  it("a row not marked paid is left alone; a plain user can't import", async () => {
+  it("a row not marked paid is left alone; a plain user can't import; the Admin still SEES every line", async () => {
     const csv = Buffer.from(
       ["Vendor Code,Reference,Payment Status,Paid On", `CSTEPVEN0001,0098/${MMYY},Unpaid,`].join("\n") + "\n",
     );
-    expect(ok(await upload("preview", ACT.admin, csv, "p.csv")).body.results[0]).toMatchObject({ outcome: "NOT_MARKED_PAID" });
+    expect(ok(await upload("preview", ACT.finA, csv, "p.csv")).body.results[0]).toMatchObject({ outcome: "NOT_MARKED_PAID" });
     expect((await upload("preview", ACT.plain, csv, "p.csv")).status).toBe(403);
+    // The list (and its export / Tally export) keeps the Admin's workspace view.
+    const all = ok(await get(ACT.admin, "/vendor-payables")).body;
+    expect(all.scope).toBe("ALL");
+    expect(all.rows.some((x: any) => x.reference === `0099/${MMYY}`)).toBe(true);
   });
 });
 
