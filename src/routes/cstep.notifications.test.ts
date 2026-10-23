@@ -246,9 +246,16 @@ describe("CSTEP notifications through the router — Tour Proposal, full pipelin
     expect(await delta()).toEqual([]);
   });
 
-  it("REPORT_SUBMITTED → the Official", async () => {
+  // Report approval — the submitted report goes to the Manager first; only
+  // their approval hands it to the Official.
+  it("REPORT_SUBMITTED → the Manager (Tour Approver), not the Official", async () => {
     ok(await post(ACT.traveller, `/requests/${id}/report/submit`));
-    expect(await delta()).toEqual([["cstep_report_submitted", EMAIL.official]]);
+    expect(await delta()).toEqual([["cstep_report_submitted", EMAIL.approver]]);
+  });
+
+  it("REPORT_APPROVED → the Official", async () => {
+    ok(await post(ACT.approver, `/requests/${id}/report/approve`));
+    expect(await delta()).toEqual([["cstep_report_approved", EMAIL.official]]);
   });
 
   it("settlement/start (auto-fire on open) sends nothing", async () => {
@@ -262,11 +269,27 @@ describe("CSTEP notifications through the router — Tour Proposal, full pipelin
     expect(await delta()).toEqual([["cstep_return_report", EMAIL.traveller]]);
   });
 
-  it("report/start on an already-pending report sends nothing; resubmitting the report → the Official again", async () => {
+  it("report/start on an already-pending report sends nothing; resubmitting → the Manager, approving → the Official again", async () => {
     ok(await post(ACT.traveller, `/requests/${id}/report/start`));
     expect(await delta()).toEqual([]);
     ok(await post(ACT.traveller, `/requests/${id}/report/submit`));
-    expect(await delta()).toEqual([["cstep_report_submitted", EMAIL.official]]);
+    expect(await delta()).toEqual([["cstep_report_submitted", EMAIL.approver]]);
+    ok(await post(ACT.approver, `/requests/${id}/report/approve`));
+    expect(await delta()).toEqual([["cstep_report_approved", EMAIL.official]]);
+  });
+
+  it("the Manager sending a report back (REPORT_UNDER_APPROVAL) → the traveller", async () => {
+    // A second Tour, taken to the Manager's step.
+    const r = ok(await post(ACT.traveller, "/requests", { ...TOUR, purpose: "QC manager send-back" }));
+    const other = String(r.body.request._id);
+    ok(await post(ACT.approver, `/requests/${other}/approve`));
+    ok(await post(ACT.official, `/requests/${other}/start-arranging`));
+    ok(await post(ACT.official, `/requests/${other}/mark-arranged`));
+    ok(await post(ACT.traveller, `/requests/${other}/report/start`));
+    ok(await post(ACT.traveller, `/requests/${other}/report/submit`));
+    await delta();
+    ok(await post(ACT.approver, `/requests/${other}/report/return`, { reason: "Hotel bill missing" }));
+    expect(await delta()).toEqual([["cstep_return_report", EMAIL.traveller]]);
   });
 
   it("settlement/start + a per-diem edit send nothing", async () => {
@@ -315,6 +338,7 @@ describe("CSTEP notifications through the router — reject and nothing-owed pat
     ok(await post(ACT.official, `/requests/${id}/mark-arranged`));
     ok(await post(ACT.traveller, `/requests/${id}/report/start`));
     ok(await post(ACT.traveller, `/requests/${id}/report/submit`));
+    ok(await post(ACT.approver, `/requests/${id}/report/approve`));
     ok(await post(ACT.official, `/requests/${id}/settlement/start`));
     await delta();
     const f = ok(await post(ACT.official, `/requests/${id}/settlement/finalize`, { force: true }));
@@ -386,6 +410,7 @@ describe("CSTEP_NOTIFICATIONS_ENABLED off (the default) — dormant", () => {
     ok(await post(ACT.official, `/requests/${id}/mark-arranged`));
     ok(await post(ACT.traveller, `/requests/${id}/report/start`));
     ok(await post(ACT.traveller, `/requests/${id}/report/submit`));
+    ok(await post(ACT.approver, `/requests/${id}/report/approve`));
     ok(await post(ACT.official, `/requests/${id}/settlement/start`));
     ok(await patch(ACT.official, `/requests/${id}/settlement/perdiem`, { rate: 1500 }));
     ok(await post(ACT.official, `/requests/${id}/settlement/finalize`, { force: true }));

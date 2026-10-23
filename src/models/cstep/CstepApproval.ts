@@ -42,6 +42,9 @@ export type CstepApprovalAction =
   // Step 4 — the traveller's post-trip Travel Report.
   | "START_REPORT"
   | "SUBMIT_REPORT"
+  // Report approval — the Manager approves the submitted report on to the
+  // Official (REPORT_UNDER_APPROVAL → REPORT_SUBMITTED).
+  | "APPROVE_REPORT"
   // Step 5 — Office/Accounts settlement (verification of the CstepSettlement
   // opened once REPORT_SUBMITTED is reached).
   | "START_VERIFICATION"
@@ -54,7 +57,7 @@ export type CstepApprovalAction =
   | "FINANCE_SETTLE"
   // Exit/bounce paths — send-backs after approval. The approval-stage
   // send-back stays RETURN; reject at that stage is REJECT (above).
-  | "RETURN_REPORT" // Official → traveller: REPORT_SUBMITTED → REPORT_PENDING
+  | "RETURN_REPORT" // Manager → traveller (REPORT_UNDER_APPROVAL) or Official → traveller (REPORT_SUBMITTED), → REPORT_PENDING
   | "RETURN_TO_OFFICIAL" // Finance → Official: TRANSFERRED_TO_FINANCE → REPORT_SUBMITTED
   // Claims addition — a claim has no Official stage: Finance sends it back
   // to CSTEP Admin verification (TRANSFERRED_TO_FINANCE → APPROVED). The
@@ -104,6 +107,7 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "VENDOR_PAYMENT",
       "START_REPORT",
       "SUBMIT_REPORT",
+      "APPROVE_REPORT",
       "START_VERIFICATION",
       "VERIFY_LINE",
       "SETTLE",

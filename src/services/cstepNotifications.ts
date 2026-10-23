@@ -27,7 +27,8 @@
 //   APPROVED                 Official user   (TravellerProfile.officialUserId) — not for claims
 //   CLAIM_APPROVED           CSTEP Admin(s)  (settings.adminRecipients) — a claim's next step
 //   RETURN_TO_ADMIN          CSTEP Admin(s)  — Finance sent a claim back
-//   REPORT_SUBMITTED         Official user
+//   REPORT_SUBMITTED         Tour Approver   — the travel report waits on the Manager
+//   REPORT_APPROVED          Official user   — the Manager approved it on to settlement
 //   RETURN_TO_OFFICIAL       Official user
 //   TRANSFERRED_TO_FINANCE   Finance user    (TravellerProfile.financeUserId)
 //   RETURN, RETURN_REPORT,   owner — the traveller: claimedBy User's email →
@@ -53,6 +54,7 @@ export type CstepNotifyEvent =
   | "CLAIM_APPROVED"
   | "RETURN_TO_ADMIN"
   | "REPORT_SUBMITTED"
+  | "REPORT_APPROVED"
   | "TRANSFERRED_TO_FINANCE"
   | "RETURN"
   | "RETURN_REPORT"
@@ -69,7 +71,8 @@ const RECIPIENT: Record<CstepNotifyEvent, Role> = {
   APPROVED: "OFFICIAL",
   CLAIM_APPROVED: "ADMIN",
   RETURN_TO_ADMIN: "ADMIN",
-  REPORT_SUBMITTED: "OFFICIAL",
+  REPORT_SUBMITTED: "APPROVER",
+  REPORT_APPROVED: "OFFICIAL",
   RETURN_TO_OFFICIAL: "OFFICIAL",
   TRANSFERRED_TO_FINANCE: "FINANCE",
   RETURN: "OWNER",
@@ -165,7 +168,9 @@ function copyFor(event: CstepNotifyEvent, who: string, kind: string, claim: bool
     case "RETURN_TO_ADMIN":
       return { subject: `${kind} sent back by Finance — ${who}`, badge: "Sent back", tone: "red", headline: `Finance has sent ${who}'s ${lower} back`, instruction: "Please review the claim and verify it again.", note: reason };
     case "REPORT_SUBMITTED":
-      return { subject: `Travel report submitted — ${who}`, badge: "Report submitted", tone: "blue", headline: `${who} has submitted their travel report`, instruction: "Please verify it and settle the claim." };
+      return { subject: `Travel report awaiting your approval — ${who}`, badge: "Approval needed", tone: "orange", headline: `${who} has submitted their travel report`, instruction: "Please review it and approve it, or send it back with a reason." };
+    case "REPORT_APPROVED":
+      return { subject: `Travel report approved — ready to settle — ${who}`, badge: "Report approved", tone: "blue", headline: `${who}'s travel report is approved`, instruction: "Please verify it and settle the claim." };
     case "RETURN_TO_OFFICIAL":
       return { subject: `Claim sent back by Finance — ${who}`, badge: "Sent back", tone: "red", headline: `Finance has sent ${who}'s claim back`, instruction: "Please review the settlement and finalize it again.", note: reason };
     case "TRANSFERRED_TO_FINANCE":
@@ -240,6 +245,12 @@ function nextStepsFor(event: CstepNotifyEvent, claim: boolean, ctx: CstepNotifyC
         { title: "Send to Finance", detail: "Or return it to the traveller with a reason." },
       ];
     case "REPORT_SUBMITTED":
+      return [
+        { title: "Review", detail: "Open the travel report and check its legs and bills." },
+        { title: "Decide", detail: "Approve it on to the Travel Desk, or send it back with a reason." },
+        { title: "Traveller informed", detail: "The traveller is emailed if it is sent back." },
+      ];
+    case "REPORT_APPROVED":
     case "RETURN_TO_OFFICIAL":
       return [
         { title: "Verify", detail: "Check the travel report and its bills." },

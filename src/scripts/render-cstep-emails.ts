@@ -51,6 +51,7 @@ const CASES: Array<[Event, string[], Record<string, any>, string]> = [
   ["REJECTED", ALL, { reason: "Not within this quarter's travel budget." }, ""],
   ["ARRANGED", TRIP, {}, ""],
   ["REPORT_SUBMITTED", TRIP, {}, ""],
+  ["REPORT_APPROVED", TRIP, {}, ""],
   ["RETURN_REPORT", TRIP, { reason }, ""],
   ["RETURN_TO_OFFICIAL", TRIP, { reason: "Per-diem for 5 Nov is counted twice." }, ""],
   ["RETURN_TO_ADMIN", CLAIMS, { reason: "Two receipts are illegible." }, ""],

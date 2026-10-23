@@ -1661,6 +1661,11 @@ router.get("/requests/:id", async (req: any, res: any) => {
     const isClaim = isClaimFormType(doc.formType);
     const canApprove =
       doc.status === "SUBMITTED" && (admin || (await callerCanActOnTraveller(req, doc.travelerProfileId)));
+    // Report approval — may this caller approve or return the submitted
+    // travel report (REPORT_UNDER_APPROVAL)? The Manager, or a CSTEP Admin
+    // as the fallback, the same authority as canApprove.
+    const canApproveReport =
+      doc.status === "REPORT_UNDER_APPROVAL" && (admin || (await callerCanActOnTraveller(req, doc.travelerProfileId)));
     // A claim is never arranged — it has no arrangement stage at all.
     const canArrange =
       !isClaim &&
@@ -1759,6 +1764,7 @@ router.get("/requests/:id", async (req: any, res: any) => {
       ok: true,
       request: doc.toObject(),
       canApprove,
+      canApproveReport,
       isAdmin: admin,
       canArrange,
       canSettle,
@@ -2062,10 +2068,14 @@ async function withTravellerNames(req: any, docs: any[]): Promise<any[]> {
   return docs.map((d) => ({ ...d, travellerName: names.get(String(d.travelerProfileId)) || undefined }));
 }
 
+// What waits on the Manager: a submitted request, and (report approval) a
+// submitted travel report, which the frontend tells apart by status.
+const APPROVER_QUEUE_STATUSES = ["SUBMITTED", "REPORT_UNDER_APPROVAL"];
+
 router.get("/approvals", async (req: any, res: any) => {
   try {
     const admin = isCstepAdmin(req);
-    const filter: any = { workspaceId: req.workspaceObjectId, status: "SUBMITTED" };
+    const filter: any = { workspaceId: req.workspaceObjectId, status: { $in: APPROVER_QUEUE_STATUSES } };
 
     if (!admin) {
       const uid = ownerId(req);
@@ -2174,11 +2184,14 @@ router.get("/my-roles", async (req: any, res: any) => {
 // widened from the old APPROVED/ARRANGING-only filter, which dropped a
 // case the moment it reached ARRANGED (Step 3 done) or REPORT_SUBMITTED
 // (Step 4 done), even though the Official/Admin still needed to see it.
+// REPORT_UNDER_APPROVAL (report approval) is the Manager's step, listed here
+// for the record so a report the Manager holds never drops off the board.
 const OFFICIAL_QUEUE_STAGES = [
   "APPROVED",
   "ARRANGING",
   "ARRANGED",
   "REPORT_PENDING",
+  "REPORT_UNDER_APPROVAL",
   "REPORT_SUBMITTED",
   "TRANSFERRED_TO_FINANCE",
   "SETTLED",
@@ -2328,9 +2341,10 @@ router.get("/finance-queue", async (req: any, res: any) => {
  * exception: it reads the approval log, so it stays with whoever approved.
  *
  * Buckets:
- *   pending      — APPROVER_PENDING_STATUSES (the caller's live to-do list),
- *                  never period-filtered
- *   approvedByMe — APPROVE log entries whose actor is the caller, by the
+ *   pending      — APPROVER_PENDING_STATUSES (the caller's live to-do list:
+ *                  requests and travel reports), never period-filtered
+ *   approvedByMe — APPROVE / APPROVE_REPORT log entries whose actor is the
+ *                  caller (latest one per request), by the
  *                  date of the approval. A row's status is its status now,
  *                  and it stays even if the traveller has left the team
  *   planned      — APPROVER_PLANNED_STATUSES, with the proposal's estimated
@@ -2344,11 +2358,12 @@ router.get("/finance-queue", async (req: any, res: any) => {
  * (resolveRegisterPeriod), default the current FY. DRAFT and RETURNED are
  * with the traveller and belong to no bucket.
  * ───────────────────────────────────────────────────────────────────── */
-// #1 hook: once the Manager approves post-tour reports, add
-// "REPORT_UNDER_APPROVAL" here, and its approve action to
-// APPROVER_REPORT_APPROVE_ACTIONS.
-const APPROVER_PENDING_STATUSES = ["SUBMITTED"];
-const APPROVER_REPORT_APPROVE_ACTIONS = ["APPROVE"];
+// Pending = what waits on the Manager: a submitted request, or a submitted
+// travel report (report approval). The same set as GET /approvals.
+// A report approval counts as an approval too, so a report the Manager
+// approves this period lists the trip under Approved by me.
+const APPROVER_PENDING_STATUSES = APPROVER_QUEUE_STATUSES;
+const APPROVER_REPORT_APPROVE_ACTIONS = ["APPROVE", "APPROVE_REPORT"];
 const APPROVER_PLANNED_STATUSES = ["APPROVED", "ARRANGING", "ARRANGED", "REPORT_PENDING", "REPORT_SUBMITTED"];
 // TRANSFERRED_TO_FINANCE counts as closed. The trip's settlement is final
 // and only the payout is left. Leaving it out would hide the case from the
@@ -4186,9 +4201,10 @@ router.post("/attachments/staging", reportAttachmentUpload.single("file"), async
 
 /* ─────────────────────────────────────────────────────────────────────
  * POST /requests/:id/report/submit — creator-only, REPORT_PENDING →
- * REPORT_SUBMITTED. Logs SUBMIT_REPORT. Does not build any Step 5
- * verification — the request just becomes visible to the Admin at this
- * status for that later work.
+ * REPORT_UNDER_APPROVAL. Logs SUBMIT_REPORT and emails the Manager (the
+ * traveller's Approver), whose approval (POST /report/approve) is what
+ * hands the report to the Official at REPORT_SUBMITTED. Builds no
+ * settlement — that still starts from REPORT_SUBMITTED.
  *
  * Per CSTEP's rule, EVERY leg needs a supporting document — even a
  * "Booked by CSTEP" leg (boarding pass/hotel voucher/cab receipt) — so this
@@ -4229,7 +4245,7 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
       });
     }
 
-    doc.status = "REPORT_SUBMITTED";
+    doc.status = "REPORT_UNDER_APPROVAL";
     await doc.save();
 
     const entry = await CstepApproval.create({
@@ -4241,12 +4257,57 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
       action: "SUBMIT_REPORT",
       at: new Date().toISOString(),
     });
+    // REPORT_SUBMITTED is the email event's name: it goes to the Manager.
     await notifyCstep("REPORT_SUBMITTED", doc, { logEntryId: entry._id });
 
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
     console.error("[CSTEP requests report submit]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to submit the travel report" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /requests/:id/report/approve — report approval. The Manager (the
+ * traveller's Approver), or a CSTEP Admin as the fallback, approves the
+ * submitted travel report: REPORT_UNDER_APPROVAL → REPORT_SUBMITTED, logs
+ * APPROVE_REPORT (stage APPROVER, with the optional comment) and emails the
+ * Official, whose settlement path from REPORT_SUBMITTED is unchanged. To
+ * send the report back instead, the Manager uses POST /report/return.
+ * (Admin-as-fallback is deliberate for now; CSTEP's "Admin shouldn't
+ * approve before the Manager" is a separate, deferred change.)
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/requests/:id/report/approve", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerCanActOnTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Approver or a CSTEP Admin can approve the travel report" });
+    }
+    if (doc.status !== "REPORT_UNDER_APPROVAL") {
+      return res.status(409).json({ error: "Only a travel report awaiting approval can be approved" });
+    }
+
+    doc.status = "REPORT_SUBMITTED";
+    await doc.save();
+
+    const comment = String(req.body?.comment || "").trim();
+    const entry = await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "APPROVER",
+      actor: new mongoose.Types.ObjectId(ownerId(req)),
+      action: "APPROVE_REPORT",
+      ...(comment ? { comment } : {}),
+      at: new Date().toISOString(),
+    });
+    await notifyCstep("REPORT_APPROVED", doc, { logEntryId: entry._id });
+
+    res.json({ ok: true, request: doc.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests report approve]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to approve the travel report" });
   }
 });
 
@@ -5001,11 +5062,14 @@ router.patch("/requests/:id/settlement/perdiem", async (req: any, res: any) => {
 });
 
 /**
- * POST /requests/:id/report/return — the Official (or a CSTEP Admin) sends a
- * submitted Travel Report back to the traveller for a fix:
- * REPORT_SUBMITTED → REPORT_PENDING, reason mandatory, logs RETURN_REPORT
- * (stage OFFICIAL). The report legs become editable again and the owner
- * resubmits via POST /report/submit.
+ * POST /requests/:id/report/return — sends a submitted Travel Report back
+ * to the traveller for a fix, → REPORT_PENDING, reason mandatory, logs
+ * RETURN_REPORT. Who, by status:
+ *   REPORT_UNDER_APPROVAL — the Manager (traveller's Approver) or a CSTEP
+ *                           Admin; stage APPROVER (report approval)
+ *   REPORT_SUBMITTED      — the Official or a CSTEP Admin; stage OFFICIAL
+ * The report legs become editable again and the owner resubmits via
+ * POST /report/submit, which goes back to the Manager.
  *
  * Any settlement still VERIFYING is discarded with its lines: its lines are
  * seeded once, from the report legs, at /settlement/start — after the
@@ -5019,11 +5083,20 @@ router.post("/requests/:id/report/return", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
-    if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
-    }
-    if (doc.status !== "REPORT_SUBMITTED") {
-      return res.status(409).json({ error: "Only a submitted travel report can be sent back to the traveller" });
+    // With the Manager the Manager returns it; at every other status the
+    // Official's rule applies, unchanged.
+    const withManager = doc.status === "REPORT_UNDER_APPROVAL";
+    if (withManager) {
+      if (!(await callerCanActOnTraveller(req, doc.travelerProfileId))) {
+        return res.status(403).json({ error: "Only this traveller's Approver or a CSTEP Admin can send this travel report back" });
+      }
+    } else {
+      if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
+        return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+      }
+      if (doc.status !== "REPORT_SUBMITTED") {
+        return res.status(409).json({ error: "Only a submitted travel report can be sent back to the traveller" });
+      }
     }
 
     const reason = String(req.body?.reason || "").trim();
@@ -5047,7 +5120,7 @@ router.post("/requests/:id/report/return", async (req: any, res: any) => {
       workspaceId: req.workspaceObjectId,
       entityType: "REQUEST",
       entityId: doc._id,
-      stage: "OFFICIAL",
+      stage: withManager ? "APPROVER" : "OFFICIAL",
       actor: new mongoose.Types.ObjectId(ownerId(req)),
       action: "RETURN_REPORT",
       comment: reason,

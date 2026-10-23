@@ -233,6 +233,9 @@ export interface ICstepTravelRequest extends Document {
   // Step 4 addition — from ARRANGED, the traveller starts their Travel
   // Report (REPORT_PENDING — legs are editable) and submits it
   // (REPORT_SUBMITTED — now with the Admin for Step 5).
+  // Report approval — between the two, REPORT_UNDER_APPROVAL: the submitted
+  // report waits on the traveller's Approver (the Manager), who approves it
+  // on to the Official (REPORT_SUBMITTED) or returns it (REPORT_PENDING).
   // Processing-queue 6-stage addition — TRANSFERRED_TO_FINANCE is the final
   // Processing-queue stage (Step 6's hand-off, not built yet). Defined here
   // only so the Processing board's 6th tab exists ahead of that work; no
@@ -254,6 +257,7 @@ export interface ICstepTravelRequest extends Document {
     | "ARRANGING"
     | "ARRANGED"
     | "REPORT_PENDING"
+    | "REPORT_UNDER_APPROVAL"
     | "REPORT_SUBMITTED"
     | "TRANSFERRED_TO_FINANCE"
     | "SETTLED"
@@ -526,6 +530,7 @@ const CstepTravelRequestSchema = new Schema<ICstepTravelRequest>(
         "ARRANGING",
         "ARRANGED",
         "REPORT_PENDING",
+        "REPORT_UNDER_APPROVAL",
         "REPORT_SUBMITTED",
         "TRANSFERRED_TO_FINANCE",
         "SETTLED",

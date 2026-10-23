@@ -286,6 +286,7 @@ const STATUS_LABEL: Record<string, string> = {
   ARRANGING: "Being arranged",
   ARRANGED: "Arranged",
   REPORT_PENDING: "Travel report pending",
+  REPORT_UNDER_APPROVAL: "Travel report with the manager",
   REPORT_SUBMITTED: "Travel report submitted",
   TRANSFERRED_TO_FINANCE: "With Finance",
   SETTLED: "Settled",
