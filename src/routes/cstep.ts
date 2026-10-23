@@ -2127,10 +2127,24 @@ router.get("/my-roles", async (req: any, res: any) => {
     const uid = new mongoose.Types.ObjectId(ownerId(req));
     // isFinanceUser — actually mapped as some traveller's Finance user. Unlike
     // isFinance (true for every Admin, for the queues), it gates what only
-    // the Finance user may do, e.g. bulk reimbursement.
+    // the Finance user may do, e.g. bulk reimbursement. isTourApprover is the
+    // same idea for the Approver slot — actually named as some traveller's
+    // approver — and gates the My Team report (GET /approver-report), which
+    // is about the caller's own team, so an Admin with no team doesn't get it.
     if (isCstepAdmin(req)) {
-      const mapped = await TravellerProfile.exists({ workspaceId: req.workspaceObjectId, financeUserId: uid });
-      return res.json({ ok: true, isAdmin: true, isApprover: true, isOfficial: true, isFinance: true, isFinanceUser: !!mapped });
+      const [mapped, approverOf] = await Promise.all([
+        TravellerProfile.exists({ workspaceId: req.workspaceObjectId, financeUserId: uid }),
+        TravellerProfile.exists({ workspaceId: req.workspaceObjectId, tourApproverId: uid }),
+      ]);
+      return res.json({
+        ok: true,
+        isAdmin: true,
+        isApprover: true,
+        isOfficial: true,
+        isFinance: true,
+        isFinanceUser: !!mapped,
+        isTourApprover: !!approverOf,
+      });
     }
 
     const [isApprover, isOfficial, isFinance] = await Promise.all([
@@ -2146,6 +2160,7 @@ router.get("/my-roles", async (req: any, res: any) => {
       isOfficial: !!isOfficial,
       isFinance: !!isFinance,
       isFinanceUser: !!isFinance,
+      isTourApprover: !!isApprover,
     });
   } catch (err: any) {
     console.error("[CSTEP my-roles GET]", err?.message);
@@ -2299,13 +2314,194 @@ router.get("/finance-queue", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
+ * GET /approver-report — the manager's My Team report. Same
+ * { rows, counts } shape as GET /official-queue, scoped to the Approver
+ * slot instead, and read-only.
+ *
+ * "My team" = travellers whose profile names the caller as approver
+ * (TravellerProfile.tourApproverId), the same filter as GET /approvals. This
+ * holds for a CSTEP Admin too: the report is about the caller's own team,
+ * not the whole workspace.
+ * Known caveat: the mapping is current, not historical. If a traveller's
+ * approver changes, that traveller's whole history moves to the new
+ * approver's Pending / Planned / Closed buckets. "Approved by me" is the
+ * exception: it reads the approval log, so it stays with whoever approved.
+ *
+ * Buckets:
+ *   pending      — APPROVER_PENDING_STATUSES (the caller's live to-do list),
+ *                  never period-filtered
+ *   approvedByMe — APPROVE log entries whose actor is the caller, by the
+ *                  date of the approval. A row's status is its status now,
+ *                  and it stays even if the traveller has left the team
+ *   planned      — APPROVER_PLANNED_STATUSES, with the proposal's estimated
+ *                  cost (a claim carries its stored totals instead)
+ *   closed       — APPROVER_CLOSED_STATUSES, with the settlement's cost of
+ *                  tour and amount claimed; a claim uses its stored totals
+ *   rejected / cancelled
+ * The team buckets other than pending are filtered by trip date, the same
+ * rule as the Travel Register: departureDate, or the IST creation date when
+ * there is none. Query: the Travel Register's period / anchor / from / to
+ * (resolveRegisterPeriod), default the current FY. DRAFT and RETURNED are
+ * with the traveller and belong to no bucket.
+ * ───────────────────────────────────────────────────────────────────── */
+// #1 hook: once the Manager approves post-tour reports, add
+// "REPORT_UNDER_APPROVAL" here, and its approve action to
+// APPROVER_REPORT_APPROVE_ACTIONS.
+const APPROVER_PENDING_STATUSES = ["SUBMITTED"];
+const APPROVER_REPORT_APPROVE_ACTIONS = ["APPROVE"];
+const APPROVER_PLANNED_STATUSES = ["APPROVED", "ARRANGING", "ARRANGED", "REPORT_PENDING", "REPORT_SUBMITTED"];
+// TRANSFERRED_TO_FINANCE counts as closed. The trip's settlement is final
+// and only the payout is left. Leaving it out would hide the case from the
+// manager for as long as it sits with Finance.
+const APPROVER_CLOSED_STATUSES = ["TRANSFERRED_TO_FINANCE", "SETTLED", "REIMBURSED"];
+
+/** The money columns of a My Team row. A claim's figures are its own stored
+ * totals. A trip's come from its settlement (a settlement still VERIFYING
+ * is provisional; settlementStatus says which). */
+function approverReportAmounts(doc: any, settlement: any) {
+  if (isClaimFormType(doc.formType)) {
+    return {
+      estimatedCost: null,
+      costOfTour: null,
+      amountClaimed: doc.claimTotals?.gross ?? null,
+      claimNet: doc.claimTotals?.net ?? null,
+      settlementStatus: settlement?.status ?? null,
+    };
+  }
+  return {
+    estimatedCost: doc.estimatedCost ?? null,
+    costOfTour: settlement?.totalCostOfTour ?? null,
+    amountClaimed: settlement?.amountClaimed ?? null,
+    claimNet: null,
+    settlementStatus: settlement?.status ?? null,
+  };
+}
+
+router.get("/approver-report", async (req: any, res: any) => {
+  try {
+    const uid = ownerId(req);
+    if (!req.workspaceObjectId || !mongoose.isValidObjectId(uid)) {
+      return res.status(400).json({ error: "Missing workspace or user context" });
+    }
+    const me = new mongoose.Types.ObjectId(uid);
+    const period = resolveRegisterPeriod(req.query, new Date());
+    if ("error" in period) return res.status(400).json({ error: period.error });
+
+    const team = await TravellerProfile.find({ workspaceId: req.workspaceObjectId, tourApproverId: me })
+      .select("_id")
+      .lean();
+    const teamIds = (team as any[]).map((t) => t._id);
+
+    const inPeriod = {
+      $or: [
+        { departureDate: { $gte: period.from, $lte: period.to } },
+        {
+          departureDate: { $in: [null, ""] },
+          createdAt: {
+            $gte: new Date(`${period.from}T00:00:00.000+05:30`),
+            $lte: new Date(`${period.to}T23:59:59.999+05:30`),
+          },
+        },
+      ],
+    };
+    const [pendingDocs, periodDocs, myApprovals] = await Promise.all([
+      teamIds.length
+        ? CstepTravelRequest.find({
+            workspaceId: req.workspaceObjectId,
+            travelerProfileId: { $in: teamIds },
+            status: { $in: APPROVER_PENDING_STATUSES },
+          })
+            .sort({ createdAt: 1 })
+            .lean()
+        : [],
+      teamIds.length
+        ? CstepTravelRequest.find({
+            workspaceId: req.workspaceObjectId,
+            travelerProfileId: { $in: teamIds },
+            status: { $in: [...APPROVER_PLANNED_STATUSES, ...APPROVER_CLOSED_STATUSES, "REJECTED", "CANCELLED"] },
+            ...inPeriod,
+          })
+            .sort({ updatedAt: -1 })
+            .lean()
+        : [],
+      CstepApproval.find({
+        workspaceId: req.workspaceObjectId,
+        entityType: "REQUEST",
+        actor: me,
+        action: { $in: APPROVER_REPORT_APPROVE_ACTIONS },
+        at: {
+          $gte: new Date(`${period.from}T00:00:00.000+05:30`).toISOString(),
+          $lte: new Date(`${period.to}T23:59:59.999+05:30`).toISOString(),
+        },
+      })
+        .select("entityId at")
+        .lean(),
+    ]);
+
+    // The latest approval per request (a request returned and resubmitted
+    // can be approved once only, but a later report approval would add one).
+    const approvedAt = new Map<string, string>();
+    for (const a of myApprovals as any[]) {
+      const id = String(a.entityId);
+      if (!approvedAt.has(id) || String(a.at) > approvedAt.get(id)!) approvedAt.set(id, String(a.at));
+    }
+    const loadedIds = new Set([...pendingDocs, ...periodDocs].map((d: any) => String(d._id)));
+    const missingApproved = [...approvedAt.keys()].filter((id) => !loadedIds.has(id));
+    const approvedOnlyDocs = missingApproved.length
+      ? await CstepTravelRequest.find({ workspaceId: req.workspaceObjectId, _id: { $in: missingApproved } }).lean()
+      : [];
+
+    const allDocs = [...pendingDocs, ...periodDocs, ...approvedOnlyDocs] as any[];
+    const byId = new Map(allDocs.map((d) => [String(d._id), d]));
+    const settlements = byId.size
+      ? await CstepSettlement.find({ workspaceId: req.workspaceObjectId, requestId: { $in: [...byId.keys()] } })
+          .select("requestId status totalCostOfTour amountClaimed")
+          .lean()
+      : [];
+    const settlementBy = new Map((settlements as any[]).map((s) => [String(s.requestId), s]));
+    const named = new Map(
+      (await withTravellerNames(req, [...byId.values()])).map((d: any) => [String(d._id), d]),
+    );
+    const row = (d: any) => {
+      const id = String(d._id);
+      return { ...named.get(id), amounts: approverReportAmounts(d, settlementBy.get(id)) };
+    };
+
+    const buckets = {
+      pending: (pendingDocs as any[]).map(row),
+      approvedByMe: [...approvedAt.entries()]
+        .filter(([id]) => byId.has(id))
+        .sort((a, b) => (a[1] < b[1] ? 1 : -1))
+        .map(([id, at]) => ({ ...row(byId.get(id)), approvedAt: at })),
+      planned: (periodDocs as any[]).filter((d) => APPROVER_PLANNED_STATUSES.includes(d.status)).map(row),
+      closed: (periodDocs as any[]).filter((d) => APPROVER_CLOSED_STATUSES.includes(d.status)).map(row),
+      rejected: (periodDocs as any[]).filter((d) => d.status === "REJECTED").map(row),
+      cancelled: (periodDocs as any[]).filter((d) => d.status === "CANCELLED").map(row),
+    };
+    const counts = Object.fromEntries(Object.entries(buckets).map(([k, v]) => [k, v.length]));
+
+    res.json({
+      ok: true,
+      period: { kind: period.kind, from: period.from, to: period.to },
+      teamSize: teamIds.length,
+      buckets,
+      counts,
+    });
+  } catch (err: any) {
+    console.error("[CSTEP approver-report GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to build the team report" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * GET /reports/travel-register — the finance team's Travel Register as an
  * .xlsx (layout + row rules: utils/cstepTravelRegister.ts). Read-only — every
  * query here is a find; nothing is opened, started or stamped.
  *
  * Who: a CSTEP Admin gets the whole workspace; a Finance user (financeUserId
  * on at least one traveller) gets only those travellers' trips — the same
- * scoping as GET /finance-queue. Anyone else is refused.
+ * scoping as GET /finance-queue — and an Approver (tourApproverId) gets their
+ * team's, the same scoping as GET /approver-report. Anyone else is refused.
  *
  * Query: period=week|month|quarter|fy|custom (default fy), anchor=YYYY-MM-DD
  * (any day inside the wanted period; default today IST), from/to for custom
@@ -2318,14 +2514,20 @@ router.get("/reports/travel-register", async (req: any, res: any) => {
     const admin = isCstepAdmin(req);
     let scopedTravellerIds: mongoose.Types.ObjectId[] | null = null;
     if (!admin) {
+      // A Finance user gets the travellers they pay; an Approver gets the
+      // travellers they approve for (their team). Someone in both slots
+      // gets both sets.
+      const uid = new mongoose.Types.ObjectId(ownerId(req));
       const mine = await TravellerProfile.find({
         workspaceId: req.workspaceObjectId,
-        financeUserId: new mongoose.Types.ObjectId(ownerId(req)),
+        $or: [{ financeUserId: uid }, { tourApproverId: uid }],
       })
         .select("_id")
         .lean();
       if (mine.length === 0) {
-        return res.status(403).json({ error: "Only a CSTEP Admin or Finance user can export the Travel Register" });
+        return res
+          .status(403)
+          .json({ error: "Only a CSTEP Admin, Finance user or Approver can export the Travel Register" });
       }
       scopedTravellerIds = (mine as any[]).map((t) => t._id);
     }
