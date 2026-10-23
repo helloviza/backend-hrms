@@ -67,7 +67,11 @@ export type CstepApprovalAction =
   // Claims addition — a claim has no Official stage: Finance sends it back
   // to CSTEP Admin verification (TRANSFERRED_TO_FINANCE → APPROVED). The
   // Admin's verification itself reuses ADMIN_VERIFY above.
-  | "RETURN_TO_ADMIN";
+  | "RETURN_TO_ADMIN"
+  // Change requests — a cancel / rebook raised against an arranged service
+  // (CstepChangeRequest), and the Official's DONE / DECLINED resolution.
+  | "CHANGE_REQUEST"
+  | "CHANGE_RESOLVE";
 
 export interface ICstepApproval extends Document {
   workspaceId: mongoose.Types.ObjectId;
@@ -122,6 +126,8 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "RETURN_REPORT",
       "RETURN_TO_OFFICIAL",
       "RETURN_TO_ADMIN",
+      "CHANGE_REQUEST",
+      "CHANGE_RESOLVE",
     ],
     required: true,
   },

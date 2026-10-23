@@ -33,7 +33,9 @@
 //   TRANSFERRED_TO_FINANCE   Finance user    (TravellerProfile.financeUserId)
 //   RETURN, RETURN_REPORT,   owner — the traveller: claimedBy User's email →
 //   REJECTED, REIMBURSED,      TravellerProfile.email → the request creator's
-//   SETTLED, ARRANGED          email, first one present
+//   SETTLED, ARRANGED,         email, first one present
+//   CHANGE_RESOLVED
+//   CHANGE_RAISED            Official user   — a cancel / rebook on an arranged service
 import mongoose from "mongoose";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import TravellerProfile from "../models/TravellerProfile.js";
@@ -62,7 +64,9 @@ export type CstepNotifyEvent =
   | "REJECTED"
   | "REIMBURSED"
   | "SETTLED"
-  | "ARRANGED";
+  | "ARRANGED"
+  | "CHANGE_RAISED"
+  | "CHANGE_RESOLVED";
 
 type Role = "APPROVER" | "OFFICIAL" | "FINANCE" | "ADMIN" | "OWNER";
 
@@ -81,6 +85,8 @@ const RECIPIENT: Record<CstepNotifyEvent, Role> = {
   REIMBURSED: "OWNER",
   SETTLED: "OWNER",
   ARRANGED: "OWNER",
+  CHANGE_RAISED: "OFFICIAL",
+  CHANGE_RESOLVED: "OWNER",
 };
 
 export type CstepNotifyCtx = {
@@ -98,6 +104,15 @@ export type CstepNotifyCtx = {
   direction?: "PAY_OUT" | "COLLECT";
   /** Payment reference for REIMBURSED / a recovered SETTLED. */
   reference?: string;
+  /** CHANGE_RAISED / CHANGE_RESOLVED — the change request (CstepChangeRequest). */
+  change?: {
+    kind: "CANCEL" | "REBOOK";
+    serviceLabel: string;
+    details: string;
+    /** CHANGE_RESOLVED only. */
+    outcome?: "DONE" | "DECLINED";
+    resolutionNote?: string;
+  };
 };
 
 export type CstepNotifyResult =
@@ -152,7 +167,7 @@ function destinationOf(r: any): string {
   return (r.stations || []).map((s: any) => s?.to).filter(Boolean).join(", ");
 }
 
-type Copy = { subject: string; badge: string; tone: CstepTone; headline: string; instruction: string; note?: string };
+type Copy = { subject: string; badge: string; tone: CstepTone; headline: string; instruction: string; note?: string; noteLabel?: string };
 
 function copyFor(event: CstepNotifyEvent, who: string, kind: string, claim: boolean, ctx: CstepNotifyCtx): Copy {
   const reason = ctx.reason || "";
@@ -194,6 +209,19 @@ function copyFor(event: CstepNotifyEvent, who: string, kind: string, claim: bool
         : { subject: "Your claim is settled", badge: "Settled", tone: "green", headline: "Your claim is settled", instruction: "Nothing is owed on this trip, so it is closed." };
     case "ARRANGED":
       return { subject: "Your travel has been arranged", badge: "Arranged", tone: "green", headline: "Your travel has been arranged", instruction: "After your trip, file your travel report in the portal." };
+    case "CHANGE_RAISED": {
+      const service = (ctx.change?.serviceLabel || "service").toLowerCase();
+      const verb = ctx.change?.kind === "CANCEL" ? "cancel" : "rebook";
+      return { subject: `Change requested — ${verb} ${service} — ${who}`, badge: "Change requested", tone: "orange", headline: `A request to ${verb} ${who}'s ${service}`, instruction: "Please make the change with the supplier, then mark the request done or declined in the portal.", note: reason };
+    }
+    case "CHANGE_RESOLVED": {
+      const service = (ctx.change?.serviceLabel || "service").toLowerCase();
+      const what = ctx.change?.kind === "CANCEL" ? "cancellation" : "rebooking";
+      const note = ctx.change?.resolutionNote || "";
+      return ctx.change?.outcome === "DECLINED"
+        ? { subject: `Your ${service} ${what} request was declined`, badge: "Declined", tone: "red", headline: `Your ${service} ${what} was not made`, instruction: "Your existing booking stands. Contact the Travel Desk if you still need the change.", note, noteLabel: "Note" }
+        : { subject: `Your ${service} ${what} is done`, badge: "Change done", tone: "green", headline: `Your ${service} ${what} is done`, instruction: "The Travel Desk has made the change. Your updated booking is in the portal.", note, noteLabel: "Note" };
+    }
   }
 }
 
@@ -205,6 +233,7 @@ function copyFor(event: CstepNotifyEvent, who: string, kind: string, claim: bool
  */
 function bandFor(event: CstepNotifyEvent, ctx: CstepNotifyCtx): CstepEmailInput["band"] {
   if (["RETURN", "RETURN_REPORT", "RETURN_TO_OFFICIAL", "RETURN_TO_ADMIN", "REJECTED"].includes(event)) return "plain";
+  if (event === "CHANGE_RESOLVED" && ctx.change?.outcome === "DECLINED") return "plain";
   if (event === "TRANSFERRED_TO_FINANCE" && ctx.direction === "COLLECT") return "plain";
   return "photo";
 }
@@ -283,6 +312,14 @@ function nextStepsFor(event: CstepNotifyEvent, claim: boolean, ctx: CstepNotifyC
     case "REIMBURSED":
     case "SETTLED":
       return [{ title: "Nothing more to do", detail: `This ${claim ? "claim" : "trip's claim"} is settled and closed.` }];
+    case "CHANGE_RAISED":
+      return [
+        { title: "Change the booking", detail: "Cancel or rebook it with the supplier." },
+        { title: "Update the service", detail: "The service is open for editing in the portal while the request is open." },
+        { title: "Resolve", detail: "Mark it done, or declined with a note; the traveller is emailed." },
+      ];
+    case "CHANGE_RESOLVED":
+      return [{ title: "Check your booking", detail: "Open the request to see the service as it stands now." }];
   }
 }
 
@@ -306,6 +343,12 @@ export function renderCstepEmail(event: CstepNotifyEvent, request: any, travelle
     ...(dates ? [{ label: "Dates", value: dates }] : []),
     ...(request.claimReference ? [{ label: refLabel, value: String(request.claimReference) }] : []),
     ...(ctx.reference ? [{ label: "Payment reference", value: String(ctx.reference) }] : []),
+    ...(ctx.change
+      ? [
+          { label: "Change", value: `${ctx.change.kind === "CANCEL" ? "Cancel" : "Rebook"} — ${ctx.change.serviceLabel}` },
+          { label: "Details", value: ctx.change.details || "—" },
+        ]
+      : []),
   ];
   const href = `${frontendBaseUrl()}/cstep/requests/${String(request._id)}`;
   const role = RECIPIENT[event];
@@ -318,7 +361,7 @@ export function renderCstepEmail(event: CstepNotifyEvent, request: any, travelle
     greeting: role === "OWNER" ? (who === "A traveller" ? "traveller" : who) : GREETING[role],
     intro: c.instruction,
     facts,
-    note: c.note ? { label: "Reason", text: c.note } : undefined,
+    note: c.note ? { label: c.noteLabel || "Reason", text: c.note } : undefined,
     cta: { label: "Open request", href },
     nextSteps: nextStepsFor(event, claim, ctx),
     contactEmail,

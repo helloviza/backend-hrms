@@ -47,7 +47,13 @@ import {
   CstepVendor,
   CstepVendorType,
   CstepSequenceChange,
+  CstepChangeRequest,
 } from "../models/cstep/index.js";
+import {
+  CSTEP_CHANGE_KINDS,
+  CSTEP_CHANGE_STATUSES,
+  type CstepChangeKind,
+} from "../models/cstep/CstepChangeRequest.js";
 import {
   CSTEP_EVENT_NATURES,
   CSTEP_FORM_TYPES,
@@ -1752,6 +1758,21 @@ router.get("/requests/:id", async (req: any, res: any) => {
           .sort({ createdAt: 1 })
           .lean();
 
+    // Change requests — this trip's cancel / rebook requests (newest first),
+    // whether the caller may raise one now, and whether they handle them
+    // (the Official / Admin: resolve, and edit the lines an OPEN one reopens).
+    const canHandleChanges = !isClaim && (await callerCanArrangeForTraveller(req, doc.travelerProfileId));
+    const canRequestChange =
+      !isClaim &&
+      CHANGEABLE_STATUSES.has(doc.status) &&
+      arrangements.some((a: any) => CHANGEABLE_SERVICE_TYPES.has(a.arrangedType)) &&
+      (canHandleChanges || (await callerIsRequestTraveller(req, doc)));
+    const changeRequests = isClaim
+      ? []
+      : await CstepChangeRequest.find({ workspaceId: req.workspaceObjectId, travelRequestId: doc._id })
+          .sort({ raisedAt: -1 })
+          .lean();
+
     // Claims addition — the claim lines' receipts, presigned for viewing,
     // keyed by attachment id (the intake form shows the file name on edit;
     // the detail view links each one).
@@ -1787,6 +1808,9 @@ router.get("/requests/:id", async (req: any, res: any) => {
       financeClaimDue,
       financePaid,
       arrangements,
+      changeRequests,
+      canRequestChange,
+      canHandleChanges,
       claimAttachments,
       // The Declaration (no-bill travel lines) — same derivation as the PDF.
       claimDeclaration: doc.formType === "LOCAL_TRAVEL_CLAIM" ? localTravelClaimDeclaration(doc) : undefined,
@@ -3312,7 +3336,10 @@ router.patch("/requests/:id/arrangements/:lineId", async (req: any, res: any) =>
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
     }
-    if (doc.status !== "ARRANGING") {
+    // Past ARRANGING, a line an OPEN change request names is reopened for
+    // the Official to record the cancel / rebook (see Change requests below).
+    const reopenedForChange = doc.status !== "ARRANGING" && (await lineOpenForChange(req, doc, req.params.lineId));
+    if (doc.status !== "ARRANGING" && !reopenedForChange) {
       return res.status(409).json({ error: "Only a request currently being arranged can have its service lines updated" });
     }
 
@@ -3404,6 +3431,7 @@ router.patch("/requests/:id/arrangements/:lineId", async (req: any, res: any) =>
       actor: new mongoose.Types.ObjectId(ownerId(req)),
       action: "ARRANGE_SERVICE",
       comment:
+        (reopenedForChange ? "Change request — " : "") +
         `Requested: ${requestedLabel} -> Arranged: ${before.arrangedType} => ${line.arrangedType}` +
         (line.details ? ` — ${line.details}` : "") +
         ` [${line.status}]` +
@@ -3505,7 +3533,10 @@ router.get("/requests/:id/vendor-options", async (req: any, res: any) => {
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
     }
-    if (doc.status !== "ARRANGING") {
+    const reopened =
+      CHANGEABLE_STATUSES.has(doc.status) &&
+      !!(await CstepChangeRequest.exists({ workspaceId: req.workspaceObjectId, travelRequestId: doc._id, status: "OPEN" }));
+    if (doc.status !== "ARRANGING" && !reopened) {
       return res.status(409).json({ error: "Vendors are chosen while the request is being arranged" });
     }
     const [vendors, types] = await Promise.all([
@@ -3768,6 +3799,280 @@ router.post("/requests/:id/mark-arranged", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP requests mark-arranged]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to mark travel request arranged" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Change requests — a cancel / rebook against one arranged service on an
+ * arranged trip (models/cstep/CstepChangeRequest.ts). Tracks and routes the
+ * change only: the Travel Desk makes the booking change by hand — nothing
+ * here calls TBO or any supplier.
+ *
+ *   raise    the traveller (request creator / claimed profile), or this
+ *            traveller's Official user / a CSTEP Admin — while ARRANGED or
+ *            REPORT_PENDING (report/start auto-fires on open, so a trip that
+ *            hasn't happened yet is often REPORT_PENDING already), on a
+ *            Flight or Cab line. One OPEN change per line.
+ *   list     GET /requests/:id/change-requests — anyone who can read the
+ *            request; GET /change-requests — the Official's / Admin's queue.
+ *   resolve  the Official / a CSTEP Admin: DONE or DECLINED, note required.
+ *
+ * While a change is OPEN its line is reopened for the Official: PATCH
+ * /arrangements/:lineId and GET /vendor-options admit it outside ARRANGING
+ * (lineOpenForChange). Notifications: CHANGE_RAISED → the Official,
+ * CHANGE_RESOLVED → the traveller, each keyed on its own CstepApproval entry.
+ * ───────────────────────────────────────────────────────────────────── */
+const CHANGEABLE_STATUSES = new Set(["ARRANGED", "REPORT_PENDING"]);
+const CHANGEABLE_SERVICE_TYPES = new Set<string>(["FLIGHT", "CAB"]);
+const CHANGE_KIND_LABEL: Record<CstepChangeKind, string> = { CANCEL: "Cancel", REBOOK: "Rebook" };
+
+/** The traveller themself: the request's creator, or the User who claimed
+ * its TravellerProfile (an Admin may have filed on their behalf). */
+async function callerIsRequestTraveller(req: any, doc: any): Promise<boolean> {
+  const uid = ownerId(req);
+  if (String(doc.createdBy) === uid) return true;
+  const traveller: any = await TravellerProfile.findOne({ _id: doc.travelerProfileId, workspaceId: req.workspaceObjectId })
+    .select("claimedBy")
+    .lean();
+  return !!traveller?.claimedBy && String(traveller.claimedBy) === uid;
+}
+
+/** Is this arrangement line reopened by an OPEN change request? Only while
+ * the trip is still at a changeable status — once the report is in, the
+ * line feeds the settlement and stays as it is. */
+async function lineOpenForChange(req: any, doc: any, lineId: any): Promise<boolean> {
+  if (!CHANGEABLE_STATUSES.has(doc.status) || !mongoose.Types.ObjectId.isValid(String(lineId))) return false;
+  return !!(await CstepChangeRequest.exists({
+    workspaceId: req.workspaceObjectId,
+    travelRequestId: doc._id,
+    arrangementId: new mongoose.Types.ObjectId(String(lineId)),
+    status: "OPEN",
+  }));
+}
+
+function changeNotifyCtx(cr: any) {
+  return {
+    kind: cr.kind as CstepChangeKind,
+    serviceLabel: SERVICE_LABEL[cr.serviceType] || cr.serviceType,
+    details: cr.details,
+  };
+}
+
+/* POST /requests/:id/change-requests — body { arrangementId, kind, details, reason }. */
+router.post("/requests/:id/change-requests", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    const isTraveller = await callerIsRequestTraveller(req, doc);
+    if (!isTraveller && !(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only the traveller, their Official user or a CSTEP Admin can request a change" });
+    }
+    if (isClaimFormType(doc.formType) || !CHANGEABLE_STATUSES.has(doc.status)) {
+      return res.status(409).json({ error: "A change can be requested only on an arranged trip, before its travel report is submitted" });
+    }
+
+    const body = req.body || {};
+    if (!CSTEP_CHANGE_KINDS.includes(body.kind)) return res.status(400).json({ error: "kind must be CANCEL or REBOOK" });
+    const details = String(body.details || "").trim();
+    const reason = String(body.reason || "").trim();
+    if (!details) return res.status(400).json({ error: "Details are required — what to cancel, or the new dates / route" });
+    if (!reason) return res.status(400).json({ error: "A reason is required" });
+    if (!mongoose.Types.ObjectId.isValid(String(body.arrangementId || ""))) {
+      return res.status(400).json({ error: "Pick the arranged service to change" });
+    }
+    const line: any = await CstepArrangement.findOne({
+      _id: new mongoose.Types.ObjectId(String(body.arrangementId)),
+      workspaceId: req.workspaceObjectId,
+      requestId: doc._id,
+    }).lean();
+    if (!line) return res.status(404).json({ error: "Arranged service not found on this request" });
+    if (!CHANGEABLE_SERVICE_TYPES.has(line.arrangedType)) {
+      return res.status(400).json({ error: "Changes can be requested for flights and cabs only" });
+    }
+
+    const uid = new mongoose.Types.ObjectId(ownerId(req));
+    let cr: any;
+    try {
+      cr = await CstepChangeRequest.create({
+        workspaceId: req.workspaceObjectId,
+        travelRequestId: doc._id,
+        arrangementId: line._id,
+        serviceType: line.arrangedType,
+        kind: body.kind,
+        details,
+        reason,
+        status: "OPEN",
+        raisedBy: uid,
+        raisedAt: new Date(),
+      });
+    } catch (err: any) {
+      if (err?.code === 11000) return res.status(409).json({ error: "This service already has an open change request" });
+      throw err;
+    }
+
+    const service = SERVICE_LABEL[line.arrangedType] || line.arrangedType;
+    const entry = await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: isTraveller ? "TRAVELLER" : "OFFICIAL",
+      actor: uid,
+      action: "CHANGE_REQUEST",
+      comment: `${CHANGE_KIND_LABEL[cr.kind as CstepChangeKind]} ${service}: ${details} — Reason: ${reason}`,
+      at: new Date().toISOString(),
+    });
+    cr.raisedLogId = entry._id;
+    await cr.save();
+    await notifyCstep("CHANGE_RAISED", doc, { logEntryId: entry._id, reason, change: changeNotifyCtx(cr) });
+
+    res.status(201).json({ ok: true, changeRequest: cr.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP change-requests POST]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to request the change" });
+  }
+});
+
+/* GET /requests/:id/change-requests — this request's changes, newest first. */
+router.get("/requests/:id/change-requests", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerIsRequestTraveller(req, doc)) && !(await callerCanViewTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Not authorized to view this travel request" });
+    }
+    const changeRequests = await CstepChangeRequest.find({ workspaceId: req.workspaceObjectId, travelRequestId: doc._id })
+      .sort({ raisedAt: -1 })
+      .lean();
+    res.json({ ok: true, changeRequests });
+  } catch (err: any) {
+    console.error("[CSTEP change-requests GET one]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load change requests" });
+  }
+});
+
+/* GET /change-requests?status=OPEN|DONE|DECLINED|ALL — the Official's queue
+ * (their travellers' changes) or a CSTEP Admin's (all). Anyone else gets an
+ * empty list, same posture as the other queues. Default OPEN. Each row
+ * carries the trip's purpose / reference / status and the traveller's name. */
+router.get("/change-requests", async (req: any, res: any) => {
+  try {
+    const status = String(req.query.status || "OPEN").toUpperCase();
+    const filter: any = { workspaceId: req.workspaceObjectId };
+    if (status !== "ALL") {
+      if (!CSTEP_CHANGE_STATUSES.includes(status as any)) return res.status(400).json({ error: "Unknown status" });
+      filter.status = status;
+    }
+
+    if (!isCstepAdmin(req)) {
+      const mine = await TravellerProfile.find({
+        workspaceId: req.workspaceObjectId,
+        officialUserId: new mongoose.Types.ObjectId(ownerId(req)),
+      })
+        .select("_id")
+        .lean();
+      if (mine.length === 0) return res.json({ ok: true, changeRequests: [] });
+      // The traveller lives on the request, so scope by the requests first.
+      const theirs = await CstepTravelRequest.find({
+        workspaceId: req.workspaceObjectId,
+        travelerProfileId: { $in: mine.map((t: any) => t._id) },
+      })
+        .select("_id")
+        .lean();
+      filter.travelRequestId = { $in: theirs.map((r: any) => r._id) };
+    }
+
+    const crs: any[] = await CstepChangeRequest.find(filter).sort({ raisedAt: -1 }).limit(500).lean();
+    const requests: any[] = crs.length
+      ? await CstepTravelRequest.find({
+          workspaceId: req.workspaceObjectId,
+          _id: { $in: [...new Set(crs.map((c) => String(c.travelRequestId)))] },
+        })
+          .select("_id purpose claimReference status travelerProfileId departureDate returnDate")
+          .lean()
+      : [];
+    const named = new Map((await withTravellerNames(req, requests)).map((r: any) => [String(r._id), r]));
+    const rows = crs
+      .filter((c) => named.has(String(c.travelRequestId)))
+      .map((c) => {
+        const r: any = named.get(String(c.travelRequestId));
+        return {
+          ...c,
+          request: {
+            _id: r._id,
+            purpose: r.purpose,
+            claimReference: r.claimReference,
+            status: r.status,
+            departureDate: r.departureDate,
+            returnDate: r.returnDate,
+            travellerName: r.travellerName,
+          },
+        };
+      });
+    res.json({ ok: true, changeRequests: rows });
+  } catch (err: any) {
+    console.error("[CSTEP change-requests GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to list change requests" });
+  }
+});
+
+/* POST /change-requests/:id/resolve — body { status: DONE | DECLINED, note }.
+ * Resolvable at any request status (a change left open when the trip moved
+ * on can still be closed); only the reopened-line editing is status-bound. */
+router.post("/change-requests/:id/resolve", async (req: any, res: any) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "Change request not found" });
+    const cr: any = await CstepChangeRequest.findOne({
+      _id: new mongoose.Types.ObjectId(req.params.id),
+      workspaceId: req.workspaceObjectId,
+    });
+    if (!cr) return res.status(404).json({ error: "Change request not found" });
+    const doc = await loadRequest(req, String(cr.travelRequestId));
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can resolve a change request" });
+    }
+
+    const body = req.body || {};
+    if (body.status !== "DONE" && body.status !== "DECLINED") {
+      return res.status(400).json({ error: "status must be DONE or DECLINED" });
+    }
+    const note = String(body.note || "").trim();
+    if (!note) return res.status(400).json({ error: "A note is required" });
+
+    const uid = new mongoose.Types.ObjectId(ownerId(req));
+    const now = new Date();
+    // Conditional on OPEN, so two resolvers racing can't both close it.
+    const resolved: any = await CstepChangeRequest.findOneAndUpdate(
+      { _id: cr._id, workspaceId: req.workspaceObjectId, status: "OPEN" },
+      { $set: { status: body.status, handledBy: uid, handledAt: now, resolutionNote: note } },
+      { new: true },
+    );
+    if (!resolved) return res.status(409).json({ error: "This change request is already resolved" });
+
+    const service = SERVICE_LABEL[resolved.serviceType] || resolved.serviceType;
+    const entry = await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "OFFICIAL",
+      actor: uid,
+      action: "CHANGE_RESOLVE",
+      comment: `${CHANGE_KIND_LABEL[resolved.kind as CstepChangeKind]} ${service} — ${body.status === "DONE" ? "Done" : "Declined"}: ${note}`,
+      at: now.toISOString(),
+    });
+    await CstepChangeRequest.updateOne(
+      { _id: resolved._id, workspaceId: req.workspaceObjectId },
+      { $set: { resolvedLogId: entry._id } },
+    );
+    await notifyCstep("CHANGE_RESOLVED", doc, {
+      logEntryId: entry._id,
+      change: { ...changeNotifyCtx(resolved), outcome: body.status, resolutionNote: note },
+    });
+
+    res.json({ ok: true, changeRequest: { ...resolved.toObject(), resolvedLogId: entry._id } });
+  } catch (err: any) {
+    console.error("[CSTEP change-requests resolve]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to resolve the change request" });
   }
 });
 
