@@ -77,6 +77,9 @@ export function normalizeDateField(raw: any, label: string): { value?: string; e
   return { value: str };
 }
 
+/** The UTF-8 byte-order mark, which tells Excel a CSV is UTF-8. */
+export const CSV_BOM = "\uFEFF";
+
 export function csvEscape(v: any): string {
   const s = String(v ?? "");
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -167,10 +170,13 @@ export async function sendSheet(
 ): Promise<void> {
   const rows = opts.rows || [];
   if (opts.format === "csv") {
-    res.setHeader("Content-Type", "text/csv");
+    // UTF-8 with a BOM: without it Excel decodes the file as Windows-1252
+    // and "—" / "→" come out as "â€”" / "â†’". The importer reads it back
+    // fine (parseCsv's trim drops a leading BOM).
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${opts.filename}.csv"`);
     const lines = [opts.columns.map(csvEscape).join(","), ...rows.map((r) => r.map(csvEscape).join(","))];
-    res.send(lines.join("\n") + "\n");
+    res.send(Buffer.from(CSV_BOM + lines.join("\n") + "\n", "utf8"));
     return;
   }
 

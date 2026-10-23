@@ -304,11 +304,16 @@ describe("CSTEP bulk import — the Employee ID column", () => {
   const HEAD = "Employee ID,First Name,Last Name,Email";
 
   it("the CSTEP template leads with Employee ID; an ordinary workspace's template is unchanged", async () => {
+    // CSV downloads are UTF-8 with a BOM (sendSheet) so Excel reads them as
+    // UTF-8; the header row starts after it.
+    const BOM = String.fromCharCode(0xfeff);
+    const head = (t: string) => (t.startsWith(BOM) ? t.slice(1) : t).split("\n")[0];
     const c = ok(await call("get", ACT.leaderC, WS.C, "/api/travellers/template/download"));
-    expect(c.text.split("\n")[0].split(",").slice(0, 3)).toEqual(["Employee ID", "Title", "First Name"]);
+    expect(c.text.startsWith(BOM)).toBe(true);
+    expect(head(c.text).split(",").slice(0, 3)).toEqual(["Employee ID", "Title", "First Name"]);
     const n = ok(await call("get", ACT.leaderN, WS.N, "/api/travellers/template/download"));
-    expect(n.text.split("\n")[0]).not.toMatch(/Employee ID/);
-    expect(n.text.split("\n")[0].split(",")[0]).toBe("Title");
+    expect(head(n.text)).not.toMatch(/Employee ID/);
+    expect(head(n.text).split(",")[0]).toBe("Title");
   });
 
   const FILE = [

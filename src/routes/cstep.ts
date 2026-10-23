@@ -1731,6 +1731,17 @@ router.get("/requests/:id", async (req: any, res: any) => {
         }
       }
     }
+    // Once Finance has closed the case, what it paid (or received), when and
+    // against which reference — so the case keeps its Finance record after
+    // it leaves TRANSFERRED_TO_FINANCE. Same readers as the rest of this
+    // route; absent when Finance never paid (a nothing-owed SETTLED case).
+    let financePaid: ReturnType<typeof financePaidRecord> | undefined;
+    if (FINANCE_CLOSED_STATUSES.includes(doc.status)) {
+      const paid: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id })
+        .select("amountClaimed amountDueByCstep amountDueToCstep advanceTaken paidOn paymentRef paymentSource")
+        .lean();
+      financePaid = financePaidRecord(doc.formType, paid) || undefined;
+    }
 
     const arrangements = isClaim
       ? []
@@ -1774,6 +1785,7 @@ router.get("/requests/:id", async (req: any, res: any) => {
       canVerifyClaim,
       financeAmountClaimed,
       financeClaimDue,
+      financePaid,
       arrangements,
       claimAttachments,
       // The Declaration (no-bill travel lines) — same derivation as the PDF.
@@ -2288,6 +2300,25 @@ router.get("/claim-verification-queue", async (req: any, res: any) => {
   }
 });
 
+/** Where Finance closes a case: paid out (REIMBURSED), or a claimant's
+ * repayment received (SETTLED). */
+const FINANCE_CLOSED_STATUSES = ["REIMBURSED", "SETTLED"];
+
+/** What Finance recorded when it closed a case, read off the settlement
+ * (settleFinanceCase writes paidOn / paymentRef / paymentSource there).
+ * null when Finance never paid — e.g. a nothing-owed SETTLED case. */
+function financePaidRecord(formType: string, settlement: any) {
+  if (!settlement?.paidOn) return null;
+  const { direction, amount } = financeCaseAmount(formType, settlement);
+  return {
+    amountInr: amount,
+    direction,
+    paidOn: settlement.paidOn,
+    reference: settlement.paymentRef || "",
+    source: settlement.paymentSource || "MANUAL",
+  };
+}
+
 /* ─────────────────────────────────────────────────────────────────────
  * GET /finance-queue — the Finance user's queue (CSTEP mapping addition):
  * same shape as GET /official-queue, financeUserId slot instead. Lists
@@ -2298,6 +2329,11 @@ router.get("/claim-verification-queue", async (req: any, res: any) => {
  * POST /requests/:id/finance/settle (→ REIMBURSED). (Before Step 6 this
  * filtered on APPROVED, a leftover from when no finance stage existed,
  * so a case at the finance stage could never appear in the Finance tab.)
+ * `requests` is still only that to-do list. `closed` adds the cases Finance
+ * has closed (REIMBURSED / repayment SETTLED, each with its financePaid
+ * record) — without it a case vanished from Finance the moment it was paid,
+ * leaving only its vendor lines on Vendor payments. `stageCounts` counts
+ * all three.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/finance-queue", async (req: any, res: any) => {
   try {
@@ -2319,7 +2355,35 @@ router.get("/finance-queue", async (req: any, res: any) => {
     }
 
     const docs = await withTravellerNames(req, await CstepTravelRequest.find(filter).sort({ updatedAt: -1 }).lean());
-    res.json({ ok: true, requests: docs });
+
+    // Closed by Finance — REIMBURSED, or SETTLED by a repayment Finance
+    // recorded — kept on the board for the record so a case never vanishes
+    // once it is paid. A SETTLED case with no payment on its settlement
+    // (nothing owed, closed by the Official/Admin) never reached Finance and
+    // stays off. `requests` is still only what waits on Finance, so every
+    // existing count of it is unchanged.
+    const closedCandidates: any[] = await CstepTravelRequest.find({
+      ...filter,
+      status: { $in: FINANCE_CLOSED_STATUSES },
+    })
+      .sort({ updatedAt: -1 })
+      .lean();
+    const paidSettlements: any[] = closedCandidates.length
+      ? await CstepSettlement.find({
+          workspaceId: req.workspaceObjectId,
+          requestId: { $in: closedCandidates.map((d) => d._id) },
+          paidOn: { $exists: true, $ne: null },
+        }).lean()
+      : [];
+    const paidBy = new Map(paidSettlements.map((s) => [String(s.requestId), s]));
+    const closed = (await withTravellerNames(req, closedCandidates.filter((d) => paidBy.has(String(d._id))))).map((d: any) => ({
+      ...d,
+      financePaid: financePaidRecord(d.formType, paidBy.get(String(d._id))),
+    }));
+    const stageCounts: Record<string, number> = { TRANSFERRED_TO_FINANCE: docs.length, REIMBURSED: 0, SETTLED: 0 };
+    for (const d of closed) stageCounts[d.status] = (stageCounts[d.status] || 0) + 1;
+
+    res.json({ ok: true, requests: docs, closed, stageCounts });
   } catch (err: any) {
     console.error("[CSTEP finance-queue GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to list the finance queue" });
