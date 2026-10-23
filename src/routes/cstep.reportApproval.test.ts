@@ -224,9 +224,11 @@ describe("submit → REPORT_UNDER_APPROVAL → approve → REPORT_SUBMITTED → 
     expect(labelled).toBe(true);
   });
 
-  it("detail flags: the Manager (and Admin) may approve the report; the Official may not settle yet", async () => {
+  it("detail flags: the Manager may approve the report (an Admin only sends it back); the Official may not settle yet", async () => {
     expect(ok(await get(ACT.manager, `/requests/${id}`)).body.canApproveReport).toBe(true);
-    expect(ok(await get(ACT.admin, `/requests/${id}`)).body.canApproveReport).toBe(true);
+    // The traveller has a Manager, so the Admin is no longer a blanket
+    // fallback here (cstep.approvalGate.test.ts) — they keep the send-back.
+    expect(ok(await get(ACT.admin, `/requests/${id}`)).body).toMatchObject({ canApproveReport: false, canDecideReport: true });
     const asOfficial = ok(await get(ACT.official, `/requests/${id}`)).body;
     expect(asOfficial.canApproveReport).toBe(false);
     expect(asOfficial.canSettle).toBe(false);

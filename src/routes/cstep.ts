@@ -196,6 +196,31 @@ async function callerCanActOnTraveller(req: any, travelerProfileId: any): Promis
 }
 
 /**
+ * The APPROVAL itself — start-review, approve, report/approve. Stricter than
+ * callerCanActOnTraveller: when the traveller has a Tour Approver (Manager)
+ * assigned, only that User may approve — a CSTEP Admin is refused, never
+ * silently let through ahead of the Manager. Only when the traveller has NO
+ * approver assigned (the "unassigned" case GET /approvals flags) does a CSTEP
+ * Admin approve as the fallback. An Admin who IS the assigned approver
+ * approves as that approver. Everything else at the approval stage (return,
+ * reject, amend / reduce, report send-back) keeps callerCanActOnTraveller.
+ */
+const ONLY_ASSIGNED_MANAGER = "Only the assigned manager can approve this";
+/** Returns the refusal message, or null when the caller may approve. */
+async function callerApprovalRefusal(req: any, travelerProfileId: any): Promise<string | null> {
+  const traveller: any = await TravellerProfile.findOne({
+    _id: travelerProfileId,
+    workspaceId: req.workspaceObjectId,
+  })
+    .select("tourApproverId")
+    .lean();
+  if (traveller?.tourApproverId) {
+    return String(traveller.tourApproverId) === ownerId(req) ? null : ONLY_ASSIGNED_MANAGER;
+  }
+  return isCstepAdmin(req) ? null : "This traveller has no approver assigned — only a CSTEP Admin can approve it";
+}
+
+/**
  * Step 3 — per-request ARRANGEMENT authority: a CSTEP Admin (any request),
  * or the specific User this traveller has assigned as their Official user
  * (TravellerProfile.officialUserId) — only that traveller's requests.
@@ -1665,13 +1690,19 @@ router.get("/requests/:id", async (req: any, res: any) => {
 
     const admin = isCstepAdmin(req);
     const isClaim = isClaimFormType(doc.formType);
-    const canApprove =
-      doc.status === "SUBMITTED" && (admin || (await callerCanActOnTraveller(req, doc.travelerProfileId)));
-    // Report approval — may this caller approve or return the submitted
-    // travel report (REPORT_UNDER_APPROVAL)? The Manager, or a CSTEP Admin
-    // as the fallback, the same authority as canApprove.
-    const canApproveReport =
-      doc.status === "REPORT_UNDER_APPROVAL" && (admin || (await callerCanActOnTraveller(req, doc.travelerProfileId)));
+    // canDecide / canDecideReport — the approval-stage card: return, reject,
+    // reduce amounts, send a report back (the Manager, or any CSTEP Admin).
+    // canApprove / canApproveReport — the Approve button itself, and the
+    // auto start-review: callerApprovalRefusal (the assigned Manager only; an
+    // Admin just when the traveller has no approver). approvalBlockedReason
+    // says why an Admin who can decide can't approve.
+    const canAct = admin || (await callerCanActOnTraveller(req, doc.travelerProfileId));
+    const canDecide = doc.status === "SUBMITTED" && canAct;
+    const canDecideReport = doc.status === "REPORT_UNDER_APPROVAL" && canAct;
+    const refusal = canDecide || canDecideReport ? await callerApprovalRefusal(req, doc.travelerProfileId) : null;
+    const canApprove = canDecide && !refusal;
+    const canApproveReport = canDecideReport && !refusal;
+    const approvalBlockedReason = refusal || undefined;
     // A claim is never arranged — it has no arrangement stage at all.
     const canArrange =
       !isClaim &&
@@ -1797,6 +1828,9 @@ router.get("/requests/:id", async (req: any, res: any) => {
       request: doc.toObject(),
       canApprove,
       canApproveReport,
+      canDecide,
+      canDecideReport,
+      approvalBlockedReason,
       isAdmin: admin,
       canArrange,
       canSettle,
@@ -2776,9 +2810,9 @@ router.post("/requests/:id/start-review", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
-    if (!(await callerCanActOnTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Tour Approver or a CSTEP Admin can perform this action" });
-    }
+    // Same gate as approve: an Admin can't pull a managed request into review.
+    const refusal = await callerApprovalRefusal(req, doc.travelerProfileId);
+    if (refusal) return res.status(403).json({ error: refusal });
     if (doc.status !== "SUBMITTED") {
       return res.status(409).json({ error: "Only a submitted travel request can be reviewed" });
     }
@@ -2849,9 +2883,8 @@ router.post("/requests/:id/approve", async (req: any, res: any) => {
             workspaceId: req.workspaceObjectId,
           }).session(session);
           if (!doc) throw new CstepHttpError(404, "Travel request not found");
-          if (!(await callerCanActOnTraveller(req, doc.travelerProfileId))) {
-            throw new CstepHttpError(403, "Only this traveller's Tour Approver or a CSTEP Admin can perform this action");
-          }
+          const refusal = await callerApprovalRefusal(req, doc.travelerProfileId);
+          if (refusal) throw new CstepHttpError(403, refusal);
           if (doc.status !== "SUBMITTED") {
             throw new CstepHttpError(409, "Only a submitted travel request can be approved");
           }
@@ -4722,9 +4755,8 @@ router.post("/requests/:id/report/approve", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
-    if (!(await callerCanActOnTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Approver or a CSTEP Admin can approve the travel report" });
-    }
+    const refusal = await callerApprovalRefusal(req, doc.travelerProfileId);
+    if (refusal) return res.status(403).json({ error: refusal });
     if (doc.status !== "REPORT_UNDER_APPROVAL") {
       return res.status(409).json({ error: "Only a travel report awaiting approval can be approved" });
     }
