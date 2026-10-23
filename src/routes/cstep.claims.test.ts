@@ -420,7 +420,8 @@ describe("Local Travel Claim — end to end: submit → return → resubmit → 
     let settlement: any;
     for (const l of lines) {
       const body: any = { verified: true };
-      if (String(l.sourceId) === lineIds.food) body.amountInr = 250;
+      // Reduce-only: an amount change carries its reason.
+      if (String(l.sourceId) === lineIds.food) Object.assign(body, { amountInr: 250, amountReason: "Bill shows ₹250" });
       settlement = ok(await patch(ACT.admin, `/requests/${id}/settlement/lines/${l._id}`, body)).body.settlement;
     }
     expect(settlement.amountClaimed).toBe(850);

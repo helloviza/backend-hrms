@@ -45,6 +45,10 @@ export interface ICstepReportLeg extends Document {
   travelMode: CstepServiceType; // same pick-list as CstepArrangement.arrangedType
 
   fare?: number;
+  /** The fare as the traveller submitted it — stamped at every report
+   * submit. The Manager may reduce fare from it (with a reason) while the
+   * report awaits their approval, never raise it above. */
+  claimedFare?: number;
   currency: string; // ISO 3-letter code, default "INR" — no live-rate/FX freeze here, unlike Step 3's Amount column; this is a plain reported figure
   paidBy: CstepReportPaidBy; // "Booked by CSTEP" / "Self Paid, Receipt Attached"
 
@@ -74,6 +78,7 @@ const CstepReportLegSchema = new Schema<ICstepReportLeg>(
     travelMode: { type: String, enum: CSTEP_SERVICE_TYPES, required: true },
 
     fare: { type: Number },
+    claimedFare: { type: Number },
     currency: { type: String, trim: true, uppercase: true, default: "INR" },
     paidBy: { type: String, enum: ["CSTEP", "SELF"], required: true, default: "SELF" },
 

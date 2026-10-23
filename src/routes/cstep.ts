@@ -2822,6 +2822,8 @@ router.post("/requests/:id/approve", async (req: any, res: any) => {
             });
             const seedRows = buildClaimSettlementLines(doc).map((row) => ({
               ...row,
+              // Reduce-only ceiling: the figure the line arrives with.
+              claimedAmountInr: row.amountInr,
               workspaceId: req.workspaceObjectId,
               settlementId: settlement._id,
               requestId: doc._id,
@@ -4245,6 +4247,13 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
       });
     }
 
+    // Every leg's fare as submitted is the ceiling for the Manager's
+    // reduce-only correction (PATCH /report/legs/:legId/reduce). A
+    // resubmit stamps it afresh.
+    await CstepReportLeg.updateMany({ workspaceId: req.workspaceObjectId, requestId: doc._id }, [
+      { $set: { claimedFare: "$fare" } },
+    ]);
+
     doc.status = "REPORT_UNDER_APPROVAL";
     await doc.save();
 
@@ -4264,6 +4273,69 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP requests report submit]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to submit the travel report" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * PATCH /requests/:id/report/legs/:legId/reduce — the Manager (or a CSTEP
+ * Admin) reduces a leg's fare while the travel report awaits their approval
+ * (REPORT_UNDER_APPROVAL). Body { fare, reason }. Reduce-only: never above
+ * the fare as submitted (claimedFare, stamped at report/submit); reason
+ * mandatory. Logs REDUCE_AMOUNT (stage APPROVER). The settlement later
+ * seeds from the reduced fare.
+ * ───────────────────────────────────────────────────────────────────── */
+router.patch("/requests/:id/report/legs/:legId/reduce", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!(await callerCanActOnTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Approver or a CSTEP Admin can reduce a fare" });
+    }
+    if (doc.status !== "REPORT_UNDER_APPROVAL") {
+      return res.status(409).json({ error: "A fare can be reduced only while the travel report awaits approval" });
+    }
+    if (!mongoose.Types.ObjectId.isValid(req.params.legId)) {
+      return res.status(400).json({ error: "Invalid report leg id" });
+    }
+    const leg = await CstepReportLeg.findOne({ _id: req.params.legId, workspaceId: req.workspaceObjectId, requestId: doc._id });
+    if (!leg) return res.status(404).json({ error: "Report leg not found" });
+
+    const n = Number(req.body?.fare);
+    if (req.body?.fare === undefined || req.body?.fare === null || !isFinite(n) || n < 0) {
+      return res.status(400).json({ error: "fare must be a non-negative number" });
+    }
+    const next = Math.round(n * 100) / 100;
+    const was = Number(leg.fare) || 0;
+    const ceiling = leg.claimedFare ?? was;
+    const money = (v: number) => (leg.currency && leg.currency !== "INR" ? `${leg.currency} ${v}` : inrText(v));
+    if (next > ceiling) {
+      return res.status(400).json({ error: `A fare can only be reduced — this leg was claimed at ${money(ceiling)}`, claimedFare: ceiling });
+    }
+    if (next === was) return res.status(400).json({ error: "The fare is unchanged" });
+    const reason = String(req.body?.reason || "").trim();
+    if (!reason) return res.status(400).json({ error: "reason is required" });
+
+    leg.claimedFare = ceiling;
+    leg.fare = next;
+    await leg.save();
+
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "APPROVER",
+      actor: new mongoose.Types.ObjectId(ownerId(req)),
+      action: "REDUCE_AMOUNT",
+      comment:
+        `${leg.direction === "ONWARD" ? "Onward" : "Return"} ${leg.travelMode} leg: ${money(was)} → ${money(next)}` +
+        ` (claimed ${money(ceiling)}) — ${reason}`,
+      at: new Date().toISOString(),
+    });
+
+    res.json({ ok: true, leg: leg.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests report leg reduce]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to reduce the fare" });
   }
 });
 
@@ -4321,6 +4393,90 @@ const AMENDABLE_FIELDS = new Set(Object.keys(pickFields({})));
 // traveller's create / edit (applyProjectSelection), not amended raw.
 AMENDABLE_FIELDS.delete("projectId");
 
+/* Reduce-only claim amounts — the Manager corrects a claim at approval
+ * through /amend, and its amount fields may only go down. The ceiling is
+ * what the traveller submitted: the field's value at the last SUBMIT /
+ * RESUBMIT, read off the first approver amendment since then (the traveller
+ * can't edit while it is SUBMITTED, so that amendment's oldValue is the
+ * submitted figure), or the current value if there is none. A line can't be
+ * added; dropping one is a reduction to ₹0 (claim lines must be above zero). */
+const CLAIM_AMOUNT_LINE_FIELDS: Record<string, "fare" | "amount"> = {
+  travelLines: "fare",
+  foodLines: "amount",
+  expenseLines: "amount",
+};
+const CLAIM_AMOUNT_SCALAR_FIELDS: Record<string, string> = {
+  otherExpenses: "Other expenses",
+  taxAmount: "Tax (IGST)",
+};
+
+async function claimAmountBaseline(req: any, doc: any, field: string, current: any): Promise<any> {
+  const lastSubmit: any = await CstepApproval.findOne({
+    workspaceId: req.workspaceObjectId,
+    entityType: "REQUEST",
+    entityId: doc._id,
+    action: { $in: ["SUBMIT", "RESUBMIT"] },
+  })
+    .sort({ at: -1 })
+    .select("at")
+    .lean();
+  if (!lastSubmit) return current;
+  const first: any = await CstepAmendment.findOne({
+    workspaceId: req.workspaceObjectId,
+    requestId: doc._id,
+    field,
+    changedAt: { $gt: lastSubmit.at },
+  })
+    .sort({ changedAt: 1 })
+    .select("oldValue")
+    .lean();
+  return first ? first.oldValue : current;
+}
+
+function claimLineLabel(field: string, l: any): string {
+  if (field === "travelLines") return `Travel ${l?.date || ""}: ${[l?.from, l?.to].filter(Boolean).join(" → ")}`.trim();
+  if (field === "foodLines") return `Food ${l?.date || ""}`.trim();
+  return String(l?.description || "Expense");
+}
+
+/** The amount changes an amend makes, or the reason it is refused. */
+function checkClaimReduction(field: string, baseline: any, current: any, next: any): { error: string } | { changes: string[] } {
+  const key = CLAIM_AMOUNT_LINE_FIELDS[field];
+  if (key) {
+    if (!Array.isArray(next)) return { error: `${field} must be a list` };
+    const base = new Map(((baseline || []) as any[]).map((l) => [String(l._id), l]));
+    const cur = new Map(((current || []) as any[]).map((l) => [String(l._id), l]));
+    const seen = new Set<string>();
+    const changes: string[] = [];
+    for (const l of next) {
+      const id = l?._id ? String(l._id) : "";
+      if (!id || !base.has(id)) return { error: "A line can't be added at approval — only the claimed lines' amounts can be reduced" };
+      if (seen.has(id)) return { error: "A line appears twice" };
+      seen.add(id);
+      const label = claimLineLabel(field, base.get(id));
+      const ceiling = Number(base.get(id)[key]) || 0;
+      const was = Number(cur.get(id)?.[key]) || 0;
+      const now = Number(l[key]);
+      if (!isFinite(now) || now < 0) return { error: `${label}: the amount must be a non-negative number` };
+      if (now > ceiling) return { error: `An amount can only be reduced — ${label} was claimed at ${inrText(ceiling)}` };
+      if (now !== was) changes.push(`${label}: ${inrText(was)} → ${inrText(now)} (claimed ${inrText(ceiling)})`);
+    }
+    for (const [id, l] of cur) {
+      if (seen.has(id)) continue;
+      const ceiling = Number(base.get(id)?.[key] ?? l[key]) || 0;
+      changes.push(`${claimLineLabel(field, l)}: ${inrText(Number(l[key]) || 0)} → ${inrText(0)}, line dropped (claimed ${inrText(ceiling)})`);
+    }
+    return { changes };
+  }
+  const label = CLAIM_AMOUNT_SCALAR_FIELDS[field];
+  const ceiling = Number(baseline) || 0;
+  const was = Number(current) || 0;
+  const now = Number(next ?? 0);
+  if (!isFinite(now) || now < 0) return { error: `${label} must be a non-negative amount` };
+  if (now > ceiling) return { error: `An amount can only be reduced — ${label} was claimed at ${inrText(ceiling)}` };
+  return { changes: now !== was ? [`${label}: ${inrText(was)} → ${inrText(now)} (claimed ${inrText(ceiling)})`] : [] };
+}
+
 router.post("/requests/:id/amend", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
@@ -4346,6 +4502,15 @@ router.post("/requests/:id/amend", async (req: any, res: any) => {
     const oldValue = before[field];
     const newValue = req.body.newValue;
 
+    // Claim amounts are reduce-only (see checkClaimReduction).
+    let reductions: string[] = [];
+    if (CLAIM_AMOUNT_LINE_FIELDS[field] || CLAIM_AMOUNT_SCALAR_FIELDS[field]) {
+      const baseline = await claimAmountBaseline(req, doc, field, oldValue);
+      const check = checkClaimReduction(field, baseline, oldValue, newValue);
+      if ("error" in check) return res.status(400).json({ error: check.error });
+      reductions = check.changes;
+    }
+
     const merged: any = { ...before, [field]: newValue };
     const validationError = validatePayload(merged);
     if (validationError) return res.status(400).json({ error: validationError });
@@ -4353,16 +4518,30 @@ router.post("/requests/:id/amend", async (req: any, res: any) => {
     (doc as any)[field] = newValue;
     await doc.save();
 
+    const actor = new mongoose.Types.ObjectId(ownerId(req));
+    const changedAt = new Date().toISOString();
     await CstepAmendment.create({
       workspaceId: req.workspaceObjectId,
       requestId: doc._id,
       field,
       oldValue,
       newValue,
-      changedBy: new mongoose.Types.ObjectId(ownerId(req)),
-      changedAt: new Date().toISOString(),
+      changedBy: actor,
+      changedAt,
       reason,
     });
+    if (reductions.length > 0) {
+      await CstepApproval.create({
+        workspaceId: req.workspaceObjectId,
+        entityType: "REQUEST",
+        entityId: doc._id,
+        stage: "APPROVER",
+        actor,
+        action: "REDUCE_AMOUNT",
+        comment: `${reductions.join("; ")} — ${reason}`,
+        at: changedAt,
+      });
+    }
 
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
@@ -4769,6 +4948,8 @@ router.post("/requests/:id/settlement/start", async (req: any, res: any) => {
         await CstepSettlementLine.insertMany(
           seedRows.map((row) => ({
             ...row,
+            // Reduce-only ceiling: the figure the line arrives with.
+            claimedAmountInr: row.amountInr,
             workspaceId: req.workspaceObjectId,
             settlementId: settlement._id,
             requestId: doc._id,
@@ -4873,12 +5054,22 @@ router.get("/requests/:id/settlement", async (req: any, res: any) => {
 
 /**
  * PATCH /requests/:id/settlement/lines/:lineId — Official/Admin verifies one
- * line: confirm/correct amountInr, flip classification (reason mandatory on
+ * line: correct amountInr, flip classification (reason mandatory on
  * override), mark verified. Only touches fields present in the body (same
- * "only touch what was sent" discipline as Step 3/4's PATCH routes). Logs
- * VERIFY_LINE with a before/after comment. Recomputes the settlement's
- * buckets/totals on every change. Only while the settlement is VERIFYING.
+ * "only touch what was sent" discipline as Step 3/4's PATCH routes).
+ * Recomputes the settlement's buckets/totals (so amount claimed / due, and
+ * what Finance pays, follow) on every change. Only while VERIFYING.
+ *
+ * Amounts are reduce-only: amountInr may never go above the line's
+ * claimedAmountInr (the figure it was seeded with), and any change needs
+ * amountReason. Logged as REDUCE_AMOUNT (before → after, reason); a
+ * classification or verified change is logged as VERIFY_LINE. Finance has
+ * no edit here — it sends the case back (POST /finance/return) with a reason.
  */
+function inrText(n: number | undefined | null): string {
+  return `₹${Number(n || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
+}
+
 router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
@@ -4916,10 +5107,27 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
     const before = { amountInr: line.amountInr, classification: line.classification, verified: line.verified };
     const body = req.body || {};
 
+    let amountChange: { before: number; after: number; ceiling: number; reason: string } | null = null;
     if ("amountInr" in body) {
       const n = Number(body.amountInr);
       if (!isFinite(n) || n < 0) return res.status(400).json({ error: "amountInr must be a non-negative number" });
-      line.amountInr = Math.round(n * 100) / 100;
+      const next = Math.round(n * 100) / 100;
+      if (next !== line.amountInr) {
+        // A line seeded before reduce-only has no ceiling yet: the amount it
+        // carries now becomes it.
+        const ceiling = line.claimedAmountInr ?? line.amountInr ?? 0;
+        if (next > ceiling) {
+          return res.status(400).json({
+            error: `An amount can only be reduced — this line was claimed at ${inrText(ceiling)}`,
+            claimedAmountInr: ceiling,
+          });
+        }
+        const reason = String(body.amountReason || "").trim();
+        if (!reason) return res.status(400).json({ error: "amountReason is required to change a line's amount" });
+        amountChange = { before: line.amountInr ?? 0, after: next, ceiling, reason };
+        line.claimedAmountInr = ceiling;
+        line.amountInr = next;
+      }
     }
 
     if ("classification" in body) {
@@ -4959,21 +5167,41 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
     applySettlementTotals(settlement, allLines as any[], doc);
     await settlement.save();
 
-    await CstepApproval.create({
-      workspaceId: req.workspaceObjectId,
-      entityType: "REQUEST",
-      entityId: doc._id,
-      stage: isClaim ? "ADMIN" : "OFFICIAL",
-      actor: new mongoose.Types.ObjectId(ownerId(req)),
-      action: "VERIFY_LINE",
-      comment:
-        `Line ${line.description || line.mode}: amount ${before.amountInr ?? 0} => ${line.amountInr ?? 0}` +
-        (before.classification !== line.classification
-          ? `, classification ${before.classification} => ${line.classification} (${line.classificationOverrideReason})`
-          : "") +
-        (before.verified !== line.verified ? `, verified ${before.verified} => ${line.verified}` : ""),
-      at: new Date().toISOString(),
-    });
+    const stage = isClaim ? "ADMIN" : "OFFICIAL";
+    const actor = new mongoose.Types.ObjectId(ownerId(req));
+    const label = line.description || line.mode;
+    if (amountChange) {
+      await CstepApproval.create({
+        workspaceId: req.workspaceObjectId,
+        entityType: "REQUEST",
+        entityId: doc._id,
+        stage,
+        actor,
+        action: "REDUCE_AMOUNT",
+        comment:
+          `${label}: ${inrText(amountChange.before)} → ${inrText(amountChange.after)}` +
+          ` (claimed ${inrText(amountChange.ceiling)}) — ${amountChange.reason}`,
+        at: new Date().toISOString(),
+      });
+    }
+    const otherChanges = [
+      before.classification !== line.classification
+        ? `classification ${before.classification} => ${line.classification} (${line.classificationOverrideReason})`
+        : "",
+      before.verified !== line.verified ? `verified ${before.verified} => ${line.verified}` : "",
+    ].filter(Boolean);
+    if (otherChanges.length > 0 || !amountChange) {
+      await CstepApproval.create({
+        workspaceId: req.workspaceObjectId,
+        entityType: "REQUEST",
+        entityId: doc._id,
+        stage,
+        actor,
+        action: "VERIFY_LINE",
+        comment: `Line ${label}: ${otherChanges.length ? otherChanges.join(", ") : "no change"}`,
+        at: new Date().toISOString(),
+      });
+    }
 
     res.json({ ok: true, line: line.toObject(), settlement: settlement.toObject() });
   } catch (err: any) {

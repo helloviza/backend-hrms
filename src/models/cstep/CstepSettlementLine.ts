@@ -45,6 +45,11 @@ export interface ICstepSettlementLine extends Document {
   description?: string;
   mode: CstepServiceType; // maps to a bucket — see SETTLEMENT_BUCKET_BY_MODE in routes/cstep.ts
   amountInr: number; // Official-confirmed/corrected amount — starts as the source record's own amount
+  /** The ceiling for reductions: amountInr as seeded (the figure the line
+   * arrived with). amountInr may go down from it, with a reason, never above
+   * it. Absent on lines seeded before reduce-only — PATCH /settlement/lines
+   * then takes the current amount as the ceiling and stores it. */
+  claimedAmountInr?: number;
 
   classification: CstepSettlementLineClassification;
   classificationOverridden: boolean;
@@ -73,6 +78,7 @@ const CstepSettlementLineSchema = new Schema<ICstepSettlementLine>(
     description: { type: String, trim: true },
     mode: { type: String, enum: CSTEP_SERVICE_TYPES, required: true },
     amountInr: { type: Number, default: 0 },
+    claimedAmountInr: { type: Number },
 
     classification: { type: String, enum: ["OFFICIAL", "PERSONAL"], required: true },
     classificationOverridden: { type: Boolean, default: false },

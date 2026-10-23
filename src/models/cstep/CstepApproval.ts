@@ -45,6 +45,11 @@ export type CstepApprovalAction =
   // Report approval — the Manager approves the submitted report on to the
   // Official (REPORT_UNDER_APPROVAL → REPORT_SUBMITTED).
   | "APPROVE_REPORT"
+  // Reduce-only amount correction, reason mandatory: a settlement line
+  // (Travel Desk / Admin), a claim line at approval or a report-leg fare
+  // during report approval (Manager). The comment carries before → after
+  // and the reason.
+  | "REDUCE_AMOUNT"
   // Step 5 — Office/Accounts settlement (verification of the CstepSettlement
   // opened once REPORT_SUBMITTED is reached).
   | "START_VERIFICATION"
@@ -108,6 +113,7 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "START_REPORT",
       "SUBMIT_REPORT",
       "APPROVE_REPORT",
+      "REDUCE_AMOUNT",
       "START_VERIFICATION",
       "VERIFY_LINE",
       "SETTLE",
