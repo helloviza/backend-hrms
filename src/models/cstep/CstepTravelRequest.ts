@@ -286,6 +286,13 @@ export interface ICstepTravelRequest extends Document {
   declarationHash?: string;
   declarationGeneratedAt?: Date;
 
+  // #14 — the overdue-travel-report reminder (services/cstepReportReminders.ts).
+  // round: the anchor day ("YYYY-MM-DD") the current series counts from —
+  // the return date, or a later send-back day; a new anchor starts a new
+  // series. count: reminders sent in this round (max 3). Claimed by a
+  // conditional update before each send, so two instances never both send.
+  reportReminder?: { round: string; count: number; lastSentAt: Date };
+
   createdBy: mongoose.Types.ObjectId; // ref User
 
   createdAt: Date;
@@ -561,6 +568,10 @@ const CstepTravelRequestSchema = new Schema<ICstepTravelRequest>(
     declarationS3Key: { type: String, trim: true },
     declarationHash: { type: String, trim: true },
     declarationGeneratedAt: { type: Date },
+
+    reportReminder: {
+      type: new Schema({ round: { type: String }, count: { type: Number }, lastSentAt: { type: Date } }, { _id: false }),
+    },
 
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   },

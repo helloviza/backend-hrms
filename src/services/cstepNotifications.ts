@@ -20,11 +20,15 @@
 // Dormant unless CSTEP_NOTIFICATIONS_ENABLED is explicitly truthy (default
 // off) AND the workspace's own settings are enabled. Never throws: a mail
 // problem must not fail the transition that caused it. An unmapped recipient
-// is skipped with a log line — no fallback recipient.
+// is skipped with a log line — the one fallback is an unmapped Official, who
+// falls back to the Travel Desk grant holders (#12).
 //
 //   event                    recipient
 //   SUBMITTED                Tour Approver   (TravellerProfile.tourApproverId)
-//   APPROVED                 Official user   (TravellerProfile.officialUserId) — not for claims
+//   APPROVED                 Official user   (TravellerProfile.officialUserId) — not for claims;
+//                            with no Official email, the workspace's Travel Desk
+//                            grant holders instead (#12) — same for every
+//                            "Official user" row below
 //   CLAIM_APPROVED           CSTEP Admin(s)  (settings.adminRecipients) — a claim's next step
 //   RETURN_TO_ADMIN          CSTEP Admin(s)  — Finance sent a claim back
 //   REPORT_SUBMITTED         Tour Approver   — the travel report waits on the Manager
@@ -36,11 +40,16 @@
 //   SETTLED, ARRANGED,         email, first one present
 //   CHANGE_RESOLVED
 //   CHANGE_RAISED            Official user   — a cancel / rebook on an arranged service
+//   REPORT_REMINDER          the request's creator (the one who can file the
+//                            report) + the traveller if a different email;
+//                            from the 2nd reminder also the Tour Approver.
+//                            Sent by the daily sweep (services/cstepReportReminders.ts)
 import mongoose from "mongoose";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import User from "../models/User.js";
-import { CstepNotification } from "../models/cstep/index.js";
+import { CstepNotification, CstepTravelDeskGrant } from "../models/cstep/index.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 import { isClaimFormType } from "../models/cstep/CstepTravelRequest.js";
 import { enqueueEmail } from "./emailOutbox.js";
 import { renderCstepEmailLayout, type CstepEmailInput, type CstepFact, type CstepStep, type CstepTone } from "./cstepEmailLayout.js";
@@ -66,9 +75,10 @@ export type CstepNotifyEvent =
   | "SETTLED"
   | "ARRANGED"
   | "CHANGE_RAISED"
-  | "CHANGE_RESOLVED";
+  | "CHANGE_RESOLVED"
+  | "REPORT_REMINDER";
 
-type Role = "APPROVER" | "OFFICIAL" | "FINANCE" | "ADMIN" | "OWNER";
+type Role = "APPROVER" | "OFFICIAL" | "FINANCE" | "ADMIN" | "OWNER" | "REMINDER";
 
 const RECIPIENT: Record<CstepNotifyEvent, Role> = {
   SUBMITTED: "APPROVER",
@@ -87,6 +97,7 @@ const RECIPIENT: Record<CstepNotifyEvent, Role> = {
   ARRANGED: "OWNER",
   CHANGE_RAISED: "OFFICIAL",
   CHANGE_RESOLVED: "OWNER",
+  REPORT_REMINDER: "REMINDER",
 };
 
 export type CstepNotifyCtx = {
@@ -113,6 +124,14 @@ export type CstepNotifyCtx = {
     outcome?: "DONE" | "DECLINED";
     resolutionNote?: string;
   };
+  /** REPORT_REMINDER — which reminder this is (1–3) and the day it counts from. */
+  reminder?: {
+    count: number;
+    /** The anchor day: the return date, or a later send-back day. */
+    anchorDay: string;
+    /** True when the anchor is a send-back, not the trip's return. */
+    sentBack: boolean;
+  };
 };
 
 export type CstepNotifyResult =
@@ -127,12 +146,36 @@ async function userEmail(id: any): Promise<string> {
   return norm(u?.email || u?.officialEmail);
 }
 
-async function resolveRecipients(role: Role, traveller: any, request: any, settings: any): Promise<string[]> {
+/** #12 — the active users holding the workspace's Travel Desk grant. */
+async function travelDeskEmails(workspaceId: any): Promise<string[]> {
+  const grants = await CstepTravelDeskGrant.find({ workspaceId, revokedAt: { $exists: false } }).select("userId").lean();
+  if (!grants.length) return [];
+  const users: any[] = await User.find({ _id: { $in: grants.map((g) => g.userId) }, ...activeUserFilter() })
+    .select("email officialEmail")
+    .lean();
+  return [...new Set(users.map((u) => norm(u.email || u.officialEmail)).filter(Boolean))];
+}
+
+async function resolveRecipients(role: Role, traveller: any, request: any, settings: any, ctx: CstepNotifyCtx): Promise<string[]> {
   if (role === "ADMIN") return [...new Set(((settings?.adminRecipients || []) as string[]).map(norm).filter(Boolean))];
+  if (role === "REMINDER") {
+    // The creator first: only they can file the report (an Admin filing on
+    // someone's behalf is the creator). The Manager joins from the 2nd.
+    const all = [
+      await userEmail(request.createdBy),
+      (await userEmail(traveller?.claimedBy)) || norm(traveller?.email),
+      (ctx.reminder?.count || 0) >= 2 ? await userEmail(traveller?.tourApproverId) : "",
+    ];
+    return [...new Set(all.filter(Boolean))];
+  }
   let one = "";
   if (role === "APPROVER") one = await userEmail(traveller?.tourApproverId);
-  else if (role === "OFFICIAL") one = await userEmail(traveller?.officialUserId);
-  else if (role === "FINANCE") one = await userEmail(traveller?.financeUserId);
+  else if (role === "OFFICIAL") {
+    // No Official mapped (or no email on them): the Travel Desk grant holders
+    // are the desk for every traveller, so they get it. Never both.
+    one = await userEmail(traveller?.officialUserId);
+    if (!one) return travelDeskEmails(request.workspaceId);
+  } else if (role === "FINANCE") one = await userEmail(traveller?.financeUserId);
   else one = (await userEmail(traveller?.claimedBy)) || norm(traveller?.email) || (await userEmail(request.createdBy));
   return one ? [one] : [];
 }
@@ -222,6 +265,21 @@ function copyFor(event: CstepNotifyEvent, who: string, kind: string, claim: bool
         ? { subject: `Your ${service} ${what} request was declined`, badge: "Declined", tone: "red", headline: `Your ${service} ${what} was not made`, instruction: "Your existing booking stands. Contact the Travel Desk if you still need the change.", note, noteLabel: "Note" }
         : { subject: `Your ${service} ${what} is done`, badge: "Change done", tone: "green", headline: `Your ${service} ${what} is done`, instruction: "The Travel Desk has made the change. Your updated booking is in the portal.", note, noteLabel: "Note" };
     }
+    case "REPORT_REMINDER": {
+      const n = ctx.reminder?.count || 1;
+      const day = fmtDate(ctx.reminder?.anchorDay);
+      const ended = kind === FORM_LABEL.EVENT_REQUEST.kind ? "The event ended" : "The trip ended";
+      const lead = n === 1 ? "Reminder" : n === 2 ? "Second reminder" : "Final reminder";
+      return {
+        subject: `${lead} — travel report ${n === 1 ? "due" : "overdue"} — ${who}`,
+        badge: n === 1 ? "Report due" : lead,
+        tone: n === 1 ? "orange" : "red",
+        headline: `${who}'s travel report is still to be submitted`,
+        instruction: ctx.reminder?.sentBack
+          ? `It was sent back for a fix on ${day} and has not been submitted again. Please correct it and submit it in the portal.`
+          : `${ended} on ${day} and the travel report has not been submitted. Please file it with its bills in the portal.`,
+      };
+    }
   }
 }
 
@@ -232,7 +290,7 @@ function copyFor(event: CstepNotifyEvent, who: string, kind: string, claim: bool
  * gets the photo.
  */
 function bandFor(event: CstepNotifyEvent, ctx: CstepNotifyCtx): CstepEmailInput["band"] {
-  if (["RETURN", "RETURN_REPORT", "RETURN_TO_OFFICIAL", "RETURN_TO_ADMIN", "REJECTED"].includes(event)) return "plain";
+  if (["RETURN", "RETURN_REPORT", "RETURN_TO_OFFICIAL", "RETURN_TO_ADMIN", "REJECTED", "REPORT_REMINDER"].includes(event)) return "plain";
   if (event === "CHANGE_RESOLVED" && ctx.change?.outcome === "DECLINED") return "plain";
   if (event === "TRANSFERRED_TO_FINANCE" && ctx.direction === "COLLECT") return "plain";
   return "photo";
@@ -249,6 +307,7 @@ const GREETING: Record<Role, string> = {
   OFFICIAL: "colleague",
   FINANCE: "Finance team",
   ADMIN: "CSTEP Admin",
+  REMINDER: "colleague",
 };
 
 /** The "What happens next?" strip: the recipient's next steps after this email. */
@@ -320,6 +379,12 @@ function nextStepsFor(event: CstepNotifyEvent, claim: boolean, ctx: CstepNotifyC
       ];
     case "CHANGE_RESOLVED":
       return [{ title: "Check your booking", detail: "Open the request to see the service as it stands now." }];
+    case "REPORT_REMINDER":
+      return [
+        { title: "Open", detail: "Open the request in the portal and go to its travel report." },
+        { title: "Add legs and bills", detail: "Record each leg of the trip with its bills." },
+        { title: "Submit", detail: `It goes to the Manager for approval.${(ctx.reminder?.count || 1) < 3 ? " Reminders repeat weekly until it is submitted." : ""}` },
+      ];
   }
 }
 
@@ -397,7 +462,7 @@ export async function notifyCstep(event: CstepNotifyEvent, request: any, ctx: Cs
       .lean();
 
     const role = RECIPIENT[event];
-    const recipients = await resolveRecipients(role, traveller, request, transport.settings);
+    const recipients = await resolveRecipients(role, traveller, request, transport.settings, ctx);
     if (!recipients.length) return skip(`no ${role.toLowerCase()} email mapped`);
 
     const { subject, html, text } = renderCstepEmail(event, request, traveller, ctx, transport.orgLabel, transport.contactEmail);

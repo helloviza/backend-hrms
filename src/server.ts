@@ -1447,6 +1447,12 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
         // the run is claimed per IST date, so only one instance sweeps
         const { startLoyaltySweepCron } = await import("./jobs/loyaltySweepCron.js");
         startLoyaltySweepCron();
+
+        // CSTEP: overdue travel-report reminder, daily at 10:00 IST — sends
+        // nothing while CSTEP notifications are dormant; off entirely with
+        // CSTEP_REPORT_REMINDER_DISABLED=true
+        const { startCstepReportReminderCron } = await import("./jobs/cstep-report-reminder.js");
+        startCstepReportReminderCron();
       } else {
         logger.info("[WA-HOST] WA_HOST=true — running EOD + Sales Pulse crons only; all other crons/workers skipped on this host");
       }
