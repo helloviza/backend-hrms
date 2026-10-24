@@ -22,6 +22,7 @@ import path from "path";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import Proposal from "../models/Proposal.js";
 import TravelBooking from "../models/TravelBooking.js";
+import ManualBooking from "../models/ManualBooking.js";
 import { DISABLE_EMAILS } from "../routes/approvals.security.js";
 import { buildEmailAttachmentsFromMeta, sanitizeAdminCommentForEmail } from "../routes/approvals.email.js";
 import { notifySafely, recipientsFor } from "./approvalEmails/dispatch.js";
@@ -115,13 +116,21 @@ export async function markRequestDone(opts: {
     /* non-blocking */
   }
 
-  // Concierge booking record (unchanged behaviour of the queue's Mark Done).
+  // Concierge booking record — only for Mark Done WITHOUT a booking. When the
+  // request has a live (not deleted) Book Now booking — recorded on
+  // meta.manualBookingId by services/bookingDocuments.ts — that booking's own
+  // TravelBooking mirror carries the trip (models/ManualBooking.ts), and a
+  // second, request-keyed row would count it again.
   try {
+    const linkedId = str(doc.meta?.manualBookingId);
+    const linked = linkedId
+      ? await ManualBooking.exists({ _id: linkedId, isActive: { $ne: false } })
+      : null;
     const serviceMatch = comment.match(/\[SERVICE:(\w+)\]/i);
     const amountMatch = comment.match(/\[BOOKING_AMOUNT:(\d+(?:\.\d+)?)\]/i);
     const service = serviceMatch ? serviceMatch[1].toUpperCase() : conciergeService(opts.service);
     const amount = amountMatch ? parseFloat(amountMatch[1]) : Number(opts.bookingAmount) || 0;
-    if (service && amount) {
+    if (!linked && service && amount) {
       if (["FLIGHT", "HOTEL", "VISA", "CAB", "FOREX", "ESIM", "HOLIDAY", "MICE"].includes(service) && amount > 0) {
         await TravelBooking.findOneAndUpdate(
           { reference: doc._id },

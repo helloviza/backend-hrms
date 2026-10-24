@@ -937,7 +937,10 @@ router.get("/", requirePermission("invoices", "READ"), async (req: any, res: any
         { $match: filter },
         { $group: {
           _id: null,
-          totalReceivables: { $sum: { $ifNull: ["$grandTotal", 0] } },
+          // A cancelled invoice is not receivable, whatever the list filter.
+          totalReceivables: { $sum: { $cond: [
+            { $eq: ["$status", "CANCELLED"] }, 0, { $ifNull: ["$grandTotal", 0] },
+          ] } },
           outstanding: { $sum: { $cond: [
             { $in: ["$status", ["DRAFT", "SENT", "PAYMENT_DECLARED"]] },
             { $ifNull: ["$grandTotal", 0] },

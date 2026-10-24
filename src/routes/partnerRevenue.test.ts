@@ -439,6 +439,26 @@ describe("partner endpoints — /api/my-bookings/revenue", () => {
       for (const k of FORBIDDEN) expect(keysDeep(res.body).has(k)).toBe(false);
     });
 
+    it("stats cards count CONFIRMED + INVOICED only — PENDING / WIP / demo rows are not trips; Revenue Earned unchanged", async () => {
+      const invoiced = await makeBooking(CUST_P);
+      await generate([invoiced._id]);
+      await makeBooking(CUST_P, { status: "CONFIRMED" });
+      await makeBooking(CUST_P, { status: "PENDING" });
+      await makeBooking(CUST_P, { status: "WIP" });
+      const demo = await makeBooking(CUST_P);
+      await col("manualbookings").updateOne({ _id: demo._id }, { $set: { isDemo: true } });
+      // A row with no isActive / isDemo keys at all (as most prod rows are) still counts.
+      const bare = await makeBooking(CUST_P);
+      await col("manualbookings").updateOne({ _id: bare._id }, { $unset: { isActive: "", isDemo: "" } });
+
+      const p = (await get("/stats")).body.primary;
+      expect(p.totalTrips).toBe(3);
+      expect(p.totalSpend).toBe(3 * 11_180);
+      expect(p.breakdown.find((x: any) => x.service === "FLIGHT")).toMatchObject({ count: 3 });
+      expect(p.totalBakedIn).toBe(500);
+      expect(p.totalShare).toBe(200);
+    });
+
     it("bookings: /manual row shape + revenueEarned (number / PENDING / null); never a cost field", async () => {
       const invoiced = await makeBooking(CUST_P);
       const full = await makeBooking(CUST_P);

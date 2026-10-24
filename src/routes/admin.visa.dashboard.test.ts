@@ -555,6 +555,17 @@ describe("GET /dashboard — value", () => {
     expect(res.body.value.wipFilter).toEqual({ mb_type: "VISA", mb_status: "WIP" });
     expect(res.body.value.confirmedFilter).toEqual({ mb_type: "VISA", mb_status: "CONFIRMED" });
   });
+
+  it("never counts a soft-deleted or demo booking (missing isActive / isDemo = live)", async () => {
+    _bookings.insert({ type: "VISA", status: "WIP", pricing: { grandTotal: 5000 } }); // no flags at all
+    _bookings.insert({ type: "VISA", status: "WIP", isActive: false, pricing: { grandTotal: 4000 } });
+    _bookings.insert({ type: "VISA", status: "CONFIRMED", isActive: true, isDemo: false, pricing: { grandTotal: 7500 } });
+    _bookings.insert({ type: "VISA", status: "CONFIRMED", isDemo: true, pricing: { grandTotal: 6000 } });
+
+    const res = await request(makeApp()).get("/dashboard");
+    expect(res.body.value.wipTotalInr).toBe(5000);
+    expect(res.body.value.confirmedTotalInr).toBe(7500);
+  });
 });
 
 describe("GET /dashboard — permission gate", () => {

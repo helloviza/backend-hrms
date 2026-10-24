@@ -29,6 +29,7 @@ import TravellerProfile from "../models/TravellerProfile.js";
 import User from "../models/User.js";
 import { assessProcessingRisk } from "../utils/visaEta.js";
 import { objectIdKeys } from "../utils/objectIdKeys.js";
+import { liveBookingMatch } from "../utils/bookingMetrics.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -332,9 +333,11 @@ async function buildOutcomes(from: Date, to: Date) {
  * figures (task brief: committed work in flight is visible separately
  * from completed — never merged into one number).
  * ───────────────────────────────────────────────────────────────────── */
-async function buildValue() {
+async function buildValue(user?: any) {
   const grouped = await ManualBooking.aggregate([
-    { $match: { type: "VISA", status: { $in: ["WIP", "CONFIRMED"] } } },
+    // Status logic is this tile's own (WIP vs CONFIRMED, kept apart); deleted
+    // and off-side demo rows never count (utils/bookingMetrics.ts).
+    { $match: { type: "VISA", status: { $in: ["WIP", "CONFIRMED"] }, ...liveBookingMatch(user) } },
     { $group: { _id: "$status", total: { $sum: "$pricing.grandTotal" } } },
   ]);
   const totalByStatus = new Map<string, number>((grouped as any[]).map((g) => [g._id, g.total]));
@@ -359,7 +362,7 @@ router.get("/dashboard", requirePermission("visaApplication", "READ"), async (re
       buildWorkload(),
       buildThroughput(from, to),
       buildOutcomes(from, to),
-      buildValue(),
+      buildValue(req.user),
     ]);
 
     res.json({

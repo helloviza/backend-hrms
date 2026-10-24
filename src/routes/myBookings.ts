@@ -24,7 +24,8 @@ import TravelBooking from "../models/TravelBooking.js";
 import ManualBooking from "../models/ManualBooking.js";
 import CarbonRecord from "../models/CarbonRecord.js";
 import ExtractedDocument from "../models/ExtractedDocument.js";
-import { CARBON_CALCULATION_VERSION } from "../services/carbonEngine.service.js";
+import { CARBON_CALCULATION_VERSION, CARBON_REPORTING_RULE_VERSION } from "../services/carbonEngine.service.js";
+import { countedBookingMatch, CANCELLED_OR_DELETED_MATCH } from "../utils/bookingMetrics.js";
 import Customer from "../models/Customer.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { canCustomerAccessBookingAttachments } from "../utils/bookingCustomerAccess.js";
@@ -667,7 +668,7 @@ router.get("/manual/export", async (req: Request, res: Response) => {
  * booking rows to the browser and has no .limit() on the result set.
  *
  * SOURCE: ManualBooking directly (NOT the TravelBooking mirror). The mirror
- * skips source==="SBT"/"SBT_AUTO"/sourceBookingId rows (ManualBooking.ts:502)
+ * skips source==="SBT"/"SBT_AUTO" rows (models/ManualBooking.ts)
  * and only updates on post-save, so it is a structurally incomplete copy —
  * see infra/audit/customer-bookings-export-audit.md. ManualBooking is the
  * source of truth the customer's own export already reads
@@ -864,10 +865,12 @@ router.get("/stats", async (req: Request, res: Response) => {
     const compareTo = parseDayEnd(req.query.compareTo);
     const hasCompare = Boolean(compareFrom && compareTo);
 
+    // Total Trips / Total Spend and everything under them count CONFIRMED +
+    // INVOICED bookings only, never deleted, demo session-aware
+    // (utils/bookingMetrics.ts).
     const match: Record<string, any> = {
       workspaceId: new mongoose.Types.ObjectId(customerId),
-      isActive: { $ne: false },
-      isDemo: user?.isDemoUser ? true : { $ne: true },
+      ...countedBookingMatch(user),
     };
 
     // OWN-scope (plain member, non-leader/approver/staff-admin): restrict to
@@ -1024,6 +1027,7 @@ function emptyCarbon() {
     ok: true,
     available: true,
     calculationVersion: CARBON_CALCULATION_VERSION,
+    reportingRuleVersion: CARBON_REPORTING_RULE_VERSION,
     totalCo2eKg: 0,
     records: 0,
     priced: 0,
@@ -1066,6 +1070,21 @@ router.get("/carbon", async (req: Request, res: Response) => {
     // restate a figure the customer has already seen.
     const [agg] = await CarbonRecord.aggregate([
       { $match: { workspaceId, calculationVersion: CARBON_CALCULATION_VERSION } },
+      // Reporting rule v2 (CARBON_REPORTING_RULE_VERSION): a cancelled or
+      // deleted booking's flights are not travel — drop their records.
+      // Records with no bookingId find nothing here and still count.
+      {
+        $lookup: {
+          from: "manualbookings",
+          let: { bid: "$bookingId" },
+          pipeline: [
+            { $match: { $expr: { $eq: ["$_id", "$$bid"] } } },
+            { $project: { status: 1, isActive: 1 } },
+          ],
+          as: "_booking",
+        },
+      },
+      { $match: { _booking: { $not: { $elemMatch: CANCELLED_OR_DELETED_MATCH } } } },
       {
         $group: {
           _id: null,
@@ -1119,6 +1138,7 @@ router.get("/carbon", async (req: Request, res: Response) => {
       ok: true,
       available: true,
       calculationVersion: CARBON_CALCULATION_VERSION,
+      reportingRuleVersion: CARBON_REPORTING_RULE_VERSION,
       totalCo2eKg: Math.round((agg.totalCo2eKg || 0) * 100) / 100,
       records: agg.records || 0,
       priced: agg.priced || 0,

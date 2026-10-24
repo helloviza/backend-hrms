@@ -14,6 +14,7 @@ import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import User from "../models/User.js";
 import Customer from "../models/Customer.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
+import { countedBookingMatch } from "../utils/bookingMetrics.js";
 import { buildEodHtml } from "./eodReportTemplate.js";
 import { renderEodImage } from "./eodImageRenderer.js";
 import logger from "../utils/logger.js";
@@ -133,8 +134,7 @@ async function getKpisForRange(start: Date, end: Date): Promise<RangeKpis> {
     {
       $match: {
         bookingDate: { $gte: start, $lte: end },
-        isActive: { $ne: false },
-        isDemo: { $ne: true },
+        ...countedBookingMatch(),
       },
     },
     {
@@ -168,8 +168,7 @@ async function getBreakdownByType(start: Date, end: Date): Promise<TypeBreakdown
     {
       $match: {
         bookingDate: { $gte: start, $lte: end },
-        isActive: { $ne: false },
-        isDemo: { $ne: true },
+        ...countedBookingMatch(),
       },
     },
     {
@@ -211,9 +210,8 @@ async function getTopPerformers(start: Date, end: Date, limit = 3): Promise<TopP
     {
       $match: {
         bookingDate: { $gte: start, $lte: end },
-        isActive: { $ne: false },
         bookedBy: { $ne: null },
-        isDemo: { $ne: true },
+        ...countedBookingMatch(),
       },
     },
     {
@@ -253,9 +251,8 @@ async function getTopClients(start: Date, end: Date, limit = 3): Promise<TopClie
     {
       $match: {
         bookingDate: { $gte: start, $lte: end },
-        isActive: { $ne: false },
         workspaceId: { $ne: null },
-        isDemo: { $ne: true },
+        ...countedBookingMatch(),
       },
     },
     {
@@ -343,19 +340,9 @@ async function getAlerts(
   const sevenDaysAgo = new Date(todayEnd.getTime() - 7 * 24 * 60 * 60 * 1000);
   const out: string[] = [];
 
-  if (toggles.failedBookings) {
-    const failedToday = await ManualBooking.countDocuments({
-      bookingDate: { $gte: todayStart, $lte: todayEnd },
-      status: "FAILED",
-      isActive: { $ne: false },
-      isDemo: { $ne: true },
-    });
-    if (failedToday > 0) {
-      out.push(
-        `⚠️ ${failedToday} booking${failedToday > 1 ? "s" : ""} marked FAILED today — review & retry`,
-      );
-    }
-  }
+  // No "failed bookings" alert: FAILED is not a ManualBooking status, so the
+  // count it read was always 0 and the line never printed. The settings
+  // toggle (alerts.failedBookings) is left as stored; it has nothing to read.
 
   if (toggles.holdsExpiring) {
     const expiringHolds = await SBTHotelBooking.find({
@@ -415,8 +402,7 @@ async function getLast7DayTrend(todayStr: string): Promise<TrendPoint[]> {
     {
       $match: {
         bookingDate: { $gte: earliest, $lte: latest },
-        isActive: { $ne: false },
-        isDemo: { $ne: true },
+        ...countedBookingMatch(),
       },
     },
     {

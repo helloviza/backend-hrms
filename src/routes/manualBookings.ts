@@ -43,6 +43,7 @@ import type { VoucherType } from "../types/index.js";
 import { userNames, nameOrUnknown, personName } from "../services/actorNames.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import { syncRequestFromManualBooking } from "../services/bookingDocuments.js";
+import { countedBookingMatch, countedStatusClause, countsInMetrics } from "../utils/bookingMetrics.js";
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -192,6 +193,16 @@ function applyBookingReadGates(req: any, filter: Record<string, any>): void {
   } else {
     filter.isActive = { $ne: false };
   }
+}
+
+/**
+ * The list's (already gated) filter narrowed to the rows that count in the
+ * stat strip and the export TOTALS row: the caller's status filter, else
+ * CONFIRMED + INVOICED; and never a soft-deleted row, whatever showDeleted
+ * did to the list filter. Demo is already in the filter (buildSearchFilter).
+ */
+export function statsFilter(filter: Record<string, any>): Record<string, any> {
+  return { ...filter, isActive: { $ne: false }, ...countedStatusClause(filter.status) };
 }
 
 export function invoicePendingDays(b: any): number {
@@ -882,7 +893,7 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(200, parseInt(req.query.limit) || 25);
-    const filter = buildSearchFilter(req.query);
+    const filter = buildSearchFilter(req.query, req.user);
 
     // Tenant + own-scope + soft-delete gates — shared verbatim with GET /export
     // (see applyBookingReadGates above), which previously had none of them.
@@ -915,20 +926,26 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
       // pages show the same numbers for the same dataset. grandTotal is always the
       // full GST-inclusive client payment (see ManualBooking pre-save hook), so
       // netSales = grandTotal − gstAmount = sell-ex-GST in both GST modes.
+      //
+      // The stat strip counts by the shared rule (utils/bookingMetrics.ts):
+      // CONFIRMED + INVOICED unless the status filter is set, and never a
+      // deleted row — even with Show Deleted on (the list still shows them).
       ManualBooking.aggregate([
-        { $match: filter },
+        { $match: statsFilter(filter) },
         { $group: {
           _id: null,
+          bookingCount:    { $sum: 1 },
           grossSales:      { $sum: { $ifNull: [ "$pricing.grandTotal",
                              { $ifNull: [ "$pricing.totalWithGST", "$pricing.quotedPrice" ] } ] } },
           gstPayable:      { $sum: "$pricing.gstAmount" },
           netProfit:       { $sum: "$pricing.basePrice" },
-          pendingInvoices: { $sum: { $cond: [{ $ne: ["$status", "INVOICED"] }, 1, 0] } },
+          // Confirmed, not yet invoiced.
+          pendingInvoices: { $sum: { $cond: [{ $eq: ["$status", "CONFIRMED"] }, 1, 0] } },
         }},
       ]),
     ]);
 
-    const aggStats = statsAgg[0] ?? { grossSales: 0, gstPayable: 0, netProfit: 0, pendingInvoices: 0 };
+    const aggStats = statsAgg[0] ?? { bookingCount: 0, grossSales: 0, gstPayable: 0, netProfit: 0, pendingInvoices: 0 };
     const grossSales = aggStats.grossSales ?? 0;
     const gstPayable = aggStats.gstPayable ?? 0;
     const netProfit  = aggStats.netProfit  ?? 0;
@@ -998,7 +1015,7 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
         // aggregate. Masking the rows and leaving these would hand over the
         // margin for the whole filtered set in one field.
         netProfit: seeInternals ? netProfit : 0,
-        bookingCount:    total,
+        bookingCount:    aggStats.bookingCount ?? 0,
         avgMargin: seeInternals ? avgMargin : 0,
         pendingInvoices: aggStats.pendingInvoices,
       },
@@ -1012,7 +1029,7 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
 // GET /api/admin/manual-bookings/export
 router.get("/export", requirePermission("manualBookings", "FULL"), async (req: any, res: any) => {
   try {
-    const filter = buildSearchFilter(req.query);
+    const filter = buildSearchFilter(req.query, req.user);
     // LEAK 2: this handler used to stop here. Same three gates as the list —
     // without them, anything hidden from the list was still downloadable from
     // the export, cost and margin columns included.
@@ -1105,9 +1122,13 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     const totals: Record<number, number> = {};
     MONEY_COLS.forEach((ci) => { totals[ci] = 0; });
 
+    // Every row is listed; only the rows that count (utils/bookingMetrics.ts)
+    // are totalled — same rule as the list's stat strip.
+    const statusFiltered = filter.status !== undefined;
     docs.forEach((b, idx) => {
       const row = bookingToRow(b, idx + 1, wsNameMap, tidMap, redacted);
       sheet.addRow(row);
+      if (!countsInMetrics(b, statusFiltered)) return;
       MONEY_COLS.forEach((ci) => {
         totals[ci] = (totals[ci] || 0) + (Number(row[ci - 1]) || 0);
       });
@@ -1149,8 +1170,9 @@ router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req
     const importedHotelSet = new Set(importedHotelRaw.map((id: any) => id.toString()));
 
     const [flights, hotels] = await Promise.all([
+      // CANCELLED is left out — it cannot be imported (see /import-from-sbt).
       SBTBooking.find({
-        status: { $in: ["CONFIRMED", "PENDING", "CANCELLED"] },
+        status: { $in: ["CONFIRMED", "PENDING"] },
         isDemo: { $ne: true },
         isTest: { $ne: true }, // internal test bookings are never invoiced
       })
@@ -1159,7 +1181,7 @@ router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req
         .limit(200)
         .lean(),
       SBTHotelBooking.find({
-        status: { $in: ["CONFIRMED", "PENDING", "HELD", "CANCELLED"] },
+        status: { $in: ["CONFIRMED", "PENDING", "HELD"] },
         isDemo: { $ne: true },
         isTest: { $ne: true },
       })
@@ -1285,9 +1307,9 @@ router.post("/markup-analysis", requirePermission("manualBookings", "READ"), asy
         $match: {
           workspaceId: new mongoose.Types.ObjectId(workspaceId),
           type,
-          status: { $in: ["CONFIRMED", "INVOICED"] },
           "pricing.actualPrice": { $gt: 0 },
-          isDemo: { $ne: true },
+          // CONFIRMED + INVOICED, not deleted, demo side (utils/bookingMetrics.ts).
+          ...countedBookingMatch(req.user),
         },
       },
       {
@@ -2494,6 +2516,13 @@ router.post("/import-from-sbt", requirePermission("manualBookings", "FULL"), asy
         if (sbtDoc.isTest === true) {
           failed++;
           details.push({ bookingId, status: "failed", error: "test booking — not imported" });
+          continue;
+        }
+        // A cancelled SBT booking is not a sale: importing it used to write a
+        // full-fare CONFIRMED ManualBooking. Refused, like a test booking.
+        if (String(sbtDoc.status || "").toUpperCase() === "CANCELLED") {
+          failed++;
+          details.push({ bookingId, status: "failed", error: "cancelled booking — not imported" });
           continue;
         }
 

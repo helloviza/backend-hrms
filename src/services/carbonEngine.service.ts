@@ -80,6 +80,17 @@ import type { ExtractedDocumentDoc, ExtractedFlightRow } from "../models/Extract
 export const CARBON_CALCULATION_VERSION = "1.0.0";
 
 /**
+ * Which records a customer-facing TOTAL sums — separate from how each record
+ * is computed (above), so changing it restates the card without rewriting or
+ * re-versioning a single CarbonRecord. Bump it, and log the change here,
+ * whenever the inclusion rule changes.
+ *   1 — every record of the engine's current version for the workspace.
+ *   2 — (2026-10-24) records whose ManualBooking is CANCELLED or soft-deleted
+ *       (isActive:false) are left out; records with no booking still count.
+ */
+export const CARBON_REPORTING_RULE_VERSION = 2;
+
+/**
  * DEFRA publishes both an RF and a non-RF factor for every band/cabin. We
  * default to With RF on DEFRA's own advice that organisations "should include
  * the indirect effects of non-CO2 emissions ... to capture the full climate

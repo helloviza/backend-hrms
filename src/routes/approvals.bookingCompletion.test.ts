@@ -431,3 +431,71 @@ describe("Booking History scope and shape", () => {
     expect(JSON.stringify(own.body)).not.toContain(MEERA.email);
   });
 });
+
+/* ───────────────────────── TravelBooking mirror (Travel Spend) ───────────────────────── */
+
+describe("TravelBooking mirror — Book Now bookings", () => {
+  const rowsFor = async (rid: string, bookingId?: string) =>
+    (await col("travelbookings")
+      .find({ reference: { $in: [new mongoose.Types.ObjectId(rid), ...(bookingId ? [new mongoose.Types.ObjectId(bookingId)] : [])] } })
+      .toArray()) as any[];
+
+  it("a Book Now booking mirrors like any manual booking; no extra CONCIERGE row once it is booked", async () => {
+    const { rid, bookingId } = await bookedRequest();
+    const rows = await rowsFor(rid, bookingId);
+    const live = rows.filter((r) => r.isActive !== false);
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ referenceModel: "ManualBooking", status: "CONFIRMED", isDemo: false });
+    expect(String(live[0].reference)).toBe(bookingId);
+    expect(rows.some((r) => r.referenceModel === "ApprovalRequest" && r.isActive !== false)).toBe(false);
+  });
+
+  it("cancelling the booking re-syncs the mirror (CANCELLED) and retires a CONCIERGE row left from before", async () => {
+    const rid = await approvedRequest();
+    expect((await startBooking(rid)).status).toBe(200);
+    const { booking } = await createBooking(rid);
+    // The row the old Mark Done path wrote, keyed on the request.
+    await col("travelbookings").insertOne({
+      reference: new mongoose.Types.ObjectId(rid), referenceModel: "ApprovalRequest", source: "CONCIERGE",
+      status: "CONFIRMED", service: "FLIGHT", amount: 12000, tenantId: String(ACME_CUSTOMER), userId: oid(), bookedAt: new Date(),
+    } as any);
+    const cancel = await as(request(app).post(`/api/admin/manual-bookings/${booking._id}/cancel`), OPS).send({ reason: "CUSTOMER_CANCELLED" });
+    expect(cancel.status, JSON.stringify(cancel.body)).toBe(200);
+
+    const rows = await rowsFor(rid, String(booking._id));
+    const mirror = rows.find((r) => r.referenceModel === "ManualBooking");
+    const concierge = rows.find((r) => r.referenceModel === "ApprovalRequest");
+    expect(mirror).toMatchObject({ status: "CANCELLED", isActive: true });
+    expect(concierge.isActive).toBe(false);
+  });
+
+  it("deleting the booking deactivates its mirror row", async () => {
+    const { rid, bookingId } = await bookedRequest();
+    const del = await as(request(app).delete(`/api/admin/manual-bookings/${bookingId}`), OPS).send({ reason: "DUPLICATE_ENTRY" });
+    expect(del.status, JSON.stringify(del.body)).toBe(200);
+    const rows = await rowsFor(rid, bookingId);
+    expect(rows.filter((r) => r.isActive !== false)).toHaveLength(0);
+  });
+
+  it("Mark Done WITHOUT a booking still writes the CONCIERGE row", async () => {
+    const rid = await approvedRequest();
+    expect((await startBooking(rid)).status).toBe(200);
+    const done = await as(request(app).put(`/api/approvals/admin/${rid}/done`), OPS)
+      .send({ comment: "[SERVICE:FLIGHT] [BOOKING_AMOUNT:12000]", notifyEmail: false, bookingAmount: 12000 });
+    expect(done.status, JSON.stringify(done.body)).toBe(200);
+    const rows = await rowsFor(rid);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ referenceModel: "ApprovalRequest", source: "CONCIERGE", status: "CONFIRMED", amount: 12000 });
+  });
+
+  it("a demo booking mirrors as demo", async () => {
+    const rid = await approvedRequest();
+    expect((await startBooking(rid)).status).toBe(200);
+    const res = await as(request(app).post("/api/admin/manual-bookings"), OPS)
+      .set("x-test-user", JSON.stringify({ sub: OPS.sub, _id: OPS.sub, email: OPS.email, name: OPS.name, roles: OPS.roles, isDemoUser: true }))
+      .send(bookingBody(rid));
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const mirror = (await rowsFor(rid, String(res.body.booking._id))).find((r) => r.referenceModel === "ManualBooking");
+    expect(mirror).toMatchObject({ isDemo: true, createdByDemoUser: true });
+  });
+});

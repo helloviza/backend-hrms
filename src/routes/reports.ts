@@ -13,6 +13,12 @@ import ReportSchedule from "../models/ReportSchedule.js";
 import User from "../models/User.js";
 import { sendReportEmail } from "../utils/reportMailer.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
+import {
+  countedStatusClause,
+  liveBookingMatch,
+  parseStatusFilter,
+  InvalidStatusFilterError,
+} from "../utils/bookingMetrics.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -154,7 +160,9 @@ export async function getReportData(filters: {
   workspaceId?: string;
   type?: string;
   status?: string;
-}): Promise<ReportSummary> {
+}, user?: any): Promise<ReportSummary> {
+  // Throws InvalidStatusFilterError on a value outside the enum (routes → 400).
+  const status = parseStatusFilter(filters.status);
   const match: Record<string, any> = {};
 
   // Primary filter — when bookings were transacted (canonical business date).
@@ -174,10 +182,8 @@ export async function getReportData(filters: {
     if (filters.createdAtTo)   match.createdAt.$lte = parseISTEnd(filters.createdAtTo);
   }
 
-  // Exclude soft-deleted bookings from every aggregation.
-  match.isActive = { $ne: false };
-  // Demo Platform — exclude demo bookings from production reports.
-  match.isDemo = { $ne: true };
+  // Never soft-deleted rows; demo rows only for a demo session.
+  Object.assign(match, liveBookingMatch(user));
 
   if (filters.workspaceId) {
     try {
@@ -187,7 +193,13 @@ export async function getReportData(filters: {
     }
   }
   if (filters.type) match.type = filters.type;
-  if (filters.status) match.status = filters.status;
+
+  // Status-count buckets (pending / WIP / confirmed / invoiced / cancelled)
+  // read every live status, so the separate cancelledCount keeps working.
+  const statusCountMatch: Record<string, any> = { ...match, ...(status ? { status } : {}) };
+  // Every money / volume figure: CONFIRMED + INVOICED unless a status filter
+  // was passed (utils/bookingMetrics.ts).
+  Object.assign(match, countedStatusClause(status));
 
   // One-time: backfill createdByEmail on all bookings missing it
   ManualBooking.find({ createdByEmail: { $exists: false } })
@@ -245,6 +257,7 @@ export async function getReportData(filters: {
 
   const [
     overviewResult,
+    statusCountResult,
     byClientResult,
     byTypeResult,
     byStaffResult,
@@ -269,6 +282,16 @@ export async function getReportData(filters: {
           totalDiff: { $sum: "$pricing.diff" },
           totalGST: { $sum: "$pricing.gstAmount" },
           totalBaseProfit: { $sum: "$pricing.basePrice" },
+        },
+      },
+    ]),
+
+    // Status breakdown — over every live status (see statusCountMatch).
+    ManualBooking.aggregate([
+      { $match: statusCountMatch },
+      {
+        $group: {
+          _id: null,
           pendingCount: { $sum: { $cond: [{ $eq: ["$status", "PENDING"] }, 1, 0] } },
           wipCount: { $sum: { $cond: [{ $eq: ["$status", "WIP"] }, 1, 0] } },
           confirmedCount: { $sum: { $cond: [{ $eq: ["$status", "CONFIRMED"] }, 1, 0] } },
@@ -665,7 +688,7 @@ export async function getReportData(filters: {
     };
   });
 
-  const ov = overviewResult[0] || {};
+  const ov = { ...(overviewResult[0] || {}), ...(statusCountResult[0] || {}) };
 
   // Six-metric financial summary — identical formulas to the /admin/manual-bookings
   // summary so both pages show the same numbers for the same dataset.
@@ -727,9 +750,12 @@ router.get("/summary", requirePermission("reports", "READ"), async (req, res, ne
       req.query as Record<string, string>;
     const data = await getReportData({
       dateFrom, dateTo, createdAtFrom, createdAtTo, workspaceId, type, status,
-    });
+    }, (req as any).user);
     res.json(data);
   } catch (err) {
+    if (err instanceof InvalidStatusFilterError) {
+      return res.status(400).json({ error: err.message, code: err.code });
+    }
     next(err);
   }
 });
@@ -756,7 +782,7 @@ router.get("/export", requirePermission("reports", "FULL"), async (req, res, nex
 
     const data = await getReportData({
       dateFrom, dateTo, createdAtFrom, createdAtTo, workspaceId, type, status,
-    });
+    }, (req as any).user);
 
     const fname = `plumtrips-report-${dateFrom || "all"}-${dateTo || "all"}`;
 
@@ -903,6 +929,9 @@ router.get("/export", requirePermission("reports", "FULL"), async (req, res, nex
     await wb.xlsx.write(res);
     res.end();
   } catch (err) {
+    if (err instanceof InvalidStatusFilterError) {
+      return res.status(400).json({ error: err.message, code: err.code });
+    }
     next(err);
   }
 });
@@ -937,7 +966,7 @@ router.post("/send-now", requirePermission("reports", "WRITE"), async (req, res,
 
     const data = await getReportData({
       dateFrom, dateTo, createdAtFrom, createdAtTo, workspaceId, type,
-    });
+    }, (req as any).user);
 
     const fromStr = dateFrom ? new Date(dateFrom).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "All time";
     const toStr = dateTo ? new Date(dateTo).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" }) : "Today";

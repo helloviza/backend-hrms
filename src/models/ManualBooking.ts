@@ -889,9 +889,26 @@ function manualStatusToTravel(s: string): "CONFIRMED" | "CANCELLED" | "PENDING" 
   return "PENDING"; // PENDING and any unexpected value
 }
 
+/**
+ * The Book Now path used to leave a "CONCIERGE" TravelBooking keyed on the
+ * ApprovalRequest (services/approvalProgress.ts markRequestDone). Once the
+ * request has a booking, that booking's own mirror row is the one figure, so
+ * the request-keyed row is retired (isActive:false, never deleted) — on every
+ * save, which covers create, confirm, cancel and delete alike.
+ */
+export async function retireConciergeRowForRequest(requestId: unknown, bookingId: unknown): Promise<void> {
+  if (!requestId) return;
+  await TravelBooking.updateOne(
+    { reference: requestId, referenceModel: "ApprovalRequest", source: "CONCIERGE", isActive: { $ne: false } },
+    { $set: { isActive: false, "metadata.supersededByManualBooking": String(bookingId) } },
+  );
+}
+
 export async function syncManualBookingToMirror(doc: any): Promise<void> {
-  // Skip SBT-origin rows — those already mirror in from the SBT side (avoid double-count).
-  if (doc.source === "SBT" || doc.source === "SBT_AUTO" || doc.sourceBookingId) return;
+  // Skip SBT-origin rows — those already mirror in from the SBT side (avoid
+  // double-count). ADMIN_QUEUE (Book Now) bookings mirror like any manual
+  // booking; their sourceBookingId is the ApprovalRequest, not an SBT row.
+  if (doc.source === "SBT" || doc.source === "SBT_AUTO") return;
 
   const tenantId = String(doc.workspaceId); // = Customer._id (the canonical key)
 
@@ -973,6 +990,10 @@ export async function syncManualBookingToMirror(doc: any): Promise<void> {
     // isActive field. Fires both ways since delete/restore both call
     // booking.save(), which triggers this sync via the post("save") hook.
     isActive: doc.isActive !== false,
+    // Demo Platform parity — without these the mirror defaulted to
+    // isDemo:false and demo bookings leaked into production travel spend.
+    isDemo: doc.isDemo === true,
+    createdByDemoUser: doc.createdByDemoUser === true,
     bookedAt: doc.bookingDate || doc.createdAt,
     travelDate: doc.travelDate ? new Date(doc.travelDate) : null,
     travelDateEnd: doc.returnDate ? new Date(doc.returnDate) : null,
@@ -1006,6 +1027,10 @@ export async function syncManualBookingToMirror(doc: any): Promise<void> {
     upsert: true,
     new: true,
   });
+
+  if (doc.source === "ADMIN_QUEUE" && doc.sourceBookingId) {
+    await retireConciergeRowForRequest(doc.sourceBookingId, doc._id);
+  }
 }
 
 ManualBookingSchema.post("save", async function (doc: any) {

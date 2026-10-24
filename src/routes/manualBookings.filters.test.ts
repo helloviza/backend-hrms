@@ -76,14 +76,14 @@ import router from "./manualBookings.js";
 
 const captured: any[] = (globalThis as any).__capt;
 
-function makeApp() {
+function makeApp(extraUser: Record<string, any> = {}) {
   const app = express();
   app.use(express.json());
   app.use((req: any, _res, next) => {
     // SUPERADMIN so the tenant/own-scope gates stay out of the way — this file
     // is about the NON-gate filter params. Gate coverage lives in
     // manualBookings.exportScope.test.ts.
-    req.user = { _id: String(new mongoose.Types.ObjectId()), roles: ["SUPERADMIN"] };
+    req.user = { _id: String(new mongoose.Types.ObjectId()), roles: ["SUPERADMIN"], ...extraUser };
     next();
   });
   app.use("/", router);
@@ -91,12 +91,12 @@ function makeApp() {
 }
 
 /** Runs one query string against BOTH read paths and returns both filters. */
-async function bothPaths(qs: string) {
+async function bothPaths(qs: string, extraUser: Record<string, any> = {}) {
   captured.length = 0;
-  await request(makeApp()).get(`/${qs}`);
+  await request(makeApp(extraUser)).get(`/${qs}`);
   const list = captured[0];
   captured.length = 0;
-  await request(makeApp()).get(`/export${qs}`);
+  await request(makeApp(extraUser)).get(`/export${qs}`);
   const exp = captured[0];
   return { list, exp };
 }
@@ -263,5 +263,11 @@ describe("every new param reaches the export path", () => {
     const { list, exp } = await bothPaths("?status=PENDING");
     expect(list.isDemo).toEqual({ $ne: true });
     expect(exp.isDemo).toEqual({ $ne: true });
+  });
+
+  it("a demo session sees only demo rows, on both paths (session-aware)", async () => {
+    const { list, exp } = await bothPaths("?status=PENDING", { isDemoUser: true });
+    expect(list.isDemo).toBe(true);
+    expect(exp.isDemo).toBe(true);
   });
 });

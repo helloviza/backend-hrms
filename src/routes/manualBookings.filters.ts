@@ -30,12 +30,12 @@ import {
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { escapeRegex } from "../utils/escapeRegex.js";
 import { enumFilter } from "../utils/filterParams.js";
+import { BOOKING_STATUSES, demoClause } from "../utils/bookingMetrics.js";
 
-const BOOKING_STATUSES = ["PENDING", "WIP", "CONFIRMED", "INVOICED", "CANCELLED"] as const;
 const BOOKING_SOURCES = ["MANUAL", "SBT", "ADMIN_QUEUE", "SBT_AUTO"] as const;
 const ASSIGNMENT_STATUSES = ["PENDING_TO_ASSIGN", "ASSIGNED"] as const;
 
-export function buildSearchFilter(query: Record<string, any>) {
+export function buildSearchFilter(query: Record<string, any>, user?: any) {
   const filter: Record<string, any> = {};
 
   // Bug 5 fix: explicit ObjectId cast so the query is always typed correctly
@@ -118,8 +118,9 @@ export function buildSearchFilter(query: Record<string, any>) {
     ];
   }
 
-  // Demo Platform — exclude demo bookings from admin manual-bookings views.
-  filter.isDemo = { $ne: true };
+  // Demo Platform — session-aware: a demo session sees only demo bookings,
+  // everyone else never sees one (utils/bookingMetrics.ts).
+  Object.assign(filter, demoClause(user));
 
   return filter;
 }

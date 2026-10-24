@@ -61,6 +61,7 @@ import {
 } from "./myBookings.js";
 import { companyDocIds, creditRatioForBooking, combinedLineTotals, issuedCreditNotesFor, netOfCredit } from "../services/partnerRevenue.js";
 import logger from "../utils/logger.js";
+import { countedStatusClause } from "../utils/bookingMetrics.js";
 
 const router = Router();
 
@@ -139,6 +140,8 @@ function netFor(b: AnyObj, ctx: CreditCtx): { bakedIn: number; share: number } |
   return netOfCredit(snap, creditRatioForBooking(b, inv, ctx.creditNotes, ctx.totals));
 }
 
+const COUNTED = countedStatusClause();
+
 async function periodStats(req: Request, customerId: string, match: AnyObj, from: Date, to: Date) {
   const pipeline = [
     { $match: { ...match, bookingDate: { $gte: from, $lte: to } } },
@@ -152,20 +155,27 @@ async function periodStats(req: Request, customerId: string, match: AnyObj, from
         "passengers.email": 1,
         bookingRef: 1,
         invoiceId: 1,
+        status: 1,
         ...SNAPSHOT_PROJECTION,
       },
     },
     {
       $facet: {
+        // The cards (trips, spend, by service, travellers) count CONFIRMED +
+        // INVOICED only (utils/bookingMetrics.ts). `earning` keeps the wider
+        // match on purpose: Revenue Earned is unchanged.
         totals: [
+          { $match: COUNTED },
           { $addFields: { _amount: STATS_AMOUNT_EXPR } },
           { $group: { _id: null, totalTrips: { $sum: 1 }, totalSpend: { $sum: "$_amount" } } },
         ],
         byService: [
+          { $match: COUNTED },
           { $addFields: { _amount: STATS_AMOUNT_EXPR, _bucket: SERVICE_BUCKET_EXPR } },
           { $group: { _id: "$_bucket", count: { $sum: 1 }, spend: { $sum: "$_amount" } } },
         ],
         travellers: [
+          { $match: COUNTED },
           { $unwind: "$passengers" },
           { $addFields: { _travellerKey: TRAVELLER_KEY_EXPR } },
           { $match: { _travellerKey: { $ne: null } } },
