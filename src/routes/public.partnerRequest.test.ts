@@ -443,6 +443,22 @@ describe("travellers and items", () => {
     expect([res.status, res.body.code]).toEqual([400, "SERVICE_NOT_OFFERED"]);
   });
 
+  it("a multi-city flight is refused, however it is spelled; one way and round trip still go through", async () => {
+    const legs = [
+      { origin: "BLR", destination: "DEL", date: "2027-04-02" },
+      { origin: "DEL", destination: "BOM", date: "2027-04-05" },
+    ];
+    for (const tripType of ["multicity", "multi-city", "Multi City", "MULTI_CITY"]) {
+      const res = await submit(body({ cartItems: [flight({ tripType, legs })] }));
+      expect([res.status, res.body.code, res.body.itemIndex], tripType).toEqual([400, "TRIP_TYPE_NOT_OFFERED", 0]);
+    }
+    expect(await col("approvalrequests").countDocuments({})).toBe(0);
+    const oneway = await submit(body({ cartItems: [flight({ tripType: "oneway" })] }));
+    expect(oneway.status).toBe(201);
+    const round = await submit(body({ cartItems: [flight({ tripType: "roundtrip", returnDate: "2027-04-09" })] }));
+    expect(round.status).toBe(201);
+  });
+
   it("contact (name, email, phone) and consent are required", async () => {
     const noPhone = await submit(body({ contact: { name: "Riya", email: "riya@student.test" } }));
     expect([noPhone.status, noPhone.body.code, noPhone.body.missing]).toEqual([400, "CONTACT_REQUIRED", ["phone"]]);

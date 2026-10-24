@@ -221,6 +221,10 @@ export async function createPartnerIntakeCase(input: PartnerIntakeInput): Promis
   const offered = new Set((Array.isArray(link.services) && link.services.length ? link.services : ["flight", "hotel", "visa"]).map(String));
   const off = items.findIndex((it) => !offered.has(it.type));
   if (off >= 0) throw badRequest("SERVICE_NOT_OFFERED", "This service isn't available through this link.", { itemIndex: off });
+  // The partner page offers one way and round trip only; a multi-city flight
+  // sent by hand is refused here (the signed-in request form still allows it).
+  const multi = items.findIndex((it) => it.type === "flight" && String(it.meta?.tripType ?? "").toLowerCase().replace(/[^a-z]/g, "") === "multicity");
+  if (multi >= 0) throw badRequest("TRIP_TYPE_NOT_OFFERED", "Multi-city trips aren't available here. Choose one way or round trip.", { itemIndex: multi });
 
   const ownerUserId = await partnerIntakeUserId();
   // Manual travellers only (checked above), so prepareCartTravellers never
