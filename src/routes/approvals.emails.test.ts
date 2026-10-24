@@ -535,6 +535,54 @@ describe("booking", () => {
     expect(h).not.toContain("admin_notify_queued");
   });
 
+  it("partner lead case: done goes TO the student with the documents — no partner leader, approver or Partner Intake; no prices, no login links", async () => {
+    const INTAKE = "system-partner-intake@plumtrips.com";
+    const STUDENT = "Arjun.Student@Mail.test";
+    const id = await inProgress(WS3);
+    await col("approvalrequests").updateOne(
+      { _id: new mongoose.Types.ObjectId(id) },
+      {
+        $set: {
+          frontlinerEmail: INTAKE,
+          frontlinerName: "Partner Intake",
+          managerEmail: INTAKE,
+          "meta.source": "PARTNER_LINK",
+          "meta.ccLeaders": [LEADER],
+          "meta.partnerLead": { partnerName: "Amber Student", contact: { name: "Arjun Student", email: STUDENT, phone: "9876543210" } },
+          "meta.attachments": [{ filename: "Eticket-BLR-BOM.pdf", path: "package.json", mime: "application/pdf" }],
+        },
+      },
+    );
+    sent.length = 0;
+    const d = await as(request(app).put(`/api/approvals/admin/${id}/done`), OPS).send({ comment: "PNR K7Q2LX. Fare ₹5,600 paid." });
+    expect([d.status, d.body.message]).toEqual([200, "Marked done"]);
+    expect(sent.length).toBe(1);
+    const [m] = sent;
+    expect([m.to, m.cc]).toEqual([[STUDENT.toLowerCase()], []]);
+    for (const nobody of [INTAKE, LEADER, APPROVER, REQUESTER]) expect(everyone()).not.toContain(nobody);
+    expect(m.attachments!.map((a: any) => a.filename)).toEqual(["Eticket-BLR-BOM.pdf"]);
+    expect(m.html).toContain("Arjun Student");
+    expect(m.html).toContain("PNR K7Q2LX");
+    expect(m.html).not.toContain("Partner Intake");
+    expect(m.html).not.toMatch(/₹|5,600|5600/);
+    expect(m.html).not.toMatch(/customer\/approvals|approval\/email\?token|\/login/);
+    expect([...m.html.matchAll(/href="([^"]+)"/g)].map((x) => x[1]).filter((h) => !h.startsWith("mailto:"))).toEqual([]);
+    expect(m.html).not.toContain("9876543210");
+    expect((await reqDoc(id)).history.map((x: any) => x.action)).toContain("admin_notify_sent");
+  });
+
+  it("partner lead case without a student email: done emails nobody (never the Partner Intake placeholder)", async () => {
+    const id = await inProgress(WS3);
+    await col("approvalrequests").updateOne(
+      { _id: new mongoose.Types.ObjectId(id) },
+      { $set: { frontlinerEmail: "system-partner-intake@plumtrips.com", managerEmail: "system-partner-intake@plumtrips.com", "meta.source": "PARTNER_LINK", "meta.partnerLead": { contact: { name: "No Mail" } } } },
+    );
+    sent.length = 0;
+    const d = await as(request(app).put(`/api/approvals/admin/${id}/done`), OPS).send({});
+    expect([d.status, d.body.message]).toEqual([200, "Marked done (nobody to notify)"]);
+    expect(sent).toEqual([]);
+  });
+
   it("outbox: a failed send is retried at +2 min and +10 min, then FAILED — listed for staff, alerted to ops@, never 'notified'", async () => {
     const id = await inProgress();
     sent.length = 0;

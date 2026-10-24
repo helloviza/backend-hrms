@@ -36,6 +36,7 @@ import { isEmail, isPhone, todayIST } from "./approvalItemRules.js";
 import { prepareCartTravellers } from "./approvalTravellers.js";
 import { PARTNER_INTAKE_EMAIL, PARTNER_INTAKE_NAME, PARTNER_LINK_SOURCE } from "./partnerLeadCase.js";
 import { sendPartnerLeadReceived } from "./partnerIntake.email.js";
+import { contactEmailHashOf } from "./partnerTrackHash.js";
 
 type AnyObj = Record<string, any>;
 const str = (v: any, max = 200) => String(v ?? "").trim().slice(0, max);
@@ -254,6 +255,8 @@ export async function createPartnerIntakeCase(input: PartnerIntakeInput): Promis
     referrer: str(input.referrer, 300),
     ...(isUtmEmpty(utm as any) ? {} : { utm }),
     contact,
+    // The salted lookup hash "Track my case" finds the student's cases by (services/partnerTrack.ts).
+    ...(contactEmailHashOf(contact.email) ? { contactEmailHash: contactEmailHashOf(contact.email) } : {}),
     consent,
     submittedAt: now,
     ipHash: ipHash(str(input.ip, 64)),

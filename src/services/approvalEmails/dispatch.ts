@@ -80,17 +80,21 @@ async function resolveRole(role: EmailRole, spec: EmailEventSpec, ctx: EmailCtx,
 }
 
 /**
- * Partner lead cases (meta.source PARTNER_LINK): the partner's Workspace
- * Leaders are not copied on "booking done" — it carries the student's tickets
- * and vouchers. Keyed on a field no other request has.
+ * Partner lead cases (meta.source PARTNER_LINK): "booking done" carries the
+ * student's tickets and vouchers, so it goes to the student alone
+ * (meta.partnerLead.contact.email) — never the partner's Workspace Leaders,
+ * never the Partner Intake placeholder. Keyed on a field no other request has.
  */
-function ccRolesFor(event: ApprovalEmailEvent, spec: EmailEventSpec, ctx: EmailCtx): EmailRole[] {
-  if (event === "booking_done" && isPartnerLeadCase(ctx.ar)) return spec.cc.filter((r) => r !== "leaders");
-  return spec.cc;
+function partnerStudentRecipients(event: ApprovalEmailEvent, ctx: EmailCtx): { to: string[]; cc: string[] } | null {
+  if (event !== "booking_done" || !isPartnerLeadCase(ctx.ar)) return null;
+  const student = norm(ctx.ar?.meta?.partnerLead?.contact?.email);
+  return { to: student && student !== norm(PARTNER_INTAKE_EMAIL) ? [student] : [], cc: [] };
 }
 
 /** Who gets this event, after every map rule. Exported for tests and the renderer. */
 export async function recipientsFor(event: ApprovalEmailEvent, ctx: EmailCtx): Promise<{ to: string[]; cc: string[] }> {
+  const student = partnerStudentRecipients(event, ctx);
+  if (student) return student;
   const spec: EmailEventSpec = APPROVAL_EMAIL_MAP[event];
   const cache = new Map<string, string[]>();
   const gather = async (roles: EmailRole[]) => (await Promise.all(roles.map((r) => resolveRole(r, spec, ctx, cache)))).flat();
@@ -104,7 +108,7 @@ export async function recipientsFor(event: ApprovalEmailEvent, ctx: EmailCtx): P
 
   const uniq = (list: string[]) => Array.from(new Set(list)).filter((e) => e && !excluded.has(e));
   let to = uniq(await gather(spec.to));
-  let cc = uniq(await gather(ccRolesFor(event, spec, ctx))).filter((e) => !to.includes(e));
+  let cc = uniq(await gather(spec.cc)).filter((e) => !to.includes(e));
 
   const dead = await inactiveEmails([...to, ...cc].filter((e) => e !== desk));
   to = to.filter((e) => !dead.has(e));

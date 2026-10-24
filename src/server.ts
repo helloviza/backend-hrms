@@ -272,6 +272,7 @@ app.use("/api/whatsapp", express.raw({ type: "application/json" }), whatsappWebh
 import travelIntakeRouter from "./routes/intake.travel.js";
 import publicTravelRequestRouter from "./routes/public.travelRequest.js";
 import publicPartnerRequestRouter from "./routes/public.partnerRequest.js";
+import publicPartnerTrackRouter from "./routes/public.partnerTrack.js";
 import publicSupportContactRouter from "./routes/publicSupportContact.js";
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — manual bookings (and this intake feed) are Plumtrips Travel only.
@@ -379,6 +380,8 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // Partner lead links (resolve + submit) — same conventions; own limiters,
   // per-code daily cap and Turnstile inside routes/public.partnerRequest.ts.
   app.use("/api/public", publicPartnerRequestRouter);
+  // Student "Track my case" on a partner link — one-time email code, own token.
+  app.use("/api/public", publicPartnerTrackRouter);
 }
 
 // Support-contact lookup — unauthenticated, used by useSupportEmail() across

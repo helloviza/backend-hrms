@@ -9,6 +9,7 @@
 //                                        submission, also under a concurrent double submit
 //     partner_lead_case_number  unique  meta.partnerLead.caseNumber  — the student's PL- number
 //     partner_lead_workspace            workspaceId + meta.source + createdAt — the tracker list
+//     partner_lead_contact_email_hash   workspaceId + meta.partnerLead.contactEmailHash — Track my case
 //   manualbookings
 //     workspace_source_booking          workspaceId + sourceBookingId — a case's bookings
 //   partnerlinks
@@ -45,6 +46,12 @@ export const PARTNER_LEAD_INDEXES: Spec[] = [
     name: "partner_lead_workspace",
     key: { workspaceId: 1, "meta.source": 1, createdAt: -1 },
     partialFilterExpression: { "meta.source": { $exists: true } },
+  },
+  {
+    collection: "approvalrequests",
+    name: "partner_lead_contact_email_hash",
+    key: { workspaceId: 1, "meta.partnerLead.contactEmailHash": 1 },
+    partialFilterExpression: { "meta.partnerLead.contactEmailHash": { $exists: true } },
   },
   {
     collection: "manualbookings",

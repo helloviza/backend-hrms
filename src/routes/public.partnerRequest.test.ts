@@ -97,6 +97,7 @@ const { resetPartnerIntakeCache } = await import("../services/partnerIntake.crea
 const { PARTNER_INTAKE_EMAIL } = await import("../services/partnerLeadCase.js");
 const { isPriceKey } = await import("./approvals.security.js");
 const { DESK_EMAIL } = await import("../services/actorNames.js");
+const { emailHash } = await import("../services/partnerTrackHash.js");
 
 const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
 const oid = () => new mongoose.Types.ObjectId();
@@ -254,6 +255,7 @@ describe("a submit becomes an approved case in the ops queue", () => {
     expect(pl.intakeRef).toMatch(/^partner:[0-9a-f-]{36}$/);
     expect(pl.consent.version).toBe("2026-10");
     expect(pl.ipHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(pl.contactEmailHash).toBe(emailHash("riya@student.test")); // Track my case looks the student up by it
     expect(JSON.stringify(pl)).not.toContain("127.0.0.1");
     expect([0, undefined]).toContain(doc.cartItems[0].price); // the student's 99999 is never kept
     expect(doc.cartItems[0].meta.travellers[0].kind).toBe("manual");
@@ -508,14 +510,18 @@ describe("Book Now and booking done", () => {
     expect(String(ok.body.booking.workspaceId)).toBe(String(AMBER_CUSTOMER));
   });
 
-  it("Done completes the case; 'booking done' copies neither the partner's leaders nor the intake address", async () => {
+  it("Done completes the case; 'booking done' goes to the student with the documents — never the partner's leaders or the intake address", async () => {
     mails.length = 0;
     const { rid } = await bookedCase();
     const doc: any = await col("approvalrequests").findOne({ _id: new mongoose.Types.ObjectId(rid) });
     expect([doc.adminState, doc.stage]).toEqual(["done", "COMPLETED"]);
     expect(recipients()).not.toContain(LEAD.email);
     expect(recipients()).not.toContain(PARTNER_INTAKE_EMAIL);
-    expect(mails.some((m) => /Processed/.test(String(m.subject)))).toBe(false);
+    const done = mails.filter((m) => /Processed/.test(String(m.subject)));
+    expect(done).toHaveLength(1);
+    expect([[done[0].to].flat(), [done[0].cc || []].flat()]).toEqual([["riya@student.test"], []]);
+    expect((done[0].attachments || []).length).toBeGreaterThan(0);
+    expect(String(done[0].html)).not.toMatch(/₹|customer\/approvals|href="http|\/login/);
   });
 });
 

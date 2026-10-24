@@ -42,6 +42,7 @@ import {
   type ItineraryRow,
 } from "./layout.js";
 import { safe, serviceOf, SERVICE_LABEL, tripModel, type TripModel } from "./tripModel.js";
+import { isPartnerLeadCase } from "../partnerLeadCase.js";
 import type { ApprovalEmailEvent } from "./map.js";
 
 type AnyObj = Record<string, any>;
@@ -548,7 +549,11 @@ function progressHtml(event: ApprovalEmailEvent, ctx: EmailCtx) {
 }
 
 function bookingDoneHtml(ctx: EmailCtx) {
-  const ar = ctx.ar;
+  // A partner lead case goes to the student, who has no login: their own name
+  // as the requester, and no links to the (login-only) request page.
+  const student = isPartnerLeadCase(ctx.ar);
+  const ar = student ? { ...ctx.ar, frontlinerName: str(ctx.ar?.meta?.partnerLead?.contact?.name) || "you", frontlinerEmail: "" } : ctx.ar;
+  const href = student ? "" : myRequestsUrl();
   const t = tripModel(ar);
   const files = (ctx.attachmentNames || []).map(str).filter(Boolean);
   const docs = files.length
@@ -565,9 +570,9 @@ function bookingDoneHtml(ctx: EmailCtx) {
       headline: `${yours(t)} is booked`,
       instruction: files.length ? "Your tickets and vouchers are attached to this email." : `The ${TRAVEL_DESK_NAME} has completed your booking.`,
     },
-    blocks: body(ar, t, myRequestsUrl(), {
+    blocks: body(ar, t, href, {
       notes: [noteBox(`Message from the ${TRAVEL_DESK_NAME}`, safe(sanitizeAdminCommentForEmail(ctx.doneComment)))],
-      after: [docs, viewButton(myRequestsUrl())],
+      after: [docs, href ? viewButton(href) : ""],
     }),
   });
 }

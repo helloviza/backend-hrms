@@ -23,6 +23,9 @@
 
 import mongoose from "mongoose";
 import Invoice from "../models/Invoice.js";
+import ApprovalRequest from "../models/ApprovalRequest.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import PartnerLink from "../models/PartnerLink.js";
 import {
   MANUAL_BOOKING_TYPES,
   ALL_SUB_STATUSES,
@@ -126,6 +129,44 @@ export function buildSearchFilter(query: Record<string, any>, user?: any) {
 }
 
 // Bug 3 fix: async invoice-number filter applied after buildSearchFilter
+/**
+ * ?partner=<CustomerWorkspace._id>: only bookings made for that partner's
+ * partner lead cases (Book Now on a PARTNER_LINK case — source ADMIN_QUEUE,
+ * sourceBookingId = the case, on the partner's own Customer._id). ANDed onto
+ * whatever else the filter says, so it narrows like any other filter. An
+ * unknown / invalid partner, or one with no cases, matches nothing.
+ */
+export async function applyPartnerFilter(filter: Record<string, any>, partner: unknown) {
+  const id = String(partner ?? "").trim();
+  if (!id) return;
+  const none = () => {
+    filter._id = { $in: [] };
+  };
+  if (!mongoose.isValidObjectId(id)) return none();
+  const ws: any = await CustomerWorkspace.findById(id).select("_id customerId").lean();
+  if (!ws || !mongoose.isValidObjectId(String(ws.customerId || ""))) return none();
+  const cases = await ApprovalRequest.find({ workspaceId: ws._id, "meta.source": "PARTNER_LINK" }).select("_id").lean();
+  if (!cases.length) return none();
+  filter.$and = [
+    ...(Array.isArray(filter.$and) ? filter.$and : []),
+    {
+      workspaceId: new mongoose.Types.ObjectId(String(ws.customerId)),
+      source: "ADMIN_QUEUE",
+      sourceBookingId: { $in: cases.map((c: any) => c._id) },
+    },
+  ];
+}
+
+/** The Partner filter's options: every workspace with at least one partner link (active or not), A–Z. */
+export async function partnerFilterOptions(): Promise<Array<{ workspaceId: string; name: string }>> {
+  const ids = await PartnerLink.distinct("workspaceId");
+  if (!ids.length) return [];
+  const rows: any[] = await CustomerWorkspace.find({ _id: { $in: ids } }).select("_id companyName").lean();
+  return rows
+    .map((w) => ({ workspaceId: String(w._id), name: String(w.companyName || "").trim() || "Partner" }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
 export async function applyInvoiceFilter(filter: Record<string, any>, invoiceNo: string) {
   const matches = await Invoice.find({
     invoiceNo: { $regex: invoiceNo, $options: "i" },

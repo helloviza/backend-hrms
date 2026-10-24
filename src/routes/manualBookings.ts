@@ -20,7 +20,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import Invoice from "../models/Invoice.js";
 import User from "../models/User.js";
-import { buildSearchFilter, applyInvoiceFilter } from "./manualBookings.filters.js";
+import { buildSearchFilter, applyInvoiceFilter, applyPartnerFilter, partnerFilterOptions } from "./manualBookings.filters.js";
 import { canAccessBooking, isHouseCallerContext } from "../utils/bookingAccess.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
@@ -900,6 +900,18 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
   }
 });
 
+// GET /api/admin/manual-bookings/partner-options — the "More filters"
+// Partner list: every workspace with a partner link, so a new partner shows
+// up as soon as its first link is made.
+router.get("/partner-options", requirePermission("manualBookings", "READ"), async (_req: any, res: any) => {
+  try {
+    res.json({ ok: true, partners: await partnerFilterOptions() });
+  } catch (err: any) {
+    console.error("[ManualBookings partner-options]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/admin/manual-bookings
 router.get("/", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
   try {
@@ -913,6 +925,8 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
 
     // Bug 3 fix: resolve invoice number to booking invoiceId
     if (req.query.invoiceNo) await applyInvoiceFilter(filter, req.query.invoiceNo);
+    // Partner (More filters): that partner's partner-lead bookings only.
+    if (req.query.partner) await applyPartnerFilter(filter, req.query.partner);
 
     const [docs, total, statsAgg] = await Promise.all([
       ManualBooking.find(filter)
@@ -1047,6 +1061,7 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     // the export, cost and margin columns included.
     applyBookingReadGates(req, filter);
     if (req.query.invoiceNo) await applyInvoiceFilter(filter, req.query.invoiceNo);
+    if (req.query.partner) await applyPartnerFilter(filter, req.query.partner);
     const format = req.query.format === "xlsx" ? "xlsx" : "csv";
     const docs = await ManualBooking.find(filter)
       .sort({ createdAt: -1 })
