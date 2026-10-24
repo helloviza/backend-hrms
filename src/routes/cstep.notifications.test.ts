@@ -294,7 +294,7 @@ describe("CSTEP notifications through the router — Tour Proposal, full pipelin
 
   it("settlement/start + a per-diem edit send nothing", async () => {
     ok(await post(ACT.official, `/requests/${id}/settlement/start`));
-    ok(await patch(ACT.official, `/requests/${id}/settlement/perdiem`, { rate: 1500 }));
+    ok(await patch(ACT.official, `/requests/${id}/settlement/perdiem`, { rate: 1500, rateReason: "QC rate" }));
     expect(await delta()).toEqual([]);
   });
 
@@ -412,7 +412,7 @@ describe("CSTEP_NOTIFICATIONS_ENABLED off (the default) — dormant", () => {
     ok(await post(ACT.traveller, `/requests/${id}/report/submit`));
     ok(await post(ACT.approver, `/requests/${id}/report/approve`));
     ok(await post(ACT.official, `/requests/${id}/settlement/start`));
-    ok(await patch(ACT.official, `/requests/${id}/settlement/perdiem`, { rate: 1500 }));
+    ok(await patch(ACT.official, `/requests/${id}/settlement/perdiem`, { rate: 1500, rateReason: "QC rate" }));
     ok(await post(ACT.official, `/requests/${id}/settlement/finalize`, { force: true }));
     ok(await post(ACT.finance, `/requests/${id}/finance/return`, { reason: "dormant send-back" }));
     ok(await post(ACT.official, `/requests/${id}/settlement/finalize`, { force: true }));

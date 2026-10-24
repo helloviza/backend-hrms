@@ -5763,10 +5763,13 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
 
 /**
  * PATCH /requests/:id/settlement/perdiem — Official/Admin sets/overrides the
- * per-diem rate and/or days. overrideDays requires overrideReason (days are
- * otherwise fixed at computedDays, from the trip's own dates). Recomputes
- * amountInr = days * rate and the settlement's buckets/totals. Only while
- * the settlement is VERIFYING.
+ * per-diem rate, days and/or a meal / provided-benefit deduction. Every
+ * change needs its reason: rate → rateReason, overrideDays → overrideReason,
+ * deductionInr → deductionReason (resending the stored value is a no-op and
+ * needs none; null clears an override / deduction, no reason). Recomputes
+ * amountInr = max(0, days * rate - deductionInr) — days * rate stays the
+ * gross — and the settlement's buckets/totals. Logs PERDIEM_ADJUST with each
+ * figure's before → after. Only while the settlement is VERIFYING.
  */
 router.patch("/requests/:id/settlement/perdiem", async (req: any, res: any) => {
   try {
@@ -5784,31 +5787,74 @@ router.patch("/requests/:id/settlement/perdiem", async (req: any, res: any) => {
     }
 
     const body = req.body || {};
-    const before = { rate: settlement.perDiem.rate, overrideDays: settlement.perDiem.overrideDays };
+    const before = {
+      days: settlement.perDiem.days,
+      rate: settlement.perDiem.rate,
+      deductionInr: settlement.perDiem.deductionInr || 0,
+      amountInr: settlement.perDiem.amountInr,
+    };
+    // Every check runs before any field is written, so a refused call leaves
+    // the settlement untouched.
+    const reasons: string[] = [];
+    let nextRate: number | undefined;
+    let nextOverride: { days?: number; reason?: string } | undefined;
+    let nextDeduction: { amount?: number; reason?: string } | undefined;
 
     if ("rate" in body) {
       const n = Number(body.rate);
       if (!isFinite(n) || n < 0) return res.status(400).json({ error: "rate must be a non-negative number" });
-      settlement.perDiem.rate = n;
+      if (n !== settlement.perDiem.rate) {
+        const reason = String(body.rateReason || "").trim();
+        if (!reason) return res.status(400).json({ error: "rateReason is required when changing the per-diem rate" });
+        nextRate = n;
+        reasons.push(`rate: ${reason}`);
+      }
     }
 
     if ("overrideDays" in body) {
       if (body.overrideDays === null) {
-        settlement.perDiem.overrideDays = undefined;
-        settlement.perDiem.overrideReason = undefined;
+        nextOverride = {};
       } else {
         const n = Number(body.overrideDays);
         if (!isFinite(n) || n < 0) return res.status(400).json({ error: "overrideDays must be a non-negative number" });
         const reason = String(body.overrideReason || "").trim();
-        if (!reason) return res.status(400).json({ error: "overrideReason is required when overriding per-diem days" });
-        settlement.perDiem.overrideDays = n;
-        settlement.perDiem.overrideReason = reason;
+        if (n !== settlement.perDiem.overrideDays || reason) {
+          if (!reason) return res.status(400).json({ error: "overrideReason is required when overriding per-diem days" });
+          nextOverride = { days: n, reason };
+          reasons.push(`days: ${reason}`);
+        }
       }
+    }
+
+    if ("deductionInr" in body) {
+      if (body.deductionInr === null) {
+        nextDeduction = {};
+      } else {
+        const n = Number(body.deductionInr);
+        if (!isFinite(n) || n < 0) return res.status(400).json({ error: "deductionInr must be a non-negative number" });
+        const reason = String(body.deductionReason || "").trim();
+        if (n !== settlement.perDiem.deductionInr || reason) {
+          if (!reason) return res.status(400).json({ error: "deductionReason is required for a per-diem deduction" });
+          nextDeduction = { amount: Math.round(n * 100) / 100, reason };
+          reasons.push(`deduction: ${reason}`);
+        }
+      }
+    }
+
+    if (nextRate !== undefined) settlement.perDiem.rate = nextRate;
+    if (nextOverride) {
+      settlement.perDiem.overrideDays = nextOverride.days;
+      settlement.perDiem.overrideReason = nextOverride.reason;
+    }
+    if (nextDeduction) {
+      settlement.perDiem.deductionInr = nextDeduction.amount;
+      settlement.perDiem.deductionReason = nextDeduction.reason;
     }
 
     const days = settlement.perDiem.overrideDays ?? settlement.perDiem.computedDays;
     settlement.perDiem.days = days;
-    settlement.perDiem.amountInr = Math.round(days * settlement.perDiem.rate * 100) / 100;
+    const grossInr = days * settlement.perDiem.rate;
+    settlement.perDiem.amountInr = Math.round(Math.max(0, grossInr - (settlement.perDiem.deductionInr || 0)) * 100) / 100;
 
     const lines = await CstepSettlementLine.find({ workspaceId: req.workspaceObjectId, settlementId: settlement._id }).lean();
     const { buckets, totalCostOfTour, amountClaimed } = recomputeSettlementTotals(
@@ -5820,18 +5866,28 @@ router.patch("/requests/:id/settlement/perdiem", async (req: any, res: any) => {
     settlement.amountClaimed = amountClaimed;
     await settlement.save();
 
-    await CstepApproval.create({
-      workspaceId: req.workspaceObjectId,
-      entityType: "REQUEST",
-      entityId: doc._id,
-      stage: "OFFICIAL",
-      actor: new mongoose.Types.ObjectId(ownerId(req)),
-      action: "VERIFY_LINE",
-      comment:
-        `Per diem: days ${before.overrideDays ?? settlement.perDiem.computedDays} => ${days}, rate ${before.rate} => ${settlement.perDiem.rate}` +
-        (settlement.perDiem.overrideReason ? ` (${settlement.perDiem.overrideReason})` : ""),
-      at: new Date().toISOString(),
-    });
+    const after = {
+      days,
+      rate: settlement.perDiem.rate,
+      deductionInr: settlement.perDiem.deductionInr || 0,
+      amountInr: settlement.perDiem.amountInr,
+    };
+    const changed = (Object.keys(after) as Array<keyof typeof after>).some((k) => after[k] !== before[k]);
+    if (changed || reasons.length > 0) {
+      await CstepApproval.create({
+        workspaceId: req.workspaceObjectId,
+        entityType: "REQUEST",
+        entityId: doc._id,
+        stage: "OFFICIAL",
+        actor: new mongoose.Types.ObjectId(ownerId(req)),
+        action: "PERDIEM_ADJUST",
+        comment:
+          `Per diem: days ${before.days} => ${after.days}, rate ${before.rate} => ${after.rate}, ` +
+          `deduction ${before.deductionInr} => ${after.deductionInr}, net ${before.amountInr} => ${after.amountInr}` +
+          (reasons.length > 0 ? ` (${reasons.join("; ")})` : ""),
+        at: new Date().toISOString(),
+      });
+    }
 
     res.json({ ok: true, settlement: settlement.toObject() });
   } catch (err: any) {

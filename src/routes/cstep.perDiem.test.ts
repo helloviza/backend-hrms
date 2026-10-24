@@ -280,6 +280,7 @@ describe("settlement/start — the traveller's rate seeds settlement.perDiem", (
     const r = ok(
       await call("patch", ACT.admin, WS.C, `/api/cstep/requests/${id}/settlement/perdiem`).send({
         rate: 1000,
+        rateReason: "Revised grade rate",
         overrideDays: 3,
         overrideReason: "Left early",
       }),

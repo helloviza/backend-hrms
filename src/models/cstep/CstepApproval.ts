@@ -54,6 +54,9 @@ export type CstepApprovalAction =
   // opened once REPORT_SUBMITTED is reached).
   | "START_VERIFICATION"
   | "VERIFY_LINE"
+  // A per-diem change at settlement (days / rate / meal deduction), reason
+  // mandatory; the comment carries each figure's before → after.
+  | "PERDIEM_ADJUST"
   | "SETTLE"
   // Step 6 — hand-off to Finance (not built yet; defined ahead of time so
   // the Processing board's "Transferred to Finance" stage/tab can exist).
@@ -120,6 +123,7 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "REDUCE_AMOUNT",
       "START_VERIFICATION",
       "VERIFY_LINE",
+      "PERDIEM_ADJUST",
       "SETTLE",
       "TRANSFER_TO_FINANCE",
       "FINANCE_SETTLE",

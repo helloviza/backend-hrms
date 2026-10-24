@@ -138,7 +138,7 @@ async function withFinance(as: any, purpose: string): Promise<string> {
   ok(await post(as, `/requests/${id}/report/submit`));
   ok(await post(ACT.approver, `/requests/${id}/report/approve`));
   ok(await post(ACT.official, `/requests/${id}/settlement/start`));
-  ok(await patch(ACT.official, `/requests/${id}/settlement/perdiem`, { rate: 1500 }));
+  ok(await patch(ACT.official, `/requests/${id}/settlement/perdiem`, { rate: 1500, rateReason: "QC rate" }));
   const r = ok(await post(ACT.official, `/requests/${id}/settlement/finalize`, { force: true }));
   expect(r.body.request.status).toBe("TRANSFERRED_TO_FINANCE");
   return id;

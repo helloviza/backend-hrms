@@ -33,10 +33,12 @@ export interface ICstepSettlementPerDiem {
   days: number; // the days actually used in the amount below — overrideDays if set, else computedDays
   rate: number; // INR per day
   currency: string; // always "INR" — per-diem is a domestic-rupee figure, unlike Step 3's foreign-currency arrangements
-  amountInr: number; // = days * rate, recomputed on every perdiem/line write
+  amountInr: number; // NET = max(0, days * rate - deductionInr), recomputed on every perdiem write
   computedDays: number; // from the trip's departureDate/returnDate — never edited directly
   overrideDays?: number; // Official's override of computedDays, reason mandatory (see routes/cstep.ts)
   overrideReason?: string;
+  deductionInr?: number; // Official's meal / provided-benefit deduction off the gross days * rate, reason mandatory
+  deductionReason?: string;
 }
 
 export interface ICstepSettlementBuckets {
@@ -95,6 +97,8 @@ const CstepSettlementPerDiemSchema = new Schema<ICstepSettlementPerDiem>(
     computedDays: { type: Number, default: 0 },
     overrideDays: { type: Number },
     overrideReason: { type: String, trim: true },
+    deductionInr: { type: Number },
+    deductionReason: { type: String, trim: true },
   },
   { _id: false },
 );
