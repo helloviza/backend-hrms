@@ -31,6 +31,7 @@ import { detectGSTType, calculateGSTAmounts, GST_STATE_CODES, UNION_TERRITORIES,
 import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
 import { triggerTaskAutomation } from "./taskAutomation.js";
 import { snapshotPartnerShareSafe } from "./partnerRevenue.js";
+import { partnerBookingIds } from "./partnerLeadBooking.js";
 
 /* ── Error type so route wrappers can reproduce the exact HTTP responses ── */
 
@@ -572,6 +573,22 @@ export async function createInvoiceFromBookings(
   }
   const wsId = wsIds[0].toString();
 
+  // Partner lead bookings are invoiced only once Confirmed (services/partnerLeadBooking.ts):
+  // COMBINED refuses the batch, SEPARATE skips them. Keyed on the booking's
+  // case being a PARTNER_LINK case; no other booking is affected.
+  const partnerIds = await partnerBookingIds(bookings as any[]);
+  const partnerNotConfirmed = (b: any) => partnerIds.has(String(b._id)) && b.status !== "CONFIRMED";
+  if (opts.format === "COMBINED") {
+    const notConfirmed = (bookings as any[]).filter(partnerNotConfirmed);
+    if (notConfirmed.length) {
+      throw new InvoiceGenerationError(400, {
+        error: `${notConfirmed.length} partner lead booking(s) are not Confirmed yet`,
+        code: "PARTNER_BOOKING_NOT_CONFIRMED",
+        refs: notConfirmed.map((b: any) => b.bookingRef),
+      });
+    }
+  }
+
   const customer = await Customer.findById(wsId).lean();
   const { invoiceWorkspaceId, workspace } = await resolveInvoiceWorkspace(wsId);
 
@@ -604,7 +621,7 @@ export async function createInvoiceFromBookings(
   // caller derives the failure list from the returned set.
   const created: any[] = [];
   for (const booking of bookings as any[]) {
-    if (booking.invoiceId || booking.status === "INVOICED" || booking.status === "CANCELLED") {
+    if (booking.invoiceId || booking.status === "INVOICED" || booking.status === "CANCELLED" || partnerNotConfirmed(booking)) {
       continue;
     }
     try {

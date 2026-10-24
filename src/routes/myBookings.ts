@@ -32,6 +32,7 @@ import { canCustomerAccessBookingAttachments } from "../utils/bookingCustomerAcc
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
+import { partnerBookingIds } from "../services/partnerLeadBooking.js";
 import { formatLineItems, invoicePendingDays } from "./manualBookings.js";
 import { bookingTripType, bookingLegRoute, bookingLegDetail } from "../utils/bookingLegs.js";
 
@@ -95,6 +96,17 @@ function resolveScopeFilter(req: Request): { filter: Record<string, any>; scope:
   const userId =
     uid && mongoose.isValidObjectId(uid) ? new mongoose.Types.ObjectId(String(uid)) : uid;
   return { filter: { userId }, scope: "OWN" };
+}
+
+/** Mirror rows whose ManualBooking is a partner lead booking (services/partnerLeadBooking.ts). */
+async function partnerLeadMirrorIds(docs: any[]): Promise<Set<string>> {
+  const manual = docs.filter((d) => d.referenceModel === "ManualBooking" && d.reference);
+  if (!manual.length) return new Set();
+  const bookings: any[] = await ManualBooking.find({ _id: { $in: manual.map((d) => d.reference) }, source: "ADMIN_QUEUE" })
+    .select("_id workspaceId source sourceBookingId")
+    .lean();
+  const partner = await partnerBookingIds(bookings);
+  return new Set(manual.filter((d) => partner.has(String(d.reference))).map((d) => String(d._id)));
 }
 
 /* ── Customer-safe allowlist projection ──────────────────────────────
@@ -175,7 +187,16 @@ router.get("/", async (req: Request, res: Response) => {
       .lean()
       .exec();
 
-    res.json({ ok: true, scope, bookings: docs.map(toSafeRow) });
+    // Partner lead bookings: the student's email is not the partner's to see.
+    const partnerRows = await partnerLeadMirrorIds(docs);
+    res.json({
+      ok: true,
+      scope,
+      bookings: docs.map((d) => {
+        const row = toSafeRow(d);
+        return partnerRows.has(String(d._id)) ? { ...row, _user: { ...row._user, email: "" } } : row;
+      }),
+    });
   } catch (err: any) {
     logger.error("my-bookings failed", {
       userId: (req as any).user?.sub || (req as any).user?._id,
@@ -377,7 +398,7 @@ async function loadManualBookingsForCustomer(
       "workspaceId bookingDate bookingRef reqDate sector type travelDate returnDate " +
         "status subStatus priceBenefits invoiceRaisedDate bookingWeek bookingMonth supplierPNR " +
         "pricing.grandTotal pricing.totalWithGST pricing.quotedPrice " +
-        "passengers.name passengers.email " +
+        "passengers.name passengers.email source sourceBookingId " +
         "itinerary.origin itinerary.destination itinerary.hotelName itinerary.flightNo itinerary.airline " +
         "itinerary.trainClass itinerary.roomType itinerary.nights itinerary.roomCount itinerary.description " +
         "itinerary.pickupLocation itinerary.dropLocation itinerary.vehicleType itinerary.visaCountry itinerary.visaType " +
@@ -391,7 +412,16 @@ async function loadManualBookingsForCustomer(
 
   // Re-run the access predicate per record — the tenant clause in `filter`
   // above is a coarse pre-filter, not the authority (see doc comment above).
-  const filtered = docs.filter((b) => canCustomerAccessBookingAttachments(ctx, b));
+  const visible = docs.filter((b) => canCustomerAccessBookingAttachments(ctx, b));
+  // Partner lead bookings: the student's email is blanked after the access
+  // check (which may match on it), so nothing derived from it — the Traveler
+  // ID lookup below — reaches the partner either.
+  const partner = await partnerBookingIds(visible);
+  const filtered = visible.map((b) =>
+    partner.has(String(b._id))
+      ? { ...b, passengers: (b.passengers || []).map((p: any) => ({ ...p, email: "" })) }
+      : b,
+  );
 
   // Business Name — same value for every row (the caller's own tenant), no
   // cross-tenant lookup: Customer.findById(customerId), the id this whole

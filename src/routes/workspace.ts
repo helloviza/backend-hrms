@@ -583,6 +583,10 @@ router.get("/config", async (req: AnyObj, res) => {
       if (ws.config.features.revenueShareEnabled !== undefined) {
         config.features.revenueShareEnabled = ws.config.features.revenueShareEnabled;
       }
+      // Same for the partner case tracker switch (Workspace Manager only).
+      if (ws.config.features.partnerCasesEnabled !== undefined) {
+        config.features.partnerCasesEnabled = ws.config.features.partnerCasesEnabled;
+      }
     }
 
     // Attach per-user formTier and travelerId from CustomerMember

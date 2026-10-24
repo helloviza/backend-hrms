@@ -156,6 +156,15 @@ describe("subStatus / source / assignment — exact match", () => {
     });
   });
 
+  it("the partner-lead Sub Status values filter like any other", async () => {
+    const one = await bothPaths("?subStatus=" + encodeURIComponent("Lead Not Contactable"));
+    expect(one.list.subStatus).toBe("Lead Not Contactable");
+    expect(one.exp.subStatus).toBe("Lead Not Contactable");
+    const q = ["NC Leads - Email Sent", "NC Leads - Multiple Follow-up Done"].map(encodeURIComponent).join(",");
+    const { list } = await bothPaths("?subStatus=" + q);
+    expect(list.subStatus).toEqual({ $in: ["NC Leads - Email Sent", "NC Leads - Multiple Follow-up Done"] });
+  });
+
   it("source is enum-validated", async () => {
     const { list, exp } = await bothPaths("?source=SBT_AUTO");
     expect(list.source).toBe("SBT_AUTO");

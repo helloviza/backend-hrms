@@ -48,6 +48,10 @@ export interface WorkspaceFeatures {
   // DEFAULT false; set only by routes/admin.partnerRevenue.ts when a partner
   // config is saved (= its `enabled`) or removed (false).
   revenueShareEnabled?: boolean;
+  // Partner case tracker (/api/partner/cases): a partner workspace's view of
+  // the leads it sent through its partner links. SCHEMA DEFAULT false; not in
+  // any plan preset — set only from the Workspace Manager features toggle.
+  partnerCasesEnabled?: boolean;
 }
 
 export type WorkspacePlan = "trial" | "starter" | "growth" | "enterprise";
@@ -351,6 +355,7 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         // Plumtrips Rewards client view — visibility only, see the interface.
         loyaltyRewardsEnabled: { type: Boolean, default: false },
         revenueShareEnabled: { type: Boolean, default: false },
+        partnerCasesEnabled: { type: Boolean, default: false },
       },
     },
 

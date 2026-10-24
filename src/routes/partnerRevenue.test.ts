@@ -821,6 +821,26 @@ describe("GET /api/v1/workspace/config carries revenueShareEnabled", () => {
   });
 });
 
+describe("partnerCasesEnabled — Workspace Manager's Partner Cases toggle", () => {
+  const cfg = () =>
+    request(app).get("/api/v1/workspace/config").set("x-test-user", user(WL_ID, ["WORKSPACE_LEADER"], { customerId: String(CUST_P) }));
+  const toggle = (enabled: boolean) =>
+    request(app).put(`/api/superadmin/workspaces/${WS_P}/features`).set("x-test-user", SA).send({ feature: "partnerCasesEnabled", enabled });
+  const stored = async () => ((await col("customerworkspaces").findOne({ _id: WS_P })) as any).config.features.partnerCasesEnabled;
+
+  it("is off by default, saved by the toggle, and returned by the workspace config (legacy and travelFlow workspaces)", async () => {
+    expect((await cfg()).body.config.features.partnerCasesEnabled).toBeFalsy();
+    expect((await toggle(true)).status).toBe(200);
+    expect(await stored()).toBe(true);
+    expect((await cfg()).body.config.features.partnerCasesEnabled).toBe(true);
+    await col("customerworkspaces").updateOne({ _id: WS_P }, { $set: { "config.travelFlow": "APPROVAL_FLOW" } });
+    expect((await cfg()).body.config.features.partnerCasesEnabled).toBe(true);
+    expect((await toggle(false)).status).toBe(200);
+    expect(await stored()).toBe(false);
+    expect((await cfg()).body.config.features.partnerCasesEnabled).toBe(false);
+  });
+});
+
 /* ───────────────────────── a failed post-commit snapshot is repaired by the backfill ───────────────────────── */
 
 describe("snapshot failure after the invoicing commit", () => {

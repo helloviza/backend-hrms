@@ -271,6 +271,7 @@ app.use("/api/whatsapp", express.raw({ type: "application/json" }), whatsappWebh
 // body HMAC check, same shape as the Razorpay webhook above.
 import travelIntakeRouter from "./routes/intake.travel.js";
 import publicTravelRequestRouter from "./routes/public.travelRequest.js";
+import publicPartnerRequestRouter from "./routes/public.partnerRequest.js";
 import publicSupportContactRouter from "./routes/publicSupportContact.js";
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — manual bookings (and this intake feed) are Plumtrips Travel only.
@@ -375,6 +376,9 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
 // limiter is applied inside public.travelRequest.ts itself.
 if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/public", publicTravelRequestRouter);
+  // Partner lead links (resolve + submit) — same conventions; own limiters,
+  // per-code daily cap and Turnstile inside routes/public.partnerRequest.ts.
+  app.use("/api/public", publicPartnerRequestRouter);
 }
 
 // Support-contact lookup — unauthenticated, used by useSupportEmail() across
@@ -971,6 +975,7 @@ import travelFormRouter from "./routes/travelForm.js";
 // Customer-facing READ-ONLY booking history (TravelBooking mirror, no feature gate)
 import myBookingsRouter from "./routes/myBookings.js";
 import myBookingsRevenueRouter from "./routes/myBookings.revenue.js";
+import partnerCasesRouter from "./routes/partner.cases.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // SHARED_API — SBT (Self-Booking Tool) routes (will be exposed via tenant API in Phase 4)
@@ -985,6 +990,9 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // matched first. Its own requireFeature("revenueShareEnabled") +
   // requireInvoiceAccess live inside the router.
   app.use("/api/my-bookings/revenue", requireAuth, requireWorkspace, myBookingsRevenueRouter);
+  // Partner case tracker — the partner workspace's own partner-link leads.
+  // Its own partnerCasesEnabled gate + requireInvoiceAccess inside.
+  app.use("/api/partner/cases", requireAuth, requireWorkspace, partnerCasesRouter);
   // Read-only booking history for any authenticated workspace member — NO requireFeature
   app.use("/api/my-bookings", requireAuth, requireWorkspace, myBookingsRouter);
 }
@@ -1053,6 +1061,7 @@ import carbonRouter from "./routes/admin.carbon.js";
 import tasksRouter from "./routes/tasks.js";
 // Task Automations (settings)
 import taskAutomationsRouter from "./routes/admin.task-automations.js";
+import adminPartnerLinksRouter from "./routes/admin.partnerLinks.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Manual bookings + broad /api/admin routers (Plumtrips Travel).
@@ -1101,6 +1110,9 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // Same HOUSE gate: requireAdmin alone admits a tenant admin from another
   // workspace, who could then switch Plumtrips' SYSTEM automations off.
   app.use("/api/admin/task-automations", requireAuth, requireWorkspace, requireHouse, taskAutomationsRouter);
+  // Partner lead links (ops): HOUSE here, ADMIN / SUPERADMIN in the router.
+  // Before the broad /api/admin routers for the same interception reason.
+  app.use("/api/admin/partner-links", requireAuth, requireWorkspace, requireHouse, adminPartnerLinksRouter);
 }
 // Notification bell — every row is the caller's own (userId-scoped in the
 // router). requireBillingStaff is the same door the blanket requireAdmin was,

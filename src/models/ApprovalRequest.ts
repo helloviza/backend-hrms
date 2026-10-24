@@ -124,6 +124,14 @@ export interface ApprovalHistoryItem {
   /** Travel Desk rows (staff only): who the case went to / came from. */
   assigneeName?: string;
   assigneeEmail?: string;
+  /**
+   * "booking_status" rows (partner lead cases only, services/partnerLeadBooking.ts):
+   * a linked manual booking's Status / Sub Status after a change.
+   */
+  bookingStatus?: string;
+  bookingSubStatus?: string;
+  manualBookingId?: string;
+  bookingRef?: string;
 }
 
 export interface ApprovalRequestDocument extends Document {
@@ -392,6 +400,10 @@ const HistorySchema = new Schema<ApprovalHistoryItem>(
     actorKind: { type: String },
     assigneeName: { type: String },
     assigneeEmail: { type: String },
+    bookingStatus: { type: String },
+    bookingSubStatus: { type: String },
+    manualBookingId: { type: String },
+    bookingRef: { type: String },
   },
   { _id: false },
 );
@@ -566,6 +578,60 @@ doc.fsm.current = deriveFsmCurrent(doc.fsm, stageFinal);
     return next();
   }
 });
+
+/**
+ * meta.partnerLead is written once, when a partner lead case is created
+ * (services/partnerIntake.create.ts), and never changes: it is the record of
+ * where the lead came from and what the student consented to. A save that
+ * would change, add or remove it on an existing request is refused, as is an
+ * update query that names it. Requests without it are unaffected by both.
+ */
+export class PartnerLeadImmutableError extends Error {
+  code = "PARTNER_LEAD_IMMUTABLE";
+  constructor() {
+    super("meta.partnerLead is set when a partner lead case is created and cannot be changed");
+  }
+}
+
+const partnerLeadJson = (doc: any) => JSON.stringify(doc?.meta?.partnerLead ?? null);
+
+ApprovalRequestSchema.post("init", function (this: any) {
+  this.$locals.partnerLeadAtLoad = partnerLeadJson(this);
+});
+
+ApprovalRequestSchema.pre("save", function (this: any, next) {
+  if (this.isNew) return next();
+  const atLoad = this.$locals?.partnerLeadAtLoad;
+  if (atLoad === undefined) return next(); // not loaded from the database (e.g. hydrated by hand)
+  return partnerLeadJson(this) === atLoad ? next() : next(new PartnerLeadImmutableError());
+});
+
+/** Any update-operator path (or a whole `meta` replacement) that would touch meta.partnerLead. */
+function updateTouchesPartnerLead(update: any): boolean {
+  if (!update || typeof update !== "object") return false;
+  const touches = (k: string) => k === "meta" || k === "meta.partnerLead" || k.startsWith("meta.partnerLead.");
+  for (const [k, v] of Object.entries(update)) {
+    if (k.startsWith("$")) {
+      if (v && typeof v === "object" && Object.keys(v).some(touches)) return true;
+    } else if (touches(k)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+for (const op of ["updateOne", "updateMany", "findOneAndUpdate", "replaceOne"] as const) {
+  ApprovalRequestSchema.pre(op, async function (this: any) {
+    const update = this.getUpdate?.();
+    if (op === "replaceOne" || (update && typeof update === "object" && "meta" in (update.$set || {}))) {
+      // A whole-`meta` write is allowed only when no matched request carries partnerLead.
+      const hit = await this.model.exists({ ...this.getFilter(), "meta.partnerLead": { $exists: true } });
+      if (hit) throw new PartnerLeadImmutableError();
+      return;
+    }
+    if (updateTouchesPartnerLead(update)) throw new PartnerLeadImmutableError();
+  });
+}
 
 ApprovalRequestSchema.plugin(workspaceScopePlugin);
 ApprovalRequestSchema.index({ workspaceId: 1, status: 1, updatedAt: -1 });

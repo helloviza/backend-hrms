@@ -43,6 +43,8 @@ import type { VoucherType } from "../types/index.js";
 import { userNames, nameOrUnknown, personName } from "../services/actorNames.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import { syncRequestFromManualBooking } from "../services/bookingDocuments.js";
+import { isPartnerLeadCase } from "../services/partnerLeadCase.js";
+import { partnerCaseForBooking, partnerRequiredErrors, recordPartnerBookingStatus } from "../services/partnerLeadBooking.js";
 import { countedBookingMatch, countedStatusClause, countsInMetrics } from "../utils/bookingMetrics.js";
 
 const router = express.Router();
@@ -824,7 +826,15 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
       return res.status(400).json({ error: `status must be one of: ${CLIENT_SETTABLE_STATUSES.join(", ")}` });
     }
 
-    const vErrors = validateBookingRequired(body);
+    // Book Now: the request this booking is for (checked below).
+    const linkedRid = source === "ADMIN_QUEUE" && body.sourceBookingId ? String(body.sourceBookingId) : "";
+    const linked: any = linkedRid && mongoose.isValidObjectId(linkedRid)
+      ? await ApprovalRequest.findById(linkedRid).select("customerId meta.source").lean()
+      : null;
+    // A partner lead case's booking: supplier / given-by optional until Confirmed (services/partnerLeadBooking.ts).
+    const isPartnerBooking = !!linked && isPartnerLeadCase(linked) && String(linked.customerId || "") === String(body.workspaceId);
+
+    const vErrors = partnerRequiredErrors(validateBookingRequired(body), { ...body, status }, isPartnerBooking);
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
@@ -832,11 +842,7 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
     // Book Now: a booking for an approval request is for THAT request's
     // customer — the Client is locked to it, and an unknown request is refused
     // rather than silently booked unlinked.
-    if (source === "ADMIN_QUEUE" && body.sourceBookingId) {
-      const rid = String(body.sourceBookingId);
-      const linked: any = mongoose.isValidObjectId(rid)
-        ? await ApprovalRequest.findById(rid).select("customerId").lean()
-        : null;
+    if (linkedRid) {
       if (!linked) return res.status(400).json({ error: "The approval request for this booking was not found", code: "REQUEST_NOT_FOUND" });
       if (String(linked.customerId || "") !== String(body.workspaceId)) {
         return res.status(400).json({ error: "The client must be the request's company", code: "CLIENT_MISMATCH" });
@@ -880,6 +886,7 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
 
     // Book Now: the linked request moves to "Booking in progress" (or Booked).
     const requestSync = await syncRequestFromManualBooking(booking, req.user);
+    if (isPartnerBooking) await recordPartnerBookingStatus(booking, null, req.user);
 
     res.status(201).json({ ok: true, booking, requestSync });
   } catch (err: any) {
@@ -1919,7 +1926,13 @@ router.get("/:id", requirePermission("manualBookings", "READ"), async (req: any,
     // its edit form straight from this response (line ~433) and PUTs the
     // passengers array back unchanged for untouched fields; masking would
     // silently overwrite real passport/PAN numbers with "****1234" on save.
-    res.json({ ok: true, booking: { ...booking, invoicePendingDays: invoicePendingDays(booking) } });
+    // A partner lead booking: the form relaxes supplier / given-by while
+    // Pending / WIP (services/partnerLeadBooking.ts). Absent for every other booking.
+    // (Raw ids: the populate above can leave workspaceId null.)
+    const partnerCase = booking.source === "ADMIN_QUEUE"
+      ? await partnerCaseForBooking(await ManualBooking.findById(booking._id).select("workspaceId source sourceBookingId").lean())
+      : null;
+    res.json({ ok: true, booking: { ...booking, invoicePendingDays: invoicePendingDays(booking) }, ...(partnerCase ? { partnerLead: true } : {}) });
   } catch (err: any) {
     console.error("[ManualBookings GET one]", err.message);
     res.status(500).json({ error: err.message });
@@ -1955,13 +1968,23 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
       body.status = status;
     }
 
+    // The case a booking was made for is fixed at create: an edit can't
+    // re-point it at another request (another company's, or another case).
+    if (
+      Object.prototype.hasOwnProperty.call(body, "sourceBookingId") &&
+      String(body.sourceBookingId ?? "") !== String(booking.sourceBookingId ?? "")
+    ) {
+      return res.status(400).json({ error: "A booking's request can't be changed after it is created", code: "LINKED_CASE_LOCKED" });
+    }
+    const partnerCase = await partnerCaseForBooking(booking);
+
     // Snapshot the pre-update document so we can tell which required fields
     // were already present (Option B: enforce only those — don't force legacy
     // bookings to backfill fields they never had).
     const before = booking.toObject();
     Object.assign(booking, body);
 
-    const vErrors = validateBookingRequiredForUpdate(booking, before);
+    const vErrors = partnerRequiredErrors(validateBookingRequiredForUpdate(booking, before), booking, !!partnerCase);
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
@@ -1976,6 +1999,7 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
     // Saved Done → the linked request is Booked (documents + email); Pending /
     // WIP → it stays "Booking in progress". services/bookingDocuments.ts.
     const requestSync = await syncRequestFromManualBooking(booking, req.user);
+    if (partnerCase) await recordPartnerBookingStatus(booking, { status: before.status, subStatus: before.subStatus }, req.user);
     res.json({ ok: true, booking, requestSync });
   } catch (err: any) {
     console.error("[ManualBookings PUT]", err.message);
@@ -2018,12 +2042,14 @@ router.post("/:id/cancel", requirePermission("manualBookings", "FULL"), async (r
       });
     }
 
+    const prev = { status: booking.status, subStatus: booking.subStatus };
     booking.status = "CANCELLED";
     booking.cancelledAt = new Date();
     booking.cancelledBy = req.user._id;
     booking.cancellationReason = reason;
     booking.cancellationNote = reasonNote ? String(reasonNote).trim() : undefined;
     await booking.save();
+    await recordPartnerBookingStatus(booking, prev, req.user); // partner lead bookings only
 
     res.json({ ok: true, booking });
   } catch (err: any) {

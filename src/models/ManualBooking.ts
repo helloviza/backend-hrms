@@ -4,9 +4,15 @@ import CustomerWorkspace from "./CustomerWorkspace.js";
 import { lookupDestination, lookupDestinationFuzzy } from "../data/destinationLookup.js";
 import { returnJourneyStart } from "../services/flightLegs.js";
 
+// The frontend restates these lists in pages/admin/ManualBookingForm.tsx (the
+// dropdown) and pages/admin/ManualBookings.tsx (the filter);
+// models/ManualBooking.subStatus.parity.test.ts keeps all three in step.
 export const PENDING_SUB_STATUSES = [
   "Pending for Customer Confirmation",
   "Pending for Supplier Confirmation",
+  "Lead Not Contactable",
+  "NC Leads - Email Sent",
+  "NC Leads - Multiple Follow-up Done",
 ] as const;
 
 export const CANCELLED_SUB_STATUSES = [
@@ -16,12 +22,13 @@ export const CANCELLED_SUB_STATUSES = [
   "Not Sure for Location",
   "Plan changed",
   "Travel cancelled",
+  "Lead Not Contactable",
 ] as const;
 
-export const ALL_SUB_STATUSES = [
-  ...PENDING_SUB_STATUSES,
-  ...CANCELLED_SUB_STATUSES,
-] as const;
+// "Lead Not Contactable" is in both groups; the enum lists it once.
+export const ALL_SUB_STATUSES = Array.from(
+  new Set([...PENDING_SUB_STATUSES, ...CANCELLED_SUB_STATUSES]),
+);
 
 export type SubStatus = (typeof ALL_SUB_STATUSES)[number] | "";
 

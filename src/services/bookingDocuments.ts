@@ -36,6 +36,7 @@ import {
   resolveLeaderCustomerIds,
 } from "../routes/approvals.security.js";
 import { requestDocuments, publicDocuments, CUSTOMER_DOC_TYPES as CUSTOMER_TYPES, type RequestDocument } from "./requestDocumentList.js";
+import { isPartnerLeadCase } from "./partnerLeadCase.js";
 
 export { requestDocuments, publicDocuments, type RequestDocument };
 
@@ -62,6 +63,10 @@ function userWorkspaceLeader(user: AnyObj): boolean {
 export async function requestDocumentsVisibleTo(req: AnyObj, doc: AnyObj): Promise<boolean> {
   if (!doc) return false;
   if (caseInQueueScope(req, doc)) return true;
+  // A partner lead case's documents are the student's tickets and vouchers:
+  // the partner (its Workspace Leaders) sees their status only, through the
+  // partner tracker, never the files. Its requester is a system user.
+  if (isPartnerLeadCase(doc)) return false;
   const user = req?.user || {};
   if (isOwnerOfRequest(doc, user) || isManagerOrLeaderOfRequest(doc, user)) return true;
 
@@ -135,6 +140,23 @@ function bookedText(booking: AnyObj, docs: AnyObj[]): string {
   return docs.length ? "Booking confirmed and documents shared" : "Booking confirmed";
 }
 
+/**
+ * The request's document list after one booking's save: that booking's
+ * entries are replaced by `docs`, every other booking's are kept. A request
+ * can have several bookings (one per service), and each used to overwrite the
+ * whole list. Entries carry the booking they came from (manualBookingId);
+ * entries written before that field existed belong to the booking that last
+ * synced (meta.manualBookingId) and are tagged with it here.
+ */
+function mergedBookingDocs(meta: AnyObj, bookingId: string, docs: AnyObj[]): AnyObj[] {
+  const legacyOwner = str(meta?.manualBookingId);
+  const existing = (Array.isArray(meta?.bookingDocuments) ? meta.bookingDocuments : []).map((d: AnyObj) => ({
+    ...d,
+    manualBookingId: str(d?.manualBookingId) || legacyOwner,
+  }));
+  return [...existing.filter((d: AnyObj) => d.manualBookingId !== bookingId), ...docs.map((d) => ({ ...d, manualBookingId: bookingId }))];
+}
+
 export type SyncOutcome = "completed" | "documents_updated" | "in_progress" | "none";
 
 /**
@@ -156,17 +178,20 @@ export async function syncRequestFromManualBooking(booking: AnyObj, actor: AnyOb
 
     const docs = bookingDocsOf(booking);
     doc.meta = doc.meta || {};
+    const merged = mergedBookingDocs(doc.meta, String(booking._id), docs);
     const setDocs = () => {
       doc.meta.manualBookingId = String(booking._id);
-      doc.meta.bookingDocuments = docs;
+      doc.meta.bookingDocuments = merged;
       doc.markModified("meta");
     };
 
     if (booked) {
       // Already booked: keep the document list in step with the booking
       // (a replaced ticket, a second voucher). No new trail row, no email.
-      const before = JSON.stringify((doc.meta.bookingDocuments || []).map((d: AnyObj) => str(d.attachmentId)));
-      if (before === JSON.stringify(docs.map((d: AnyObj) => d.attachmentId)) && str(doc.meta.manualBookingId) === String(booking._id)) {
+      const ids = (list: AnyObj[]) => JSON.stringify(list.map((d: AnyObj) => `${str(d.manualBookingId)}:${str(d.attachmentId)}`));
+      const unchanged = ids(doc.meta.bookingDocuments || []) === ids(merged) &&
+        (doc.meta.bookingDocuments || []).every((d: AnyObj) => str(d.manualBookingId));
+      if (unchanged && str(doc.meta.manualBookingId) === String(booking._id)) {
         return "none";
       }
       setDocs();

@@ -61,7 +61,7 @@ export function buildSearchFilter(query: Record<string, any>, user?: any) {
   const sourceF = enumFilter(query.source, BOOKING_SOURCES);
   if (sourceF !== undefined) filter.source = sourceF;
 
-  // subStatus — the "why is this stuck" dimension. Only the eight real values
+  // subStatus — the "why is this stuck" dimension. Only the real values (ALL_SUB_STATUSES)
   // are accepted; the enum's "" default is not a filterable choice.
   const subStatusF = enumFilter(query.subStatus, ALL_SUB_STATUSES);
   if (subStatusF !== undefined) filter.subStatus = subStatusF;

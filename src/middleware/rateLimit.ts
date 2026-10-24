@@ -425,6 +425,40 @@ export const travelRequestLimiter = rateLimit({
   message: { success: false, message: 'Too many requests, please try again later.' },
 });
 
+// Partner lead links (routes/public.partnerRequest.ts). Their own counters, not
+// travelRequestLimiter's: a student on a partner's page and a visitor on the
+// public travel-request form are different doors, and sharing a counter would
+// let one spend the other's budget. Submit is as tight as the travel-request
+// form (one real submit per visit); resolve runs once per page load, so 60.
+// A per-code daily cap (PartnerLink.dailyCap) sits on top, in Mongo.
+export const partnerRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests, please try again later.' },
+});
+
+// The form's hotel city typeahead (one call per pause in typing, a database read).
+export const partnerHotelCityLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 120,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests, please try again later.' },
+});
+
+export const partnerLinkResolveLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests, please try again later.' },
+});
+
 /* ── CONSUMER PASSPORT AUTOFILL (2026-09-06) ──────────────────────────
  * POST /api/consumer/profile/documents/:id/extract — reading a passport
  * so the apply form can fill itself in.

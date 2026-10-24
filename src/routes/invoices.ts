@@ -219,6 +219,7 @@ import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { isHouseCallerContext } from "../utils/bookingAccess.js";
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { buildInvoiceQueryFilter } from "./invoices.filters.js";
+import { partnerBookingIds } from "../services/partnerLeadBooking.js";
 import { normalizeGstStatus } from "../utils/customerGst.js";
 import {
   billingOwnUserId, bookingCreatorClause, ownInvoiceClause, invoiceOwnedBy, bookingRefsNotCreatedBy,
@@ -1171,6 +1172,17 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
       return res.status(400).json({
         error: `${alreadyInvoiced.length} booking(s) are already invoiced`,
         refs: alreadyInvoiced.map((b: any) => b.bookingRef),
+      });
+    }
+
+    // Partner lead bookings only once Confirmed (services/partnerLeadBooking.ts).
+    const partnerIds = await partnerBookingIds(newBookings as any[]);
+    const notConfirmed = (newBookings as any[]).filter((b) => partnerIds.has(String(b._id)) && b.status !== "CONFIRMED");
+    if (notConfirmed.length) {
+      return res.status(400).json({
+        error: `${notConfirmed.length} partner lead booking(s) are not Confirmed yet`,
+        code: "PARTNER_BOOKING_NOT_CONFIRMED",
+        refs: notConfirmed.map((b: any) => b.bookingRef),
       });
     }
 

@@ -21,6 +21,7 @@ import type { MailAttachment } from "../../utils/mailer.js";
 import { APPROVAL_EMAIL_MAP, type ApprovalEmailEvent, type EmailEventSpec, type EmailRole } from "./map.js";
 import { renderApprovalEmail, type EmailCtx } from "./templates.js";
 import { caseCode } from "./links.js";
+import { isPartnerLeadCase, PARTNER_INTAKE_EMAIL } from "../partnerLeadCase.js";
 
 type AnyObj = Record<string, any>;
 const norm = (v: any) => String(v ?? "").trim().toLowerCase();
@@ -78,6 +79,16 @@ async function resolveRole(role: EmailRole, spec: EmailEventSpec, ctx: EmailCtx,
   return out;
 }
 
+/**
+ * Partner lead cases (meta.source PARTNER_LINK): the partner's Workspace
+ * Leaders are not copied on "booking done" — it carries the student's tickets
+ * and vouchers. Keyed on a field no other request has.
+ */
+function ccRolesFor(event: ApprovalEmailEvent, spec: EmailEventSpec, ctx: EmailCtx): EmailRole[] {
+  if (event === "booking_done" && isPartnerLeadCase(ctx.ar)) return spec.cc.filter((r) => r !== "leaders");
+  return spec.cc;
+}
+
 /** Who gets this event, after every map rule. Exported for tests and the renderer. */
 export async function recipientsFor(event: ApprovalEmailEvent, ctx: EmailCtx): Promise<{ to: string[]; cc: string[] }> {
   const spec: EmailEventSpec = APPROVAL_EMAIL_MAP[event];
@@ -86,11 +97,14 @@ export async function recipientsFor(event: ApprovalEmailEvent, ctx: EmailCtx): P
 
   const excluded = new Set(await gather(spec.exclude));
   if (spec.excludeActor && ctx.actorEmail) excluded.add(norm(ctx.actorEmail));
+  // The Partner Intake system user requests and approves every partner lead
+  // case; it is a placeholder, never a mailbox.
+  excluded.add(norm(PARTNER_INTAKE_EMAIL));
   const desk = norm(DESK_EMAIL);
 
   const uniq = (list: string[]) => Array.from(new Set(list)).filter((e) => e && !excluded.has(e));
   let to = uniq(await gather(spec.to));
-  let cc = uniq(await gather(spec.cc)).filter((e) => !to.includes(e));
+  let cc = uniq(await gather(ccRolesFor(event, spec, ctx))).filter((e) => !to.includes(e));
 
   const dead = await inactiveEmails([...to, ...cc].filter((e) => e !== desk));
   to = to.filter((e) => !dead.has(e));
