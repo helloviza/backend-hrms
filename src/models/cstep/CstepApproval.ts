@@ -87,6 +87,12 @@ export interface ICstepApproval extends Document {
   action: CstepApprovalAction;
   comment?: string;
   documentHash?: string;
+  /** #12 — a Travel Desk action (arrange / change request / settlement) taken
+   * by a CSTEP Admin who is not the Travel Desk for this traveller: neither
+   * holds the workspace Travel Desk grant nor is the traveller's Official.
+   * Allowed — the Admin is top authority — but marked, so it reads as an
+   * override, not a desk action. Unset on every other entry. */
+  adminOverride?: boolean;
   at: string; // ISO string, not Date — see module note
 }
 
@@ -137,6 +143,7 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
   },
   comment: { type: String, trim: true },
   documentHash: { type: String, trim: true },
+  adminOverride: { type: Boolean },
   at: { type: String, required: true },
 });
 

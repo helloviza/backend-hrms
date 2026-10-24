@@ -77,8 +77,18 @@ import type {
 } from "../models/cstep/CstepSettlementLine.js";
 import CstepProject from "../models/cstep/CstepProject.js";
 import TravellerProfile from "../models/TravellerProfile.js";
+import User from "../models/User.js";
+import CstepTravelDeskGrant from "../models/cstep/CstepTravelDeskGrant.js";
+import { activeUserFilter } from "../utils/userActiveStatus.js";
 import Counter from "../models/Counter.js";
-import { ownerId, isCstepAdmin, resolveOwnTravellerProfile, ONLY_ASSIGNED_FINANCE, NO_FINANCE_ASSIGNED } from "../utils/cstepAccess.js";
+import {
+  ownerId,
+  isCstepAdmin,
+  holdsTravelDeskGrant,
+  resolveOwnTravellerProfile,
+  ONLY_ASSIGNED_FINANCE,
+  NO_FINANCE_ASSIGNED,
+} from "../utils/cstepAccess.js";
 import {
   uploadCstepTourProposalPdf,
   type CstepApprovalTrailEntry,
@@ -223,16 +233,14 @@ async function callerApprovalRefusal(req: any, travelerProfileId: any): Promise<
 }
 
 /**
- * Step 3 — per-request ARRANGEMENT authority: a CSTEP Admin (any request),
- * or the specific User this traveller has assigned as their Official user
- * (TravellerProfile.officialUserId) — only that traveller's requests.
- * Mirrors callerCanActOnTraveller's exact shape, checking officialUserId
- * instead of tourApproverId — the Official's authority to open/edit the
- * arrangement stage is a separate concept from the Tour Approver's
- * authority to approve/return.
+ * #12 — the Travel Desk for this traveller: the holder of the workspace
+ * Travel Desk grant (every traveller — CstepTravelDeskGrant), or the User
+ * this traveller has assigned as their Official (TravellerProfile.
+ * officialUserId — that traveller only). Being a CSTEP Admin is NOT enough;
+ * an Admin is the Travel Desk only if granted or assigned.
  */
-async function callerCanArrangeForTraveller(req: any, travelerProfileId: any): Promise<boolean> {
-  if (isCstepAdmin(req)) return true;
+async function callerIsTravelDesk(req: any, travelerProfileId: any): Promise<boolean> {
+  if (await holdsTravelDeskGrant(req)) return true;
   const traveller: any = await TravellerProfile.findOne({
     _id: travelerProfileId,
     workspaceId: req.workspaceObjectId,
@@ -241,6 +249,28 @@ async function callerCanArrangeForTraveller(req: any, travelerProfileId: any): P
     .lean();
   if (!traveller?.officialUserId) return false;
   return String(traveller.officialUserId) === ownerId(req);
+}
+
+/**
+ * Step 3 — per-request ARRANGEMENT authority, the gate on every Travel Desk
+ * action (arranging, vendor options, change requests, settlement): the
+ * traveller's Travel Desk (callerIsTravelDesk), or — #12 — a CSTEP Admin who
+ * is not, as an Admin OVERRIDE. The override is never refused (the Admin is
+ * top authority) but it is stamped on the request (req.cstepAdminOverride)
+ * so the route's audit entry carries adminOverride: true (adminOverrideMark)
+ * and reads as an override, not a desk action.
+ */
+async function callerCanArrangeForTraveller(req: any, travelerProfileId: any): Promise<boolean> {
+  if (await callerIsTravelDesk(req, travelerProfileId)) return true;
+  if (!isCstepAdmin(req)) return false;
+  req.cstepAdminOverride = true;
+  return true;
+}
+
+/** Spread into a Travel Desk route's CstepApproval entry: { adminOverride:
+ * true } when the gate passed only as an Admin override, else nothing. */
+function adminOverrideMark(req: any): { adminOverride?: true } {
+  return req.cstepAdminOverride ? { adminOverride: true } : {};
 }
 
 /**
@@ -316,14 +346,15 @@ async function callerIsTravellerFinanceUser(req: any, travelerProfileId: any): P
 
 /**
  * READ authority over a traveller's case for anyone in its pipeline: a
- * CSTEP Admin, or the traveller's mapped Approver, Official or Finance
- * user. Used by the read-only routes (activity log, proposal PDF, packet,
+ * CSTEP Admin, the workspace Travel Desk (#12), or the traveller's mapped
+ * Approver, Official or Finance user. Used by the read-only routes (activity log, proposal PDF, packet,
  * travel report) — before Step 6 those admitted only owner/approver (+
  * official for report/packet), so a non-admin Finance user opening a case
  * from their own queue was refused the activity log.
  */
 async function callerCanViewTraveller(req: any, travelerProfileId: any): Promise<boolean> {
-  if (isCstepAdmin(req)) return true;
+  // #12 — the workspace Travel Desk works every traveller's case, so reads them too.
+  if (isCstepAdmin(req) || (await holdsTravelDeskGrant(req))) return true;
   const traveller: any = await TravellerProfile.findOne({
     _id: travelerProfileId,
     workspaceId: req.workspaceObjectId,
@@ -1731,11 +1762,15 @@ router.get("/requests/:id", async (req: any, res: any) => {
     const canApprove = canDecide && !refusal;
     const canApproveReport = canDecideReport && !refusal;
     const approvalBlockedReason = refusal || undefined;
+    // #12 — the Travel Desk surface (arrange, change requests, settlement):
+    // the traveller's Travel Desk (workspace grant or their Official), or a
+    // CSTEP Admin who is neither — allowed, but as an Admin override, which
+    // travelDeskOverride tells the page so it can say so.
+    const isTravelDesk = !isClaim && (await callerIsTravelDesk(req, doc.travelerProfileId));
+    const deskAuthority = isTravelDesk || (!isClaim && admin);
+    const travelDeskOverride = deskAuthority && !isTravelDesk;
     // A claim is never arranged — it has no arrangement stage at all.
-    const canArrange =
-      !isClaim &&
-      (doc.status === "APPROVED" || doc.status === "ARRANGING") &&
-      (admin || (await callerCanArrangeForTraveller(req, doc.travelerProfileId)));
+    const canArrange = !isClaim && (doc.status === "APPROVED" || doc.status === "ARRANGING") && deskAuthority;
     // Step 5 — same authority as canArrange (callerCanArrangeForTraveller):
     // the Official who arranges services also settles accounts. Covers both
     // "may open the settlement card" and "may act on it while VERIFYING" —
@@ -1750,7 +1785,7 @@ router.get("/requests/:id", async (req: any, res: any) => {
           doc.status === "TRANSFERRED_TO_FINANCE" ||
           doc.status === "SETTLED" ||
           doc.status === "REIMBURSED") &&
-        (admin || (await callerCanArrangeForTraveller(req, doc.travelerProfileId)));
+        deskAuthority;
     // Claims addition — may this caller run the Admin verification (APPROVED
     // claim -> TRANSFERRED_TO_FINANCE)?
     const canVerifyClaim = isClaim && admin && doc.status === "APPROVED";
@@ -1827,7 +1862,7 @@ router.get("/requests/:id", async (req: any, res: any) => {
     // Change requests — this trip's cancel / rebook requests (newest first),
     // whether the caller may raise one now, and whether they handle them
     // (the Official / Admin: resolve, and edit the lines an OPEN one reopens).
-    const canHandleChanges = !isClaim && (await callerCanArrangeForTraveller(req, doc.travelerProfileId));
+    const canHandleChanges = deskAuthority;
     const canRequestChange =
       !isClaim &&
       CHANGEABLE_STATUSES.has(doc.status) &&
@@ -1867,6 +1902,8 @@ router.get("/requests/:id", async (req: any, res: any) => {
       canDecideReport,
       approvalBlockedReason,
       isAdmin: admin,
+      isTravelDesk,
+      travelDeskOverride,
       canArrange,
       canSettle,
       canFinance,
@@ -2253,33 +2290,41 @@ router.get("/my-roles", async (req: any, res: any) => {
     // same idea for the Approver slot — actually named as some traveller's
     // approver — and gates the My Team report (GET /approver-report), which
     // is about the caller's own team, so an Admin with no team doesn't get it.
+    //
+    // #12 — isTravelDesk (and isOfficial, its older name) is true only for a
+    // real Travel Desk: the workspace Travel Desk grant (hasTravelDeskGrant)
+    // or the Official assigned to some traveller — never just for being an
+    // Admin. An Admin still gets the all-cases Processing / Changes views
+    // (the frontend shows them on isAdmin), but isn't labelled the desk.
+    const [isApprover, isMappedOfficial, isFinance, hasTravelDeskGrant] = await Promise.all([
+      TravellerProfile.exists({ workspaceId: req.workspaceObjectId, tourApproverId: uid }),
+      TravellerProfile.exists({ workspaceId: req.workspaceObjectId, officialUserId: uid }),
+      TravellerProfile.exists({ workspaceId: req.workspaceObjectId, financeUserId: uid }),
+      holdsTravelDeskGrant(req),
+    ]);
+    const isTravelDesk = hasTravelDeskGrant || !!isMappedOfficial;
+
     if (isCstepAdmin(req)) {
-      const [mapped, approverOf] = await Promise.all([
-        TravellerProfile.exists({ workspaceId: req.workspaceObjectId, financeUserId: uid }),
-        TravellerProfile.exists({ workspaceId: req.workspaceObjectId, tourApproverId: uid }),
-      ]);
       return res.json({
         ok: true,
         isAdmin: true,
         isApprover: true,
-        isOfficial: true,
+        isOfficial: isTravelDesk,
+        isTravelDesk,
+        hasTravelDeskGrant,
         isFinance: true,
-        isFinanceUser: !!mapped,
-        isTourApprover: !!approverOf,
+        isFinanceUser: !!isFinance,
+        isTourApprover: !!isApprover,
       });
     }
-
-    const [isApprover, isOfficial, isFinance] = await Promise.all([
-      TravellerProfile.exists({ workspaceId: req.workspaceObjectId, tourApproverId: uid }),
-      TravellerProfile.exists({ workspaceId: req.workspaceObjectId, officialUserId: uid }),
-      TravellerProfile.exists({ workspaceId: req.workspaceObjectId, financeUserId: uid }),
-    ]);
 
     res.json({
       ok: true,
       isAdmin: false,
       isApprover: !!isApprover,
-      isOfficial: !!isOfficial,
+      isOfficial: isTravelDesk,
+      isTravelDesk,
+      hasTravelDeskGrant,
       isFinance: !!isFinance,
       isFinanceUser: !!isFinance,
       isTourApprover: !!isApprover,
@@ -2287,6 +2332,97 @@ router.get("/my-roles", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP my-roles GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load your CSTEP roles" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * #12 — the workspace Travel Desk role (CstepTravelDeskGrant). CSTEP Admin
+ * only, like the per-traveller mapping it sits beside (workspace.travellers
+ * PATCH /:id/tour-approver). Any active user of this workspace may hold it,
+ * an Admin included.
+ *
+ *   GET    /travel-desk          — the current holders
+ *   POST   /travel-desk          — { userId } grants it (again, if revoked)
+ *   DELETE /travel-desk/:userId  — revokes it; the row stays, stamped
+ * ───────────────────────────────────────────────────────────────────── */
+const userNameOf = (u: any): string =>
+  u?.name || [u?.firstName, u?.lastName].filter(Boolean).join(" ").trim() || u?.email || "Unnamed";
+
+router.get("/travel-desk", async (req: any, res: any) => {
+  try {
+    if (!isCstepAdmin(req)) return res.status(403).json({ error: "Only a CSTEP Admin can view the Travel Desk role" });
+    const grants: any[] = await CstepTravelDeskGrant.find({
+      workspaceId: req.workspaceObjectId,
+      revokedAt: { $exists: false },
+    })
+      .sort({ grantedAt: 1 })
+      .lean();
+    const users: any[] = grants.length
+      ? await User.find({ _id: { $in: grants.flatMap((g) => [g.userId, g.grantedBy]) } })
+          .select("firstName lastName name email")
+          .lean()
+      : [];
+    const byId = new Map(users.map((u) => [String(u._id), u]));
+    res.json({
+      ok: true,
+      grants: grants.map((g) => ({
+        userId: String(g.userId),
+        name: userNameOf(byId.get(String(g.userId))),
+        email: byId.get(String(g.userId))?.email || "",
+        grantedAt: g.grantedAt,
+        grantedByName: userNameOf(byId.get(String(g.grantedBy))),
+      })),
+    });
+  } catch (err: any) {
+    console.error("[CSTEP travel-desk GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load the Travel Desk role" });
+  }
+});
+
+router.post("/travel-desk", async (req: any, res: any) => {
+  try {
+    if (!isCstepAdmin(req)) return res.status(403).json({ error: "Only a CSTEP Admin can grant the Travel Desk role" });
+    const raw = String(req.body?.userId || "");
+    if (!mongoose.isValidObjectId(raw)) return res.status(400).json({ error: "userId must be a user id" });
+    const user: any = await User.findOne({ _id: raw, workspaceId: req.workspaceObjectId, ...activeUserFilter() })
+      .select("_id")
+      .lean();
+    if (!user) return res.status(400).json({ error: "userId does not resolve to an active user in this workspace" });
+
+    const now = new Date();
+    const grant: any = await CstepTravelDeskGrant.findOneAndUpdate(
+      { workspaceId: req.workspaceObjectId, userId: user._id },
+      {
+        $set: { grantedBy: new mongoose.Types.ObjectId(ownerId(req)), grantedAt: now },
+        $unset: { revokedAt: 1, revokedBy: 1 },
+      },
+      { upsert: true, new: true },
+    ).lean();
+    res.json({ ok: true, grant: { userId: String(grant.userId), grantedAt: grant.grantedAt } });
+  } catch (err: any) {
+    console.error("[CSTEP travel-desk POST]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to grant the Travel Desk role" });
+  }
+});
+
+router.delete("/travel-desk/:userId", async (req: any, res: any) => {
+  try {
+    if (!isCstepAdmin(req)) return res.status(403).json({ error: "Only a CSTEP Admin can revoke the Travel Desk role" });
+    if (!mongoose.isValidObjectId(req.params.userId)) return res.status(404).json({ error: "No Travel Desk grant for this user" });
+    const revoked = await CstepTravelDeskGrant.findOneAndUpdate(
+      {
+        workspaceId: req.workspaceObjectId,
+        userId: new mongoose.Types.ObjectId(req.params.userId),
+        revokedAt: { $exists: false },
+      },
+      { $set: { revokedAt: new Date(), revokedBy: new mongoose.Types.ObjectId(ownerId(req)) } },
+      { new: true },
+    ).lean();
+    if (!revoked) return res.status(404).json({ error: "No Travel Desk grant for this user" });
+    res.json({ ok: true });
+  } catch (err: any) {
+    console.error("[CSTEP travel-desk DELETE]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to revoke the Travel Desk role" });
   }
 });
 
@@ -2319,7 +2455,8 @@ const OFFICIAL_QUEUE_STAGES = [
  * `stageCounts` gives it the per-tab count directly without recomputing it
  * from the full list. Same tenant-scoped shape as GET /approvals
  * (mapped-user field + status set), just a different slot. A CSTEP Admin
- * sees every request at any of these 6 statuses, unchanged from how Admin
+ * (oversight) and the workspace Travel Desk (#12, every traveller's desk)
+ * see every request at any of these 6 statuses, unchanged from how Admin
  * already sees everything elsewhere in this module. Anyone else with no
  * travellers mapped to them gets an empty queue, not a 403 — same posture
  * as /approvals.
@@ -2336,7 +2473,8 @@ router.get("/official-queue", async (req: any, res: any) => {
     };
     const emptyStageCounts = Object.fromEntries(OFFICIAL_QUEUE_STAGES.map((s) => [s, 0]));
 
-    if (!admin) {
+    // #12 — the workspace Travel Desk works every traveller, so sees every case.
+    if (!admin && !(await holdsTravelDeskGrant(req))) {
       const uid = ownerId(req);
       const myTravellers = await TravellerProfile.find({
         workspaceId: req.workspaceObjectId,
@@ -3339,7 +3477,7 @@ router.post("/requests/:id/start-arranging", async (req: any, res: any) => {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
     }
     if (isClaimFormType(doc.formType)) {
       return res.status(409).json({ error: "A claim has no arrangement stage" });
@@ -3361,6 +3499,7 @@ router.post("/requests/:id/start-arranging", async (req: any, res: any) => {
         stage: "OFFICIAL",
         actor: new mongoose.Types.ObjectId(uid),
         action: "START_ARRANGING",
+        ...adminOverrideMark(req),
         at: new Date().toISOString(),
       });
     }
@@ -3409,7 +3548,7 @@ router.patch("/requests/:id/arrangements/:lineId", async (req: any, res: any) =>
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
     }
     // Past ARRANGING, a line an OPEN change request names is reopened for
     // the Official to record the cancel / rebook (see Change requests below).
@@ -3505,6 +3644,7 @@ router.patch("/requests/:id/arrangements/:lineId", async (req: any, res: any) =>
       stage: "OFFICIAL",
       actor: new mongoose.Types.ObjectId(ownerId(req)),
       action: "ARRANGE_SERVICE",
+      ...adminOverrideMark(req),
       comment:
         (reopenedForChange ? "Change request — " : "") +
         `Requested: ${requestedLabel} -> Arranged: ${before.arrangedType} => ${line.arrangedType}` +
@@ -3536,7 +3676,7 @@ router.post("/requests/:id/arrangements", async (req: any, res: any) => {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
     }
     if (doc.status !== "ARRANGING") {
       return res.status(409).json({ error: "Only a request currently being arranged can have services added" });
@@ -3580,6 +3720,7 @@ router.post("/requests/:id/arrangements", async (req: any, res: any) => {
       stage: "OFFICIAL",
       actor: new mongoose.Types.ObjectId(uid),
       action: "ADD_SERVICE",
+      ...adminOverrideMark(req),
       comment:
         `Added ${arrangedType}${details ? ` — ${details}` : ""}` +
         amountLabel +
@@ -3606,7 +3747,7 @@ router.get("/requests/:id/vendor-options", async (req: any, res: any) => {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
     }
     const reopened =
       CHANGEABLE_STATUSES.has(doc.status) &&
@@ -3833,7 +3974,7 @@ router.post("/requests/:id/mark-arranged", async (req: any, res: any) => {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
     }
     if (doc.status !== "ARRANGING") {
       return res.status(409).json({ error: "Only a request currently being arranged can be marked arranged" });
@@ -3860,6 +4001,7 @@ router.post("/requests/:id/mark-arranged", async (req: any, res: any) => {
       stage: "OFFICIAL",
       actor: new mongoose.Types.ObjectId(ownerId(req)),
       action: "MARK_ARRANGED",
+      ...adminOverrideMark(req),
       comment:
         untouched.length > 0
           ? `Dropped ${untouched.length} untouched seed line(s): ${untouched.map((a) => a.arrangedType).join(", ")}`
@@ -3938,7 +4080,7 @@ router.post("/requests/:id/change-requests", async (req: any, res: any) => {
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     const isTraveller = await callerIsRequestTraveller(req, doc);
     if (!isTraveller && !(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only the traveller, their Official user or a CSTEP Admin can request a change" });
+      return res.status(403).json({ error: "Only the traveller, their Travel Desk or a CSTEP Admin can request a change" });
     }
     if (isClaimFormType(doc.formType) || !CHANGEABLE_STATUSES.has(doc.status)) {
       return res.status(409).json({ error: "A change can be requested only on an arranged trip, before its travel report is submitted" });
@@ -3991,6 +4133,7 @@ router.post("/requests/:id/change-requests", async (req: any, res: any) => {
       stage: isTraveller ? "TRAVELLER" : "OFFICIAL",
       actor: uid,
       action: "CHANGE_REQUEST",
+      ...adminOverrideMark(req),
       comment: `${CHANGE_KIND_LABEL[cr.kind as CstepChangeKind]} ${service}: ${details} — Reason: ${reason}`,
       at: new Date().toISOString(),
     });
@@ -4024,7 +4167,8 @@ router.get("/requests/:id/change-requests", async (req: any, res: any) => {
 });
 
 /* GET /change-requests?status=OPEN|DONE|DECLINED|ALL — the Official's queue
- * (their travellers' changes) or a CSTEP Admin's (all). Anyone else gets an
+ * (their travellers' changes), or the workspace Travel Desk's / a CSTEP
+ * Admin's (all). Anyone else gets an
  * empty list, same posture as the other queues. Default OPEN. Each row
  * carries the trip's purpose / reference / status and the traveller's name. */
 router.get("/change-requests", async (req: any, res: any) => {
@@ -4036,7 +4180,7 @@ router.get("/change-requests", async (req: any, res: any) => {
       filter.status = status;
     }
 
-    if (!isCstepAdmin(req)) {
+    if (!isCstepAdmin(req) && !(await holdsTravelDeskGrant(req))) {
       const mine = await TravellerProfile.find({
         workspaceId: req.workspaceObjectId,
         officialUserId: new mongoose.Types.ObjectId(ownerId(req)),
@@ -4102,7 +4246,7 @@ router.post("/change-requests/:id/resolve", async (req: any, res: any) => {
     const doc = await loadRequest(req, String(cr.travelRequestId));
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can resolve a change request" });
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can resolve a change request" });
     }
 
     const body = req.body || {};
@@ -4130,6 +4274,7 @@ router.post("/change-requests/:id/resolve", async (req: any, res: any) => {
       stage: "OFFICIAL",
       actor: uid,
       action: "CHANGE_RESOLVE",
+      ...adminOverrideMark(req),
       comment: `${CHANGE_KIND_LABEL[resolved.kind as CstepChangeKind]} ${service} — ${body.status === "DONE" ? "Done" : "Declined"}: ${note}`,
       at: now.toISOString(),
     });
@@ -5036,6 +5181,8 @@ router.get("/requests/:id/activity", async (req: any, res: any) => {
         actorName: actorNameOf(a.actor),
         at: a.at,
         comment: a.comment,
+        // #12 — a Travel Desk action by an Admin who isn't the Travel Desk
+        ...(a.adminOverride ? { adminOverride: true } : {}),
       })),
       ...amendments.map((a: any) => ({
         kind: "AMENDMENT" as const,
@@ -5456,7 +5603,7 @@ router.post("/requests/:id/settlement/start", async (req: any, res: any) => {
       return res.status(409).json({ error: "A claim's settlement is opened when it is approved" });
     }
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
     }
     if (doc.status !== "REPORT_SUBMITTED") {
       return res.status(409).json({ error: "Only a request with a submitted travel report can start settlement" });
@@ -5529,6 +5676,7 @@ router.post("/requests/:id/settlement/start", async (req: any, res: any) => {
         stage: "OFFICIAL",
         actor: new mongoose.Types.ObjectId(uid),
         action: "START_VERIFICATION",
+        ...adminOverrideMark(req),
         at: new Date().toISOString(),
       });
     }
@@ -5560,7 +5708,7 @@ router.get("/requests/:id/settlement", async (req: any, res: any) => {
       return res.status(403).json({
         error: isClaimFormType(doc.formType)
           ? "Only a CSTEP Admin can view a claim's settlement"
-          : "Only this traveller's Official user or a CSTEP Admin can view the settlement",
+          : "Only this traveller's Travel Desk or a CSTEP Admin can view the settlement",
       });
     }
 
@@ -5630,7 +5778,7 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
       return res.status(403).json({
         error: isClaim
           ? "Only a CSTEP Admin can verify a claim's lines"
-          : "Only this traveller's Official user or a CSTEP Admin can perform this action",
+          : "Only this traveller's Travel Desk or a CSTEP Admin can perform this action",
       });
     }
     // A claim's lines are editable only while it awaits the Admin's
@@ -5729,6 +5877,7 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
         stage,
         actor,
         action: "REDUCE_AMOUNT",
+        ...adminOverrideMark(req),
         comment:
           `${label}: ${inrText(amountChange.before)} → ${inrText(amountChange.after)}` +
           ` (claimed ${inrText(amountChange.ceiling)}) — ${amountChange.reason}`,
@@ -5749,6 +5898,7 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
         stage,
         actor,
         action: "VERIFY_LINE",
+        ...adminOverrideMark(req),
         comment: `Line ${label}: ${otherChanges.length ? otherChanges.join(", ") : "no change"}`,
         at: new Date().toISOString(),
       });
@@ -5777,7 +5927,7 @@ router.patch("/requests/:id/settlement/perdiem", async (req: any, res: any) => {
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     if (isClaimFormType(doc.formType)) return res.status(409).json({ error: "A claim has no per diem" });
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
     }
 
     const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id });
@@ -5881,6 +6031,7 @@ router.patch("/requests/:id/settlement/perdiem", async (req: any, res: any) => {
         stage: "OFFICIAL",
         actor: new mongoose.Types.ObjectId(ownerId(req)),
         action: "PERDIEM_ADJUST",
+        ...adminOverrideMark(req),
         comment:
           `Per diem: days ${before.days} => ${after.days}, rate ${before.rate} => ${after.rate}, ` +
           `deduction ${before.deductionInr} => ${after.deductionInr}, net ${before.amountInr} => ${after.amountInr}` +
@@ -5927,7 +6078,7 @@ router.post("/requests/:id/report/return", async (req: any, res: any) => {
       }
     } else {
       if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-        return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+        return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
       }
       if (doc.status !== "REPORT_SUBMITTED") {
         return res.status(409).json({ error: "Only a submitted travel report can be sent back to the traveller" });
@@ -5958,6 +6109,7 @@ router.post("/requests/:id/report/return", async (req: any, res: any) => {
       stage: withManager ? "APPROVER" : "OFFICIAL",
       actor: new mongoose.Types.ObjectId(ownerId(req)),
       action: "RETURN_REPORT",
+      ...adminOverrideMark(req),
       comment: reason,
       at: new Date().toISOString(),
     });
@@ -5988,7 +6140,7 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
       return res.status(409).json({ error: "A claim is verified with POST /requests/:id/claim/verify, not finalized here" });
     }
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
-      return res.status(403).json({ error: "Only this traveller's Official user or a CSTEP Admin can perform this action" });
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
     }
     if (doc.status !== "REPORT_SUBMITTED") {
       return res.status(409).json({ error: "Only a request awaiting settlement can be finalized" });
@@ -6062,6 +6214,7 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
       stage: "OFFICIAL",
       actor: new mongoose.Types.ObjectId(uid),
       action: "SETTLE",
+      ...adminOverrideMark(req),
       comment:
         `Total cost of tour: ₹${totalCostOfTour} | Amount claimed: ₹${amountClaimed} | Outcome: ${outcome}` +
         (claim ? ` | Claim ${claim.claimReference}: ${claim.status}` : ""),
@@ -6075,6 +6228,7 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
         stage: "OFFICIAL",
         actor: new mongoose.Types.ObjectId(uid),
         action: "TRANSFER_TO_FINANCE",
+        ...adminOverrideMark(req),
         comment: `₹${amountClaimed} owed to the traveller`,
         at: now,
       });

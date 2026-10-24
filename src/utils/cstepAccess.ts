@@ -19,6 +19,7 @@
 // site for non-Admin approvers.
 
 import mongoose from "mongoose";
+import CstepTravelDeskGrant from "../models/cstep/CstepTravelDeskGrant.js";
 import TravellerProfile, { type TravellerProfileDocument } from "../models/TravellerProfile.js";
 import { normalizeEmail } from "./travellerMatch.js";
 
@@ -63,6 +64,25 @@ export async function isCstepFinanceUser(req: any): Promise<boolean> {
     workspaceId: req.workspaceObjectId,
     financeUserId: new mongoose.Types.ObjectId(uid),
   }));
+}
+
+/** #12 — holds the workspace-level CSTEP Travel Desk grant (an active
+ * CstepTravelDeskGrant row): the Travel Desk for every traveller here. Not
+ * implied by isCstepAdmin — an Admin has it only if granted. Memoised on the
+ * request, since one route may ask for several travellers. */
+export function holdsTravelDeskGrant(req: any): Promise<boolean> {
+  if (!req._cstepTravelDeskGrant) {
+    const uid = ownerId(req);
+    req._cstepTravelDeskGrant =
+      !req.workspaceObjectId || !mongoose.isValidObjectId(uid)
+        ? Promise.resolve(false)
+        : CstepTravelDeskGrant.exists({
+            workspaceId: req.workspaceObjectId,
+            userId: new mongoose.Types.ObjectId(uid),
+            revokedAt: { $exists: false },
+          }).then((r) => !!r);
+  }
+  return req._cstepTravelDeskGrant;
 }
 
 export type OwnTravellerResolution =

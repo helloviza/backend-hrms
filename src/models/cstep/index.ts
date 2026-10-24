@@ -23,3 +23,4 @@ export { default as CstepNotification } from "./CstepNotification.js";
 export { default as CstepSequenceChange } from "./CstepSequenceChange.js";
 export { default as CstepTrainingProgress } from "./CstepTrainingProgress.js";
 export { default as CstepChangeRequest } from "./CstepChangeRequest.js";
+export { default as CstepTravelDeskGrant } from "./CstepTravelDeskGrant.js";
