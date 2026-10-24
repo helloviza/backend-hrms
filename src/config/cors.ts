@@ -52,6 +52,11 @@ export const corsMiddleware = cors({
     "Authorization",
     "X-Request-ID",
     "X-Requested-With",
+    // Track my case on /p/:code (routes/public.partnerTrack.ts) sends its
+    // track token in this header on GET /cases. Plumbox and the API are on
+    // different origins, so without it here the browser's preflight refuses
+    // the request and the page only sees "Failed to fetch".
+    "X-Partner-Track-Token",
   ],
   // X-Report-* (routes/admin.visa.reports.ts's sendReport) — the visa
   // reports page reads these off a completed download to know whether it
