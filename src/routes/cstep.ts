@@ -80,6 +80,13 @@ import TravellerProfile from "../models/TravellerProfile.js";
 import User from "../models/User.js";
 import CstepTravelDeskGrant from "../models/cstep/CstepTravelDeskGrant.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
+import { todayIST } from "../utils/dateIST.js";
+import {
+  buildDeskDashboard,
+  DESK_DASHBOARD_STATUSES,
+  DESK_NEAR_DAYS,
+  type DeskServiceCounts,
+} from "../utils/cstepDeskDashboard.js";
 import Counter from "../models/Counter.js";
 import {
   ownerId,
@@ -2446,6 +2453,22 @@ const OFFICIAL_QUEUE_STAGES = [
   "REIMBURSED",
 ] as const;
 
+/** Which travellers' cases the Processing board (and the #13 desk dashboard)
+ * shows the caller: {} for a CSTEP Admin or the workspace Travel Desk (#12,
+ * every traveller's desk), the travellers they are the Official for, or null
+ * when they are neither — an empty board, not a 403. */
+async function officialQueueScope(req: any): Promise<Record<string, unknown> | null> {
+  if (isCstepAdmin(req) || (await holdsTravelDeskGrant(req))) return {};
+  const myTravellers = await TravellerProfile.find({
+    workspaceId: req.workspaceObjectId,
+    officialUserId: new mongoose.Types.ObjectId(ownerId(req)),
+  })
+    .select("_id")
+    .lean();
+  if (myTravellers.length === 0) return null;
+  return { travelerProfileId: { $in: myTravellers.map((t: any) => t._id) } };
+}
+
 /* ─────────────────────────────────────────────────────────────────────
  * GET /official-queue — the Official user's queue (CSTEP mapping addition):
  * requests for travellers who have this caller set as officialUserId,
@@ -2463,7 +2486,6 @@ const OFFICIAL_QUEUE_STAGES = [
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/official-queue", async (req: any, res: any) => {
   try {
-    const admin = isCstepAdmin(req);
     // Claims never reach the Official — they go to the Admin's claim
     // verification queue (GET /claim-verification-queue) instead.
     const filter: any = {
@@ -2473,22 +2495,10 @@ router.get("/official-queue", async (req: any, res: any) => {
     };
     const emptyStageCounts = Object.fromEntries(OFFICIAL_QUEUE_STAGES.map((s) => [s, 0]));
 
-    // #12 — the workspace Travel Desk works every traveller, so sees every case.
-    if (!admin && !(await holdsTravelDeskGrant(req))) {
-      const uid = ownerId(req);
-      const myTravellers = await TravellerProfile.find({
-        workspaceId: req.workspaceObjectId,
-        officialUserId: new mongoose.Types.ObjectId(uid),
-      })
-        .select("_id")
-        .lean();
-      if (myTravellers.length === 0) {
-        return res.json({ ok: true, requests: [], stageCounts: emptyStageCounts });
-      }
-      filter.travelerProfileId = { $in: myTravellers.map((t: any) => t._id) };
-    }
+    const scope = await officialQueueScope(req);
+    if (!scope) return res.json({ ok: true, requests: [], stageCounts: emptyStageCounts });
 
-    const docs = await withTravellerNames(req, await CstepTravelRequest.find(filter).sort({ updatedAt: -1 }).lean());
+    const docs = await withTravellerNames(req, await CstepTravelRequest.find({ ...filter, ...scope }).sort({ updatedAt: -1 }).lean());
     const stageCounts: Record<string, number> = { ...emptyStageCounts };
     for (const d of docs as any[]) {
       if (stageCounts[d.status] !== undefined) stageCounts[d.status]++;
@@ -2498,6 +2508,56 @@ router.get("/official-queue", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP official-queue GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to list the processing queue" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /desk-dashboard — #13, the Travel Desk dashboard: upcoming travels
+ * and the pending-bookings reminder (see utils/cstepDeskDashboard.ts).
+ * Read-only. Same scoping as GET /official-queue (officialQueueScope):
+ * Admin / Travel Desk grant -> every traveller, an Official -> their
+ * travellers, anyone else -> empty lists. Claims never reach the desk.
+ * Rows are the same request docs the queue returns (with travellerName),
+ * plus daysToDeparture, pendingServices / totalServices and, on pending,
+ * deskAction (AWAITING_ARRANGEMENT | PENDING_SERVICES |
+ * READY_TO_MARK_ARRANGED) and urgency (OVERDUE | DUE_SOON | null).
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/desk-dashboard", async (req: any, res: any) => {
+  try {
+    const today = todayIST();
+    const scope = await officialQueueScope(req);
+    if (!scope) return res.json({ ok: true, today, nearDays: DESK_NEAR_DAYS, upcoming: [], pending: [] });
+
+    const docs = await withTravellerNames(
+      req,
+      await CstepTravelRequest.find({
+        workspaceId: req.workspaceObjectId,
+        status: { $in: DESK_DASHBOARD_STATUSES },
+        formType: { $nin: ["LOCAL_TRAVEL_CLAIM", "EXPENSE_CLAIM"] },
+        ...scope,
+      }).lean(),
+    );
+
+    // Arrangement lines only matter while ARRANGING (APPROVED has none yet,
+    // ARRANGED is done). A line with no status reads as the schema default.
+    const arrangingIds = docs.filter((d: any) => d.status === "ARRANGING").map((d: any) => d._id);
+    const lines: any[] = arrangingIds.length
+      ? await CstepArrangement.find({ workspaceId: req.workspaceObjectId, requestId: { $in: arrangingIds } })
+          .select("requestId status")
+          .lean()
+      : [];
+    const services = new Map<string, DeskServiceCounts>();
+    for (const l of lines) {
+      const c = services.get(String(l.requestId)) ?? { pending: 0, total: 0 };
+      c.total++;
+      if ((l.status ?? "PENDING") === "PENDING") c.pending++;
+      services.set(String(l.requestId), c);
+    }
+
+    res.json({ ok: true, today, nearDays: DESK_NEAR_DAYS, ...buildDeskDashboard(docs, services, today) });
+  } catch (err: any) {
+    console.error("[CSTEP desk-dashboard GET]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to load the Travel Desk dashboard" });
   }
 });
 
