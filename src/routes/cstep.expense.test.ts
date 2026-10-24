@@ -328,7 +328,9 @@ describe("Expense Claim — end to end: submit → approve → Admin verify → 
       const g = ok(await get(as, `/requests/${id}`)).body;
       expect(g.canArrange).toBe(false);
       expect(g.arrangements).toEqual([]);
-      expect(g.claimDeclaration).toBeUndefined(); // no Declaration path for an Expense Claim
+      // Invoiced on every line (submit requires it) — nothing to declare.
+      expect(g.claimDeclaration).toEqual([]);
+      expect(g.hasDeclarationForm).toBe(false);
     }
     expect(ok(await get(ACT.admin, `/requests/${id}`)).body.canVerifyClaim).toBe(true);
     expect((await post(ACT.official, `/requests/${id}/start-arranging`)).status).toBe(409);

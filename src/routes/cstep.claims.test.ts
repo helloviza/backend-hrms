@@ -389,10 +389,14 @@ describe("Local Travel Claim — end to end: submit → return → resubmit → 
     expect(nonAdmin.requests).toEqual([]);
   });
 
-  it("the no-bill line lands in the Declaration (detail payload), the receipted ones do not", async () => {
+  it("every item with no bill lands in the Declaration (detail payload), the receipted ones do not", async () => {
     const g = ok(await get(ACT.traveller, `/requests/${id}`)).body;
+    // #8: not only the travel line marked "no bill" — the food line with no
+    // receipt and the Other expenses amount (nowhere to attach one) too.
     expect(g.claimDeclaration).toEqual([
-      { lineId: lineIds.noBill, date: "2026-10-06", particulars: "Metro: Client HQ → Metro station — Token, no ticket", amount: 120 },
+      { lineId: lineIds.noBill, kind: "TRAVEL", date: "2026-10-06", particulars: "Metro: Client HQ → Metro station — Token, no ticket", amount: 120 },
+      { lineId: lineIds.food, kind: "FOOD", date: "2026-10-06", particulars: "Food: Working lunch", amount: 300 },
+      { lineId: "otherExpenses", kind: "OTHER", particulars: "Other expenses", amount: 80 },
     ]);
     expect(Object.keys(g.claimAttachments)).toEqual([receipt]);
   });

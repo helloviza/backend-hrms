@@ -6,15 +6,21 @@
 //
 // Expense Claim (module 2): the Expenses table (date / description / amount
 // / invoice), then subtotal, tax, total, less advance and the amount due BY
-// or TO CSTEP, with the project as the "bill to". No Declaration — the tax
-// invoice is attached.
+// or TO CSTEP, with the project as the "bill to". The tax invoice is
+// required on submit, so it normally carries no Declaration; one only
+// prints if an item somehow has no invoice at all (see claimDeclarationItems).
 //
 // Local Travel Claim (module 1): claimant + claim header on top, the Travel table
 // (date / from / to / mode / fare / bill), the Food table, the totals block
 // net of the advance (amount due BY CSTEP to the claimant, or TO CSTEP from
 // the claimant — both shown, never zeroed), the auto-generated "Declaration
-// (where no supports available)" listing every travel line filed with no
-// bill, and a sign-off area.
+// (where no supports available)" listing every item with no bill (see
+// claimDeclarationItems), and a sign-off area.
+//
+// Declaration form (#8): the same items as a standalone, signable
+// self-declaration PDF of their own (generateCstepClaimDeclarationPdf) —
+// generated at claim submission and regenerated whenever the invoice-less
+// set changes (routes/cstep.ts ensureClaimDeclaration).
 //
 // Signatures follow the Event Request PDF's rule: the system is the source
 // of truth, so a line prints a text-based DIGITAL signature only once that
@@ -28,6 +34,7 @@
 // can never destabilize the other two. Only the shared TYPES are imported.
 
 import PDFDocument from "pdfkit";
+import crypto from "crypto";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
@@ -90,30 +97,100 @@ function fmtDateRange(from?: string, to?: string): string {
   return f || t || "";
 }
 
+/** NotoSans has no "→" glyph (it prints as a box), so the PDFs say "to". */
+function pdfText(s: string): string {
+  return s.replace(/ → /g, " to ");
+}
+
 function inr(n?: number): string {
   return `₹${(Number(n) || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+/**
+ * The self-declaration statement — on the standalone Declaration form and in
+ * the claim PDF's Declaration section alike.
+ * PLACEHOLDER WORDING — to be confirmed by CSTEP (their exact legal text).
+ */
+export const CLAIM_DECLARATION_TEXT =
+  "I hereby declare that the expenses listed above were genuinely incurred by me for official purposes, and that no bill or invoice is available for them.";
+
+export type CstepClaimDeclarationKind = "TRAVEL" | "FOOD" | "OTHER" | "EXPENSE";
+
 /** One row of the claim's "Declaration (where no supports available)". */
 export interface CstepClaimDeclarationEntry {
-  lineId: string;
+  lineId: string; // the claim line's _id; "otherExpenses" for the Local Travel lump sum
+  kind: CstepClaimDeclarationKind;
   date?: string; // "YYYY-MM-DD"
   particulars: string;
   amount: number;
 }
 
-/** The Declaration: every travel line filed with noBill, in line order. The
- * ONE derivation both this PDF and the claim detail view (GET
- * /requests/:id's claimDeclaration) use, so the two can never disagree. */
-export function localTravelClaimDeclaration(request: Pick<ICstepTravelRequest, "travelLines">): CstepClaimDeclarationEntry[] {
-  return (request.travelLines || [])
-    .filter((l) => l.noBill)
-    .map((l) => ({
-      lineId: String(l._id || ""),
-      date: l.date,
-      particulars: `${MODE_LABELS[l.mode || ""] || "Travel"}: ${[l.from, l.to].filter(Boolean).join(" → ")}${l.remarks ? ` — ${l.remarks}` : ""}`,
-      amount: Number(l.fare) || 0,
-    }));
+/**
+ * The Declaration: every claim item with no bill or invoice attached, in form
+ * order. The ONE derivation the claim PDF's section, the standalone
+ * Declaration form and the claim detail view (GET /requests/:id's
+ * claimDeclaration) all use, so they can never disagree.
+ *   Local Travel — a travel line with no receipt (marked "no bill"), a food
+ *     line with no receipt, and the "Other expenses" amount (it has nowhere
+ *     to attach one).
+ *   Expense — a line with no invoice of its own when the claim has no
+ *     claim-level tax invoice either (submit requires one, so normally none).
+ * Tours / Events: none — their bills are the report legs' documents, which
+ * report/submit requires on every leg.
+ */
+export function claimDeclarationItems(
+  request: Pick<ICstepTravelRequest, "formType" | "travelLines" | "foodLines" | "otherExpenses" | "expenseLines" | "invoiceAttachmentIds">,
+): CstepClaimDeclarationEntry[] {
+  if (request.formType === "LOCAL_TRAVEL_CLAIM") {
+    const travel = (request.travelLines || [])
+      .filter((l) => !l.attachmentId)
+      .map((l) => ({
+        lineId: String(l._id || ""),
+        kind: "TRAVEL" as const,
+        date: l.date,
+        particulars: `${MODE_LABELS[l.mode || ""] || "Travel"}: ${[l.from, l.to].filter(Boolean).join(" → ")}${l.remarks ? ` — ${l.remarks}` : ""}`,
+        amount: Number(l.fare) || 0,
+      }));
+    const food = (request.foodLines || [])
+      .filter((l) => !l.attachmentId)
+      .map((l) => ({
+        lineId: String(l._id || ""),
+        kind: "FOOD" as const,
+        date: l.date,
+        particulars: `Food${l.remarks ? `: ${l.remarks}` : ""}`,
+        amount: Number(l.amount) || 0,
+      }));
+    const other = Number(request.otherExpenses) > 0
+      ? [{ lineId: "otherExpenses", kind: "OTHER" as const, date: undefined, particulars: "Other expenses", amount: Number(request.otherExpenses) }]
+      : [];
+    return [...travel, ...food, ...other];
+  }
+  if (request.formType === "EXPENSE_CLAIM") {
+    if ((request.invoiceAttachmentIds || []).length > 0) return [];
+    return (request.expenseLines || [])
+      .filter((l) => !l.attachmentId)
+      .map((l) => ({
+        lineId: String(l._id || ""),
+        kind: "EXPENSE" as const,
+        date: l.date,
+        particulars: l.description || "Expense",
+        amount: Number(l.amount) || 0,
+      }));
+  }
+  return [];
+}
+
+/** What the Declaration form shows, hashed — the cache key: the form is
+ * regenerated whenever any of it changes (an item added, removed or
+ * re-amounted, the reference issued, the claimant renamed, a resubmission). */
+export function claimDeclarationHash(input: {
+  items: CstepClaimDeclarationEntry[];
+  claimantName: string;
+  claimReference?: string;
+  formType?: string;
+  submittedAt?: string;
+}): string {
+  return crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
 type CstepSignature = { name: string; date: string };
@@ -385,8 +462,8 @@ function generateLocalTravelClaimPdf(
   ]);
   y += 14;
 
-  // Declaration — every travel line filed with no bill.
-  const declaration = localTravelClaimDeclaration(request);
+  // Declaration — every item with no bill (claimDeclarationItems).
+  const declaration = claimDeclarationItems(request);
   if (declaration.length) {
     y = sectionTitle(doc, fb, y, "Declaration (where no supports available)");
     y = drawTable(
@@ -400,23 +477,86 @@ function generateLocalTravelClaimPdf(
         { label: "Particulars", frac: 0.62 },
         { label: "Amount", frac: 0.2, align: "right" },
       ],
-      declaration.map((d, i) => [String(i + 1), fmtDate(d.date), d.particulars, inr(d.amount)]),
+      declaration.map((d, i) => [String(i + 1), fmtDate(d.date), pdfText(d.particulars), inr(d.amount)]),
     );
     y = ensureRoom(doc, y + 6, 30);
     doc
       .font(fn)
       .fontSize(8.5)
       .fillColor("#111111")
-      .text(
-        "I declare that the expenditure listed above was incurred by me on official work and that no supporting documents are available for it.",
-        L,
-        y,
-        { width: CW },
-      );
+      .text(CLAIM_DECLARATION_TEXT, L, y, { width: CW });
     y += 26;
   }
 
   drawClaimSignOff(doc, fn, fb, y, trail);
+
+  doc.end();
+  return promise;
+}
+
+// ── Declaration form (#8) ─────────────────────────────────────────────────────
+
+/** The standalone self-declaration for a claim's items with no bill: the
+ * claim header, the items with their total, the statement, and the
+ * claimant's signature — digital once the claim has been submitted (the
+ * claim PDF's rule), a blank line for wet signing until then. */
+function generateClaimDeclarationPdf(
+  request: ICstepTravelRequest,
+  claimant: CstepTravellerInfo,
+  items: CstepClaimDeclarationEntry[],
+  trail: CstepApprovalTrailEntry[],
+): Promise<Buffer> {
+  const { doc, fn, fb, collect } = makePdf("Declaration — expenses without bills");
+  const promise = collect();
+
+  let y = drawHeaderBlock(doc, fn, fb, M, request, "SELF-DECLARATION — EXPENSES WITHOUT BILLS");
+  y = drawClaimHeaderTable(
+    doc,
+    fn,
+    fb,
+    y,
+    request,
+    claimant,
+    request.formType === "EXPENSE_CLAIM" ? "Project (bill to)" : "Project to be debited",
+  );
+  y += 14;
+
+  y = sectionTitle(doc, fb, y, "Items without a bill or invoice");
+  y = drawTable(
+    doc,
+    fn,
+    fb,
+    y,
+    [
+      { label: "#", frac: 0.05, align: "center" },
+      { label: "Date", frac: 0.13 },
+      { label: "Description", frac: 0.62 },
+      { label: "Amount", frac: 0.2, align: "right" },
+    ],
+    items.map((d, i) => [String(i + 1), d.date ? fmtDate(d.date) : "Claim period", pdfText(d.particulars), inr(d.amount)]),
+  );
+  y = drawTotalsBlock(doc, fn, fb, y + 6, [["Total without bills", inr(items.reduce((s, d) => s + d.amount, 0)), true]]);
+  y += 14;
+
+  y = ensureRoom(doc, y, 60);
+  doc.font(fb).fontSize(10).fillColor("#111111").text("Declaration", L, y);
+  y += 16;
+  doc.font(fn).fontSize(9.5).fillColor("#111111").text(CLAIM_DECLARATION_TEXT, L, y, { width: CW });
+  y = doc.y + 30;
+
+  y = ensureRoom(doc, y, 80);
+  const signed = signatureFromEntry(latestEntryOfAction(trail, "SUBMIT") || latestEntryOfAction(trail, "RESUBMIT"));
+  const colW = Math.round((CW - 24) / 2);
+  const lineY = y + 24;
+  doc.strokeColor("#333333").lineWidth(0.75).moveTo(L, lineY).lineTo(L + colW, lineY).stroke();
+  if (signed) doc.font(fb).fontSize(9.5).fillColor("#091426").text(signed.name, L, lineY - 13, { width: colW, lineBreak: false });
+  doc
+    .font(fn)
+    .fontSize(signed ? 7 : 8)
+    .fillColor(signed ? "#6b7280" : "#333333")
+    .text(signed ? `Digitally signed via CSTEP portal · ${signed.date}` : "Date: ____________________", L, lineY + 4);
+  doc.font(fn).fontSize(8).fillColor("#444444").text(`Signature of the claimant — ${claimant.name}`, L, lineY + 18, { width: colW });
+  doc.font(fn).fontSize(8).fillColor("#444444").text("Place: ____________________", L + colW + 24, lineY + 4, { width: colW });
 
   doc.end();
   return promise;
@@ -571,6 +711,28 @@ function generateExpenseClaimPdf(
     );
   y += 18;
 
+  // Declaration — only if an item has no invoice at all (normally none).
+  const declaration = claimDeclarationItems(request);
+  if (declaration.length) {
+    y = sectionTitle(doc, fb, y, "Declaration (where no supports available)");
+    y = drawTable(
+      doc,
+      fn,
+      fb,
+      y,
+      [
+        { label: "#", frac: 0.05, align: "center" },
+        { label: "Date", frac: 0.13 },
+        { label: "Particulars", frac: 0.62 },
+        { label: "Amount", frac: 0.2, align: "right" },
+      ],
+      declaration.map((d, i) => [String(i + 1), fmtDate(d.date), pdfText(d.particulars), inr(d.amount)]),
+    );
+    y = ensureRoom(doc, y + 6, 30);
+    doc.font(fn).fontSize(8.5).fillColor("#111111").text(CLAIM_DECLARATION_TEXT, L, y, { width: CW });
+    y += 26;
+  }
+
   drawClaimSignOff(doc, fn, fb, y, trail);
   doc.end();
   return promise;
@@ -623,6 +785,34 @@ export async function uploadCstepExpenseClaimPdf(
 ): Promise<{ key: string }> {
   const buf = await generateCstepExpenseClaimPdf(request, claimant, trail, settlement);
   const key = `cstep-claims/${request.workspaceId}/${request._id}/expense-claim-${Date.now()}.pdf`;
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: env.S3_BUCKET,
+      Key: key,
+      Body: buf,
+      ContentType: "application/pdf",
+    }),
+  );
+  return { key };
+}
+
+export function generateCstepClaimDeclarationPdf(
+  request: ICstepTravelRequest,
+  claimant: CstepTravellerInfo,
+  items: CstepClaimDeclarationEntry[],
+  trail: CstepApprovalTrailEntry[],
+): Promise<Buffer> {
+  return generateClaimDeclarationPdf(request, claimant, items, trail);
+}
+
+export async function uploadCstepClaimDeclarationPdf(
+  request: ICstepTravelRequest,
+  claimant: CstepTravellerInfo,
+  items: CstepClaimDeclarationEntry[],
+  trail: CstepApprovalTrailEntry[],
+): Promise<{ key: string }> {
+  const buf = await generateCstepClaimDeclarationPdf(request, claimant, items, trail);
+  const key = `cstep-claims/${request.workspaceId}/${request._id}/declaration-${Date.now()}.pdf`;
   await s3.send(
     new PutObjectCommand({
       Bucket: env.S3_BUCKET,
