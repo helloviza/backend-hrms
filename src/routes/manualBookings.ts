@@ -45,6 +45,7 @@ import ApprovalRequest from "../models/ApprovalRequest.js";
 import { syncRequestFromManualBooking } from "../services/bookingDocuments.js";
 import { isPartnerLeadCase } from "../services/partnerLeadCase.js";
 import { partnerCaseForBooking, partnerRequiredErrors, recordPartnerBookingStatus } from "../services/partnerLeadBooking.js";
+import { isNcLead, ncLeadRequiredErrors } from "../utils/ncLead.js";
 import { countedBookingMatch, countedStatusClause, countsInMetrics } from "../utils/bookingMetrics.js";
 
 const router = express.Router();
@@ -834,7 +835,11 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
     // A partner lead case's booking: supplier / given-by optional until Confirmed (services/partnerLeadBooking.ts).
     const isPartnerBooking = !!linked && isPartnerLeadCase(linked) && String(linked.customerId || "") === String(body.workspaceId);
 
-    const vErrors = partnerRequiredErrors(validateBookingRequired(body), { ...body, status }, isPartnerBooking);
+    // A Not Contactable lead needs only the basics (utils/ncLead.ts); every
+    // other status keeps the full rule set (and the partner relaxation).
+    const vErrors = isNcLead(status, body.subStatus)
+      ? ncLeadRequiredErrors({ ...body, status })
+      : partnerRequiredErrors(validateBookingRequired(body), { ...body, status }, isPartnerBooking);
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
@@ -1984,7 +1989,16 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
     const before = booking.toObject();
     Object.assign(booking, body);
 
-    const vErrors = partnerRequiredErrors(validateBookingRequiredForUpdate(booking, before), booking, !!partnerCase);
+    // Not Contactable lead: the basics only. Moving OFF an NC sub status: the
+    // full create rules, not Option B — an NC lead was allowed to skip fields
+    // that Option B would then never ask for again (utils/ncLead.ts).
+    const vErrors = isNcLead(booking.status, booking.subStatus)
+      ? ncLeadRequiredErrors(booking)
+      : partnerRequiredErrors(
+          isNcLead(before.status, before.subStatus) ? validateBookingRequired(booking) : validateBookingRequiredForUpdate(booking, before),
+          booking,
+          !!partnerCase,
+        );
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
