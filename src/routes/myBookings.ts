@@ -28,7 +28,7 @@ import { CARBON_CALCULATION_VERSION, CARBON_REPORTING_RULE_VERSION } from "../se
 import { countedBookingMatch, CANCELLED_OR_DELETED_MATCH } from "../utils/bookingMetrics.js";
 import Customer from "../models/Customer.js";
 import CustomerMember from "../models/CustomerMember.js";
-import { canCustomerAccessBookingAttachments } from "../utils/bookingCustomerAccess.js";
+import { canCustomerAccessBookingAttachments, customerVisibleAttachments } from "../utils/bookingCustomerAccess.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
 import logger from "../utils/logger.js";
@@ -252,7 +252,8 @@ router.get("/:bookingRef/attachments", async (req: Request, res: Response) => {
       return res.status(404).json({ ok: false, error: "Booking not found" });
     }
 
-    const attachments = (result.booking.attachments || []).map((a: any) => ({
+    // Staff-only ("internal") files never reach a customer; legacy "other" still does.
+    const attachments = customerVisibleAttachments<any>(result.booking.attachments).map((a: any) => ({
       _id: String(a._id),
       type: a.type,
       originalFilename: a.originalFilename,
@@ -282,7 +283,8 @@ router.get("/:bookingRef/attachments/:attId/url", async (req: Request, res: Resp
       return res.status(404).json({ ok: false, error: "Booking not found" });
     }
 
-    const attachment = (result.booking.attachments || []).find(
+    // An "internal" file is not found for a customer, same as an unknown id.
+    const attachment = customerVisibleAttachments<any>(result.booking.attachments).find(
       (a: any) => String(a._id) === req.params.attId,
     );
     if (!attachment) return res.status(404).json({ ok: false, error: "Attachment not found" });

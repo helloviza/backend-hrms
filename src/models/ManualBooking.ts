@@ -64,7 +64,32 @@ export const ATTACHMENT_REQUIRED_TYPES: readonly ManualBookingType[] = [
   "HOTEL", "DUMMY_HOTEL",
 ];
 
-export const MANUAL_BOOKING_TRIP_TYPES = ["ONE_WAY", "ROUND_TRIP", "MULTI_CITY"] as const;
+// Attachment types, and who sees each:
+//   ticket, voucher  customer documents: My Bookings, the request's Documents,
+//                    the "booking done" email, the partner / student tracker.
+//   other            legacy (every upload before the type picker): staff, and
+//                    My Bookings only, exactly as before.
+//   internal         staff only: never on any customer surface.
+// The frontend twin is AttachmentType in services/manualBookings.ts.
+export const ATTACHMENT_TYPES = ["ticket", "voucher", "internal", "other"] as const;
+export type AttachmentType = (typeof ATTACHMENT_TYPES)[number];
+export const isAttachmentType = (v: unknown): v is AttachmentType => (ATTACHMENT_TYPES as readonly string[]).includes(String(v));
+
+/** The customer document type a booking type issues: FLIGHT* / DUMMY_FLIGHT → ticket,
+ * HOTEL* / DUMMY_HOTEL → voucher, else null. Same rule as the admin form's
+ * defaultAttachmentType (frontend services/manualBookings.ts). */
+export const DOCUMENT_BOOKING_TYPE = /^(DUMMY_)?(FLIGHT|HOTEL)/;
+export function documentTypeForBookingType(bookingType: unknown): "ticket" | "voucher" | null {
+  const t = String(bookingType ?? "").trim().toUpperCase().replace(/^DUMMY_/, "");
+  if (t.startsWith("FLIGHT")) return "ticket";
+  if (t.startsWith("HOTEL")) return "voucher";
+  return null;
+}
+
+// Which a customer sees on My Bookings: customerVisibleAttachments in
+// utils/bookingCustomerAccess.ts.
+
+export const MANUAL_BOOKING_TRIP_TYPES =["ONE_WAY", "ROUND_TRIP", "MULTI_CITY"] as const;
 export type ManualBookingTripType = (typeof MANUAL_BOOKING_TRIP_TYPES)[number];
 
 // One flight segment of a multi-leg booking — 1:1 with the ticket's printed
@@ -141,17 +166,20 @@ export interface IManualBooking extends Document {
     passportNo?: string;
     type: "ADULT" | "CHILD" | "INFANT";
   }[];
-  // Uploaded ticket/voucher/other files — see infra/audit/
+  // Uploaded ticket/voucher/internal/other files — see infra/audit/
   // manual-bookings-voucher-upload-audit.md. Metadata only; bytes live in S3
   // under bookings/attachments/<bookingId>/... (utils/s3Upload.ts).
+  // Who sees which type: see ATTACHMENT_TYPES below.
   attachments: {
-    type: "ticket" | "voucher" | "other";
+    type: AttachmentType;
     originalFilename: string;
     s3Key: string;
     size: number;
     mimeType: string;
     uploadedBy: Schema.Types.ObjectId;
     uploadedAt: Date;
+    // Every change of `type` after upload: who and when (staff only).
+    typeChanges?: { from: AttachmentType; to: AttachmentType; by?: Schema.Types.ObjectId; byName?: string; at: Date }[];
   }[];
   // Repeatable invoice-line-item table — Group Booking (Holidays/Events/Group
   // Booking) only, for now. See infra/audit/events-line-items-audit.md. When
@@ -397,13 +425,27 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     ],
     attachments: [
       {
-        type: { type: String, enum: ["ticket", "voucher", "other"], required: true },
+        type: { type: String, enum: ATTACHMENT_TYPES, required: true },
         originalFilename: { type: String, required: true },
         s3Key: { type: String, required: true },
         size: { type: Number, required: true },
         mimeType: { type: String, required: true },
         uploadedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
         uploadedAt: { type: Date, default: Date.now },
+        typeChanges: {
+          type: [
+            {
+              _id: false,
+              from: { type: String, enum: ATTACHMENT_TYPES, required: true },
+              to: { type: String, enum: ATTACHMENT_TYPES, required: true },
+              // Unset for a change a repair script made; byName says which.
+              by: { type: Schema.Types.ObjectId, ref: "User" },
+              byName: { type: String },
+              at: { type: Date, default: Date.now },
+            },
+          ],
+          default: undefined,
+        },
       },
     ],
     lineItems: [

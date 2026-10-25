@@ -9,6 +9,8 @@ import { requirePermission } from "../middleware/requirePermission.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import ManualBooking, {
   ATTACHMENT_REQUIRED_TYPES,
+  ATTACHMENT_TYPES,
+  isAttachmentType,
   isNewModelLineItems,
   MANUAL_BOOKING_TYPES,
   ALL_SUB_STATUSES,
@@ -2169,7 +2171,7 @@ router.post("/:id/restore", requirePermission("manualBookings", "FULL"), async (
   }
 });
 
-/* ── Attachments (ticket/voucher/other) ─────────────────────────────
+/* ── Attachments (ticket/voucher/internal/other) ────────────────────
  * infra/audit/manual-bookings-voucher-upload-audit.md. Every route below
  * uses the SAME two-tier gate: requirePermission() as the coarse module
  * check (matches whatever level view/upload/delete needs), then
@@ -2197,8 +2199,8 @@ router.post(
       }
 
       const type = String(req.body?.type || "").toLowerCase();
-      if (!["ticket", "voucher", "other"].includes(type)) {
-        return res.status(400).json({ error: "type must be one of: ticket, voucher, other" });
+      if (!isAttachmentType(type)) {
+        return res.status(400).json({ error: `type must be one of: ${ATTACHMENT_TYPES.join(", ")}` });
       }
 
       const uploaderId = String(req.user._id || req.user.id || req.user.sub);
@@ -2312,6 +2314,50 @@ router.get(
       res.json({ ok: true, url, expiresIn: env.PRESIGN_TTL });
     } catch (err: any) {
       console.error("[ManualBookings ATTACHMENTS url]", err.message);
+      res.status(500).json({ error: err.message });
+    }
+  },
+);
+
+// PATCH /api/admin/manual-bookings/:id/attachments/:attId — change the type
+// (Ticket / Voucher / Internal / Other). Recorded on the attachment
+// (typeChanges: who, when). A linked request's document list follows through
+// the same sync as an upload: a booked request only gets its list refreshed,
+// never a second "booking done" email.
+router.patch(
+  "/:id/attachments/:attId",
+  requirePermission("manualBookings", "WRITE"),
+  async (req: any, res: any) => {
+    try {
+      const type = String(req.body?.type || "").toLowerCase();
+      if (!isAttachmentType(type)) {
+        return res.status(400).json({ error: `type must be one of: ${ATTACHMENT_TYPES.join(", ")}` });
+      }
+
+      const booking: any = await ManualBooking.findById(req.params.id);
+      if (!booking) return res.status(404).json({ error: "Booking not found" });
+
+      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+        return res.status(403).json({ success: false, message: "Not found" });
+      }
+
+      const attachment = booking.attachments.id(req.params.attId);
+      if (!attachment) return res.status(404).json({ error: "Attachment not found" });
+
+      if (attachment.type === type) return res.json({ ok: true, attachment, requestSync: "none" });
+
+      const changes = Array.isArray(attachment.typeChanges) ? attachment.typeChanges : [];
+      attachment.typeChanges = [
+        ...changes,
+        { from: attachment.type, to: type, by: req.user._id || req.user.sub, byName: personName(req.user), at: new Date() },
+      ];
+      attachment.type = type;
+      await booking.save();
+      const requestSync = await syncRequestFromManualBooking(booking, req.user);
+
+      res.json({ ok: true, attachment, requestSync });
+    } catch (err: any) {
+      console.error("[ManualBookings ATTACHMENTS type]", err.message);
       res.status(500).json({ error: err.message });
     }
   },

@@ -68,3 +68,12 @@ export function canCustomerAccessBookingAttachments(
   const passengers = Array.isArray(booking.passengers) ? booking.passengers : [];
   return passengers.some((p) => String(p?.email || "").trim().toLowerCase() === email);
 }
+
+/**
+ * Which of an accessible booking's attachments a customer sees: every type
+ * but "internal" (staff only — models/ManualBooking.ts ATTACHMENT_TYPES).
+ * Legacy "other" files stay visible, exactly as before the types existed.
+ */
+export function customerVisibleAttachments<T extends { type?: unknown }>(list: T[] | null | undefined): T[] {
+  return (Array.isArray(list) ? list : []).filter((a) => String(a?.type ?? "").toLowerCase() !== "internal");
+}

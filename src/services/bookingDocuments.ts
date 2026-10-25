@@ -6,8 +6,9 @@
 //   • Which files: the ticket / voucher attachments of the manual booking that
 //     completed the request (meta.bookingDocuments, bytes in S3), and files ops
 //     uploaded on the queue's old Mark Processed (meta.attachments, kind
-//     "admin_pdf", local disk). Never a manual booking's "other" (internal)
-//     files and never proposal option PDFs (supplier quotes, staff only).
+//     "admin_pdf", local disk). Never a manual booking's "internal" or
+//     legacy "other" files and never proposal option PDFs (supplier quotes,
+//     staff only).
 //   • Who: requestDocumentsVisibleTo — Travel Desk staff inside their queue
 //     scope, the requester, the approver, and Workspace Leaders of the
 //     request's own company. Everyone else gets 404 (not 403: a request of
