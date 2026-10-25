@@ -243,6 +243,10 @@ describe("Tally settings — CSTEP Admin only", () => {
     expect(r.settings).toEqual({
       companyName: "", voucherType: "Journal", defaultLedger: "", ledgerMap: [],
       locationLabel: "Locations", locationSource: "BASE", locationMap: [],
+      reimbursement: {
+        defaultLedger: "", categoryLedgerMap: [], taxLedger: "", advanceLedger: "",
+        employeeLedgerMode: "CONTROL", controlLedger: "Staff Reimbursement Payable", employeeLedgerName: "NAME_AND_ID",
+      },
     });
     expect(r.vendorTypes.map((t: any) => t.name)).toEqual(["Airline", "Hotel", "Venue"]);
     // Base = travellers' work locations; destination = event location, an

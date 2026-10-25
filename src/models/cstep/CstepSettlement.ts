@@ -79,6 +79,10 @@ export interface ICstepSettlement extends Document {
   paymentRef?: string;
   paymentSource?: "MANUAL" | "IMPORT";
   paymentBatchId?: mongoose.Types.ObjectId;
+  // Finance-a Stage 2: the reimbursement journal's Tally voucher number, from
+  // the TALLY series the vendor lines also use (routes/cstep.tally.ts). It is
+  // taken at the case's first export and kept after that.
+  tallyVoucherNo?: number;
 
   // Finance-c — Finance's own changes while the case is with it (reduce,
   // disallow, per-diem deduction; routes/cstep.ts runFinanceAdjustment).
@@ -149,6 +153,7 @@ const CstepSettlementSchema = new Schema<ICstepSettlement>(
     paymentRef: { type: String, trim: true },
     paymentSource: { type: String, enum: ["MANUAL", "IMPORT"] },
     paymentBatchId: { type: Schema.Types.ObjectId },
+    tallyVoucherNo: { type: Number },
 
     financeRevision: { type: Number },
     financeClosedAt: { type: Date },
