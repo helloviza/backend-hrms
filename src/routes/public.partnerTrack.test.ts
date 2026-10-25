@@ -241,7 +241,7 @@ describe("the student's cases", () => {
     expect(r.status).toBe(200);
     expect(r.body.cases.map((c: any) => c.caseNumber).sort()).toEqual(["PL-AAAAA2", "PL-AAAAA3"]);
     const one = r.body.cases.find((c: any) => c.caseNumber === "PL-AAAAA2");
-    expect(one.currentStep).toMatchObject({ label: "Pending", subStatus: "Lead Not Contactable" });
+    expect(one.currentStep).toMatchObject({ state: "in_progress", label: "In progress", subStatus: "Lead Not Contactable" });
     expect(one.rmName).toBe("Rita Menon");
     expect(one.documents).toEqual([{ service: "Flight", ticketIssued: true, voucherIssued: false, documentIssued: false }]);
     const keys = keysDeep(r.body);

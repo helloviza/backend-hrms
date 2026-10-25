@@ -13,17 +13,27 @@
 //   GET  /api/public/partner-track/cases?code=   header X-Partner-Track-Token
 //        that student's cases with that partner, from the partner tracker's
 //        allowlist — no prices, no contact details, no other student or partner
+//        — plus each case's customer documents (id, name, type)
+//   POST /api/public/partner-track/document-link?code=  header X-Partner-Track-Token
+//        {caseNumber, fileId} → a signed 5-minute download path for one of
+//        the student's own ticket / voucher / document files
+//   GET  /api/public/partner-track/document?code=&t=
+//        the file, streamed through the API (attachment, no-store); expired,
+//        tampered or another partner's link → 404; a staff-only audit row
 //
 // An unknown or inactive link is the same 404 as on the request routes.
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { partnerTrackCasesLimiter, partnerTrackRequestLimiter, partnerTrackVerifyLimiter } from "../middleware/rateLimit.js";
+import { partnerTrackCasesLimiter, partnerTrackDocumentLimiter, partnerTrackRequestLimiter, partnerTrackVerifyLimiter } from "../middleware/rateLimit.js";
 import { createTurnstileGate } from "../middleware/turnstile.js";
 import { isEmail } from "../services/approvalItemRules.js";
 import { resolveActivePartnerLink } from "../services/partnerIntake.create.js";
 import { sendPartnerTrackCode } from "../services/partnerTrack.email.js";
 import {
+  createStudentFileLink,
   normEmail,
+  openStudentFileLink,
   readTrackToken,
+  TrackFileError,
   requestTrackCode,
   studentCases,
   TRACK_TOKEN_HEADER,
@@ -102,6 +112,44 @@ router.get("/partner-track/cases", partnerTrackCasesLimiter, linkGate, async (re
     return res.json({ ok: true, cases });
   } catch (err) {
     log.error("track cases failed", { error: err instanceof Error ? err.message : String(err) });
+    return res.status(500).json({ error: "Something went wrong. Please try again shortly." });
+  }
+});
+
+router.post("/partner-track/document-link", partnerTrackDocumentLimiter, linkGate, async (req: Request, res: Response) => {
+  const scope = readTrackToken(req.get(TRACK_TOKEN_HEADER));
+  const { workspace } = (req as any).partnerLink;
+  if (!scope || scope.partnerWorkspaceId !== String(workspace._id)) {
+    return res.status(401).json({ error: "Your session has ended. Enter your email again.", code: "TRACK_TOKEN_INVALID" });
+  }
+  try {
+    const b: any = req.body || {};
+    const t = await createStudentFileLink(scope, String(workspace.customerId), String(b.caseNumber || ""), String(b.fileId || ""));
+    const code = String((req.query.code ?? b.code) || "");
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ ok: true, path: `/public/partner-track/document?code=${encodeURIComponent(code)}&t=${encodeURIComponent(t)}` });
+  } catch (err) {
+    if (err instanceof TrackFileError) return res.status(err.status).json({ error: err.message, code: err.code });
+    log.error("track document link failed", { error: err instanceof Error ? err.message : String(err) });
+    return res.status(500).json({ error: "Something went wrong. Please try again shortly." });
+  }
+});
+
+router.get("/partner-track/document", partnerTrackDocumentLimiter, linkGate, async (req: Request, res: Response) => {
+  const { workspace } = (req as any).partnerLink;
+  try {
+    const file = await openStudentFileLink(req.query.t, String(workspace._id), String(workspace.customerId));
+    if (!file) return res.status(404).json({ error: "This download link has expired. Open your case again to get a new one.", code: "LINK_INVALID" });
+    const { getObjectBuffer } = await import("../utils/s3Upload.js");
+    const bytes = await getObjectBuffer(file.s3Key);
+    const safeName = file.filename.replace(/[^\w.\- ()]+/g, "_");
+    res.setHeader("Content-Type", file.mime);
+    res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+    res.setHeader("Cache-Control", "no-store");
+    log.info("track document downloaded");
+    return res.send(bytes);
+  } catch (err) {
+    log.error("track document failed", { error: err instanceof Error ? err.message : String(err) });
     return res.status(500).json({ error: "Something went wrong. Please try again shortly." });
   }
 });

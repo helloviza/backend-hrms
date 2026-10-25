@@ -229,10 +229,11 @@ describe("steps, current step and counts", () => {
     expect(cur("queued")).toEqual(["In Admin Queue", "", "pendingAction"]);
     expect(cur("assigned")).toEqual(["Assigned to RM", "", "pendingAction"]);
     expect(cur("started")).toEqual(["Work started", "", "inProgress"]); // the foreign booking doesn't count
-    expect(cur("pending")).toEqual(["Pending", "Lead Not Contactable", "inProgress"]);
-    expect(cur("done")).toEqual(["Done", "", "actioned"]);
-    expect(cur("closed")).toEqual(["Closed", "", "actioned"]);
-    expect(cur("allCancelled")).toEqual(["Cancelled", "Lead Not Contactable", "actioned"]);
+    expect(cur("pending")).toEqual(["In progress", "Lead Not Contactable", "inProgress"]);
+    expect(cur("done")).toEqual(["Booking processed", "", "actioned"]);
+    // Closed by ops: a free-text closedReason is never shown (only a known reason's label is).
+    expect(cur("closed")).toEqual(["Request closed", "", "actioned"]);
+    expect(cur("allCancelled")).toEqual(["Request cancelled", "Lead Not Contactable", "actioned"]);
     expect(of(m, "assigned").rmName).toBe("Rita Menon");
     expect(of(m, "queued").rmName).toBe("");
   });
@@ -240,10 +241,10 @@ describe("steps, current step and counts", () => {
   it("step history: case steps, then each booking Status / Sub Status", async () => {
     const m = await byNumber();
     expect(of(m, "pending").steps.map((s: any) => [s.label, s.subStatus])).toEqual([
-      ["Case created", ""], ["In Admin Queue", ""], ["Assigned to RM", ""], ["Work started", ""], ["Pending", ""], ["Pending", "Lead Not Contactable"],
+      ["Case created", ""], ["In Admin Queue", ""], ["Assigned to RM", ""], ["Work started", ""], ["In progress", ""], ["In progress", "Lead Not Contactable"],
     ]);
-    expect(of(m, "done").steps.map((s: any) => s.label)).toEqual(["Case created", "In Admin Queue", "Assigned to RM", "Work started", "Pending", "Done"]);
-    expect(of(m, "closed").steps.map((s: any) => s.label)).toEqual(["Case created", "In Admin Queue", "Assigned to RM", "Closed"]);
+    expect(of(m, "done").steps.map((s: any) => s.label)).toEqual(["Case created", "In Admin Queue", "Assigned to RM", "Work started", "In progress", "Booking processed"]);
+    expect(of(m, "closed").steps.map((s: any) => s.label)).toEqual(["Case created", "In Admin Queue", "Assigned to RM", "Request closed"]);
     for (const s of of(m, "pending").steps) expect(typeof s.at).toBe("string");
   });
 

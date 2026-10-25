@@ -134,4 +134,6 @@ export const CUSTOMER_HIDDEN_ACTIONS = new Set([
   "admin_notify_queued",
   "email_skipped",
   "admin_attachment_uploaded",
+  // A partner lead student downloaded a document (Track my case) — staff audit only.
+  "student_document_downloaded",
 ]);

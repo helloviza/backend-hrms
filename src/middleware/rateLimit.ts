@@ -471,6 +471,16 @@ export const partnerTrackVerifyLimiter = rateLimit({
   message: { success: false, message: 'Too many requests, please try again later.' },
 });
 
+/** Track my case documents: the signed link and the download, per IP. */
+export const partnerTrackDocumentLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || "unknown"),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests, please try again later.' },
+});
+
 export const partnerTrackCasesLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 60,

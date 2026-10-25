@@ -13,28 +13,62 @@
 //   Never out: the student's phone or email, staff notes or comments, any
 //        price / cost / margin / partner share, supplier, ids, emails of staff.
 //
-// Steps: Case created → In Admin Queue → Assigned to RM (name) → Work started
-// → the bookings' Status / Sub Status (Pending – <sub>, WIP, Done, Cancelled –
-// <sub>), from the case history; Closed when ops close the case.
+// Steps (the timeline): Case created → In Admin Queue → Assigned to RM (name)
+// → Work started, then the bookings' status changes from the case history,
+// and "Request closed" when ops close the case.
+//
+// Every label comes from TRACKER_LABEL below — the ONE map both trackers
+// show (partner Student Cases and the student's Track my case render these
+// strings as sent). Each step also carries its machine `state`, which the
+// screens use for colour and empty states (never the wording):
+//   created / queued / assigned / started   the case steps, unchanged
+//   in_progress   a booking Pending (with its sub status) or WIP
+//   processed     "Booking processed": a booking Confirmed / Invoiced, or
+//                 the case marked done without one
+//   cancelled     "Request cancelled": every booking cancelled (sub status)
+//   closed        "Request closed": ops closed the case (Mark Processed /
+//                 cancel) with no booking left — the close reason's label,
+//                 never the note ops typed
 //
 // Current step and the counts come from the live state: the case's bookings
-// (bookingRollup: most advanced open booking; Done only when none is open;
-// Closed when all are cancelled), else the case itself.
+// (bookingRollup: most advanced open booking; processed only when none is
+// open; cancelled when all are), else the case itself.
 //   Registered     every case
-//   Pending action not yet started (In Admin Queue / Assigned to RM)
-//   In progress    started, and a booking Pending / WIP (or none yet)
-//   Actioned       Done, or Cancelled / closed
+//   Pending action not yet started (queued / assigned)
+//   In progress    started, or a booking in progress
+//   Actioned       processed, cancelled or closed
 // Every case is in exactly one of the last three, so they sum to Registered.
 import { itemDates, itemTitle, serviceOf } from "./approvalItemRules.js";
-import { BOOKING_STATUS_LABEL, bookingRollup } from "./partnerLeadBooking.js";
+import { bookingRollup } from "./partnerLeadBooking.js";
 import { CUSTOMER_DOCUMENT_TYPES, documentTypeForBookingType } from "../models/ManualBooking.js";
+import { CLOSE_REASONS } from "./closeReasons.js";
 
 type AnyObj = Record<string, any>;
 const str = (v: any, max = 200) => String(v ?? "").trim().slice(0, max);
 const iso = (v: any) => (v ? new Date(v).toISOString() : null);
 
 export type Bucket = "pendingAction" | "inProgress" | "actioned";
-export type TrackerStep = { label: string; subStatus: string; at: string | null };
+export type TrackerState = "created" | "queued" | "assigned" | "started" | "in_progress" | "processed" | "cancelled" | "closed";
+export type TrackerStep = { state: TrackerState; label: string; subStatus: string; at: string | null };
+
+/** The tracker's wording, for both trackers. */
+export const TRACKER_LABEL: Record<TrackerState, string> = {
+  created: "Case created",
+  queued: "In Admin Queue",
+  assigned: "Assigned to RM",
+  started: "Work started",
+  in_progress: "In progress",
+  processed: "Booking processed",
+  cancelled: "Request cancelled",
+  closed: "Request closed",
+};
+
+/** A booking status → its tracker state (unknown statuses read as in progress). */
+const BOOKING_STATE: Record<string, TrackerState> = { PENDING: "in_progress", WIP: "in_progress", CONFIRMED: "processed", INVOICED: "processed", CANCELLED: "cancelled" };
+/** Booking statuses whose sub status the tracker shows. */
+const SHOWS_SUB = new Set(["PENDING", "CANCELLED"]);
+
+const step = (state: TrackerState, at: string | null, subStatus = ""): TrackerStep => ({ state, label: TRACKER_LABEL[state], subStatus, at });
 
 const SERVICE_LABEL: Record<string, string> = { flight: "Flight", hotel: "Hotel", visa: "Visa", cab: "Cab", forex: "Forex", esim: "eSIM", holiday: "Holiday", mice: "MICE" };
 const BOOKING_TYPE_LABEL: Record<string, string> = { FLIGHT: "Flight", HOTEL: "Hotel", VISA: "Visa" };
@@ -45,31 +79,36 @@ const CLOSED = new Set(["admin_cancelled", "admin_closed"]);
 
 /** The fields the tracker reads, for the query's projection. */
 export const TRACKER_CASE_FIELDS =
-  "_id createdAt adminState stage ticketId meta.source meta.partnerLead.caseNumber meta.partnerLead.contact.name " +
+  "_id createdAt adminState stage ticketId meta.source meta.closedReason meta.partnerLead.caseNumber meta.partnerLead.contact.name " +
   "cartItems.type cartItems.meta history.action history.at history.assigneeName history.bookingStatus history.bookingSubStatus";
 
 function caseClosed(c: AnyObj): boolean {
   return str(c.adminState) === "cancelled" || str(c.stage).toUpperCase() === "BOOKING_CANCELLED" || (c.history || []).some((h: AnyObj) => CLOSED.has(str(h?.action)));
 }
 
+/** Why ops closed the case, customer-safe ("Not available"), or "": Mark Processed's reason only. */
+function closeReason(c: AnyObj, action: string): string {
+  return action === "admin_closed" ? str(CLOSE_REASONS[str(c.meta?.closedReason).toUpperCase()], 80) : "";
+}
+
 export function stepHistory(c: AnyObj): TrackerStep[] {
   const history: AnyObj[] = Array.isArray(c.history) ? c.history : [];
   const hasBookingRows = history.some((h) => h?.action === "booking_status");
-  const steps: TrackerStep[] = [{ label: "Case created", subStatus: "", at: iso(c.createdAt) }];
+  const steps: TrackerStep[] = [step("created", iso(c.createdAt))];
   let started = false;
   for (const h of history) {
     const action = str(h?.action);
     const at = iso(h?.at);
-    if (action === "approved") steps.push({ label: "In Admin Queue", subStatus: "", at });
-    else if (ASSIGN.has(action)) steps.push({ label: "Assigned to RM", subStatus: "", at });
+    if (action === "approved") steps.push(step("queued", at));
+    else if (ASSIGN.has(action)) steps.push(step("assigned", at));
     else if (STARTED.has(action) && !started) {
       started = true;
-      steps.push({ label: "Work started", subStatus: "", at });
+      steps.push(step("started", at));
     } else if (action === "booking_status") {
       const status = str(h.bookingStatus).toUpperCase();
-      steps.push({ label: BOOKING_STATUS_LABEL[status] || "Updated", subStatus: status === "PENDING" || status === "CANCELLED" ? str(h.bookingSubStatus, 80) : "", at });
-    } else if (action === "admin_done" && !hasBookingRows) steps.push({ label: "Done", subStatus: "", at });
-    else if (CLOSED.has(action)) steps.push({ label: "Closed", subStatus: "", at });
+      steps.push(step(BOOKING_STATE[status] || "in_progress", at, SHOWS_SUB.has(status) ? str(h.bookingSubStatus, 80) : ""));
+    } else if (action === "admin_done" && !hasBookingRows) steps.push(step("processed", at));
+    else if (CLOSED.has(action)) steps.push(step("closed", at, closeReason(c, action)));
   }
   return steps;
 }
@@ -81,34 +120,43 @@ function rmName(c: AnyObj): string {
   return last && str(last.action) !== "admin_unassigned" ? str(last.assigneeName, 80) : "";
 }
 
+const BUCKET: Record<TrackerState, Bucket> = {
+  created: "pendingAction",
+  queued: "pendingAction",
+  assigned: "pendingAction",
+  started: "inProgress",
+  in_progress: "inProgress",
+  processed: "actioned",
+  cancelled: "actioned",
+  closed: "actioned",
+};
+
 /** Current step + its bucket, from the live bookings, else the case. */
 export function currentStep(c: AnyObj, bookings: AnyObj[]): { step: TrackerStep; bucket: Bucket } {
   const history: AnyObj[] = Array.isArray(c.history) ? c.history : [];
   const last = (pred: (h: AnyObj) => boolean) => [...history].reverse().find(pred);
   const r = bookingRollup(bookings);
+  const of = (s: TrackerStep) => ({ step: s, bucket: BUCKET[s.state] });
   if (caseClosed(c)) {
+    // Every booking cancelled → the bookings say why; otherwise ops closed it.
+    if (r.state === "closed") return of(step("cancelled", iso(r.at), str(r.subStatus, 80)));
     const row = last((h) => CLOSED.has(str(h?.action)));
-    return { step: { label: "Closed", subStatus: "", at: iso(row?.at) }, bucket: "actioned" };
+    return of(step("closed", iso(row?.at), closeReason(c, str(row?.action))));
   }
   if (r.state !== "none") {
-    const step = {
-      label: BOOKING_STATUS_LABEL[r.status] || "Updated",
-      subStatus: r.state === "pending" || r.state === "closed" ? str(r.subStatus, 80) : "",
-      at: iso(r.at),
-    };
-    return { step, bucket: r.state === "done" || r.state === "closed" ? "actioned" : "inProgress" };
+    if (r.state === "done") return of(step("processed", iso(r.at)));
+    if (r.state === "closed") return of(step("cancelled", iso(r.at), str(r.subStatus, 80)));
+    return of(step("in_progress", iso(r.at), r.state === "pending" ? str(r.subStatus, 80) : ""));
   }
   if (str(c.adminState) === "done" || str(c.stage).toUpperCase() === "COMPLETED") {
-    return { step: { label: "Done", subStatus: "", at: iso(last((h) => h?.action === "admin_done")?.at) }, bucket: "actioned" };
+    return of(step("processed", iso(last((h) => h?.action === "admin_done")?.at)));
   }
   const started = history.find((h) => STARTED.has(str(h?.action)));
-  if (started || str(c.adminState) === "in_progress") {
-    return { step: { label: "Work started", subStatus: "", at: iso(started?.at) }, bucket: "inProgress" };
-  }
+  if (started || str(c.adminState) === "in_progress") return of(step("started", iso(started?.at)));
   const assigned = last((h) => ASSIGN.has(str(h?.action)));
-  if (assigned && rmName(c)) return { step: { label: "Assigned to RM", subStatus: "", at: iso(assigned.at) }, bucket: "pendingAction" };
+  if (assigned && rmName(c)) return of(step("assigned", iso(assigned.at)));
   const queued = history.find((h) => h?.action === "approved");
-  return { step: { label: "In Admin Queue", subStatus: "", at: iso(queued?.at || c.createdAt) }, bucket: "pendingAction" };
+  return of(step("queued", iso(queued?.at || c.createdAt)));
 }
 
 /** One case as the partner sees it. `bookings` are the case's live bookings. */

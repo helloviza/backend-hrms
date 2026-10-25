@@ -81,6 +81,7 @@ import { checkCartItems, CartItemError } from "../services/approvalCartItems.js"
 import { inboxBucket, requesterProfiles } from "../services/approvalInbox.js";
 import { dateRangeOr400, withDateRange } from "../utils/dateRange.js";
 import { withRequestBookings } from "../services/requestBookings.js";
+import { CLOSE_REASONS } from "../services/closeReasons.js";
 
 import {
   sumBookingAmount,
@@ -1597,12 +1598,7 @@ router.put("/admin/:id/done", requireApprovalsAdminWrite, async (req: AnyObj, re
  * here: saving the manual booking as Done completes the request
  * (services/bookingDocuments.ts).
  */
-export const CLOSE_REASONS: Record<string, string> = {
-  CANCELLED_BY_CLIENT: "Cancelled by the client",
-  NOT_AVAILABLE: "Not available",
-  DUPLICATE: "Duplicate request",
-  HANDLED_ELSEWHERE: "Handled outside Plumbox",
-};
+export { CLOSE_REASONS }; // services/closeReasons.ts (the tracker reads them too)
 
 router.put("/admin/:id/close", requireApprovalsAdminWrite, async (req: AnyObj, res, next) => {
   try {

@@ -8,7 +8,13 @@
 //   2. verify — the code in, a short-lived track token out (30 min), scoped
 //      to {emailHash, partnerWorkspaceId};
 //   3. cases — the token in, that student's cases with that partner only,
-//      built by the partner tracker's own allowlist (partnerLeadTracker.ts).
+//      built by the partner tracker's own allowlist (partnerLeadTracker.ts),
+//      plus — for the student only, never the partner — each case's customer
+//      documents (ticket / voucher / document): id, name, type, service;
+//   4. a document — the token + a case number + a file id in, a signed link
+//      out (5 minutes, its own key, bound to the student, the partner, the
+//      case and the file); the link streams the file through the API (never a
+//      bucket URL) and writes a staff-only audit row on the case.
 //
 // The track token is NOT a session: it is signed with its own key (derived,
 // never JWT_SECRET itself, so requireAuth can never accept it), carries no
@@ -22,6 +28,7 @@ import PartnerTrackOtp from "../models/PartnerTrackOtp.js";
 import { bookingsOfCases } from "./partnerLeadBooking.js";
 import { PARTNER_LINK_SOURCE } from "./partnerLeadCase.js";
 import { TRACKER_CASE_FIELDS, trackerRow } from "./partnerLeadTracker.js";
+import ManualBooking, { CUSTOMER_DOCUMENT_TYPES } from "../models/ManualBooking.js";
 import { emailHash, normEmail, trackHmac, trackSalt } from "./partnerTrackHash.js";
 
 export { emailHash, normEmail };
@@ -36,6 +43,10 @@ export const TRACK_TOKEN_HEADER = "x-partner-track-token";
 
 const codeHash = (otpScope: string, code: string) => trackHmac("partner-track-code", `${otpScope}:${code}`);
 const tokenKey = () => crypto.createHash("sha256").update(`partner-track-token:${trackSalt()}`).digest("hex");
+// The document link's own key: a track token is never a document link, nor the other way round.
+const fileLinkKey = () => crypto.createHash("sha256").update(`partner-track-file:${trackSalt()}`).digest("hex");
+export const FILE_LINK_TTL_S = 5 * 60;
+export const STUDENT_DOWNLOAD_ACTION = "student_document_downloaded";
 
 export function newCode(): string {
   return String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
@@ -149,10 +160,123 @@ export function readTrackToken(token: any): { emailHash: string; partnerWorkspac
 
 /* ───────────────────────── the student's cases ───────────────────────── */
 
+export type StudentFile = { id: string; name: string; type: "Ticket" | "Voucher" | "Document"; service: string };
+
+const FILE_TYPE_LABEL: Record<string, StudentFile["type"]> = { ticket: "Ticket", voucher: "Voucher", document: "Document" };
+const SERVICE_OF_TYPE: Record<string, string> = { FLIGHT: "Flight", HOTEL: "Hotel", VISA: "Visa" };
+
+/**
+ * The live bookings of these cases WITH their customer documents' names (the
+ * partner tracker's bookingsOfCases reads types only — the partner never gets
+ * a name). Same scope: the case's own customer, Book Now bookings, not deleted.
+ */
+async function caseBookingsWithFiles(customerId: string, caseIds: any[]): Promise<AnyObj[]> {
+  if (!mongoose.isValidObjectId(customerId) || !caseIds.length) return [];
+  return ManualBooking.find({
+    workspaceId: new mongoose.Types.ObjectId(customerId),
+    source: "ADMIN_QUEUE",
+    sourceBookingId: { $in: caseIds.map((id) => new mongoose.Types.ObjectId(String(id))) },
+    isActive: { $ne: false },
+  })
+    .select("_id sourceBookingId type status subStatus isActive updatedAt bookingRef attachments._id attachments.type attachments.originalFilename attachments.s3Key attachments.mimeType")
+    .lean();
+}
+
+/** A booking's customer documents as the student sees them (never internal / other, never a key). */
+function studentFilesOf(bookings: AnyObj[]): StudentFile[] {
+  const out: StudentFile[] = [];
+  for (const b of bookings) {
+    for (const a of Array.isArray(b.attachments) ? b.attachments : []) {
+      const t = String(a?.type ?? "").toLowerCase();
+      if (!CUSTOMER_DOCUMENT_TYPES.has(t) || !a?._id) continue;
+      out.push({
+        id: String(a._id),
+        name: String(a.originalFilename || "document.pdf").slice(0, 120),
+        type: FILE_TYPE_LABEL[t],
+        service: SERVICE_OF_TYPE[String(b.type ?? "").toUpperCase().replace(/^DUMMY_/, "").replace(/_.*/, "")] || "Other",
+      });
+    }
+  }
+  return out;
+}
+
 export async function studentCases(scope: { emailHash: string; partnerWorkspaceId: string }, customerId: string) {
   const cases = await casesFor(new mongoose.Types.ObjectId(scope.partnerWorkspaceId), customerId, scope.emailHash);
-  const bookings = await bookingsOfCases(customerId, cases.map((c) => c._id));
+  const bookings = await caseBookingsWithFiles(customerId, cases.map((c) => c._id));
   const byCase = new Map<string, AnyObj[]>();
   for (const b of bookings) byCase.set(String(b.sourceBookingId), [...(byCase.get(String(b.sourceBookingId)) || []), b]);
-  return cases.map((c) => trackerRow(c, byCase.get(String(c._id)) || []));
+  // The tracker row is the partner's allowlist, unchanged; the student also gets the files.
+  return cases.map((c) => {
+    const own = byCase.get(String(c._id)) || [];
+    return { ...trackerRow(c, own), files: studentFilesOf(own) };
+  });
+}
+
+/* ───────────────────────── a document ───────────────────────── */
+
+export class TrackFileError extends Error {
+  constructor(public status: number, public code: string, message: string) {
+    super(message);
+  }
+}
+
+/** The student's own case and one of its customer documents, re-checked from the database. */
+async function findStudentFile(scope: { emailHash: string; partnerWorkspaceId: string }, customerId: string, match: { caseNumber?: string; caseId?: string }, fileId: string) {
+  const cases = await casesFor(new mongoose.Types.ObjectId(scope.partnerWorkspaceId), customerId, scope.emailHash);
+  const kase = cases.find((c) =>
+    match.caseId ? String(c._id) === match.caseId : String(c.meta?.partnerLead?.caseNumber || c.ticketId || "").toUpperCase() === String(match.caseNumber || "").toUpperCase(),
+  );
+  if (!kase || !mongoose.isValidObjectId(fileId)) return null;
+  for (const b of await caseBookingsWithFiles(customerId, [kase._id])) {
+    const a = (b.attachments || []).find((x: AnyObj) => String(x?._id) === fileId);
+    if (a && CUSTOMER_DOCUMENT_TYPES.has(String(a.type ?? "").toLowerCase()) && a.s3Key) {
+      return { kase, booking: b, file: a };
+    }
+  }
+  return null;
+}
+
+/** A signed, 5-minute link to one of the student's own documents (404 for anything else). */
+export async function createStudentFileLink(scope: { emailHash: string; partnerWorkspaceId: string }, customerId: string, caseNumber: string, fileId: string): Promise<string> {
+  const found = await findStudentFile(scope, customerId, { caseNumber }, String(fileId || ""));
+  if (!found) throw new TrackFileError(404, "FILE_NOT_FOUND", "That document isn't available.");
+  return jwt.sign(
+    { eh: scope.emailHash, ws: scope.partnerWorkspaceId, c: String(found.kase._id), a: String(found.file._id) },
+    fileLinkKey(),
+    { expiresIn: FILE_LINK_TTL_S, audience: "partner-track-file" },
+  );
+}
+
+/**
+ * The file a signed link names — re-checked now (the case still the student's,
+ * the booking still live, the file still a customer document) — with a
+ * staff-only audit row on the case. Null when the link is expired, tampered,
+ * for another partner, or the file is gone.
+ */
+export async function openStudentFileLink(link: any, partnerWorkspaceId: string, customerId: string): Promise<{ s3Key: string; filename: string; mime: string } | null> {
+  let p: any;
+  try {
+    p = jwt.verify(String(link ?? ""), fileLinkKey(), { audience: "partner-track-file" });
+  } catch {
+    return null;
+  }
+  if (typeof p?.eh !== "string" || String(p?.ws) !== String(partnerWorkspaceId) || !mongoose.isValidObjectId(String(p?.c))) return null;
+  const found = await findStudentFile({ emailHash: p.eh, partnerWorkspaceId: String(p.ws) }, customerId, { caseId: String(p.c) }, String(p.a || ""));
+  if (!found) return null;
+  const filename = String(found.file.originalFilename || "document.pdf");
+  await ApprovalRequest.updateOne(
+    { _id: found.kase._id },
+    {
+      $push: {
+        history: {
+          action: STUDENT_DOWNLOAD_ACTION,
+          at: new Date(),
+          by: "student",
+          actorKind: "system",
+          comment: `The student downloaded ${filename} (${String(found.booking.bookingRef || "booking")})`,
+        },
+      },
+    } as any,
+  ).exec();
+  return { s3Key: String(found.file.s3Key), filename, mime: String(found.file.mimeType || "application/pdf") };
 }
