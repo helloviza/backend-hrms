@@ -2,6 +2,7 @@
 import mongoose, { Schema, type Document, type Model } from "mongoose";
 import { workspaceScopePlugin } from "../../plugins/workspaceScope.plugin.js";
 import { CSTEP_SERVICE_TYPES, type CstepServiceType } from "./CstepArrangement.js";
+import { CSTEP_EXPENSE_CATEGORIES, type CstepExpenseCategory } from "./expenseCategories.js";
 
 /**
  * CstepSettlementLine
@@ -70,6 +71,13 @@ export interface ICstepSettlementLine extends Document {
   financeRejectedBy?: mongoose.Types.ObjectId; // ref User
   financeRejectedAt?: Date;
 
+  /** Finance a+b — what the amount was for (expenseCategories.ts), set when
+   * the line is created from its source; absent on lines created before it
+   * until the backfill sets it. itemDate is the expense's own date
+   * (YYYY-MM-DD) — the report leg's or the claim line's — when it has one. */
+  category?: CstepExpenseCategory;
+  itemDate?: string;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -104,6 +112,9 @@ const CstepSettlementLineSchema = new Schema<ICstepSettlementLine>(
     financeRejectedReason: { type: String, trim: true },
     financeRejectedBy: { type: Schema.Types.ObjectId, ref: "User" },
     financeRejectedAt: { type: Date },
+
+    category: { type: String, enum: CSTEP_EXPENSE_CATEGORIES },
+    itemDate: { type: String },
   },
   { timestamps: true },
 );

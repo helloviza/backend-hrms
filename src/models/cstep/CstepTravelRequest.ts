@@ -1,6 +1,7 @@
 // apps/backend/src/models/cstep/CstepTravelRequest.ts
 import mongoose, { Schema, type Document } from "mongoose";
 import { workspaceScopePlugin } from "../../plugins/workspaceScope.plugin.js";
+import { CSTEP_EXPENSE_LINE_HEADS, type CstepExpenseLineHead } from "./expenseCategories.js";
 
 /**
  * CstepTravelRequest
@@ -100,6 +101,7 @@ export interface ICstepClaimExpenseLine {
   description?: string;
   amount?: number; // INR, before tax
   attachmentId?: mongoose.Types.ObjectId; // ref CstepAttachment — the line's invoice, optional when a claim-level invoice exists
+  category?: CstepExpenseLineHead; // the expense head the claimant picked (Finance a+b); absent on lines filed before the picker
 }
 
 /** The claimant's own figures, STORED on every write by the pre-validate
@@ -386,6 +388,7 @@ const CstepClaimExpenseLineSchema = new Schema<ICstepClaimExpenseLine>({
   description: { type: String, trim: true },
   amount: { type: Number },
   attachmentId: { type: Schema.Types.ObjectId, ref: "CstepAttachment" },
+  category: { type: String, enum: CSTEP_EXPENSE_LINE_HEADS },
 });
 
 const CstepClaimTotalsSchema = new Schema<ICstepClaimTotals>(

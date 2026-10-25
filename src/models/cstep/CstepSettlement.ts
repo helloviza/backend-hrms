@@ -39,6 +39,7 @@ export interface ICstepSettlementPerDiem {
   overrideReason?: string;
   deductionInr?: number; // Official's meal / provided-benefit deduction off the gross days * rate, reason mandatory
   deductionReason?: string;
+  financeRejected?: boolean; // Finance-c "Reject all" zeroed the per diem (Finance a+b reads it for the per-diem item's status)
 }
 
 export interface ICstepSettlementBuckets {
@@ -110,6 +111,7 @@ const CstepSettlementPerDiemSchema = new Schema<ICstepSettlementPerDiem>(
     overrideReason: { type: String, trim: true },
     deductionInr: { type: Number },
     deductionReason: { type: String, trim: true },
+    financeRejected: { type: Boolean },
   },
   { _id: false },
 );

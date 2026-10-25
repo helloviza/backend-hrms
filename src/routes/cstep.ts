@@ -134,6 +134,15 @@ import {
 } from "../utils/cstepTravelRegister.js";
 import { env } from "../config/env.js";
 import { notifyCstep } from "../services/cstepNotifications.js";
+import { sendSheet } from "../utils/sheetImport.js";
+import {
+  CSTEP_EXPENSE_CATEGORY_LABEL,
+  categoryOfClaimTravelMode,
+  categoryOfExpenseLine,
+  categoryOfServiceType,
+  isExpenseLineHead,
+  type CstepExpenseCategory,
+} from "../models/cstep/expenseCategories.js";
 
 const router = Router();
 
@@ -627,6 +636,9 @@ function validateExpenseClaimPayload(body: any): string | null {
     const amount = Number(l.amount);
     if (!isFinite(amount) || amount <= 0) return `${n}: amount must be more than zero`;
     if (!l.attachmentId && !hasClaimInvoice) return `${n}: attach its invoice, or attach the tax invoice for the whole claim`;
+    if (l.category !== undefined && l.category !== null && l.category !== "" && !isExpenseLineHead(l.category)) {
+      return `${n}: pick an expense head from the list`;
+    }
   }
 
   if (!isOptionalAmount(body?.taxAmount)) return "Tax amount must be a non-negative amount";
@@ -891,6 +903,8 @@ function scopeFieldsToFormType(fields: any, formType: CstepFormType): any {
         description: l?.description,
         amount: asAmount(l?.amount),
         attachmentId: asOid(l?.attachmentId),
+        // Passed through as given: validateExpenseClaimPayload refuses an unknown head (400).
+        category: l?.category ? String(l.category) : undefined,
       }));
     }
     if (Array.isArray(fields.invoiceAttachmentIds)) {
@@ -982,6 +996,8 @@ function buildClaimSettlementLines(doc: any): Array<{
   sourceId: any;
   description: string;
   mode: CstepServiceType;
+  category: CstepExpenseCategory;
+  itemDate?: string;
   amountInr: number;
   classification: CstepSettlementLineClassification;
   classificationOverridden: false;
@@ -996,6 +1012,8 @@ function buildClaimSettlementLines(doc: any): Array<{
       sourceId: l._id,
       description: `${CLAIM_MODE_LABEL[l.mode] || "Travel"}: ${[l.from, l.to].filter(Boolean).join(" → ")}${l.noBill ? " (no bill)" : ""}`,
       mode: CLAIM_MODE_TO_SERVICE_TYPE[l.mode] || "OTHER",
+      category: categoryOfClaimTravelMode(l.mode),
+      itemDate: l.date || undefined,
       amountInr: Math.round((Number(l.fare) || 0) * 100) / 100,
       attachmentId: l.attachmentId || undefined,
     });
@@ -1006,6 +1024,8 @@ function buildClaimSettlementLines(doc: any): Array<{
       sourceId: l._id,
       description: `Food${l.remarks ? `: ${l.remarks}` : ""}`,
       mode: "OTHER",
+      category: "FOOD",
+      itemDate: l.date || undefined,
       amountInr: Math.round((Number(l.amount) || 0) * 100) / 100,
       attachmentId: l.attachmentId || undefined,
     });
@@ -1016,6 +1036,7 @@ function buildClaimSettlementLines(doc: any): Array<{
       sourceId: doc._id,
       description: "Other expenses",
       mode: "OTHER",
+      category: "OTHER",
       amountInr: Math.round(Number(doc.otherExpenses) * 100) / 100,
     });
   }
@@ -1028,6 +1049,8 @@ function buildClaimSettlementLines(doc: any): Array<{
       sourceId: l._id,
       description: String(l.description || "Expense"),
       mode: "OTHER",
+      category: categoryOfExpenseLine(l),
+      itemDate: l.date || undefined,
       amountInr: Math.round((Number(l.amount) || 0) * 100) / 100,
       attachmentId: l.attachmentId || doc.invoiceAttachmentIds?.[0] || undefined,
     });
@@ -1038,6 +1061,7 @@ function buildClaimSettlementLines(doc: any): Array<{
       sourceId: doc._id,
       description: "Tax (IGST)",
       mode: "OTHER",
+      category: "TAX",
       amountInr: Math.round(Number(doc.taxAmount) * 100) / 100,
       attachmentId: doc.invoiceAttachmentIds?.[0] || undefined,
     });
@@ -1484,6 +1508,8 @@ async function buildSeedSettlementLines(
     sourceId: any;
     description?: string;
     mode: CstepServiceType;
+    category: CstepExpenseCategory;
+    itemDate?: string;
     amountInr: number;
     classification: CstepSettlementLineClassification;
     classificationOverridden: false;
@@ -1522,6 +1548,8 @@ async function buildSeedSettlementLines(
     sourceId: any;
     description?: string;
     mode: CstepServiceType;
+    category: CstepExpenseCategory;
+    itemDate?: string;
     amountInr: number;
     classification: CstepSettlementLineClassification;
     classificationOverridden: false;
@@ -1537,6 +1565,7 @@ async function buildSeedSettlementLines(
       sourceId: a._id,
       description: a.details || undefined,
       mode: a.arrangedType,
+      category: categoryOfServiceType(a.arrangedType),
       amountInr: a.amountInr || 0,
       classification: "OFFICIAL",
       classificationOverridden: false,
@@ -1552,6 +1581,8 @@ async function buildSeedSettlementLines(
         sourceId: leg._id,
         description: [leg.fromLocation, leg.toLocation].filter(Boolean).join(" → ") || leg.remarks || undefined,
         mode: leg.travelMode,
+        category: categoryOfServiceType(leg.travelMode),
+        itemDate: leg.fromDate || undefined,
         amountInr: leg.fare || 0,
         classification: "PERSONAL",
         classificationOverridden: false,
@@ -1564,6 +1595,8 @@ async function buildSeedSettlementLines(
         sourceId: leg._id,
         description: [leg.fromLocation, leg.toLocation].filter(Boolean).join(" → ") || leg.remarks || undefined,
         mode: leg.travelMode,
+        category: categoryOfServiceType(leg.travelMode),
+        itemDate: leg.fromDate || undefined,
         amountInr: leg.fare || 0,
         classification: "OFFICIAL",
         classificationOverridden: false,
@@ -2742,6 +2775,226 @@ router.get("/finance-queue", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP finance-queue GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to list the finance queue" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Finance a+b — GET /finance-expenses — "Traveller-paid expenses": one row
+ * per item a traveller paid themselves and is claiming back, across Tours,
+ * Local Travel and Expense Claims, plus each Tour's per diem. The vendor
+ * side (what CSTEP paid suppliers) stays on Vendor payments.
+ *
+ * Scope, as GET /finance-queue: a CSTEP Admin sees every traveller; anyone
+ * else sees the travellers they are the Finance user of
+ * (TravellerProfile.financeUserId). Nobody else — 403.
+ *
+ * An item exists once its case has a settlement (a claim at approval, a
+ * Tour once the Desk opens its settlement after the report is approved),
+ * so its amounts are the ones Finance pays from. Items: the settlement's
+ * traveller-paid (PERSONAL) lines, and the per diem when it has a gross.
+ * A cancelled case is left out. Amount claimed = the figure the item came
+ * with (claimedAmountInr; the per diem's days × rate); amount now = after
+ * any Desk / Finance reduction or disallow.
+ *
+ * Status, first match:
+ *   DISALLOWED            Finance disallowed it (Finance-c) — with the reason
+ *   REIMBURSED            the case was paid — with the date and reference
+ *   WITH_FINANCE          the case is TRANSFERRED_TO_FINANCE
+ *   CLOSED                closed with nothing paid (nothing owed / covered by
+ *                         the advance / Finance closed it at ₹0)
+ *   DESK_VERIFIED         still being settled; the Desk has verified the line
+ *   IN_VERIFICATION       still being settled; not verified yet (and the per diem)
+ *
+ * Query: status, traveller (TravellerProfile id), from / to (YYYY-MM-DD, on
+ * the item's date — its own date, else the case's start). format=csv sends
+ * the same rows as a UTF-8 (BOM) CSV.
+ * ───────────────────────────────────────────────────────────────────── */
+export const FINANCE_EXPENSE_STATUSES = [
+  "IN_VERIFICATION",
+  "DESK_VERIFIED",
+  "WITH_FINANCE",
+  "REIMBURSED",
+  "CLOSED",
+  "DISALLOWED",
+] as const;
+export type FinanceExpenseStatus = (typeof FINANCE_EXPENSE_STATUSES)[number];
+const FINANCE_EXPENSE_STATUS_LABEL: Record<FinanceExpenseStatus, string> = {
+  IN_VERIFICATION: "In verification",
+  DESK_VERIFIED: "Desk-verified",
+  WITH_FINANCE: "With Finance",
+  REIMBURSED: "Reimbursed",
+  CLOSED: "Closed (nothing paid)",
+  DISALLOWED: "Disallowed",
+};
+
+type FinanceExpenseItem = {
+  requestId: string;
+  reference: string;
+  formType: string;
+  travelerProfileId: string;
+  traveller: string;
+  date: string;
+  category: CstepExpenseCategory | null;
+  description: string;
+  amountClaimedInr: number;
+  amountNowInr: number;
+  status: FinanceExpenseStatus;
+  paidOn?: string;
+  paymentRef?: string;
+  reason?: string;
+};
+
+/** The case-level part of an item's status (anything but DISALLOWED, which is the item's own). */
+function financeExpenseCaseStatus(doc: any, settlement: any, verified: boolean): Pick<FinanceExpenseItem, "status" | "paidOn" | "paymentRef"> {
+  if (doc.status === "REIMBURSED" || (doc.status === "SETTLED" && settlement?.paidOn)) {
+    return {
+      status: "REIMBURSED",
+      paidOn: settlement?.paidOn ? istDate(new Date(settlement.paidOn)) : undefined,
+      paymentRef: settlement?.paymentRef || undefined,
+    };
+  }
+  if (doc.status === "TRANSFERRED_TO_FINANCE") return { status: "WITH_FINANCE" };
+  if (doc.status === "SETTLED") return { status: "CLOSED" };
+  return { status: verified ? "DESK_VERIFIED" : "IN_VERIFICATION" };
+}
+
+async function financeExpenseItems(req: any): Promise<{ items: FinanceExpenseItem[] } | null> {
+  const workspaceId = req.workspaceObjectId;
+  const requestFilter: any = { workspaceId, status: { $ne: "CANCELLED" } };
+  if (!isCstepAdmin(req)) {
+    const uid = ownerId(req);
+    const mine = mongoose.isValidObjectId(uid)
+      ? await TravellerProfile.find({ workspaceId, financeUserId: new mongoose.Types.ObjectId(uid) }).select("_id").lean()
+      : [];
+    if (!mine.length) return null;
+    requestFilter.travelerProfileId = { $in: mine.map((t: any) => t._id) };
+  }
+
+  const settlements: any[] = await CstepSettlement.find({ workspaceId })
+    .select("requestId status perDiem paidOn paymentRef")
+    .lean();
+  if (!settlements.length) return { items: [] };
+  const docs: any[] = await CstepTravelRequest.find({ ...requestFilter, _id: { $in: settlements.map((s) => s.requestId) } })
+    .select("_id claimReference formType status travelerProfileId departureDate")
+    .lean();
+  if (!docs.length) return { items: [] };
+  const docById = new Map(docs.map((d) => [String(d._id), d]));
+  const inScope = settlements.filter((s) => docById.has(String(s.requestId)));
+
+  const [lines, travellers] = await Promise.all([
+    CstepSettlementLine.find({ workspaceId, settlementId: { $in: inScope.map((s) => s._id) }, classification: "PERSONAL" })
+      .sort({ createdAt: 1, _id: 1 })
+      .lean(),
+    TravellerProfile.find({ workspaceId, _id: { $in: [...new Set(docs.map((d) => String(d.travelerProfileId)))] } })
+      .select("_id firstName lastName")
+      .lean(),
+  ]);
+  const nameOf = new Map(
+    (travellers as any[]).map((t) => [String(t._id), [t.firstName, t.lastName].filter(Boolean).join(" ").trim()]),
+  );
+  const settlementById = new Map(inScope.map((s) => [String(s._id), s]));
+
+  const items: FinanceExpenseItem[] = [];
+  const base = (doc: any) => ({
+    requestId: String(doc._id),
+    reference: doc.claimReference || "",
+    formType: doc.formType,
+    travelerProfileId: String(doc.travelerProfileId),
+    traveller: nameOf.get(String(doc.travelerProfileId)) || "",
+  });
+
+  for (const l of lines as any[]) {
+    const s = settlementById.get(String(l.settlementId));
+    const doc = s && docById.get(String(s.requestId));
+    if (!doc) continue;
+    const status = l.financeRejected
+      ? { status: "DISALLOWED" as const, reason: l.financeRejectedReason || undefined }
+      : financeExpenseCaseStatus(doc, s, !!l.verified);
+    items.push({
+      ...base(doc),
+      date: l.itemDate || doc.departureDate || "",
+      category: l.category || null,
+      description: l.description || "",
+      amountClaimedInr: Number(l.claimedAmountInr ?? l.amountInr ?? 0),
+      amountNowInr: Number(l.amountInr || 0),
+      ...status,
+    });
+  }
+
+  // The per diem — a Tour's, when it has a gross (days × rate) at all.
+  for (const s of inScope) {
+    const doc = docById.get(String(s.requestId))!;
+    if (isClaimFormType(doc.formType)) continue;
+    const gross = Math.round(Number(s.perDiem?.days || 0) * Number(s.perDiem?.rate || 0) * 100) / 100;
+    if (!(gross > 0)) continue;
+    const status = s.perDiem?.financeRejected
+      ? { status: "DISALLOWED" as const, reason: s.perDiem?.deductionReason || undefined }
+      : financeExpenseCaseStatus(doc, s, false);
+    items.push({
+      ...base(doc),
+      date: doc.departureDate || "",
+      category: "PER_DIEM",
+      description: `Per diem — ${s.perDiem.days} day${s.perDiem.days === 1 ? "" : "s"} × ${inrText(s.perDiem.rate)}` +
+        (Number(s.perDiem?.deductionInr) > 0 ? `, less ${inrText(s.perDiem.deductionInr)}` : ""),
+      amountClaimedInr: gross,
+      amountNowInr: Number(s.perDiem?.amountInr || 0),
+      ...status,
+    });
+  }
+
+  items.sort((a, b) => (a.date === b.date ? a.reference.localeCompare(b.reference) : a.date < b.date ? 1 : -1));
+  return { items };
+}
+
+router.get("/finance-expenses", async (req: any, res: any) => {
+  try {
+    const status = String(req.query.status || "").trim();
+    const traveller = String(req.query.traveller || "").trim();
+    const from = String(req.query.from || "").trim();
+    const to = String(req.query.to || "").trim();
+    if (status && !(FINANCE_EXPENSE_STATUSES as readonly string[]).includes(status)) {
+      return res.status(400).json({ error: "Unknown status" });
+    }
+    for (const d of [from, to]) {
+      if (d && !isValidDateStr(d)) return res.status(400).json({ error: "from / to must be dates (YYYY-MM-DD)" });
+    }
+
+    const all = await financeExpenseItems(req);
+    if (!all) return res.status(403).json({ error: "Traveller-paid expenses are open to CSTEP Admin and Finance users" });
+
+    // The traveller filter's choices come from everything in scope, before filtering.
+    const travellers = [...new Map(all.items.map((i) => [i.travelerProfileId, i.traveller])).entries()]
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const items = all.items.filter(
+      (i) =>
+        (!status || i.status === status) &&
+        (!traveller || i.travelerProfileId === traveller) &&
+        (!from || i.date >= from) &&
+        (!to || i.date <= to),
+    );
+
+    if (String(req.query.format || "") === "csv") {
+      await sendSheet(res, {
+        format: "csv",
+        filename: `cstep-traveller-paid-expenses-${istDate(new Date())}`,
+        sheetName: "Traveller-paid expenses",
+        columns: [
+          "Reference", "Traveller", "Date", "Category", "Description", "Amount claimed (INR)", "Amount now (INR)",
+          "Status", "Paid on", "Payment ref", "Reason",
+        ],
+        rows: items.map((i) => [
+          i.reference, i.traveller, i.date, i.category ? CSTEP_EXPENSE_CATEGORY_LABEL[i.category] : "Not categorised yet",
+          i.description, i.amountClaimedInr, i.amountNowInr, FINANCE_EXPENSE_STATUS_LABEL[i.status],
+          i.paidOn || "", i.paymentRef || "", i.reason || "",
+        ]),
+      });
+      return;
+    }
+    res.json({ ok: true, items, travellers });
+  } catch (err: any) {
+    console.error("[CSTEP finance-expenses GET]", err?.message);
+    if (!res.headersSent) res.status(500).json({ error: err?.message || "Failed to list the traveller-paid expenses" });
   }
 });
 
@@ -7109,6 +7362,7 @@ router.post("/requests/:id/finance/reject-all", async (req: any, res: any) => {
         // deduction of its whole gross.
         settlement.perDiem.deductionInr = round2((settlement.perDiem.days || 0) * (settlement.perDiem.rate || 0));
         settlement.perDiem.deductionReason = `Disallowed by Finance — ${reason}`;
+        settlement.perDiem.financeRejected = true;
         settlement.perDiem.amountInr = 0;
         items.push(`Per diem ${inrText(perDiemNet)}`);
       }
