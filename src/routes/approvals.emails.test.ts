@@ -248,7 +248,7 @@ describe("the email design (one layout for every email)", () => {
     request_submitted_approver: "orange", request_submitted_leaders: "orange", request_resent: "orange", request_resubmitted: "orange",
     request_reminder: "orange", clarification_answered: "orange", clarification_asked: "orange", proposal_submitted: "orange",
     proposal_reminder: "orange", proposal_ready: "orange",
-    request_approved: "green", request_approved_fyi: "green", proposal_approved: "green", booking_done: "green",
+    request_approved: "green", request_approved_fyi: "green", proposal_approved: "green", booking_done: "green", documents_ready: "green",
     request_declined: "red", request_declined_fyi: "red", proposal_declined: "red", booking_cancelled: "red", ops_customer_cancelled: "red",
     request_submitted_confirmation: "blue", request_auto_approved: "blue", booking_started: "blue", booking_on_hold: "blue",
     case_assigned: "blue", ops_no_agent: "blue", ops_new_case: "blue", email_send_failed_alert: "blue", proposal_changes_requested: "blue",
@@ -278,7 +278,9 @@ describe("the email design (one layout for every email)", () => {
       expect(text(h1).trim(), event).not.toBe("");
       expect(text(off), event).toContain("TKT-777");
       const links = [...off.matchAll(/<a href="([^"]+)"[^>]*class="btn /g)].map((m) => m[1]);
-      expect(links.length, event).toBeGreaterThan(0);
+      // "Documents ready" carries the files and deliberately no link (no login, no request page).
+      if (event === "documents_ready") expect(links, event).toEqual([]);
+      else expect(links.length, event).toBeGreaterThan(0);
       // Every image says what it is or is marked decorative; the logo falls back to the name.
       for (const tag of html.match(/<img\b[^>]*>/g) || []) expect(tag, event).toMatch(/\salt="[^"]*"/);
       expect(html, event).toContain('alt="PLUMTRIPS"');
@@ -314,6 +316,7 @@ describe("the email design (one layout for every email)", () => {
       const spec: any = (APPROVAL_EMAIL_MAP as any)[event];
       if (spec.link === "decision-request") expect(labels, event).toEqual(["Approve request", "Decline", "Ask a question"]);
       else if (spec.link === "decision-proposal") expect(labels, event).toEqual(["Approve proposal", "Request changes", "Decline"]);
+      else if (event === "documents_ready") expect(labels, event).toEqual([]);
       else expect(labels, event).toEqual(["View request"]);
     }
   });

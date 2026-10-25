@@ -3,7 +3,6 @@ import { Router } from "express";
 import mongoose from "mongoose";
 import fs from "fs";
 import path from "path";
-import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace, resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
@@ -81,6 +80,7 @@ import {
 import { checkCartItems, CartItemError } from "../services/approvalCartItems.js";
 import { inboxBucket, requesterProfiles } from "../services/approvalInbox.js";
 import { dateRangeOr400, withDateRange } from "../utils/dateRange.js";
+import { withRequestBookings } from "../services/requestBookings.js";
 
 import {
   sumBookingAmount,
@@ -150,6 +150,9 @@ function forViewer(doc: any, req: AnyObj) {
   return hasQueueView(req) ? maskPassportsForStaff(doc) : sanitizeApprovalForViewer(doc, req.user);
 }
 
+/** Ops rows carry their Book Now bookings (`_bookings`: the queue buttons); nobody else gets them. */
+const staffBookings = <T extends AnyObj>(req: AnyObj, rows: T[]) => (hasQueueView(req) ? withRequestBookings(rows) : Promise.resolve(rows));
+
 const router = Router();
 router.use(requireAuth);
 router.use(requireWorkspace);
@@ -180,36 +183,12 @@ router.get("/queue-access", async (req: AnyObj, res) => {
   res.json({ ok: true, view: a.view, work: a.work, via: a.via, scope: a.scope });
 });
 
-/* ───────────────────────── uploads (PDF attachments) ───────────────────────── */
+/* ───────────────────────── old queue uploads (read only) ───────────────────────── */
 
 const approvalsUploadRoot = path.join(process.cwd(), "uploads", "approvals");
 if (!fs.existsSync(approvalsUploadRoot)) {
   fs.mkdirSync(approvalsUploadRoot, { recursive: true });
 }
-
-const approvalsStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, approvalsUploadRoot),
-  filename: (req, file, cb) => {
-    const id = String((req as AnyObj).params?.id || "approval");
-    const ts = Date.now();
-    const safeOriginal = String(file.originalname || "file.pdf").replace(
-      /[^a-zA-Z0-9.\-_]+/g,
-      "_",
-    );
-    cb(null, `${id}_${ts}_${safeOriginal}`);
-  },
-});
-
-const approvalsUpload = multer({
-  storage: approvalsStorage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-  fileFilter: (_req, file, cb) => {
-    if (file.mimetype === "application/pdf") return cb(null, true);
-    const err: any = new Error("Only PDF files are allowed");
-    err.statusCode = 400;
-    return cb(err, false);
-  },
-});
 
 /* ────────────────────────────────────────────────────────────────
  * Workspace helpers
@@ -1212,7 +1191,8 @@ router.get("/admin/pending", requireApprovalsAdminRead, async (req: AnyObj, res,
       .lean()
       .exec();
     if (hasQueueView(req)) await flagNeedsReassignment(rows as any[]);
-    res.json({ rows: rows.map((r: any) => forViewer(r, req)) });
+    // Staff rows carry their Book Now bookings (the queue's booking buttons).
+    res.json({ rows: await staffBookings(req, rows.map((r: any) => forViewer(r, req))) });
   } catch (err) {
     next(err);
   }
@@ -1240,7 +1220,8 @@ router.get("/admin/approved", requireApprovalsAdminRead, async (req: AnyObj, res
       .exec();
     if (hasQueueView(req)) await flagNeedsReassignment(rows as any[]);
 
-    res.json({ rows: rows.map((r: any) => forViewer(r, req)) });
+    // Staff rows carry their Book Now bookings (the queue's booking buttons).
+    res.json({ rows: await staffBookings(req, rows.map((r: any) => forViewer(r, req))) });
   } catch (err) {
     next(err);
   }
@@ -1259,7 +1240,8 @@ router.get("/admin/done", requireApprovalsAdminRead, async (req: AnyObj, res, ne
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows: rows.map((r: any) => forViewer(r, req)) });
+    // Staff rows carry their Book Now bookings (the queue's booking buttons).
+    res.json({ rows: await staffBookings(req, rows.map((r: any) => forViewer(r, req))) });
   } catch (err) {
     next(err);
   }
@@ -1278,7 +1260,8 @@ router.get("/admin/rejected", requireApprovalsAdminRead, async (req: AnyObj, res
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean()
       .exec();
-    res.json({ rows: rows.map((r: any) => forViewer(r, req)) });
+    // Staff rows carry their Book Now bookings (the queue's booking buttons).
+    res.json({ rows: await staffBookings(req, rows.map((r: any) => forViewer(r, req))) });
   } catch (err) {
     next(err);
   }
@@ -1297,7 +1280,7 @@ router.get("/admin/requests/:id", requireApprovalsAdminRead, async (req: AnyObj,
 
     if (!doc) return res.status(404).json({ error: "Request not found" });
 
-    res.json(forViewer(doc, req));
+    res.json((await staffBookings(req, [forViewer(doc, req)]))[0]);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1685,101 +1668,10 @@ router.get("/requests/:id/documents/:docId/download", requireAuth, async (req: A
   }
 });
 
-router.post(
-  "/admin/:id/attachment",
-  requireApprovalsAdminWrite,
-  // Scope check BEFORE multer, so a refused upload never lands on disk.
-  async (req: AnyObj, res, next) => {
-    try {
-      const id = String(req.params.id || "");
-      if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid request id" });
-      if (!(await ApprovalRequest.exists(queueCaseFilter(req, id)))) return res.status(404).json({ error: "Request not found" });
-      next();
-    } catch (err) {
-      next(err);
-    }
-  },
-  (req, res, next) => {
-    approvalsUpload.single("file")(req as any, res as any, (err: any) => {
-      if (err) {
-        return res
-          .status(Number(err?.statusCode) || 400)
-          .json({ error: String(err?.message || "Upload failed") });
-      }
-      next();
-    });
-  },
-  async (req: AnyObj, res, next) => {
-    try {
-      setNoStore(res);
-
-      const id = String(req.params.id || "");
-      if (!mongoose.Types.ObjectId.isValid(id)) {
-        return res.status(400).json({ error: "Invalid request id" });
-      }
-
-      const file = (req as any).file as
-        | { filename: string; originalname: string; mimetype: string; size: number }
-        | undefined;
-
-      if (!file) return res.status(400).json({ error: "File is required" });
-
-      const doc: any = await ApprovalRequest.findOne(queueCaseFilter(req, id));
-      if (!doc) return res.status(404).json({ error: "Request not found" });
-
-      const base = (process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 8080}`).replace(
-        /\/$/,
-        "",
-      );
-      const safeFile = encodeURIComponent(file.filename);
-      const protectedUrl = `${base}/api/approvals/attachments/${safeFile}/download`;
-      const relativePath = `/uploads/approvals/${file.filename}`;
-
-      doc.meta = doc.meta || {};
-      if (!Array.isArray(doc.meta.attachments)) doc.meta.attachments = [];
-
-      const attachment = {
-        kind: "admin_pdf",
-        rid: String(doc._id),
-        url: protectedUrl,
-        path: relativePath,
-        filename: file.originalname,
-        mime: file.mimetype,
-        size: file.size,
-        uploadedAt: new Date().toISOString(),
-        uploadedBy: normEmail(req.user?.email),
-      };
-
-      doc.meta.attachments.push(attachment);
-
-      doc.history = Array.isArray(doc.history) ? doc.history : [];
-      doc.history.push({
-        action: "admin_attachment_uploaded",
-        at: new Date(),
-        by: String(req.user?.sub || req.user?._id || ""),
-        userEmail: normEmail(req.user?.email),
-        userName: req.user?.name || req.user?.firstName || "",
-        ...actorStamp(req.user, "staff"),
-        comment: `Attachment uploaded: ${file.originalname}`,
-      });
-
-      doc.markModified("meta.attachments");
-      doc.markModified("meta");
-
-      await doc.save();
-
-      return res.json({
-        ok: true,
-        url: protectedUrl,
-        attachmentUrl: protectedUrl,
-        path: relativePath,
-        filename: file.originalname,
-      });
-    } catch (err) {
-      next(err);
-    }
-  },
-);
+// The queue's old upload (POST /admin/:id/attachment, files on local disk) is
+// gone: booking documents are uploaded on the Book Now booking (S3) and reach
+// the request through services/bookingDocuments.ts. Files uploaded the old way
+// (meta.attachments, kind "admin_pdf") are still listed and downloadable.
 
 router.get("/attachments/:filename/download", requireAuth, async (req: AnyObj, res, next) => {
   try {

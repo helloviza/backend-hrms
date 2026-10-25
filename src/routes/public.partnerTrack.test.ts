@@ -243,7 +243,7 @@ describe("the student's cases", () => {
     const one = r.body.cases.find((c: any) => c.caseNumber === "PL-AAAAA2");
     expect(one.currentStep).toMatchObject({ label: "Pending", subStatus: "Lead Not Contactable" });
     expect(one.rmName).toBe("Rita Menon");
-    expect(one.documents).toEqual([{ service: "Flight", ticketIssued: true, voucherIssued: false }]);
+    expect(one.documents).toEqual([{ service: "Flight", ticketIssued: true, voucherIssued: false, documentIssued: false }]);
     const keys = keysDeep(r.body);
     const FORBIDDEN = ["contact", "phone", "email", "notes", "staffNote", "supplierName", "supplierPNR", "partnerShare", "pricing", "passengers", "travellers", "ipHash", "contactEmailHash", "s3Key", "_id", "workspaceId", "customerId", "adminAssigned"];
     expect(keys.filter((k) => FORBIDDEN.includes(k))).toEqual([]);

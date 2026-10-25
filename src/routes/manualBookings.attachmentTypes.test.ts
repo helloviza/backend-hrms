@@ -236,16 +236,16 @@ beforeEach(async () => {
 /* ───────────────────────── upload + type change ───────────────────────── */
 
 describe("attachment types — upload and change", () => {
-  it("upload accepts ticket, voucher, internal and other; anything else is 400", async () => {
+  it("upload accepts ticket, voucher, document, internal and other; anything else is 400", async () => {
     const rid = await approvedRequest();
     const booking = await createBooking(rid);
-    for (const t of ["ticket", "voucher", "internal", "other"]) await upload(booking._id, t, `${t}.pdf`);
+    for (const t of ["ticket", "voucher", "document", "internal", "other"]) await upload(booking._id, t, `${t}.pdf`);
     const bad = await as(request(app).post(`/api/admin/manual-bookings/${booking._id}/attachments`), OPS)
       .field("type", "secret")
       .attach("file", Buffer.from("%PDF-1.4 fake"), { filename: "x.pdf", contentType: "application/pdf" });
     expect(bad.status).toBe(400);
-    expect(bad.body.error).toBe("type must be one of: ticket, voucher, internal, other");
-    expect((await getBooking(booking._id)).attachments.map((a: any) => a.type)).toEqual(["ticket", "voucher", "internal", "other"]);
+    expect(bad.body.error).toBe("type must be one of: ticket, voucher, document, internal, other");
+    expect((await getBooking(booking._id)).attachments.map((a: any) => a.type)).toEqual(["ticket", "voucher", "document", "internal", "other"]);
   });
 
   it("the picker saves: PATCH changes the type and records who and when; a bad type or unknown file is refused", async () => {
@@ -297,28 +297,50 @@ describe("booking done — documents and email follow the type", () => {
     expect(doneMails().map((m) => m.attachments.map((a: any) => a.filename))).toEqual([["hotel-voucher.pdf"]]);
   });
 
-  it("PL-T46PH8's shape: Done with only an 'other' file → no documents; changed to ticket → re-synced, no second email", async () => {
+  it("PL-T46PH8's shape is refused now: Done with only an 'other' file → 400; typed as a ticket → Done, emailed with it", async () => {
     const rid = await approvedRequest();
     const booking = await createBooking(rid);
     const attId = await upload(booking._id, "other", "E-Ticket MR ADITYA.pdf");
+    const refused = await markDone(booking._id);
+    expect([refused.status, refused.body.code]).toEqual([400, "ATTACHMENT_REQUIRED"]);
+    expect(refused.body.error).toMatch(/Ticket or Voucher/);
+    expect((await getDoc(rid)).stage).toBe("BOOKING_IN_PROGRESS");
+
+    expect((await setType(booking._id, attId, "ticket")).body.requestSync).toBe("in_progress");
     mails.length = 0;
     expect((await markDone(booking._id)).body.requestSync).toBe("completed");
-    expect((await getDoc(rid)).meta.bookingDocuments).toEqual([]);
-    const sentAtDone = mails.length;
+    expect((await getDoc(rid)).meta.bookingDocuments.map((d: any) => [d.type, d.filename, d.attachmentId])).toEqual([["ticket", "E-Ticket MR ADITYA.pdf", attId]]);
+    expect(doneMails().map((m) => m.attachments.map((x: any) => x.filename))).toEqual([["E-Ticket MR ADITYA.pdf"]]);
+  });
 
-    const res = await setType(booking._id, attId, "ticket");
-    expect(res.status).toBe(200);
-    expect(res.body.requestSync).toBe("documents_updated");
-    const doc = await getDoc(rid);
-    expect(doc.meta.bookingDocuments.map((d: any) => [d.type, d.filename, d.attachmentId])).toEqual([["ticket", "E-Ticket MR ADITYA.pdf", attId]]);
-    expect(mails.length, "no second email").toBe(sentAtDone);
-    expect(doc.history.filter((h: any) => h.action === "admin_done")).toHaveLength(1);
+  it("a Done request booking keeps its last ticket: delete / retype away → 409; with a second ticket it may go", async () => {
+    const rid = await approvedRequest();
+    const booking = await createBooking(rid);
+    const t1 = await upload(booking._id, "ticket", "t1.pdf");
+    await upload(booking._id, "internal", "invoice.pdf");
+    expect((await markDone(booking._id)).body.requestSync).toBe("completed");
 
-    // And back to internal: the document leaves the request, still no email.
-    const back = await setType(booking._id, attId, "internal");
-    expect(back.body.requestSync).toBe("documents_updated");
-    expect((await getDoc(rid)).meta.bookingDocuments).toEqual([]);
-    expect(mails.length).toBe(sentAtDone);
+    const retype = await setType(booking._id, t1, "internal");
+    expect([retype.status, retype.body.code]).toEqual([409, "ATTACHMENT_REQUIRED"]);
+    const del = await as(request(app).delete(`/api/admin/manual-bookings/${booking._id}/attachments/${t1}`), OPS);
+    expect([del.status, del.body.code]).toEqual([409, "ATTACHMENT_REQUIRED"]);
+    expect((await setType(booking._id, t1, "voucher")).status, "ticket ↔ voucher is fine").toBe(200);
+
+    await upload(booking._id, "ticket", "t2.pdf");
+    expect((await as(request(app).delete(`/api/admin/manual-bookings/${booking._id}/attachments/${t1}`), OPS)).status).toBe(200);
+  });
+
+  it("plain manual bookings (no request) keep the any-file rule", async () => {
+    const res = await as(request(app).post("/api/admin/manual-bookings"), OPS).send({
+      workspaceId: String(ACME_CUSTOMER), type: "FLIGHT", status: "PENDING", supplierName: "IndiGo", givenBy: "Asha Rao",
+      travelDate: "2027-04-02", passengers: [{ name: "Asha Rao", type: "ADULT" }], pricing: { actualPrice: 9800, quotedPrice: 12000 },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const id = res.body.booking._id;
+    expect((await markDone(id)).status, "no file at all").toBe(400);
+    const attId = await upload(id, "internal", "invoice.pdf");
+    expect((await markDone(id)).status, "an internal file is enough here, as before").toBe(200);
+    expect((await as(request(app).delete(`/api/admin/manual-bookings/${id}/attachments/${attId}`), OPS)).status, "last file rule as before").toBe(409);
   });
 });
 
@@ -332,9 +354,9 @@ describe("partner / student tracker", () => {
     await upload(booking._id, "other", "legacy-other.pdf");
     const row = async () => trackerRow(await getDoc(rid), await bookingsOfCases(String(ACME_CUSTOMER), [rid]));
 
-    expect((await row()).documents).toEqual([{ service: "Flight", ticketIssued: false, voucherIssued: false }]);
+    expect((await row()).documents).toEqual([{ service: "Flight", ticketIssued: false, voucherIssued: false, documentIssued: false }]);
     await setType(booking._id, attId, "ticket");
-    expect((await row()).documents).toEqual([{ service: "Flight", ticketIssued: true, voucherIssued: false }]);
+    expect((await row()).documents).toEqual([{ service: "Flight", ticketIssued: true, voucherIssued: false, documentIssued: false }]);
   });
 });
 

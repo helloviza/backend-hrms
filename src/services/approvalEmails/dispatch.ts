@@ -80,13 +80,14 @@ async function resolveRole(role: EmailRole, spec: EmailEventSpec, ctx: EmailCtx,
 }
 
 /**
- * Partner lead cases (meta.source PARTNER_LINK): "booking done" carries the
+ * Partner lead cases (meta.source PARTNER_LINK): "booking done" (and a later
+ * "documents ready") carries the
  * student's tickets and vouchers, so it goes to the student alone
  * (meta.partnerLead.contact.email) — never the partner's Workspace Leaders,
  * never the Partner Intake placeholder. Keyed on a field no other request has.
  */
 function partnerStudentRecipients(event: ApprovalEmailEvent, ctx: EmailCtx): { to: string[]; cc: string[] } | null {
-  if (event !== "booking_done" || !isPartnerLeadCase(ctx.ar)) return null;
+  if ((event !== "booking_done" && event !== "documents_ready") || !isPartnerLeadCase(ctx.ar)) return null;
   const student = norm(ctx.ar?.meta?.partnerLead?.contact?.email);
   return { to: student && student !== norm(PARTNER_INTAKE_EMAIL) ? [student] : [], cc: [] };
 }

@@ -65,13 +65,18 @@ export const ATTACHMENT_REQUIRED_TYPES: readonly ManualBookingType[] = [
 ];
 
 // Attachment types, and who sees each:
-//   ticket, voucher  customer documents: My Bookings, the request's Documents,
-//                    the "booking done" email, the partner / student tracker.
+//   ticket, voucher, document
+//                    customer documents: My Bookings, the request's Documents,
+//                    the "booking done" / "documents ready" emails, the
+//                    partner / student tracker. "document" is the one for
+//                    every booking type that is not a flight or a hotel.
 //   other            legacy (every upload before the type picker): staff, and
 //                    My Bookings only, exactly as before.
 //   internal         staff only: never on any customer surface.
 // The frontend twin is AttachmentType in services/manualBookings.ts.
-export const ATTACHMENT_TYPES = ["ticket", "voucher", "internal", "other"] as const;
+export const ATTACHMENT_TYPES = ["ticket", "voucher", "document", "internal", "other"] as const;
+/** The types a customer receives as booking documents (request Documents, emails, tracker). */
+export const CUSTOMER_DOCUMENT_TYPES: ReadonlySet<string> = new Set(["ticket", "voucher", "document"]);
 export type AttachmentType = (typeof ATTACHMENT_TYPES)[number];
 export const isAttachmentType = (v: unknown): v is AttachmentType => (ATTACHMENT_TYPES as readonly string[]).includes(String(v));
 
@@ -89,7 +94,7 @@ export function documentTypeForBookingType(bookingType: unknown): "ticket" | "vo
 // Which a customer sees on My Bookings: customerVisibleAttachments in
 // utils/bookingCustomerAccess.ts.
 
-export const MANUAL_BOOKING_TRIP_TYPES =["ONE_WAY", "ROUND_TRIP", "MULTI_CITY"] as const;
+export const MANUAL_BOOKING_TRIP_TYPES = ["ONE_WAY", "ROUND_TRIP", "MULTI_CITY"] as const;
 export type ManualBookingTripType = (typeof MANUAL_BOOKING_TRIP_TYPES)[number];
 
 // One flight segment of a multi-leg booking — 1:1 with the ticket's printed

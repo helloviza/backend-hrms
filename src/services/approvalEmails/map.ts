@@ -348,6 +348,16 @@ export const APPROVAL_EMAIL_MAP = {
     subject: "Your Booking has been Processed — {customer} ({code})",
     notes: "Carries the booking documents. The request records \"notified\" only once the send succeeds.",
   },
+  documents_ready: {
+    label: "Documents ready",
+    flows: BOTH,
+    trigger: "A customer document (ticket / voucher / document) is added to a booking whose request is already booked",
+    to: ["requester"], cc: ["approver", "leaders"], exclude: [], excludeActor: false,
+    replyTo: "desk", audience: "customer", perRecipient: false, link: "none",
+    template: "documentsReadyHtml",
+    subject: "Your travel documents — {customer} ({code})",
+    notes: "Same recipients as \"Booking processed\" (a partner lead case: the student only). Carries only the documents not sent before — once per new set, never a file twice. No prices, no links.",
+  },
   ops_customer_cancelled: {
     label: "Customer cancelled after approval",
     flows: BOTH,

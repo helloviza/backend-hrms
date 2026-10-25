@@ -241,7 +241,8 @@ describe("a booking's request is fixed at create (every booking)", () => {
 describe("a request with several bookings keeps every booking's documents (every request)", () => {
   it("a later booking's save adds its documents instead of replacing the list", async () => {
     const flight = (await create(ordinaryBody({ type: "FLIGHT" }))).body.booking;
-    const hotel = (await create(ordinaryBody({ type: "HOTEL", sector: "Delhi", returnDate: "2027-04-05" }))).body.booking;
+    // The second service of the case: a booking added on purpose ("+ Add another booking").
+    const hotel = (await create(ordinaryBody({ type: "HOTEL", sector: "Delhi", returnDate: "2027-04-05", additional: true }))).body.booking;
     const ticket = await upload(flight._id, "ticket", "ticket.pdf");
     expect((await put(flight._id, { status: "CONFIRMED" })).body.requestSync).toBe("completed");
     const voucher = await upload(hotel._id, "voucher", "voucher.pdf");

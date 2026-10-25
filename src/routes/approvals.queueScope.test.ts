@@ -133,7 +133,6 @@ function caseRoutes(id: string, pid: string): Array<[string, (who: Who) => reque
     ["PUT done", (w) => as(request(app).put(`/api/approvals/admin/${id}/done`), w).send({})],
     ["PUT on-hold", (w) => as(request(app).put(`/api/approvals/admin/${id}/on-hold`), w).send({})],
     ["PUT cancel", (w) => as(request(app).put(`/api/approvals/admin/${id}/cancel`), w).send({})],
-    ["POST attachment", (w) => as(request(app).post(`/api/approvals/admin/${id}/attachment`), w).attach("file", Buffer.from("%PDF-1.4 x"), { filename: "t.pdf", contentType: "application/pdf" })],
     ["GET proposals/by-request", (w) => as(request(app).get(`/api/proposals/by-request/${id}`), w)],
     ["POST proposals draft", (w) => as(request(app).post(`/api/proposals/by-request/${id}/draft`), w).send({})],
     ["GET proposals/:id", (w) => as(request(app).get(`/api/proposals/${pid}`), w)],

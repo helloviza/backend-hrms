@@ -446,6 +446,7 @@ export function sanitizeApprovalForViewer(doc: any, user: any) {
   if (safe?.meta && typeof safe.meta === "object") {
     delete safe.meta.bookingDocuments;
     delete safe.meta.manualBookingId;
+    delete safe.meta.documentsEmailed;
   }
 
   // Proposal option PDFs are supplier quotes (they carry prices) — staff only.

@@ -217,7 +217,7 @@ export async function applySuggestionsCsv(opts: {
       continue;
     }
     const fresh = await bookings.findOne({ _id: new mongoose.Types.ObjectId(bookingId) });
-    report.synced.push({ requestId: rid, result: await syncRequestFromManualBooking(fresh as any, { name: ACTOR_NAME }) });
+    report.synced.push({ requestId: rid, result: await syncRequestFromManualBooking(fresh as any, { name: ACTOR_NAME }, { notify: false }) });
   }
   for (const s of report.synced) log(`  request ${s.requestId}: ${s.result}`);
   log(`Written: ${report.applied} file(s) retyped · ${report.synced.filter((s) => s.result === "documents_updated").length} request(s) re-synced.`);

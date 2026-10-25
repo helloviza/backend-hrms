@@ -250,8 +250,8 @@ describe("steps, current step and counts", () => {
   it("documents: status only, per live booking", async () => {
     const m = await byNumber();
     expect(of(m, "done").documents).toEqual([
-      { service: "Flight", ticketIssued: true, voucherIssued: false },
-      { service: "Hotel", ticketIssued: false, voucherIssued: false },
+      { service: "Flight", ticketIssued: true, voucherIssued: false, documentIssued: false },
+      { service: "Hotel", ticketIssued: false, voucherIssued: false, documentIssued: false },
     ]);
   });
 

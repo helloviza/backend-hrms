@@ -23,13 +23,15 @@
 // one markRequestDone path — documents from the booking, final prices from the
 // booking (staff-only fields), and the "booking done" email via the outbox
 // with the documents attached. Saved Pending / WIP, the request stays (or
-// becomes) "Booking in progress". Idempotent: a request already booked only
-// gets its document list refreshed, never a second email.
+// becomes) "Booking in progress". A request already booked gets its document
+// list refreshed — and, when that brings customer documents it was never
+// sent, ONE "documents ready" email with just those (never a file twice:
+// meta.documentsEmailed lists every attachment id already emailed).
 import fs from "fs";
 import mongoose from "mongoose";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import { actorStamp } from "./actorNames.js";
-import { markRequestDone, notifyRequesterProgress } from "./approvalProgress.js";
+import { markRequestDone, notifyDocumentsReady, notifyRequesterProgress } from "./approvalProgress.js";
 import {
   caseInQueueScope,
   isManagerOrLeaderOfRequest,
@@ -160,12 +162,39 @@ function mergedBookingDocs(meta: AnyObj, bookingId: string, docs: AnyObj[]): Any
 
 export type SyncOutcome = "completed" | "documents_updated" | "in_progress" | "none";
 
+/** The customer documents of a document list that can be emailed (an S3 file of a customer type). */
+const emailable = (list: AnyObj[]) =>
+  list.filter((d) => CUSTOMER_TYPES.has(str(d?.type).toLowerCase()) && str(d?.s3Key) && str(d?.attachmentId));
+
+/**
+ * Attachment ids the customer was already emailed. Requests booked before
+ * meta.documentsEmailed existed: everything on their list then counts as
+ * handled (only documents added from now on are new).
+ */
+function emailedIdsOf(meta: AnyObj): Set<string> {
+  if (Array.isArray(meta?.documentsEmailed)) return new Set(meta.documentsEmailed.map(str));
+  return new Set(emailable(Array.isArray(meta?.bookingDocuments) ? meta.bookingDocuments : []).map((d) => str(d.attachmentId)));
+}
+
+const actorOf = (actor: AnyObj) => ({
+  sub: str(actor?.sub || actor?._id || actor?.id),
+  email: str(actor?.email).toLowerCase(),
+  name: str(actor?.name) || [str(actor?.firstName), str(actor?.lastName)].filter(Boolean).join(" "),
+});
+
 /**
  * Called after a manual booking is created, saved or has an attachment added
  * or removed. Never throws (the booking save already succeeded); returns what
  * it did, for the caller's response and for tests.
  */
-export async function syncRequestFromManualBooking(booking: AnyObj, actor: AnyObj): Promise<SyncOutcome> {
+export async function syncRequestFromManualBooking(
+  booking: AnyObj,
+  actor: AnyObj,
+  // notify: false — repair scripts: refresh the list only, no "documents
+  // ready" email and no record of one (send-documents-ready-backfill does that).
+  opts: { notify?: boolean } = {},
+): Promise<SyncOutcome> {
+  const notify = opts.notify !== false;
   const rid = linkedRequestId(booking);
   if (!rid) return "none";
   try {
@@ -187,16 +216,22 @@ export async function syncRequestFromManualBooking(booking: AnyObj, actor: AnyOb
     };
 
     if (booked) {
-      // Already booked: keep the document list in step with the booking
-      // (a replaced ticket, a second voucher). No new trail row, no email.
+      // Already booked: keep the document list in step with the booking (a
+      // replaced ticket, a second voucher, a type changed). No new trail
+      // row; documents the customer was never sent go out once, in one
+      // "documents ready" email.
       const ids = (list: AnyObj[]) => JSON.stringify(list.map((d: AnyObj) => `${str(d.manualBookingId)}:${str(d.attachmentId)}`));
       const unchanged = ids(doc.meta.bookingDocuments || []) === ids(merged) &&
         (doc.meta.bookingDocuments || []).every((d: AnyObj) => str(d.manualBookingId));
       if (unchanged && str(doc.meta.manualBookingId) === String(booking._id)) {
         return "none";
       }
+      const emailed = emailedIdsOf(doc.meta);
+      const fresh = notify ? emailable(merged).filter((d) => !emailed.has(str(d.attachmentId))) : [];
       setDocs();
+      if (fresh.length) doc.meta.documentsEmailed = [...emailed, ...fresh.map((d) => str(d.attachmentId))];
       await doc.save();
+      if (fresh.length) await notifyDocumentsReady(doc, emailAttachmentsOf(fresh), actorOf(actor));
       return "documents_updated";
     }
 
@@ -205,19 +240,20 @@ export async function syncRequestFromManualBooking(booking: AnyObj, actor: AnyOb
       const pricing = booking.pricing || {};
       const sell = Number(pricing.grandTotal) || Number(pricing.quotedPrice) || undefined;
       const cost = Number(pricing.actualPrice) || undefined;
+      // The email carries every customer document on the request (another
+      // booking of the same case may have added some while it was open), and
+      // records them as sent.
+      const sendNow = emailable(merged);
       await markRequestDone({
         doc,
-        admin: {
-          sub: str(actor?.sub || actor?._id || actor?.id),
-          email: str(actor?.email).toLowerCase(),
-          name: str(actor?.name) || [str(actor?.firstName), str(actor?.lastName)].filter(Boolean).join(" "),
-        },
+        admin: actorOf(actor),
         comment: bookedText(booking, docs),
         bookingAmount: sell,
         actualBookingPrice: cost,
-        extraAttachments: emailAttachmentsOf(docs),
+        extraAttachments: emailAttachmentsOf(sendNow),
         service: str(booking.type),
       });
+      await ApprovalRequest.updateOne({ _id: doc._id }, { $set: { "meta.documentsEmailed": sendNow.map((d) => str(d.attachmentId)) } }).exec();
       return "completed";
     }
 

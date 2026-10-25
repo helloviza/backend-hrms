@@ -8,6 +8,8 @@
 //     approver and Workspace Leaders copied, carrying the booking documents
 //     (queue uploads and proposal booking uploads). "Notified" is recorded
 //     only once that email is actually sent (the outbox retries a failure).
+//   - notifyDocumentsReady: documents added to an already-booked request
+//     (after "booking done" went out) reach the same people, once.
 //   - notifyRequesterProgress: booking started / on hold with Plumtrips /
 //     cancelled.
 //   - notifyProposalReady: the requester hears a proposal is ready, with a
@@ -16,7 +18,7 @@
 // Recipients for all of these are in the email map (approvalEmails/map.ts).
 // Every email here is price-free.
 
-import { actorStamp, userNames } from "./actorNames.js";
+import { actorStamp, SYSTEM_ACTOR, userNames } from "./actorNames.js";
 import fs from "fs";
 import path from "path";
 import ApprovalRequest from "../models/ApprovalRequest.js";
@@ -214,6 +216,46 @@ export async function markRequestDone(opts: {
   // History rows above were written by the outbox / updateOne: return the stored request.
   const fresh = await ApprovalRequest.findById(doc._id).exec();
   return { doc: fresh || doc, message };
+}
+
+/**
+ * "Documents ready": customer documents added to a request that is already
+ * booked — the "booking done" email went without them. Same recipients as
+ * "booking done" (a partner lead case: the student only); only the files
+ * given here (the caller passes the ones never sent before). Price-free, no
+ * link. Delivery is recorded like "booking done" (admin_notify_sent, hidden
+ * from customers) once the outbox actually sends it.
+ */
+export async function notifyDocumentsReady(
+  doc: AnyObj,
+  files: Array<{ filename: string; s3Key: string; contentType?: string }>,
+  actor: { sub?: string; email?: string; name?: string } = {},
+): Promise<{ to: string[]; cc: string[]; queued: boolean; skipped?: string }> {
+  if (!files.length) return { to: [], cc: [], queued: false, skipped: "no-files" };
+  if (DISABLE_EMAILS) return { to: [], cc: [], queued: false, skipped: "disabled" };
+  const ar = typeof doc?.toObject === "function" ? doc.toObject() : doc;
+  const requesterLookup = await userNames([ar.frontlinerId, norm(ar.frontlinerEmail)]);
+  const requesterName =
+    requesterLookup.get(String(ar.frontlinerId || "")) || requesterLookup.get(norm(ar.frontlinerEmail)) || str(ar.frontlinerName);
+  const ctx = { ar: { ...ar, frontlinerName: requesterName || ar.frontlinerName }, attachmentNames: files.map((f) => f.filename) };
+  const who = await recipientsFor("documents_ready", ctx);
+  const row = {
+    by: str(actor.sub) || "system",
+    userEmail: norm(actor.email),
+    userName: str(actor.name),
+    ...(actor.sub ? actorStamp({ sub: actor.sub, name: str(actor.name) }, "staff") : SYSTEM_ACTOR),
+  };
+  const sent = await notifySafely("documents_ready", ctx, {
+    attachments: files,
+    onSent: {
+      action: "admin_notify_sent",
+      ...row,
+      comment: `Documents ready: to=${who.to.join(",")}${who.cc.length ? ` cc=${who.cc.join(",")}` : ""} attachments=${files.length}`,
+    },
+    onFailed: { action: "admin_notify_failed", ...row, comment: "Documents email could not be delivered after retries" },
+  });
+  if (!sent || sent.skipped) return { to: who.to, cc: who.cc, queued: false, skipped: sent?.skipped || "failed" };
+  return { to: sent.to, cc: sent.cc, queued: true };
 }
 
 /**

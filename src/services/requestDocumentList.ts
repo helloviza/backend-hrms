@@ -19,7 +19,8 @@ export type RequestDocument = {
   uploadedAt?: string;
 };
 
-export const CUSTOMER_DOC_TYPES = new Set(["ticket", "voucher"]);
+// Twin of CUSTOMER_DOCUMENT_TYPES in models/ManualBooking.ts (kept here so this file stays import-free).
+export const CUSTOMER_DOC_TYPES = new Set(["ticket", "voucher", "document"]);
 const typeLabel = (t: any): RequestDocument["type"] =>
   str(t).toLowerCase() === "ticket" ? "Ticket" : str(t).toLowerCase() === "voucher" ? "Voucher" : "Document";
 

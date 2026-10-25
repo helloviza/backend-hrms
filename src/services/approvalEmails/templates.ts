@@ -77,7 +77,7 @@ export type EmailCtx = {
   assignNote?: string;
   /** One line per item (route and dates), for staff emails. */
   tripLines?: string[];
-  /** booking_done */
+  /** booking_done, documents_ready */
   doneComment?: string;
   attachmentNames?: string[];
   /** email_send_failed_alert */
@@ -577,6 +577,34 @@ function bookingDoneHtml(ctx: EmailCtx) {
   });
 }
 
+/**
+ * Documents added after "Booking processed" went out: only the new files, no
+ * prices and no link (a partner student has no login; customers have the
+ * documents in their request already).
+ */
+function documentsReadyHtml(ctx: EmailCtx) {
+  const student = isPartnerLeadCase(ctx.ar);
+  const ar = student ? { ...ctx.ar, frontlinerName: str(ctx.ar?.meta?.partnerLead?.contact?.name) || "you", frontlinerEmail: "" } : ctx.ar;
+  const t = tripModel(ar);
+  const files = (ctx.attachmentNames || []).map(str).filter(Boolean);
+  const docs = files.length
+    ? card(`${sectionLabel("Attached to this email")}<div style="height:6px;line-height:6px;font-size:0;">&nbsp;</div>${factsGrid(
+        files.map((f, i) => ({ label: `Document ${i + 1}`, value: escapeHtml(f) })),
+      )}`)
+    : "";
+  return doc({
+    title: "Documents ready",
+    preheader: `Your documents for ${caseCode(ar)} are attached.`,
+    hero: {
+      badge: "Documents",
+      tone: "green",
+      headline: `Your documents for your ${thing(t)} are ready`,
+      instruction: `The ${TRAVEL_DESK_NAME} has added ${files.length === 1 ? "a document" : "documents"} to your booking. ${files.length === 1 ? "It is" : "They are"} attached to this email.`,
+    },
+    blocks: body(ar, t, "", { notes: [], after: [docs] }),
+  });
+}
+
 /* ───────────────────────── subjects ───────────────────────── */
 
 function subjectFor(event: ApprovalEmailEvent, ctx: EmailCtx): string {
@@ -641,6 +669,8 @@ function subjectFor(event: ApprovalEmailEvent, ctx: EmailCtx): string {
       return `Booking Update — Request Cancelled — ${code}`;
     case "booking_done":
       return `Your Booking has been Processed — ${cust} (${code})`;
+    case "documents_ready":
+      return `Your travel documents — ${cust} (${code})`;
     case "email_send_failed_alert":
       return `Email not delivered — ${code} — ${ctx.failure?.subject || ""}`;
   }
@@ -730,6 +760,9 @@ export function renderApprovalEmail(event: ApprovalEmailEvent, ctx: EmailCtx, re
       break;
     case "booking_done":
       html = bookingDoneHtml(ctx);
+      break;
+    case "documents_ready":
+      html = documentsReadyHtml(ctx);
       break;
     case "email_send_failed_alert":
       html = buildSendFailureAlertHtml({

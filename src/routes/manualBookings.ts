@@ -45,6 +45,7 @@ import type { VoucherType } from "../types/index.js";
 import { userNames, nameOrUnknown, personName } from "../services/actorNames.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import { syncRequestFromManualBooking } from "../services/bookingDocuments.js";
+import { bookingsByRequest, requestBookingSummaries, requestBookingSummary } from "../services/requestBookings.js";
 import { isPartnerLeadCase } from "../services/partnerLeadCase.js";
 import { partnerCaseForBooking, partnerRequiredErrors, recordPartnerBookingStatus } from "../services/partnerLeadBooking.js";
 import { isNcLead, ncLeadRequiredErrors } from "../utils/ncLead.js";
@@ -372,6 +373,13 @@ function rejectClientAttachments(body: any): string | null {
  *     rows whose document lives in the SBT system, not here.
  *   - This route only, not the pre-save hook: cancel/restore/attachment
  *     saves and the sync jobs all call save() and must never trip it.
+ *
+ * A Book Now booking (linked to an approval request: source ADMIN_QUEUE +
+ * sourceBookingId) is held to more: its file is what the customer receives,
+ * so it may enter Done only with a TICKET or VOUCHER on record — an internal
+ * or legacy "other" file does not count — and, once Done, its last ticket /
+ * voucher can be neither deleted nor retyped away (DELETE / PATCH below).
+ * Plain manual bookings keep the any-file rule above, unchanged.
  */
 const FINAL_BOOKING_STATUSES = ["CONFIRMED", "INVOICED"];
 const ATTACHMENT_EXEMPT_SOURCES = ["SBT", "SBT_AUTO"];
@@ -387,13 +395,32 @@ function isAttachmentGated(b: { type?: string; status?: string; source?: string 
 
 const ATTACHMENT_GATE_MESSAGE =
   "At least one attachment (ticket/voucher) is required before a flight or hotel booking can be marked Done";
+const LINKED_GATE_MESSAGE =
+  "This booking is for a request: a Ticket or Voucher file is needed before it can be marked Done (internal and other files don't count — set the file's type)";
+const LAST_CUSTOMER_FILE_MESSAGE =
+  "This is the last Ticket/Voucher on a Done booking for a request — the customer would lose it. Upload the replacement first, or move the booking back to Pending.";
+
+/** A Book Now booking: made for an approval request. */
+function isRequestBooking(b: any): boolean {
+  return String(b?.source ?? "").toUpperCase() === "ADMIN_QUEUE" && !!String(b?.sourceBookingId ?? "").trim();
+}
+const isTicketOrVoucher = (a: any) => ["ticket", "voucher"].includes(String(a?.type ?? "").toLowerCase());
+const ticketVoucherCount = (b: any) => (Array.isArray(b?.attachments) ? b.attachments.filter(isTicketOrVoucher).length : 0);
 
 /** Returns the 400 message when `after` would ENTER the gated state without a file, else null. */
 function attachmentGateError(before: any, after: any): string | null {
   if (!isAttachmentGated(after)) return null;
   if (isAttachmentGated(before)) return null; // already there — not our edit to police
+  if (isRequestBooking(after)) return ticketVoucherCount(after) > 0 ? null : LINKED_GATE_MESSAGE;
   const count = Array.isArray(after?.attachments) ? after.attachments.length : 0;
   return count > 0 ? null : ATTACHMENT_GATE_MESSAGE;
+}
+
+/** 409 message when removing / retyping `attachment` would leave a Done request booking without its ticket / voucher. */
+function lastCustomerFileError(booking: any, attachment: any, nextType: string | null): string | null {
+  if (!isAttachmentGated(booking) || !isRequestBooking(booking) || !isTicketOrVoucher(attachment)) return null;
+  if (nextType && isTicketOrVoucher({ type: nextType })) return null;
+  return ticketVoucherCount(booking) <= 1 ? LAST_CUSTOMER_FILE_MESSAGE : null;
 }
 
 // Reduced rule set for import paths — supplier + hotel-city only.
@@ -832,7 +859,7 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
     // Book Now: the request this booking is for (checked below).
     const linkedRid = source === "ADMIN_QUEUE" && body.sourceBookingId ? String(body.sourceBookingId) : "";
     const linked: any = linkedRid && mongoose.isValidObjectId(linkedRid)
-      ? await ApprovalRequest.findById(linkedRid).select("customerId meta.source").lean()
+      ? await ApprovalRequest.findById(linkedRid).select("customerId meta.source stage adminState").lean()
       : null;
     // A partner lead case's booking: supplier / given-by optional until Confirmed (services/partnerLeadBooking.ts).
     const isPartnerBooking = !!linked && isPartnerLeadCase(linked) && String(linked.customerId || "") === String(body.workspaceId);
@@ -853,6 +880,23 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
       if (!linked) return res.status(400).json({ error: "The approval request for this booking was not found", code: "REQUEST_NOT_FOUND" });
       if (String(linked.customerId || "") !== String(body.workspaceId)) {
         return res.status(400).json({ error: "The client must be the request's company", code: "CLIENT_MISMATCH" });
+      }
+      // One booking per request, unless another one is asked for on purpose
+      // ("+ Add another booking": additional: true) — a second Book Now click
+      // opens the existing booking instead (409 names it). A booked request
+      // takes a new booking only on purpose too.
+      if (req.body?.additional !== true) {
+        const existing = await requestBookingSummaries(linkedRid);
+        const booked = String(linked.stage || "").toUpperCase() === "COMPLETED" || String(linked.adminState || "") === "done";
+        if (existing.length || booked) {
+          return res.status(409).json({
+            error: existing.length
+              ? "This request already has a booking — open it, or add another booking on purpose."
+              : "This request is already booked — add another booking on purpose to continue.",
+            code: "BOOKING_EXISTS",
+            bookings: existing,
+          });
+        }
       }
     }
 
@@ -898,6 +942,23 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
     res.status(201).json({ ok: true, booking, requestSync });
   } catch (err: any) {
     console.error("[ManualBookings POST]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/manual-bookings/by-request/:requestId — the live Book Now
+// bookings of one approval request (summary: id, ref, type, status), oldest
+// first; the booking form opened from the queue offers "Open existing
+// booking" from it. Only bookings the caller may open are listed.
+router.get("/by-request/:requestId", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
+  try {
+    const rid = String(req.params.requestId || "");
+    if (!mongoose.isValidObjectId(rid)) return res.status(400).json({ error: "Invalid request id" });
+    const rows = (await bookingsByRequest([rid], "workspaceId createdBy assignPerson assignmentStatus")).get(rid) || [];
+    const ctx = bookingAccessContextFromReq(req);
+    res.json({ ok: true, bookings: rows.filter((b) => canAccessBooking(ctx, b, "READ")).map(requestBookingSummary) });
+  } catch (err: any) {
+    console.error("[ManualBookings by-request]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2346,6 +2407,9 @@ router.patch(
 
       if (attachment.type === type) return res.json({ ok: true, attachment, requestSync: "none" });
 
+      const lastFile = lastCustomerFileError(booking, attachment, type);
+      if (lastFile) return res.status(409).json({ error: lastFile, code: "ATTACHMENT_REQUIRED" });
+
       const changes = Array.isArray(attachment.typeChanges) ? attachment.typeChanges : [];
       attachment.typeChanges = [
         ...changes,
@@ -2388,6 +2452,8 @@ router.delete(
           code: "ATTACHMENT_REQUIRED",
         });
       }
+      const lastFile = lastCustomerFileError(booking, attachment, null);
+      if (lastFile) return res.status(409).json({ error: lastFile, code: "ATTACHMENT_REQUIRED" });
 
       // No shared delete helper exists in utils/s3Upload.ts — inline
       // DeleteObjectCommand, same pattern as workspace.branding.ts / users.ts.

@@ -136,7 +136,7 @@ export async function fixLinkedDoneAttachments(opts: {
       );
     }
     const fresh = await bookings.findOne({ _id: new mongoose.Types.ObjectId(l.bookingId) });
-    l.sync = await syncRequestFromManualBooking(fresh as any, actor);
+    l.sync = await syncRequestFromManualBooking(fresh as any, actor, { notify: false });
     report.fixed++;
     log(`  ${l.bookingRef}: retyped ${l.files.length} file(s) · request sync: ${l.sync}`);
     // The sync never throws; "none" means it did not update the request (see its log line).

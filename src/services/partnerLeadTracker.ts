@@ -6,7 +6,10 @@
 //
 //   Out: case number, student name, services, route, dates, current step,
 //        RM display name, step history {label, subStatus, at}, document STATUS
-//        (ticket / voucher issued — no file, name or link).
+//        per booking (no file, name or link): issued once the booking holds a
+//        customer document (ticket / voucher / document), labelled by the
+//        booking's service — a flight's is a ticket, a hotel's a voucher,
+//        anything else a document. Internal and legacy "other" files never count.
 //   Never out: the student's phone or email, staff notes or comments, any
 //        price / cost / margin / partner share, supplier, ids, emails of staff.
 //
@@ -24,6 +27,7 @@
 // Every case is in exactly one of the last three, so they sum to Registered.
 import { itemDates, itemTitle, serviceOf } from "./approvalItemRules.js";
 import { BOOKING_STATUS_LABEL, bookingRollup } from "./partnerLeadBooking.js";
+import { CUSTOMER_DOCUMENT_TYPES, documentTypeForBookingType } from "../models/ManualBooking.js";
 
 type AnyObj = Record<string, any>;
 const str = (v: any, max = 200) => String(v ?? "").trim().slice(0, max);
@@ -129,11 +133,13 @@ export function trackerRow(c: AnyObj, bookings: AnyObj[]) {
     rmName: rmName(c),
     steps: stepHistory(c),
     documents: bookings.map((b) => {
-      const types = new Set((b.attachments || []).map((a: AnyObj) => str(a?.type).toLowerCase()));
+      const issued = (b.attachments || []).some((a: AnyObj) => CUSTOMER_DOCUMENT_TYPES.has(str(a?.type).toLowerCase()));
+      const kind = documentTypeForBookingType(b.type);
       return {
         service: BOOKING_TYPE_LABEL[str(b.type).toUpperCase()] || "Other",
-        ticketIssued: types.has("ticket"),
-        voucherIssued: types.has("voucher"),
+        ticketIssued: issued && kind === "ticket",
+        voucherIssued: issued && kind === "voucher",
+        documentIssued: issued && !kind,
       };
     }),
   };
