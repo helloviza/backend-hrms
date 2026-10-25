@@ -79,6 +79,17 @@ export interface ICstepSettlement extends Document {
   paymentSource?: "MANUAL" | "IMPORT";
   paymentBatchId?: mongoose.Types.ObjectId;
 
+  // Finance-c — Finance's own changes while the case is with it (reduce,
+  // disallow, per-diem deduction; routes/cstep.ts runFinanceAdjustment).
+  // financeRevision goes up by one on each, so the write always touches this
+  // document and a payment racing it conflicts instead of paying a stale
+  // figure. financeClosedAt/By are set when those changes left nothing owed
+  // and closed the case (SETTLED at ₹0) — the marker that keeps it on
+  // Finance's "Reimbursed & settled" list without a payment date.
+  financeRevision?: number;
+  financeClosedAt?: Date;
+  financeClosedBy?: mongoose.Types.ObjectId; // ref User
+
   startedBy: mongoose.Types.ObjectId; // ref User — who ran /settlement/start
   startedAt: Date;
   finalizedBy?: mongoose.Types.ObjectId; // ref User — who ran /settlement/finalize
@@ -136,6 +147,10 @@ const CstepSettlementSchema = new Schema<ICstepSettlement>(
     paymentRef: { type: String, trim: true },
     paymentSource: { type: String, enum: ["MANUAL", "IMPORT"] },
     paymentBatchId: { type: Schema.Types.ObjectId },
+
+    financeRevision: { type: Number },
+    financeClosedAt: { type: Date },
+    financeClosedBy: { type: Schema.Types.ObjectId, ref: "User" },
 
     startedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     startedAt: { type: Date, required: true },

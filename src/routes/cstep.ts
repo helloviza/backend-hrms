@@ -1852,9 +1852,19 @@ router.get("/requests/:id", async (req: any, res: any) => {
     let financePaid: ReturnType<typeof financePaidRecord> | undefined;
     if (FINANCE_CLOSED_STATUSES.includes(doc.status)) {
       const paid: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id })
-        .select("amountClaimed amountDueByCstep amountDueToCstep advanceTaken paidOn paymentRef paymentSource")
+        .select("amountClaimed amountDueByCstep amountDueToCstep advanceTaken paidOn paymentRef paymentSource financeClosedAt")
         .lean();
       financePaid = financePaidRecord(doc.formType, paid) || undefined;
+    }
+    // Finance-c — the settlement's lines and per diem for the Finance card:
+    // the Finance user cannot read GET /settlement (the Desk's view), so the
+    // case carries them while it is with Finance — and after Finance closed
+    // it, so a disallowed line stays visible. canFinanceAdjust (reduce /
+    // disallow) is the payment gate, same as canFinance.
+    const canFinanceAdjust = canFinance;
+    let financeSettlement: Awaited<ReturnType<typeof financeSettlementView>> | undefined;
+    if (canFinanceDecide || (financePaid && (await callerCanFinanceForTraveller(req, doc.travelerProfileId)))) {
+      financeSettlement = await financeSettlementView(req.workspaceObjectId, doc);
     }
 
     const arrangements = isClaim
@@ -1923,6 +1933,8 @@ router.get("/requests/:id", async (req: any, res: any) => {
       financeAmountClaimed,
       financeClaimDue,
       financePaid,
+      canFinanceAdjust,
+      financeSettlement,
       arrangements,
       changeRequests,
       canRequestChange,
@@ -2604,9 +2616,17 @@ const FINANCE_CLOSED_STATUSES = ["REIMBURSED", "SETTLED"];
 
 /** What Finance recorded when it closed a case, read off the settlement
  * (settleFinanceCase writes paidOn / paymentRef / paymentSource there).
- * null when Finance never paid — e.g. a nothing-owed SETTLED case. */
-function financePaidRecord(formType: string, settlement: any) {
-  if (!settlement?.paidOn) return null;
+ * null when Finance never paid — e.g. a nothing-owed SETTLED case. A case
+ * Finance itself closed at ₹0 by reducing / disallowing (financeClosedAt)
+ * is Finance's record too: ₹0, closedAtZero, dated the day it closed. */
+function financePaidRecord(
+  formType: string,
+  settlement: any,
+): { amountInr: number; direction: "PAY_OUT" | "COLLECT"; paidOn: Date; reference: string; source: string; closedAtZero?: true } | null {
+  if (!settlement?.paidOn) {
+    if (!settlement?.financeClosedAt) return null;
+    return { amountInr: 0, direction: "PAY_OUT", paidOn: settlement.financeClosedAt, reference: "", source: "MANUAL", closedAtZero: true };
+  }
   const { direction, amount } = financeCaseAmount(formType, settlement);
   return {
     amountInr: amount,
@@ -2614,6 +2634,41 @@ function financePaidRecord(formType: string, settlement: any) {
     paidOn: settlement.paidOn,
     reference: settlement.paymentRef || "",
     source: settlement.paymentSource || "MANUAL",
+  };
+}
+
+/** Finance-c — the settlement as the Finance card shows it: every line
+ * (traveller-paid ones are the ones Finance may reduce / disallow), the per
+ * diem and the totals. undefined when there is no settlement. */
+async function financeSettlementView(workspaceId: any, doc: any) {
+  const s: any = await CstepSettlement.findOne({ workspaceId, requestId: doc._id }).lean();
+  if (!s) return undefined;
+  const lines: any[] = await CstepSettlementLine.find({ workspaceId, settlementId: s._id }).sort({ createdAt: 1, _id: 1 }).lean();
+  return {
+    lines: lines.map((l) => ({
+      _id: l._id,
+      source: l.source,
+      mode: l.mode,
+      description: l.description,
+      classification: l.classification,
+      amountInr: Number(l.amountInr || 0),
+      claimedAmountInr: l.claimedAmountInr,
+      financeRejected: !!l.financeRejected,
+      financeRejectedFromInr: l.financeRejectedFromInr,
+      financeRejectedReason: l.financeRejectedReason,
+      financeRejectedAt: l.financeRejectedAt,
+    })),
+    perDiem: isClaimFormType(doc.formType)
+      ? undefined
+      : {
+          days: Number(s.perDiem?.days || 0),
+          rate: Number(s.perDiem?.rate || 0),
+          deductionInr: Number(s.perDiem?.deductionInr || 0),
+          deductionReason: s.perDiem?.deductionReason,
+          amountInr: Number(s.perDiem?.amountInr || 0),
+        },
+    totalCostOfTour: Number(s.totalCostOfTour || 0),
+    amountClaimed: Number(s.amountClaimed || 0),
   };
 }
 
@@ -2666,11 +2721,13 @@ router.get("/finance-queue", async (req: any, res: any) => {
     })
       .sort({ updatedAt: -1 })
       .lean();
+    // Finance-c — a case Finance closed at ₹0 itself (every item disallowed
+    // or reduced away) has no payment date but is Finance's: financeClosedAt.
     const paidSettlements: any[] = closedCandidates.length
       ? await CstepSettlement.find({
           workspaceId: req.workspaceObjectId,
           requestId: { $in: closedCandidates.map((d) => d._id) },
-          paidOn: { $exists: true, $ne: null },
+          $or: [{ paidOn: { $exists: true, $ne: null } }, { financeClosedAt: { $exists: true, $ne: null } }],
         }).lean()
       : [];
     const paidBy = new Map(paidSettlements.map((s) => [String(s.requestId), s]));
@@ -5823,10 +5880,42 @@ router.get("/requests/:id/settlement", async (req: any, res: any) => {
  * claimedAmountInr (the figure it was seeded with), and any change needs
  * amountReason. Logged as REDUCE_AMOUNT (before → after, reason); a
  * classification or verified change is logged as VERIFY_LINE. Finance has
- * no edit here — it sends the case back (POST /finance/return) with a reason.
+ * no edit here — once the case is with Finance, Finance reduces / disallows
+ * through its own routes (PATCH /finance/lines/:lineId and the rest).
  */
 function inrText(n: number | undefined | null): string {
   return `₹${Number(n || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
+}
+
+type LineReduction = { before: number; after: number; ceiling: number; reason: string };
+
+/**
+ * #11 — the reduce-only rule for one settlement line's amount, shared by the
+ * Travel Desk's line PATCH (ceiling: the claimed figure) and Finance's
+ * reduce (ceiling: the finalized figure). Checks only; the caller writes.
+ * change is null when the amount is unchanged (no reason needed). A refusal
+ * above the ceiling carries the ceiling.
+ */
+function planLineReduction(
+  line: { amountInr?: number },
+  rawAmount: any,
+  rawReason: any,
+  ceiling: number,
+  ceilingText: (ceiling: number) => string,
+): { ok: true; change: LineReduction | null } | { ok: false; error: string; ceiling?: number } {
+  const n = Number(rawAmount);
+  if (!isFinite(n) || n < 0) return { ok: false, error: "amountInr must be a non-negative number" };
+  const next = Math.round(n * 100) / 100;
+  if (next === line.amountInr) return { ok: true, change: null };
+  if (next > ceiling) return { ok: false, error: `An amount can only be reduced — ${ceilingText(ceiling)}`, ceiling };
+  const reason = String(rawReason || "").trim();
+  if (!reason) return { ok: false, error: "amountReason is required to change a line's amount" };
+  return { ok: true, change: { before: line.amountInr ?? 0, after: next, ceiling, reason } };
+}
+
+/** The REDUCE_AMOUNT comment: before → after, the ceiling, the reason. */
+function reductionComment(label: string, c: LineReduction, ceilingWord: string): string {
+  return `${label}: ${inrText(c.before)} → ${inrText(c.after)} (${ceilingWord} ${inrText(c.ceiling)}) — ${c.reason}`;
 }
 
 router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any) => {
@@ -5866,26 +5955,19 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
     const before = { amountInr: line.amountInr, classification: line.classification, verified: line.verified };
     const body = req.body || {};
 
-    let amountChange: { before: number; after: number; ceiling: number; reason: string } | null = null;
+    let amountChange: LineReduction | null = null;
     if ("amountInr" in body) {
-      const n = Number(body.amountInr);
-      if (!isFinite(n) || n < 0) return res.status(400).json({ error: "amountInr must be a non-negative number" });
-      const next = Math.round(n * 100) / 100;
-      if (next !== line.amountInr) {
-        // A line seeded before reduce-only has no ceiling yet: the amount it
-        // carries now becomes it.
-        const ceiling = line.claimedAmountInr ?? line.amountInr ?? 0;
-        if (next > ceiling) {
-          return res.status(400).json({
-            error: `An amount can only be reduced — this line was claimed at ${inrText(ceiling)}`,
-            claimedAmountInr: ceiling,
-          });
-        }
-        const reason = String(body.amountReason || "").trim();
-        if (!reason) return res.status(400).json({ error: "amountReason is required to change a line's amount" });
-        amountChange = { before: line.amountInr ?? 0, after: next, ceiling, reason };
+      // A line seeded before reduce-only has no ceiling yet: the amount it
+      // carries now becomes it.
+      const ceiling = line.claimedAmountInr ?? line.amountInr ?? 0;
+      const plan = planLineReduction(line, body.amountInr, body.amountReason, ceiling, (c) => `this line was claimed at ${inrText(c)}`);
+      if ("error" in plan) {
+        return res.status(400).json({ error: plan.error, ...(plan.ceiling !== undefined ? { claimedAmountInr: plan.ceiling } : {}) });
+      }
+      if (plan.change) {
+        amountChange = plan.change;
         line.claimedAmountInr = ceiling;
-        line.amountInr = next;
+        line.amountInr = plan.change.after;
       }
     }
 
@@ -5938,9 +6020,7 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
         actor,
         action: "REDUCE_AMOUNT",
         ...adminOverrideMark(req),
-        comment:
-          `${label}: ${inrText(amountChange.before)} → ${inrText(amountChange.after)}` +
-          ` (claimed ${inrText(amountChange.ceiling)}) — ${amountChange.reason}`,
+        comment: reductionComment(label, amountChange, "claimed"),
         at: new Date().toISOString(),
       });
     }
@@ -6400,13 +6480,12 @@ router.post("/requests/:id/claim/verify", async (req: any, res: any) => {
 });
 
 /**
- * Step 6 — POST /requests/:id/finance/settle — the Finance user (this
- * traveller's financeUserId) or a CSTEP Admin marks the reimbursement paid
- * out: TRANSFERRED_TO_FINANCE → REIMBURSED (terminal). A CLAIM is the
- * Finance user's alone — a CSTEP Admin gets 403 (their part ends at
- * POST /claim/verify). The finalized
- * settlement is the source of the amount; nothing on it is recomputed or
- * edited here. Optional body: { reference, note } — a payment/UTR
+ * Step 6 — POST /requests/:id/finance/settle — the traveller's assigned
+ * Finance user (financeUserId) marks the reimbursement paid out:
+ * TRANSFERRED_TO_FINANCE → REIMBURSED (terminal). Tour and claim alike, no
+ * CSTEP Admin (callerPaymentRefusal — #5). The settlement, as it stands at
+ * the moment of payment (after any Finance reduction), is the source of the
+ * amount; nothing on it is recomputed or edited here. Optional body: { reference, note } — a payment/UTR
  * reference and a remark, both folded into the FINANCE_SETTLE audit
  * comment. The linked CstepClaim goes to SETTLED (its own terminal "paid"
  * state — mirrors finalize keeping the claim in step with reality).
@@ -6486,19 +6565,6 @@ export async function settleFinanceCase(
   }
   const workspaceId = req.workspaceObjectId;
   const isClaim = isClaimFormType(doc.formType);
-  const settlement: any = await CstepSettlement.findOne({ workspaceId, requestId: doc._id }).lean();
-  const ready = isClaim ? settlement?.status === "VERIFYING" : settlement?.status === "FINALIZED";
-  if (!ready) {
-    return {
-      ok: false,
-      status: 409,
-      code: "SETTLEMENT_NOT_READY",
-      error: isClaim ? "This claim's settlement is not awaiting Finance" : "The settlement has not been finalized yet",
-    };
-  }
-
-  const { direction, amount } = financeCaseAmount(doc.formType, settlement);
-  const endStatus: "REIMBURSED" | "SETTLED" = isClaim && direction === "COLLECT" ? "SETTLED" : "REIMBURSED";
   const uid = new mongoose.Types.ObjectId(ownerId(req));
   const reference = opts.reference || "";
   const note = opts.note || "";
@@ -6512,9 +6578,22 @@ export async function settleFinanceCase(
 
   let entryId: any = null;
   let claim: any = null;
+  let direction: "PAY_OUT" | "COLLECT" = "PAY_OUT";
+  let amount = 0;
+  let endStatus: "REIMBURSED" | "SETTLED" = "REIMBURSED";
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
+      // The amount is read INSIDE the transaction, before anything is
+      // written: a Finance reduction committed first is what gets paid, and
+      // one landing mid-payment conflicts on the settlement write below, so
+      // the payment retries on the new figure instead of a stale one.
+      const settlement: any = await CstepSettlement.findOne({ workspaceId, requestId: doc._id }).session(session).lean();
+      const ready = isClaim ? settlement?.status === "VERIFYING" : settlement?.status === "FINALIZED";
+      if (!ready) throw new Error("SETTLEMENT_NOT_READY");
+      ({ direction, amount } = financeCaseAmount(doc.formType, settlement));
+      endStatus = isClaim && direction === "COLLECT" ? "SETTLED" : "REIMBURSED";
+
       const flipped = await CstepTravelRequest.updateOne(
         { _id: doc._id, workspaceId, status: "TRANSFERRED_TO_FINANCE" },
         { $set: { status: endStatus } },
@@ -6575,6 +6654,14 @@ export async function settleFinanceCase(
     if (err?.message === "ALREADY_SETTLED") {
       return { ok: false, status: 409, code: "ALREADY_SETTLED", error: "Already reimbursed" };
     }
+    if (err?.message === "SETTLEMENT_NOT_READY") {
+      return {
+        ok: false,
+        status: 409,
+        code: "SETTLEMENT_NOT_READY",
+        error: isClaim ? "This claim's settlement is not awaiting Finance" : "The settlement has not been finalized yet",
+      };
+    }
     throw err;
   } finally {
     session.endSession();
@@ -6603,14 +6690,20 @@ export async function settleFinanceCase(
  * the settlement reopens to VERIFYING (outcome/finalizedBy/finalizedAt
  * cleared; lines and per diem kept as they were), and the claim goes from
  * ADMIN_VERIFIED back to CLAIM_IN_PROGRESS. The next finalize rewrites both.
+ *
+ * Finance-c — the send-back stays open to a CSTEP Admin, but an Admin who
+ * is not this traveller's Finance user sends it back as an OVERRIDE: the
+ * entry carries adminOverride: true. The Finance user's own carries no flag.
  */
 router.post("/requests/:id/finance/return", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
-    if (!(await callerCanFinanceForTraveller(req, doc.travelerProfileId))) {
+    const isFinanceUser = await callerIsTravellerFinanceUser(req, doc.travelerProfileId);
+    if (!isFinanceUser && !isCstepAdmin(req)) {
       return res.status(403).json({ error: "Only this traveller's Finance user or a CSTEP Admin can perform this action" });
     }
+    const overrideMark: { adminOverride?: true } = isFinanceUser ? {} : { adminOverride: true };
     if (doc.status !== "TRANSFERRED_TO_FINANCE") {
       return res.status(409).json({ error: "Only a request transferred to Finance can be sent back to the Official" });
     }
@@ -6633,6 +6726,7 @@ router.post("/requests/:id/finance/return", async (req: any, res: any) => {
         stage: "FINANCE",
         actor: new mongoose.Types.ObjectId(ownerId(req)),
         action: "RETURN_TO_ADMIN",
+        ...overrideMark,
         comment: reason,
         at: new Date().toISOString(),
       });
@@ -6666,6 +6760,7 @@ router.post("/requests/:id/finance/return", async (req: any, res: any) => {
       stage: "FINANCE",
       actor: new mongoose.Types.ObjectId(ownerId(req)),
       action: "RETURN_TO_OFFICIAL",
+      ...overrideMark,
       comment: reason,
       at: new Date().toISOString(),
     });
@@ -6675,6 +6770,358 @@ router.post("/requests/:id/finance/return", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP requests finance return]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to send the case back to the Official" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Finance-c — Finance reduces and disallows at the Finance stage, while
+ * the case is TRANSFERRED_TO_FINANCE. The money levers are the assigned
+ * Finance user's alone, the same gate as recording a payment
+ * (callerPaymentRefusal — #5): no CSTEP Admin, no Travel Desk, and nobody
+ * while no Finance user is mapped. An Admin who IS the mapped Finance user
+ * acts as that Finance user.
+ *
+ *   PATCH /requests/:id/finance/lines/:lineId         { amountInr, amountReason }
+ *         reduce one traveller-paid line; the ceiling is its current
+ *         (finalized) amount, so a Desk reduction can never be undone to
+ *         raise the payout. Logs REDUCE_AMOUNT.
+ *   POST  /requests/:id/finance/lines/:lineId/reject  { reason }
+ *         disallow one traveller-paid line: → ₹0, marked "Disallowed by
+ *         Finance" (reason, who, when). Logs FINANCE_REJECT_LINE.
+ *   PATCH /requests/:id/finance/perdiem               { deductionInr, deductionReason }
+ *         per diem is deduction-only: add or raise a deduction, never the
+ *         rate or days. Logs PERDIEM_ADJUST. Not on a claim.
+ *   POST  /requests/:id/finance/reject-all            { reason }
+ *         disallow every payable line and zero the per diem with a
+ *         deduction, one shared reason. Logs FINANCE_REJECT.
+ *
+ * Company-paid (OFFICIAL) lines are the cost of the tour, not the payout,
+ * and stay as the Desk finalized them. Every entry is stage FINANCE.
+ *
+ * Each change runs in one transaction, only while the case is still with
+ * Finance: the settlement is edited in place (a Tour's stays FINALIZED, a
+ * claim's VERIFYING), its totals recomputed (applySettlementTotals) and a
+ * Tour's CstepClaim figures rewritten the way finalize writes them. When
+ * nothing is owed either way afterwards the case closes SETTLED at ₹0
+ * (finalize's rule), marked financeClosedAt so it stays on Finance's
+ * "Reimbursed & settled" list; a claim still owed back (an advance) stays
+ * with Finance to record the repayment. The traveller is emailed the new
+ * payout (FINANCE_ADJUSTED) after the commit.
+ * ───────────────────────────────────────────────────────────────────── */
+
+type FinanceEntry = {
+  action: "REDUCE_AMOUNT" | "PERDIEM_ADJUST" | "FINANCE_REJECT_LINE" | "FINANCE_REJECT" | "SETTLE";
+  comment: string;
+};
+type FinanceChange = {
+  kind: "REDUCED" | "DISALLOWED" | "ALL_DISALLOWED" | "PERDIEM_DEDUCTION";
+  /** What changed, for the traveller's email. */
+  item: string;
+  reason: string;
+  entries: FinanceEntry[];
+};
+type FinancePlanCtx = { settlement: any; lines: any[]; isClaim: boolean; uid: mongoose.Types.ObjectId; now: Date };
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+/** The traveller-paid line Finance may change, or a refusal (thrown). */
+function financeLine(lines: any[], lineId: string): any {
+  if (!mongoose.Types.ObjectId.isValid(lineId)) throw new CstepHttpError(400, "Invalid settlement line id");
+  const line = lines.find((l) => String(l._id) === String(lineId));
+  if (!line) throw new CstepHttpError(404, "Settlement line not found");
+  if (line.classification !== "PERSONAL") {
+    throw new CstepHttpError(409, "Finance can only change a traveller-paid line — this one was paid by CSTEP");
+  }
+  if (line.financeRejected) throw new CstepHttpError(409, "This line is already disallowed by Finance");
+  return line;
+}
+
+/** Disallow one line: → ₹0, with the reason, who and when. The ceiling
+ * (claimedAmountInr) keeps the figure it was claimed at. Returns the
+ * amount it had. */
+function disallowLine(line: any, reason: string, uid: mongoose.Types.ObjectId, now: Date): number {
+  const from = line.amountInr ?? 0;
+  if (line.claimedAmountInr == null) line.claimedAmountInr = from;
+  line.amountInr = 0;
+  line.financeRejected = true;
+  line.financeRejectedFromInr = from;
+  line.financeRejectedReason = reason;
+  line.financeRejectedBy = uid;
+  line.financeRejectedAt = now;
+  return from;
+}
+
+const lineLabel = (line: any) => line.description || line.mode;
+
+async function runFinanceAdjustment(req: any, res: any, plan: (ctx: FinancePlanCtx) => FinanceChange | null) {
+  const doc = await loadRequest(req, req.params.id);
+  if (!doc) return res.status(404).json({ error: "Travel request not found" });
+  const refusal = await callerPaymentRefusal(req, doc.travelerProfileId);
+  if (refusal) return res.status(403).json({ error: refusal });
+  if (doc.status !== "TRANSFERRED_TO_FINANCE") {
+    return res.status(409).json({ error: "Only a case with Finance can be changed by Finance" });
+  }
+
+  const workspaceId = req.workspaceObjectId;
+  const isClaim = isClaimFormType(doc.formType);
+  const uid = new mongoose.Types.ObjectId(ownerId(req));
+  // Filled by the transaction's last (committed) attempt.
+  const out: {
+    change?: FinanceChange | null;
+    closed?: boolean;
+    before?: ReturnType<typeof financeCaseAmount>;
+    after?: ReturnType<typeof financeCaseAmount>;
+    entryIds?: any[];
+    settlement?: any;
+    lines?: any[];
+  } = {};
+
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      const now = new Date();
+      out.change = null;
+      const live = await CstepTravelRequest.findOne({ _id: doc._id, workspaceId, status: "TRANSFERRED_TO_FINANCE" })
+        .session(session)
+        .select("_id")
+        .lean();
+      if (!live) throw new CstepHttpError(409, "This case is no longer with Finance");
+      const settlement: any = await CstepSettlement.findOne({
+        workspaceId,
+        requestId: doc._id,
+        status: isClaim ? "VERIFYING" : "FINALIZED",
+      }).session(session);
+      if (!settlement) throw new CstepHttpError(409, "This case's settlement is not awaiting Finance");
+      const lines: any[] = await CstepSettlementLine.find({ workspaceId, settlementId: settlement._id }).session(session);
+
+      const before = financeCaseAmount(doc.formType, settlement);
+      const change = plan({ settlement, lines, isClaim, uid, now });
+      if (!change) return;
+
+      for (const line of lines) if (line.isModified()) await line.save({ session });
+      applySettlementTotals(settlement, lines.map((l) => l.toObject()), doc);
+      // Always a write to this document, so a payment racing this change
+      // conflicts with it (settleFinanceCase) instead of paying the old figure.
+      settlement.financeRevision = (settlement.financeRevision || 0) + 1;
+      const after = financeCaseAmount(doc.formType, settlement);
+      const closed = isClaim
+        ? !(Number(settlement.amountDueByCstep) > 0) && !(Number(settlement.amountDueToCstep) > 0)
+        : !(Number(settlement.amountClaimed) > 0);
+      if (closed) {
+        settlement.outcome = "CLOSE";
+        if (isClaim) {
+          settlement.status = "FINALIZED";
+          settlement.finalizedBy = uid;
+          settlement.finalizedAt = now;
+        }
+        settlement.financeClosedAt = now;
+        settlement.financeClosedBy = uid;
+        const flipped = await CstepTravelRequest.updateOne(
+          { _id: doc._id, workspaceId, status: "TRANSFERRED_TO_FINANCE" },
+          { $set: { status: "SETTLED" } },
+          { session },
+        );
+        if (flipped.modifiedCount !== 1) throw new CstepHttpError(409, "This case is no longer with Finance");
+      }
+      await settlement.save({ session });
+
+      // A Tour's CstepClaim mirrors the settlement (finalize writes it the
+      // same way); an Event Request has none, so this matches nothing there.
+      if (!isClaim) {
+        await CstepClaim.updateOne(
+          { workspaceId, travelRequestId: doc._id },
+          {
+            $set: {
+              totalCostOfTour: settlement.totalCostOfTour,
+              amountClaimed: settlement.amountClaimed,
+              amountDueByCstep: settlement.amountClaimed,
+              amountDueToCstep: 0,
+              ...(closed ? { status: "SETTLED" } : {}),
+            },
+          },
+          { session },
+        );
+      }
+
+      const entries: FinanceEntry[] = [...change.entries];
+      if (closed) {
+        entries.push({
+          action: "SETTLE",
+          comment: `Nothing owed after Finance's changes — closed at ₹0 | Total cost of tour: ${inrText(settlement.totalCostOfTour)}`,
+        });
+      }
+      const created = await CstepApproval.create(
+        entries.map((e) => ({
+          workspaceId,
+          entityType: "REQUEST",
+          entityId: doc._id,
+          stage: "FINANCE",
+          actor: uid,
+          action: e.action,
+          comment: e.comment,
+          at: now.toISOString(),
+        })),
+        { session, ordered: true },
+      );
+
+      out.change = change;
+      out.closed = closed;
+      out.before = before;
+      out.after = after;
+      out.entryIds = created.map((c: any) => c._id);
+      out.settlement = settlement.toObject();
+      out.lines = lines.map((l) => l.toObject());
+    });
+  } catch (err: any) {
+    if (err instanceof CstepHttpError) return res.status(err.status).json({ error: err.message });
+    throw err;
+  } finally {
+    session.endSession();
+  }
+
+  if (!out.change) return res.json({ ok: true, changed: false, request: doc.toObject() });
+  if (out.closed) doc.status = "SETTLED";
+  await notifyCstep("FINANCE_ADJUSTED", doc, {
+    logEntryId: out.entryIds![0],
+    reason: out.change.reason,
+    amountInr: out.after!.amount,
+    direction: out.after!.direction,
+    adjustment: {
+      kind: out.change.kind,
+      item: out.change.item,
+      beforeInr: out.before!.amount,
+      beforeDirection: out.before!.direction,
+      closed: !!out.closed,
+    },
+  });
+  res.json({ ok: true, changed: true, closed: !!out.closed, request: doc.toObject(), settlement: out.settlement, lines: out.lines });
+}
+
+router.patch("/requests/:id/finance/lines/:lineId", async (req: any, res: any) => {
+  try {
+    await runFinanceAdjustment(req, res, ({ lines }) => {
+      const line = financeLine(lines, req.params.lineId);
+      const plan = planLineReduction(
+        line,
+        req.body?.amountInr,
+        req.body?.amountReason,
+        line.amountInr ?? 0,
+        (c) => `this line stands at ${inrText(c)} as finalized`,
+      );
+      if ("error" in plan) throw new CstepHttpError(400, plan.error);
+      if (!plan.change) return null;
+      if (line.claimedAmountInr == null) line.claimedAmountInr = plan.change.before;
+      line.amountInr = plan.change.after;
+      const label = lineLabel(line);
+      return {
+        kind: "REDUCED",
+        item: `${label}: ${inrText(plan.change.before)} → ${inrText(plan.change.after)}`,
+        reason: plan.change.reason,
+        entries: [{ action: "REDUCE_AMOUNT", comment: reductionComment(label, plan.change, "finalized") }],
+      };
+    });
+  } catch (err: any) {
+    console.error("[CSTEP requests finance line reduce]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to reduce the line" });
+  }
+});
+
+router.post("/requests/:id/finance/lines/:lineId/reject", async (req: any, res: any) => {
+  try {
+    const reason = String(req.body?.reason || "").trim();
+    await runFinanceAdjustment(req, res, ({ lines, uid, now }) => {
+      if (!reason) throw new CstepHttpError(400, "reason is required");
+      const line = financeLine(lines, req.params.lineId);
+      const from = disallowLine(line, reason, uid, now);
+      const label = lineLabel(line);
+      return {
+        kind: "DISALLOWED",
+        item: `${label}: ${inrText(from)} → ₹0`,
+        reason,
+        entries: [{ action: "FINANCE_REJECT_LINE", comment: `${label}: ${inrText(from)} → ₹0, disallowed by Finance — ${reason}` }],
+      };
+    });
+  } catch (err: any) {
+    console.error("[CSTEP requests finance line reject]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to disallow the line" });
+  }
+});
+
+router.patch("/requests/:id/finance/perdiem", async (req: any, res: any) => {
+  try {
+    const body = req.body || {};
+    await runFinanceAdjustment(req, res, ({ settlement, isClaim }) => {
+      if (isClaim) throw new CstepHttpError(409, "A claim has no per diem");
+      if ("rate" in body || "overrideDays" in body) {
+        throw new CstepHttpError(400, "Finance can only add or raise a per-diem deduction — not change the rate or days");
+      }
+      const n = Number(body.deductionInr);
+      if (body.deductionInr === null || !isFinite(n) || n < 0) {
+        throw new CstepHttpError(400, "deductionInr must be a non-negative number");
+      }
+      const next = round2(n);
+      const current = settlement.perDiem?.deductionInr || 0;
+      if (next === current) return null;
+      if (next < current) {
+        throw new CstepHttpError(400, `Finance can only add or raise a deduction — it stands at ${inrText(current)}`);
+      }
+      const reason = String(body.deductionReason || "").trim();
+      if (!reason) throw new CstepHttpError(400, "deductionReason is required for a per-diem deduction");
+      const netBefore = settlement.perDiem.amountInr || 0;
+      const days = settlement.perDiem.days || 0;
+      const rate = settlement.perDiem.rate || 0;
+      settlement.perDiem.deductionInr = next;
+      settlement.perDiem.deductionReason = reason;
+      settlement.perDiem.amountInr = round2(Math.max(0, days * rate - next));
+      const netAfter = settlement.perDiem.amountInr;
+      return {
+        kind: "PERDIEM_DEDUCTION",
+        item: `Per diem: ${inrText(netBefore)} → ${inrText(netAfter)}`,
+        reason,
+        entries: [
+          {
+            action: "PERDIEM_ADJUST",
+            comment:
+              `Per diem: days ${days} => ${days}, rate ${rate} => ${rate}, ` +
+              `deduction ${current} => ${next}, net ${netBefore} => ${netAfter} (deduction: ${reason})`,
+          },
+        ],
+      };
+    });
+  } catch (err: any) {
+    console.error("[CSTEP requests finance perdiem]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to update per diem" });
+  }
+});
+
+router.post("/requests/:id/finance/reject-all", async (req: any, res: any) => {
+  try {
+    const reason = String(req.body?.reason || "").trim();
+    await runFinanceAdjustment(req, res, ({ settlement, lines, isClaim, uid, now }) => {
+      if (!reason) throw new CstepHttpError(400, "reason is required");
+      const payable = lines.filter((l) => l.classification === "PERSONAL" && !l.financeRejected);
+      const perDiemNet = isClaim ? 0 : Number(settlement.perDiem?.amountInr || 0);
+      if (!payable.length && !(perDiemNet > 0)) throw new CstepHttpError(409, "Nothing payable is left to disallow");
+
+      const items = payable.map((line) => `${lineLabel(line)} ${inrText(disallowLine(line, reason, uid, now))}`);
+      if (perDiemNet > 0) {
+        // The per diem goes to ₹0 the only way Finance may move it: a
+        // deduction of its whole gross.
+        settlement.perDiem.deductionInr = round2((settlement.perDiem.days || 0) * (settlement.perDiem.rate || 0));
+        settlement.perDiem.deductionReason = `Disallowed by Finance — ${reason}`;
+        settlement.perDiem.amountInr = 0;
+        items.push(`Per diem ${inrText(perDiemNet)}`);
+      }
+      return {
+        kind: "ALL_DISALLOWED",
+        item: "Every claimed item",
+        reason,
+        entries: [{ action: "FINANCE_REJECT", comment: `All claimed items disallowed by Finance (${items.join(", ")}) — ${reason}` }],
+      };
+    });
+  } catch (err: any) {
+    console.error("[CSTEP requests finance reject all]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to disallow the claim" });
   }
 });
 

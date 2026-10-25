@@ -44,6 +44,10 @@
 //                            report) + the traveller if a different email;
 //                            from the 2nd reminder also the Tour Approver.
 //                            Sent by the daily sweep (services/cstepReportReminders.ts)
+//   FINANCE_ADJUSTED         owner — Finance reduced or disallowed part of the
+//                            payout while the case was with it (routes/cstep.ts
+//                            runFinanceAdjustment): the item, the reason, the
+//                            new figure, and whether that closed the case
 import mongoose from "mongoose";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import TravellerProfile from "../models/TravellerProfile.js";
@@ -76,7 +80,8 @@ export type CstepNotifyEvent =
   | "ARRANGED"
   | "CHANGE_RAISED"
   | "CHANGE_RESOLVED"
-  | "REPORT_REMINDER";
+  | "REPORT_REMINDER"
+  | "FINANCE_ADJUSTED";
 
 type Role = "APPROVER" | "OFFICIAL" | "FINANCE" | "ADMIN" | "OWNER" | "REMINDER";
 
@@ -98,6 +103,7 @@ const RECIPIENT: Record<CstepNotifyEvent, Role> = {
   CHANGE_RAISED: "OFFICIAL",
   CHANGE_RESOLVED: "OWNER",
   REPORT_REMINDER: "REMINDER",
+  FINANCE_ADJUSTED: "OWNER",
 };
 
 export type CstepNotifyCtx = {
@@ -131,6 +137,18 @@ export type CstepNotifyCtx = {
     anchorDay: string;
     /** True when the anchor is a send-back, not the trip's return. */
     sentBack: boolean;
+  };
+  /**
+   * FINANCE_ADJUSTED — what Finance changed. amountInr / direction carry the
+   * payout after the change; beforeInr / beforeDirection the one before it.
+   * closed: nothing is owed any more, so the case closed (SETTLED at ₹0).
+   */
+  adjustment?: {
+    kind: "REDUCED" | "DISALLOWED" | "ALL_DISALLOWED" | "PERDIEM_DEDUCTION";
+    item: string;
+    beforeInr: number;
+    beforeDirection: "PAY_OUT" | "COLLECT";
+    closed: boolean;
   };
 };
 
@@ -265,6 +283,29 @@ function copyFor(event: CstepNotifyEvent, who: string, kind: string, claim: bool
         ? { subject: `Your ${service} ${what} request was declined`, badge: "Declined", tone: "red", headline: `Your ${service} ${what} was not made`, instruction: "Your existing booking stands. Contact the Travel Desk if you still need the change.", note, noteLabel: "Note" }
         : { subject: `Your ${service} ${what} is done`, badge: "Change done", tone: "green", headline: `Your ${service} ${what} is done`, instruction: "The Travel Desk has made the change. Your updated booking is in the portal.", note, noteLabel: "Note" };
     }
+    case "FINANCE_ADJUSTED": {
+      const a = ctx.adjustment;
+      const disallowed = a?.kind === "DISALLOWED" || a?.kind === "ALL_DISALLOWED";
+      const what = claim ? lower : "claim";
+      const headline = a?.kind === "ALL_DISALLOWED"
+        ? `Finance has disallowed every item on your ${what}`
+        : disallowed
+          ? `Finance has disallowed an item on your ${what}`
+          : `Finance has reduced an amount on your ${what}`;
+      const instruction = a?.closed
+        ? "Nothing is now owed either way, so the claim is closed."
+        : collect
+          ? `${inr(ctx.amountInr)} is now to be recovered from you. Finance will record the repayment.`
+          : `${inr(ctx.amountInr)} is now payable to you. You will be emailed when it is paid.`;
+      return {
+        subject: `Your ${what} payout was changed by Finance`,
+        badge: disallowed ? "Item disallowed" : "Amount reduced",
+        tone: "red",
+        headline,
+        instruction,
+        note: reason,
+      };
+    }
     case "REPORT_REMINDER": {
       const n = ctx.reminder?.count || 1;
       const day = fmtDate(ctx.reminder?.anchorDay);
@@ -290,7 +331,7 @@ function copyFor(event: CstepNotifyEvent, who: string, kind: string, claim: bool
  * gets the photo.
  */
 function bandFor(event: CstepNotifyEvent, ctx: CstepNotifyCtx): CstepEmailInput["band"] {
-  if (["RETURN", "RETURN_REPORT", "RETURN_TO_OFFICIAL", "RETURN_TO_ADMIN", "REJECTED", "REPORT_REMINDER"].includes(event)) return "plain";
+  if (["RETURN", "RETURN_REPORT", "RETURN_TO_OFFICIAL", "RETURN_TO_ADMIN", "REJECTED", "REPORT_REMINDER", "FINANCE_ADJUSTED"].includes(event)) return "plain";
   if (event === "CHANGE_RESOLVED" && ctx.change?.outcome === "DECLINED") return "plain";
   if (event === "TRANSFERRED_TO_FINANCE" && ctx.direction === "COLLECT") return "plain";
   return "photo";
@@ -379,6 +420,15 @@ function nextStepsFor(event: CstepNotifyEvent, claim: boolean, ctx: CstepNotifyC
       ];
     case "CHANGE_RESOLVED":
       return [{ title: "Check your booking", detail: "Open the request to see the service as it stands now." }];
+    case "FINANCE_ADJUSTED":
+      return ctx.adjustment?.closed
+        ? [{ title: "Closed", detail: `Nothing more is due on this ${claim ? "claim" : "trip's claim"}. Open it to see what Finance changed.` }]
+        : [
+            { title: "Check", detail: "Open the request to see what Finance changed and why." },
+            collect
+              ? { title: "Repay", detail: "Finance records your repayment and closes the claim." }
+              : { title: "Payment", detail: "Finance pays the revised amount; you are emailed when it is paid." },
+          ];
     case "REPORT_REMINDER":
       return [
         { title: "Open", detail: "Open the request in the portal and go to its travel report." },
@@ -408,6 +458,17 @@ export function renderCstepEmail(event: CstepNotifyEvent, request: any, travelle
     ...(dates ? [{ label: "Dates", value: dates }] : []),
     ...(request.claimReference ? [{ label: refLabel, value: String(request.claimReference) }] : []),
     ...(ctx.reference ? [{ label: "Payment reference", value: String(ctx.reference) }] : []),
+    ...(ctx.adjustment
+      ? [
+          { label: "Changed", value: ctx.adjustment.item },
+          {
+            label: "Payout",
+            value:
+              `${inr(ctx.adjustment.beforeInr)}${ctx.adjustment.beforeDirection === "COLLECT" ? " to recover" : ""} → ` +
+              `${inr(ctx.amountInr)}${ctx.direction === "COLLECT" && Number(ctx.amountInr) > 0 ? " to recover" : ""}`,
+          },
+        ]
+      : []),
     ...(ctx.change
       ? [
           { label: "Change", value: `${ctx.change.kind === "CANCEL" ? "Cancel" : "Rebook"} — ${ctx.change.serviceLabel}` },

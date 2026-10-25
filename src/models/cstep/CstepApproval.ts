@@ -71,6 +71,11 @@ export type CstepApprovalAction =
   // to CSTEP Admin verification (TRANSFERRED_TO_FINANCE → APPROVED). The
   // Admin's verification itself reuses ADMIN_VERIFY above.
   | "RETURN_TO_ADMIN"
+  // Finance-c — Finance disallows one traveller-paid settlement line (→ ₹0),
+  // or every payable item at once ("Reject all"), while the case is with it.
+  // Finance's reductions reuse REDUCE_AMOUNT / PERDIEM_ADJUST, stage FINANCE.
+  | "FINANCE_REJECT_LINE"
+  | "FINANCE_REJECT"
   // Change requests — a cancel / rebook raised against an arranged service
   // (CstepChangeRequest), and the Official's DONE / DECLINED resolution.
   | "CHANGE_REQUEST"
@@ -136,6 +141,8 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "RETURN_REPORT",
       "RETURN_TO_OFFICIAL",
       "RETURN_TO_ADMIN",
+      "FINANCE_REJECT_LINE",
+      "FINANCE_REJECT",
       "CHANGE_REQUEST",
       "CHANGE_RESOLVE",
     ],

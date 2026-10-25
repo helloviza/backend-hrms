@@ -62,6 +62,14 @@ export interface ICstepSettlementLine extends Document {
   verifiedBy?: mongoose.Types.ObjectId; // ref User
   verifiedAt?: Date;
 
+  /** Finance-c — disallowed by Finance while the case was with it: amountInr
+   * went to 0 from financeRejectedFromInr, with the reason, who and when. */
+  financeRejected?: boolean;
+  financeRejectedFromInr?: number;
+  financeRejectedReason?: string;
+  financeRejectedBy?: mongoose.Types.ObjectId; // ref User
+  financeRejectedAt?: Date;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -90,6 +98,12 @@ const CstepSettlementLineSchema = new Schema<ICstepSettlementLine>(
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     verifiedBy: { type: Schema.Types.ObjectId, ref: "User" },
     verifiedAt: { type: Date },
+
+    financeRejected: { type: Boolean },
+    financeRejectedFromInr: { type: Number },
+    financeRejectedReason: { type: String, trim: true },
+    financeRejectedBy: { type: Schema.Types.ObjectId, ref: "User" },
+    financeRejectedAt: { type: Date },
   },
   { timestamps: true },
 );
