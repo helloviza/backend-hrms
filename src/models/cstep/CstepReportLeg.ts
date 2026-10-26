@@ -55,6 +55,10 @@ export interface ICstepReportLeg extends Document {
   remarks?: string;
 
   attachmentId?: mongoose.Types.ObjectId; // ref CstepAttachment — the per-row uploaded receipt/boarding pass, optional
+  /** "No bill available" — the traveller has no document for this leg. It
+   * passes report/submit without one and is listed on the self-declaration
+   * (claimDeclarationItems). Never set alongside an attachmentId. */
+  noBill?: boolean;
   source: CstepReportLegSource;
 
   createdBy: mongoose.Types.ObjectId; // ref User — the traveller (or whoever is filing on their behalf)
@@ -85,6 +89,7 @@ const CstepReportLegSchema = new Schema<ICstepReportLeg>(
     remarks: { type: String, trim: true },
 
     attachmentId: { type: Schema.Types.ObjectId, ref: "CstepAttachment" },
+    noBill: { type: Boolean, default: false },
     source: { type: String, enum: ["SEEDED", "ADDED"], required: true },
 
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },

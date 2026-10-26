@@ -58,6 +58,7 @@ export interface ICstepSettlementLine extends Document {
 
   verified: boolean;
   attachmentId?: mongoose.Types.ObjectId; // ref CstepAttachment — carried over from the source report leg, if any; an ARRANGEMENT-sourced line carries the document of the SEEDED CSTEP-paid leg that mirrors it (paired at seed time by order + travelMode)
+  noBill?: boolean; // the same leg was ticked "No bill available" — carried over at seed time, exactly like attachmentId
 
   createdBy: mongoose.Types.ObjectId; // ref User — who ran /settlement/start (the seeding action)
   verifiedBy?: mongoose.Types.ObjectId; // ref User
@@ -102,6 +103,7 @@ const CstepSettlementLineSchema = new Schema<ICstepSettlementLine>(
 
     verified: { type: Boolean, default: false },
     attachmentId: { type: Schema.Types.ObjectId, ref: "CstepAttachment" },
+    noBill: { type: Boolean, default: false },
 
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     verifiedBy: { type: Schema.Types.ObjectId, ref: "User" },

@@ -108,6 +108,7 @@ import {
   uploadCstepClaimDeclarationPdf,
   uploadCstepExpenseClaimPdf,
   uploadCstepLocalTravelClaimPdf,
+  type CstepClaimDeclarationEntry,
   type CstepClaimSettlementPdfData,
 } from "../utils/cstepClaimPdf.js";
 import { uploadCstepPacketPdf, type CstepPacketReportLeg } from "../utils/cstepPacketPdf.js";
@@ -1515,6 +1516,7 @@ async function buildSeedSettlementLines(
     classificationOverridden: false;
     verified: false;
     attachmentId?: any;
+    noBill?: boolean;
   }>
 > {
   const [arrangements, legs] = await Promise.all([
@@ -1555,6 +1557,7 @@ async function buildSeedSettlementLines(
     classificationOverridden: false;
     verified: false;
     attachmentId?: any;
+    noBill?: boolean;
   }> = [];
 
   for (const a of arrangements as any[]) {
@@ -1571,6 +1574,8 @@ async function buildSeedSettlementLines(
       classificationOverridden: false,
       verified: false,
       attachmentId: pairedLeg?.attachmentId || undefined,
+      // A ticked "No bill available" booked leg reads as declared, not "No document".
+      noBill: !pairedLeg?.attachmentId && pairedLeg?.noBill === true,
     });
   }
 
@@ -1588,6 +1593,7 @@ async function buildSeedSettlementLines(
         classificationOverridden: false,
         verified: false,
         attachmentId: leg.attachmentId,
+        noBill: !leg.attachmentId && leg.noBill === true,
       });
     } else if (leg.paidBy === "CSTEP" && leg.source === "ADDED") {
       lines.push({
@@ -1602,6 +1608,7 @@ async function buildSeedSettlementLines(
         classificationOverridden: false,
         verified: false,
         attachmentId: leg.attachmentId,
+        noBill: !leg.attachmentId && leg.noBill === true,
       });
     }
   }
@@ -1927,6 +1934,8 @@ router.get("/requests/:id", async (req: any, res: any) => {
     // Claims addition — the claim lines' receipts, presigned for viewing,
     // keyed by attachment id (the intake form shows the file name on edit;
     // the detail view links each one).
+    const declarationItems = await requestDeclarationItems(req, doc);
+
     const claimAttachments: Record<string, { _id: any; originalName?: string; mime?: string; url: string }> = {};
     if (isClaim) {
       const ids = claimAttachmentIds(doc);
@@ -1973,11 +1982,12 @@ router.get("/requests/:id", async (req: any, res: any) => {
       canRequestChange,
       canHandleChanges,
       claimAttachments,
-      // The Declaration — every claim item with no bill (claimDeclarationItems,
-      // the same derivation as both PDFs) — and whether its standalone
-      // Declaration form is available (once submitted: GET /declaration-pdf).
-      claimDeclaration: isClaim ? claimDeclarationItems(doc) : undefined,
-      hasDeclarationForm: isClaim && doc.status !== "DRAFT" && claimDeclarationItems(doc).length > 0,
+      // The Declaration — every claim item with no bill, or every travel-report
+      // leg marked "No bill available" (claimDeclarationItems, the same
+      // derivation as the PDFs) — and whether its standalone Declaration form
+      // is available (once the claim / report is submitted: GET /declaration-pdf).
+      claimDeclaration: declarationItems,
+      hasDeclarationForm: declarationFormDue(doc) && declarationItems.length > 0,
     });
   } catch (err: any) {
     console.error("[CSTEP requests GET one]", err?.message);
@@ -4958,6 +4968,14 @@ router.patch("/requests/:id/report/legs/:legId", async (req: any, res: any) => {
       leg.paidBy = body.paidBy;
     }
     if ("remarks" in body) leg.remarks = String(body.remarks || "").trim() || undefined;
+    if ("noBill" in body) {
+      if (typeof body.noBill !== "boolean") return res.status(400).json({ error: "noBill must be true or false" });
+      // A leg with a document is never also "No bill" (the claim's rule).
+      if (body.noBill && leg.attachmentId) {
+        return res.status(409).json({ error: "This leg already has a supporting document" });
+      }
+      leg.noBill = body.noBill;
+    }
 
     await leg.save();
     res.json({ ok: true, leg: leg.toObject() });
@@ -5068,6 +5086,7 @@ router.post(
       });
 
       leg.attachmentId = attachment._id;
+      leg.noBill = false; // a document replaces a "No bill available" tick
       await leg.save();
 
       const url = await presignGetObject({
@@ -5166,12 +5185,13 @@ router.post("/attachments/staging", reportAttachmentUpload.single("file"), async
  * settlement — that still starts from REPORT_SUBMITTED.
  *
  * Per CSTEP's rule, EVERY leg needs a supporting document — even a
- * "Booked by CSTEP" leg (boarding pass/hotel voucher/cab receipt) — so this
- * validates server-side that every CstepReportLeg for this request has an
- * attachmentId before allowing the transition; the frontend blocks Submit
+ * "Booked by CSTEP" leg (boarding pass/hotel voucher/cab receipt) — or an
+ * explicit "No bill available" tick (noBill), which lists the leg on the
+ * report's self-declaration instead (claimDeclarationItems; the form is
+ * generated here). A leg with neither always blocks: this validates
+ * server-side before allowing the transition; the frontend blocks Submit
  * the same way, but this is the real enforcement point, never trusted from
- * the client alone. No "declaration instead of receipt" fallback — that's
- * explicitly deferred; a missing document always blocks submission for now.
+ * the client alone.
  * ───────────────────────────────────────────────────────────────────── */
 router.post("/requests/:id/report/submit", async (req: any, res: any) => {
   try {
@@ -5190,13 +5210,14 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
       workspaceId: req.workspaceObjectId,
       requestId: doc._id,
       attachmentId: { $exists: false },
+      noBill: { $ne: true }, // also matches a leg from before the field existed
     })
       .select("direction travelMode")
       .lean();
     if (legsWithoutDocument.length > 0) {
       return res.status(400).json({
         error:
-          "Every leg needs a supporting document before the report can be submitted. Missing on: " +
+          'Every leg needs a supporting document, or "No bill available" ticked, before the report can be submitted. Missing on: ' +
           legsWithoutDocument
             .map((l: any) => `${l.direction === "ONWARD" ? "Onward" : "Return"} ${l.travelMode}`)
             .join(", "),
@@ -5225,6 +5246,7 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
     });
     // REPORT_SUBMITTED is the email event's name: it goes to the Manager.
     await notifyCstep("REPORT_SUBMITTED", doc, { logEntryId: entry._id });
+    await ensureClaimDeclarationQuietly(req, doc);
 
     res.json({ ok: true, request: doc.toObject() });
   } catch (err: any) {
@@ -5716,11 +5738,42 @@ router.get("/requests/:id/pdf", async (req: any, res: any) => {
  * unrelated edit never re-renders it. A claim whose every item has a bill
  * gets none (an earlier one is cleared). Its cache is written without
  * touching updatedAt, so it never makes the claim PDF look stale.
+ *
+ * A Tour Proposal / Event Request gets the same form for its travel-report
+ * legs marked "No bill available", once the report is submitted (POST
+ * /report/submit generates it; a returned report's resubmit regenerates it).
  * ───────────────────────────────────────────────────────────────────── */
+
+/** Statuses a filed travel report sits in — from its submission on. */
+const REPORT_FILED_STATUSES = new Set<string>([
+  "REPORT_UNDER_APPROVAL",
+  "REPORT_SUBMITTED",
+  "TRANSFERRED_TO_FINANCE",
+  "SETTLED",
+  "REIMBURSED",
+]);
+
+/** Whether the Declaration form exists yet: a claim once submitted, a Tour /
+ * Event once its travel report is filed. */
+function declarationFormDue(doc: any): boolean {
+  if (isClaimFormType(doc.formType)) return doc.status !== "DRAFT";
+  return REPORT_FILED_STATUSES.has(doc.status);
+}
+
+/** The Declaration's items — a claim's own lines, or a Tour / Event's
+ * travel-report legs (claimDeclarationItems either way). */
+async function requestDeclarationItems(req: any, doc: any): Promise<CstepClaimDeclarationEntry[]> {
+  if (isClaimFormType(doc.formType)) return claimDeclarationItems(doc);
+  const legs = await CstepReportLeg.find({ workspaceId: req.workspaceObjectId, requestId: doc._id })
+    .sort({ createdAt: 1, _id: 1 })
+    .lean();
+  return claimDeclarationItems(doc, legs as any[]);
+}
+
 async function ensureClaimDeclaration(req: any, doc: any): Promise<string | null> {
-  if (!isClaimFormType(doc.formType) || doc.status === "DRAFT") return null;
+  if (!declarationFormDue(doc)) return null;
   const scope = { _id: doc._id, workspaceId: req.workspaceObjectId };
-  const items = claimDeclarationItems(doc);
+  const items = await requestDeclarationItems(req, doc);
   if (items.length === 0) {
     if (doc.declarationS3Key) {
       await CstepTravelRequest.updateOne(scope, { $unset: { declarationS3Key: 1, declarationHash: 1, declarationGeneratedAt: 1 } }, { timestamps: false });
@@ -5748,7 +5801,8 @@ async function ensureClaimDeclaration(req: any, doc: any): Promise<string | null
     gender: traveller?.gender,
     travelerId: traveller?.travelerId,
   };
-  const submits = trail.filter((e) => e.action === "SUBMIT" || e.action === "RESUBMIT");
+  const submitActions = isClaimFormType(doc.formType) ? ["SUBMIT", "RESUBMIT"] : ["SUBMIT_REPORT"];
+  const submits = trail.filter((e) => submitActions.includes(e.action));
   const hash = claimDeclarationHash({
     items,
     claimantName: claimant.name,
@@ -5781,10 +5835,11 @@ async function ensureClaimDeclarationQuietly(req: any, doc: any): Promise<void> 
   }
 }
 
-/* GET /requests/:id/declaration-pdf?mode=view|download — the claim's
- * Declaration form. Same readers as GET /pdf: the claimant (creator), a
- * CSTEP Admin, or the traveller's mapped Approver / Official / Finance user.
- * 409 before submission or on a non-claim; 404 when every item has a bill. */
+/* GET /requests/:id/declaration-pdf?mode=view|download — the claim's (or
+ * the travel report's) Declaration form. Same readers as GET /pdf: the
+ * claimant (creator), a CSTEP Admin, or the traveller's mapped Approver /
+ * Official / Finance user. 409 before submission (a claim) or before the
+ * travel report is filed (a Tour / Event); 404 when every item has a bill. */
 router.get("/requests/:id/declaration-pdf", async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
@@ -5792,11 +5847,23 @@ router.get("/requests/:id/declaration-pdf", async (req: any, res: any) => {
     if (String(doc.createdBy) !== ownerId(req) && !(await callerCanViewTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Not authorized to view this claim" });
     }
-    if (!isClaimFormType(doc.formType)) return res.status(409).json({ error: "Only a claim has a Declaration form" });
-    if (doc.status === "DRAFT") return res.status(409).json({ error: "The Declaration form is generated once the claim is submitted" });
+    const isClaim = isClaimFormType(doc.formType);
+    if (!declarationFormDue(doc)) {
+      return res.status(409).json({
+        error: isClaim
+          ? "The Declaration form is generated once the claim is submitted"
+          : "The Declaration form is generated once the travel report is submitted",
+      });
+    }
 
     const key = await ensureClaimDeclaration(req, doc);
-    if (!key) return res.status(404).json({ error: "Every item on this claim has a bill — no Declaration form is needed" });
+    if (!key) {
+      return res.status(404).json({
+        error: isClaim
+          ? "Every item on this claim has a bill — no Declaration form is needed"
+          : "Every leg of this travel report has a bill — no Declaration form is needed",
+      });
+    }
 
     const mode = req.query?.mode === "download" ? "download" : "view";
     const url = await presignGetObject({
@@ -5920,7 +5987,10 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
         ? { buckets: settlement.buckets, totalCostOfTour: settlement.totalCostOfTour, amountClaimed: settlement.amountClaimed }
         : undefined;
 
-      const { key } = await uploadCstepPacketPdf(doc.toObject(), travellerInfo, trail, packetLegs, settlementPdfData);
+      // A leg marked "No bill available" gets its self-declaration in the
+      // packet, after the supporting documents (claimDeclarationItems).
+      const declaration = claimDeclarationItems(doc, legs as any[]);
+      const { key } = await uploadCstepPacketPdf(doc.toObject(), travellerInfo, trail, packetLegs, settlementPdfData, declaration);
       doc.packetS3Key = key;
       doc.packetGeneratedAt = new Date();
       await doc.save();

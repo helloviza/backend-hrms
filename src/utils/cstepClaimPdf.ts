@@ -20,7 +20,9 @@
 // Declaration form (#8): the same items as a standalone, signable
 // self-declaration PDF of their own (generateCstepClaimDeclarationPdf) —
 // generated at claim submission and regenerated whenever the invoice-less
-// set changes (routes/cstep.ts ensureClaimDeclaration).
+// set changes (routes/cstep.ts ensureClaimDeclaration). A Tour / Event's
+// travel report uses the same form for its legs marked "No bill
+// available", generated at report submission.
 //
 // Signatures follow the Event Request PDF's rule: the system is the source
 // of truth, so a line prints a text-based DIGITAL signature only once that
@@ -41,6 +43,7 @@ import { fileURLToPath } from "url";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { env } from "../config/env.js";
 import type { ICstepTravelRequest } from "../models/cstep/CstepTravelRequest.js";
+import type { ICstepReportLeg } from "../models/cstep/CstepReportLeg.js";
 import type { CstepTravellerInfo, CstepApprovalTrailEntry } from "./cstepTourProposalPdf.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -114,7 +117,19 @@ function inr(n?: number): string {
 export const CLAIM_DECLARATION_TEXT =
   "I hereby declare that the expenses listed above were genuinely incurred by me for official purposes, and that no bill or invoice is available for them.";
 
-export type CstepClaimDeclarationKind = "TRAVEL" | "FOOD" | "OTHER" | "EXPENSE";
+export type CstepClaimDeclarationKind = "TRAVEL" | "FOOD" | "OTHER" | "EXPENSE" | "REPORT_LEG";
+
+const SERVICE_LABELS: Record<string, string> = {
+  FLIGHT: "Flight",
+  HOTEL: "Hotel",
+  CAB: "Cab",
+  TRAIN: "Train",
+  BUS: "Bus",
+  VISA: "Visa",
+  FOREX: "Forex",
+  STATIONERY: "Stationery",
+  OTHER: "Other",
+};
 
 /** One row of the claim's "Declaration (where no supports available)". */
 export interface CstepClaimDeclarationEntry {
@@ -123,7 +138,14 @@ export interface CstepClaimDeclarationEntry {
   date?: string; // "YYYY-MM-DD"
   particulars: string;
   amount: number;
+  currency?: string; // a report leg's own currency; claim lines are always INR
 }
+
+/** The report-leg fields the Declaration reads. */
+export type CstepDeclarationReportLeg = Pick<
+  ICstepReportLeg,
+  "_id" | "direction" | "travelMode" | "fromLocation" | "toLocation" | "fromDate" | "fare" | "currency" | "remarks" | "attachmentId" | "noBill"
+>;
 
 /**
  * The Declaration: every claim item with no bill or invoice attached, in form
@@ -135,11 +157,13 @@ export interface CstepClaimDeclarationEntry {
  *     to attach one).
  *   Expense — a line with no invoice of its own when the claim has no
  *     claim-level tax invoice either (submit requires one, so normally none).
- * Tours / Events: none — their bills are the report legs' documents, which
- * report/submit requires on every leg.
+ * Tours / Events: every travel-report leg marked "No bill available" (and
+ *   with no document) — report/submit requires one or the other on every
+ *   leg. Onward legs first, then Return, each in the order given.
  */
 export function claimDeclarationItems(
   request: Pick<ICstepTravelRequest, "formType" | "travelLines" | "foodLines" | "otherExpenses" | "expenseLines" | "invoiceAttachmentIds">,
+  reportLegs: CstepDeclarationReportLeg[] = [],
 ): CstepClaimDeclarationEntry[] {
   if (request.formType === "LOCAL_TRAVEL_CLAIM") {
     const travel = (request.travelLines || [])
@@ -177,7 +201,37 @@ export function claimDeclarationItems(
         amount: Number(l.amount) || 0,
       }));
   }
-  return [];
+  const declared = reportLegs.filter((l) => l.noBill === true && !l.attachmentId);
+  return [...declared.filter((l) => l.direction === "ONWARD"), ...declared.filter((l) => l.direction !== "ONWARD")].map((l) => {
+    // A booked leg seeded from its arrangement often has no route of its own —
+    // its remarks (the arranged details) say what it was instead.
+    const route = [l.fromLocation, l.toLocation].filter(Boolean).join(" → ");
+    return {
+      lineId: String(l._id || ""),
+      kind: "REPORT_LEG" as const,
+      date: l.fromDate,
+      particulars: `${l.direction === "ONWARD" ? "Onward" : "Return"} ${SERVICE_LABELS[l.travelMode] || l.travelMode}${route ? `: ${route}` : ""}${l.remarks ? ` — ${l.remarks}` : ""}`,
+      amount: Number(l.fare) || 0,
+      currency: (l.currency || "INR").toUpperCase(),
+    };
+  });
+}
+
+/** An item's amount in its own currency — ₹ for INR (every claim line). */
+function itemMoney(d: CstepClaimDeclarationEntry): string {
+  if (!d.currency || d.currency === "INR") return inr(d.amount);
+  return `${d.currency} ${(Number(d.amount) || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** The items' total — one figure per currency, never summed across them. */
+function itemsTotal(items: CstepClaimDeclarationEntry[]): string {
+  const byCurrency = new Map<string, number>();
+  for (const d of items) {
+    const c = d.currency || "INR";
+    byCurrency.set(c, (byCurrency.get(c) || 0) + (Number(d.amount) || 0));
+  }
+  if (byCurrency.size === 0) return inr(0);
+  return [...byCurrency].map(([currency, amount]) => itemMoney({ currency, amount } as CstepClaimDeclarationEntry)).join(" + ");
 }
 
 /** What the Declaration form shows, hashed — the cache key: the form is
@@ -317,7 +371,14 @@ function drawTable(
   return y;
 }
 
+/** A Tour Proposal / Event Request — its Declaration covers travel-report
+ * legs, so the form speaks of the traveller and the tour, not a claim. */
+function isTravelReportForm(request: Pick<ICstepTravelRequest, "formType">): boolean {
+  return request.formType === "TOUR_PROPOSAL" || request.formType === "EVENT_REQUEST";
+}
+
 function drawHeaderBlock(doc: PdfDoc, fn: string, fb: string, y: number, request: ICstepTravelRequest, title: string): number {
+  const report = isTravelReportForm(request);
   if (fs.existsSync(LOGO_PATH)) {
     doc.image(LOGO_PATH, L, y, { width: 80 });
     y += 40;
@@ -329,10 +390,10 @@ function drawHeaderBlock(doc: PdfDoc, fn: string, fb: string, y: number, request
     .font(fn)
     .fontSize(8)
     .fillColor("#555555")
-    .text("(Generated by the Plumtrips CSTEP Portal — reimbursement claim)", L, y, { width: CW, align: "center" });
+    .text(`(Generated by the Plumtrips CSTEP Portal — ${report ? "travel report" : "reimbursement claim"})`, L, y, { width: CW, align: "center" });
   y += 16;
 
-  const statusLine = [`Status: ${request.status}`, request.claimReference ? `Claim ref: ${request.claimReference}` : null]
+  const statusLine = [`Status: ${request.status}`, request.claimReference ? `${report ? "Ref" : "Claim ref"}: ${request.claimReference}` : null]
     .filter(Boolean)
     .join("     ");
   doc.font(fb).fontSize(9).fillColor("#091426").text(statusLine, L, y, { width: CW, align: "center" });
@@ -508,6 +569,7 @@ function generateClaimDeclarationPdf(
 ): Promise<Buffer> {
   const { doc, fn, fb, collect } = makePdf("Declaration — expenses without bills");
   const promise = collect();
+  const report = isTravelReportForm(request);
 
   let y = drawHeaderBlock(doc, fn, fb, M, request, "SELF-DECLARATION — EXPENSES WITHOUT BILLS");
   y = drawClaimHeaderTable(
@@ -533,9 +595,9 @@ function generateClaimDeclarationPdf(
       { label: "Description", frac: 0.62 },
       { label: "Amount", frac: 0.2, align: "right" },
     ],
-    items.map((d, i) => [String(i + 1), d.date ? fmtDate(d.date) : "Claim period", pdfText(d.particulars), inr(d.amount)]),
+    items.map((d, i) => [String(i + 1), d.date ? fmtDate(d.date) : report ? "" : "Claim period", pdfText(d.particulars), itemMoney(d)]),
   );
-  y = drawTotalsBlock(doc, fn, fb, y + 6, [["Total without bills", inr(items.reduce((s, d) => s + d.amount, 0)), true]]);
+  y = drawTotalsBlock(doc, fn, fb, y + 6, [["Total without bills", itemsTotal(items), true]]);
   y += 14;
 
   y = ensureRoom(doc, y, 60);
@@ -545,7 +607,11 @@ function generateClaimDeclarationPdf(
   y = doc.y + 30;
 
   y = ensureRoom(doc, y, 80);
-  const signed = signatureFromEntry(latestEntryOfAction(trail, "SUBMIT") || latestEntryOfAction(trail, "RESUBMIT"));
+  // A travel report signs with its latest report submission (a returned
+  // report is resubmitted the same way), a claim with its latest submit.
+  const signed = signatureFromEntry(
+    report ? latestEntryOfAction(trail, "SUBMIT_REPORT") : latestEntryOfAction(trail, "SUBMIT") || latestEntryOfAction(trail, "RESUBMIT"),
+  );
   const colW = Math.round((CW - 24) / 2);
   const lineY = y + 24;
   doc.strokeColor("#333333").lineWidth(0.75).moveTo(L, lineY).lineTo(L + colW, lineY).stroke();
@@ -555,7 +621,7 @@ function generateClaimDeclarationPdf(
     .fontSize(signed ? 7 : 8)
     .fillColor(signed ? "#6b7280" : "#333333")
     .text(signed ? `Digitally signed via CSTEP portal · ${signed.date}` : "Date: ____________________", L, lineY + 4);
-  doc.font(fn).fontSize(8).fillColor("#444444").text(`Signature of the claimant — ${claimant.name}`, L, lineY + 18, { width: colW });
+  doc.font(fn).fontSize(8).fillColor("#444444").text(`Signature of the ${report ? "traveller" : "claimant"} — ${claimant.name}`, L, lineY + 18, { width: colW });
   doc.font(fn).fontSize(8).fillColor("#444444").text("Place: ____________________", L + colW + 24, lineY + 4, { width: colW });
 
   doc.end();
@@ -599,15 +665,16 @@ function drawClaimHeaderTable(
 ): number {
   const LW = Math.round(CW * 0.32);
   const VW = CW - LW;
+  const report = isTravelReportForm(request);
   const rows: [string, string, number][] = [
     [
-      "Claimant",
+      report ? "Traveller" : "Claimant",
       `${claimant.name}${claimant.gender ? ` (${claimant.gender})` : ""}${claimant.travelerId ? " | ID: " + claimant.travelerId : ""}`,
       22,
     ],
     ["Purpose", request.purpose || "", 30],
     [projectLabel, [request.project, request.projectDebitable].filter(Boolean).join(" — "), 22],
-    ["Claim period", fmtDateRange(request.departureDate, request.returnDate), 22],
+    [report ? "Travel period" : "Claim period", fmtDateRange(request.departureDate, request.returnDate), 22],
   ];
   if (request.otherInstructions) rows.push(["Remarks", request.otherInstructions, 30]);
   for (const [label, value, rh] of rows) {

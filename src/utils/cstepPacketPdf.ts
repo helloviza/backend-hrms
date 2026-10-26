@@ -14,7 +14,10 @@
 //      that can't be fetched from S3, or a format pdf-lib can't embed
 //      (WebP is an accepted upload type but pdf-lib only embeds JPG/PNG)
 //      gets a plain "Document unavailable" placeholder page instead —
-//      never aborts the whole packet over one bad file.
+//      never aborts the whole packet over one bad file. A leg the traveller
+//      marked "No bill available" says so instead, and
+//   2b. its self-declaration — the SAME Declaration form GET
+//      /requests/:id/declaration-pdf serves — follows the documents.
 //   3. The approval form — the SAME generator GET /requests/:id/pdf already
 //      uses, dispatched on formType exactly the same way, appended last
 //      with its digital signatures intact.
@@ -45,6 +48,7 @@ import {
   type CstepSettlementPdfData,
 } from "./cstepTourProposalPdf.js";
 import { generateCstepEventRequestPdf } from "./cstepEventRequestPdf.js";
+import { generateCstepClaimDeclarationPdf, type CstepClaimDeclarationEntry } from "./cstepClaimPdf.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -212,7 +216,7 @@ function generateItineraryPdf(request: ICstepTravelRequest, orderedLegs: CstepPa
       const route = [leg.fromLocation, leg.toLocation].filter(Boolean).join(" → ") || "—";
       const dateRange = [fmtDate(leg.fromDate), fmtDate(leg.toDate)].filter(Boolean).join(" – ") || "—";
       const fare = leg.fare ? `${fmtAmount(leg.fare)} ${leg.currency || ""}`.trim() : "—";
-      const paidBy = (leg.paidBy === "CSTEP" ? "Booked by CSTEP" : "Self Paid") + (attachment ? "" : " · no document");
+      const paidBy = (leg.paidBy === "CSTEP" ? "Booked by CSTEP" : "Self Paid") + (attachment ? "" : leg.noBill ? " · no bill (declared)" : " · no document");
 
       x = M;
       drawCell(doc, fn, fb, x, y, COLS[0].w, ROW_H, route + (leg.remarks ? `\n${leg.remarks}` : ""), { size: 8 });
@@ -322,10 +326,16 @@ function appendCaptionPage(pdf: PdfLibDocument, font: PDFFont, boldFont: PDFFont
   });
 }
 
-function appendPlaceholderMessage(pdf: PdfLibDocument, font: PDFFont, boldFont: PDFFont, message: string) {
+function appendPlaceholderMessage(
+  pdf: PdfLibDocument,
+  font: PDFFont,
+  boldFont: PDFFont,
+  message: string,
+  heading = "Document unavailable",
+) {
   const page = pdf.addPage([PG_W, PG_H]);
   const midY = PG_H / 2 + 20;
-  page.drawText("Document unavailable", { x: M, y: midY, size: 13, font: boldFont, color: rgb(0.6, 0.15, 0.15) });
+  page.drawText(heading, { x: M, y: midY, size: 13, font: boldFont, color: rgb(0.6, 0.15, 0.15) });
   let y = midY - 22;
   for (const line of wrapText(encodable(font, message), font, 9.5, CW)) {
     page.drawText(line, { x: M, y, size: 9.5, font, color: rgb(0.35, 0.35, 0.35) });
@@ -343,6 +353,16 @@ async function appendAttachment(
   const caption = legCaption(leg);
   appendCaptionPage(pdf, font, boldFont, caption, attachment?.originalName);
 
+  if (!attachment && leg.noBill) {
+    appendPlaceholderMessage(
+      pdf,
+      font,
+      boldFont,
+      "The traveller marked this leg \"No bill available\" — it is listed on the self-declaration at the end of the supporting documents.",
+      "No bill available",
+    );
+    return;
+  }
   if (!attachment) {
     appendPlaceholderMessage(pdf, font, boldFont, "No supporting document was uploaded for this leg.");
     return;
@@ -408,6 +428,7 @@ export async function generateCstepPacketPdf(
   trail: CstepApprovalTrailEntry[],
   legs: CstepPacketReportLeg[],
   settlement?: CstepSettlementPdfData,
+  declaration: CstepClaimDeclarationEntry[] = [],
 ): Promise<Buffer> {
   const orderedLegs = [
     ...legs.filter((l) => l.leg.direction === "ONWARD"),
@@ -427,6 +448,13 @@ export async function generateCstepPacketPdf(
   // let one bad/missing document fail the whole packet.
   for (const entry of orderedLegs) {
     await appendAttachment(pdf, font, boldFont, entry.leg, entry.attachment);
+  }
+
+  // 2b. The self-declaration for the legs marked "No bill available".
+  if (declaration.length > 0) {
+    const declarationDoc = await PdfLibDocument.load(await generateCstepClaimDeclarationPdf(request, traveller, declaration, trail));
+    const declarationPages = await pdf.copyPages(declarationDoc, declarationDoc.getPageIndices());
+    declarationPages.forEach((p) => pdf.addPage(p));
   }
 
   // 3. Approval form — same generator + formType dispatch as
@@ -458,8 +486,9 @@ export async function uploadCstepPacketPdf(
   trail: CstepApprovalTrailEntry[],
   legs: CstepPacketReportLeg[],
   settlement?: CstepSettlementPdfData,
+  declaration: CstepClaimDeclarationEntry[] = [],
 ): Promise<{ key: string }> {
-  const buf = await generateCstepPacketPdf(request, traveller, trail, legs, settlement);
+  const buf = await generateCstepPacketPdf(request, traveller, trail, legs, settlement, declaration);
   const key = `cstep-packets/${request.workspaceId}/${request._id}/packet-${Date.now()}.pdf`;
   await s3.send(
     new PutObjectCommand({
