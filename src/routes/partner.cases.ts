@@ -15,7 +15,8 @@
 // only — { workspaceId: CW._id, customerId: ws.customerId, meta.source:
 // PARTNER_LINK }; bookings by { workspaceId: that Customer._id, ADMIN_QUEUE,
 // sourceBookingId ∈ those cases }. A case outside it is the same 404 as one
-// that doesn't exist. Rows are built by services/partnerLeadTracker.ts from an
+// that doesn't exist. Rows are built by services/partnerLeadTracker.ts
+// (partnerCaseRow: the tracker row + its done / dropped outcome) from an
 // allowlist; nothing is spread from a document, and staff admins get the same
 // shape as anyone else.
 import { Router, type Request, type Response, type NextFunction } from "express";
@@ -23,7 +24,7 @@ import ApprovalRequest from "../models/ApprovalRequest.js";
 import { requireInvoiceAccess } from "../middleware/requireInvoiceAccess.js";
 import { bookingsOfCases } from "../services/partnerLeadBooking.js";
 import { PARTNER_LINK_SOURCE } from "../services/partnerLeadCase.js";
-import { TRACKER_CASE_FIELDS, trackerCounts, trackerRow } from "../services/partnerLeadTracker.js";
+import { TRACKER_CASE_FIELDS, partnerCaseRow, trackerCounts } from "../services/partnerLeadTracker.js";
 
 const router = Router();
 
@@ -55,7 +56,7 @@ async function rowsFor(req: any, cases: any[]) {
     const k = String(b.sourceBookingId);
     byCase.set(k, [...(byCase.get(k) || []), b]);
   }
-  return cases.map((c) => trackerRow(c, byCase.get(String(c._id)) || []));
+  return cases.map((c) => partnerCaseRow(c, byCase.get(String(c._id)) || []));
 }
 
 router.get("/", async (req: any, res) => {

@@ -234,6 +234,10 @@ describe("steps, current step and counts", () => {
     // Closed by ops: a free-text closedReason is never shown (only a known reason's label is).
     expect(cur("closed")).toEqual(["Request closed", "", "actioned"]);
     expect(cur("allCancelled")).toEqual(["Request cancelled", "Lead Not Contactable", "actioned"]);
+    // Each case carries its outcome: done / dropped once actioned, else null.
+    const outcome = (k: string) => of(m, k).outcome;
+    expect(["queued", "assigned", "started", "pending"].map(outcome)).toEqual([null, null, null, null]);
+    expect(["done", "closed", "allCancelled"].map(outcome)).toEqual(["bookingDone", "bookingDropped", "bookingDropped"]);
     expect(of(m, "assigned").rmName).toBe("Rita Menon");
     expect(of(m, "queued").rmName).toBe("");
   });
@@ -258,8 +262,9 @@ describe("steps, current step and counts", () => {
 
   it("the counts are server-side and sum to Registered", async () => {
     const { counts } = (await get("")).body;
-    expect(counts).toEqual({ registered: 7, pendingAction: 2, inProgress: 2, actioned: 3 });
+    expect(counts).toEqual({ registered: 7, pendingAction: 2, inProgress: 2, actioned: 3, bookingDone: 1, bookingDropped: 2 });
     expect(counts.pendingAction + counts.inProgress + counts.actioned).toBe(counts.registered);
+    expect(counts.pendingAction + counts.inProgress + counts.bookingDone + counts.bookingDropped).toBe(counts.registered);
   });
 });
 

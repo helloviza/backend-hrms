@@ -193,7 +193,7 @@ describe("Track my case — the student downloads their own documents", () => {
     const p = await request(partnerApp).get("/PL-AAAAA2").set("x-test-ws", String(AMBER));
     expect(p.status, JSON.stringify(p.body)).toBe(200);
     expect(p.body.case.files).toBeUndefined();
-    expect(Object.keys(p.body.case).sort()).toEqual(["bucket", "caseNumber", "createdAt", "currentStep", "documents", "rmName", "services", "steps", "studentName"]);
+    expect(Object.keys(p.body.case).sort()).toEqual(["bucket", "caseNumber", "createdAt", "currentStep", "documents", "outcome", "rmName", "services", "steps", "studentName"]);
     expect(p.body.case.documents).toEqual([
       { service: "Flight", ticketIssued: true, voucherIssued: false, documentIssued: false },
       { service: "Visa", ticketIssued: false, voucherIssued: false, documentIssued: true },

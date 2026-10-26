@@ -38,6 +38,15 @@
 //   In progress    started, or a booking in progress
 //   Actioned       processed, cancelled or closed
 // Every case is in exactly one of the last three, so they sum to Registered.
+//
+// Actioned is split by the step the partner sees (`outcome`, never a re-read
+// of the bookings), so a card's count always matches the pills under it:
+//   Booking done     "Booking processed"
+//   Booking dropped  "Request cancelled" (any sub status) or "Request closed"
+//                    (even when a booking on the case is Confirmed — ops closed it)
+// Pending action + In progress + Booking done + Booking dropped = Registered.
+// `bucket` and `actioned` stay as they were: Track my case reads them, and its
+// row (trackerRow) carries no outcome — only the partner's (partnerCaseRow).
 import { itemDates, itemTitle, serviceOf } from "./approvalItemRules.js";
 import { bookingRollup } from "./partnerLeadBooking.js";
 import { CUSTOMER_DOCUMENT_TYPES, documentTypeForBookingType } from "../models/ManualBooking.js";
@@ -48,6 +57,8 @@ const str = (v: any, max = 200) => String(v ?? "").trim().slice(0, max);
 const iso = (v: any) => (v ? new Date(v).toISOString() : null);
 
 export type Bucket = "pendingAction" | "inProgress" | "actioned";
+/** An actioned case's outcome; null while it is still pending or in progress. */
+export type Outcome = "bookingDone" | "bookingDropped" | null;
 export type TrackerState = "created" | "queued" | "assigned" | "started" | "in_progress" | "processed" | "cancelled" | "closed";
 export type TrackerStep = { state: TrackerState; label: string; subStatus: string; at: string | null };
 
@@ -131,6 +142,11 @@ const BUCKET: Record<TrackerState, Bucket> = {
   closed: "actioned",
 };
 
+/** The outcome of the step the partner sees. */
+export function outcomeOf(state: TrackerState): Outcome {
+  return state === "processed" ? "bookingDone" : state === "cancelled" || state === "closed" ? "bookingDropped" : null;
+}
+
 /** Current step + its bucket, from the live bookings, else the case. */
 export function currentStep(c: AnyObj, bookings: AnyObj[]): { step: TrackerStep; bucket: Bucket } {
   const history: AnyObj[] = Array.isArray(c.history) ? c.history : [];
@@ -193,7 +209,21 @@ export function trackerRow(c: AnyObj, bookings: AnyObj[]) {
   };
 }
 
-export function trackerCounts(rows: Array<{ bucket: Bucket }>) {
+/** One case as the partner's Student Cases lists it: the tracker row + its outcome. */
+export function partnerCaseRow(c: AnyObj, bookings: AnyObj[]) {
+  const row = trackerRow(c, bookings);
+  return { ...row, outcome: outcomeOf(row.currentStep.state) };
+}
+
+export function trackerCounts(rows: Array<{ bucket: Bucket; outcome: Outcome }>) {
   const n = (b: Bucket) => rows.filter((r) => r.bucket === b).length;
-  return { registered: rows.length, pendingAction: n("pendingAction"), inProgress: n("inProgress"), actioned: n("actioned") };
+  const o = (x: Outcome) => rows.filter((r) => r.outcome === x).length;
+  return {
+    registered: rows.length,
+    pendingAction: n("pendingAction"),
+    inProgress: n("inProgress"),
+    actioned: n("actioned"),
+    bookingDone: o("bookingDone"),
+    bookingDropped: o("bookingDropped"),
+  };
 }
