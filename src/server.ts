@@ -228,6 +228,7 @@ app.use((req, res, next) => {
 // Razorpay webhook — MUST be before express.json() to receive raw body
 import razorpayWebhookRouter from "./routes/razorpay.webhook.js";
 import razorpayWebhookD2cRouter from "./routes/razorpay.webhook.d2c.js";
+import razorpayWebhookLinksRouter from "./routes/razorpay.webhook.links.js";
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Razorpay webhook (Plumtrips Travel payments).
   // Must be mounted BEFORE express.json() so it receives the raw body.
@@ -256,6 +257,11 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
    *   for free. Mounted anywhere else it would meet requireWorkspace,
    *   which a webhook has no user or workspace to satisfy. */
   app.use("/api/webhooks", express.raw({ type: "application/json" }), razorpayWebhookD2cRouter);
+
+  // Payment Links (B2B MID) — POST /api/webhooks/razorpay-links, its own
+  // webhook registration and secret (RAZORPAY_LINKS_WEBHOOK_SECRET). Same
+  // three position rules as the D2C endpoint above.
+  app.use("/api/webhooks", express.raw({ type: "application/json" }), razorpayWebhookLinksRouter);
 }
 
 // WhatsApp Cloud API webhook (Expense Management inbound capture).
@@ -1053,6 +1059,7 @@ import manualBookingsRouter from "./routes/manualBookings.js";
 import invoicesRouter, { workspaceRouter as invoicesWorkspaceRouter } from "./routes/invoices.js";
 import creditNotesAdminRouter, { workspaceRouter as creditNotesWorkspaceRouter } from "./routes/creditNotes.js";
 import adminLoyaltyRouter from "./routes/admin.loyalty.js";
+import adminPaymentRequestsRouter from "./routes/admin.paymentRequests.js";
 import myRewardsRouter from "./routes/myRewards.js";
 import { requireInvoiceAccess } from "./middleware/requireInvoiceAccess.js";
 import notificationsRouter from "./routes/notifications.js";
@@ -1094,6 +1101,11 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // vendor accounts; requirePermission per route then applies the grant.
   app.use("/api/admin/invoices", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), invoicesRouter);
   app.use("/api/admin/credit-notes", requireAuth, requireWorkspace, requireFeature("invoicesEnabled"), creditNotesAdminRouter);
+  // Payment Links (Razorpay, B2B MID) on manual bookings / SENT invoices.
+  // Plumtrips staff or Super Admin only; the router applies the
+  // manualBookings / invoices grants per subject. Status only — it never
+  // changes a booking's or invoice's status.
+  app.use("/api/admin/payment-requests", requireAuth, requireWorkspace, adminPaymentRequestsRouter);
   // Loyalty Points admin (staff only): HOUSE here, and the router itself
   // requires the per-person `loyalty` capability — see its header. Before the
   // broad /api/admin routers for the same interception reason as above.

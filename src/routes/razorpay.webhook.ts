@@ -32,6 +32,7 @@ import { issueD2CInvoiceForApplication } from "../services/d2cInvoicing.js";
 import { webhookLogger } from "../utils/logger.js";
 import SBTPayment from "../models/SBTPayment.js";
 import { markPaidFromWebhook } from "../services/sbtFulfil.js";
+import { isPlumboxPaymentLinkPayment } from "../services/paymentRequests.js";
 
 const router = Router();
 
@@ -495,6 +496,14 @@ router.post("/razorpay", async (req: Request, res: Response) => {
           webhookLogger.info("payment.captured — booking confirmed", { type: booking.type, razorpayOrderId });
         }
       } else {
+        // Payment Links (services/paymentRequests.ts): a paid Plumbox link also
+        // fires payment.captured here. It is handled by payment_link.paid on
+        // /api/webhooks/razorpay-links, so it is not an orphan. A link made by
+        // hand on the Razorpay dashboard is not recognised and still orphans.
+        if (await isPlumboxPaymentLinkPayment(paymentEntity)) {
+          webhookLogger.info("payment.captured — Plumbox payment link, handled by payment_link.paid", { razorpayOrderId });
+          return res.status(200).json({ received: true });
+        }
         // No matching booking — record as orphan
         await PaymentOrphan.findOneAndUpdate(
           { razorpayPaymentId },
