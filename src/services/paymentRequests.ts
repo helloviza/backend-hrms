@@ -451,10 +451,26 @@ export type CreateInput = {
   expireBy?: unknown;
   recipient: Recipient;
   confirm?: boolean;
+  /** Validate and compute the links exactly as creation would, then stop:
+   *  nothing is saved and Razorpay is not called. The confirm screen shows
+   *  this server plan, not the browser's arithmetic. */
+  dryRun?: boolean;
+};
+
+export type CreatePlan = {
+  targetBasePaise: number;
+  splitPattern: string;
+  pgChargePct: number;
+  expireBy: Date;
+  recipient: Recipient;
+  links: Array<{ seq: number; basePaise: number; pgChargePaise: number; totalPaise: number }>;
+  /** What the customer pays across all links: target + every PG charge. */
+  customerTotalPaise: number;
 };
 
 export type CreateResult =
   | { kind: "WARNING"; warning: { code: string; message: string; summary: BookingPaymentSummary } }
+  | { kind: "DRY_RUN"; plan: CreatePlan }
   | { kind: "CREATED"; request: any };
 
 export async function createPaymentRequest(input: CreateInput, resolved: ResolvedSubject, actor: Actor): Promise<CreateResult> {
@@ -498,6 +514,25 @@ export async function createPaymentRequest(input: CreateInput, resolved: Resolve
         },
       };
     }
+  }
+
+  if (input.dryRun === true) {
+    const planLinks = bases.map((base, i) => {
+      const pg = pgChargePaise(base, pct);
+      return { seq: i + 1, basePaise: base, pgChargePaise: pg, totalPaise: base + pg };
+    });
+    return {
+      kind: "DRY_RUN",
+      plan: {
+        targetBasePaise: resolved.targetPaise,
+        splitPattern: pattern,
+        pgChargePct: pct,
+        expireBy,
+        recipient,
+        links: planLinks,
+        customerTotalPaise: planLinks.reduce((s, l) => s + l.totalPaise, 0),
+      },
+    };
   }
 
   const _id = new mongoose.Types.ObjectId();
@@ -814,6 +849,56 @@ export async function isPlumboxPaymentLinkPayment(paymentEntity: any): Promise<b
   }
 }
 
+/* ───────────────────────── list summary ───────────────────────── */
+
+export type BookingLinkSummary = {
+  /** The request the chip describes: the open one, else the latest. */
+  requestId: string;
+  status: "OPEN" | "PARTLY_PAID" | "PAID" | "CANCELLED";
+  targetBasePaise: number;
+  /** Links of that request that are live or paid (cancelled / expired left out). */
+  linkCount: number;
+  paidLinkCount: number;
+  /** Across ALL of the booking's requests — what a cancel would have to deal with. */
+  paidBasePaise: number;
+  openLinkCount: number;
+};
+
+/** One query for a page of bookings — the list's Payment chip, without N+1. */
+export async function paymentSummaryByBooking(bookingIds: mongoose.Types.ObjectId[]): Promise<Record<string, BookingLinkSummary>> {
+  const out: Record<string, BookingLinkSummary> = {};
+  if (!bookingIds.length) return out;
+  const reqs: any[] = await PaymentRequest.find({ subject: "BOOKING", subjectId: { $in: bookingIds } })
+    .select("subjectId status isOpen targetBasePaise links.status links.basePaise createdAt")
+    .sort({ createdAt: -1 })
+    .lean();
+  for (const r of reqs) {
+    const key = String(r.subjectId);
+    const links = r.links || [];
+    const paidBase = links.filter((l: any) => l.status === "PAID").reduce((s: number, l: any) => s + l.basePaise, 0);
+    const open = links.filter((l: any) => l.status === "CREATED" || l.status === "FAILED_CREATE").length;
+    const prev = out[key];
+    // Newest first, so the first one seen is the latest — unless an older
+    // request is still open, which then describes the booking better.
+    const primary = !prev || (r.isOpen && prev.status !== "OPEN" && prev.status !== "PARTLY_PAID");
+    if (primary) {
+      out[key] = {
+        requestId: String(r._id),
+        status: r.status,
+        targetBasePaise: r.targetBasePaise,
+        linkCount: links.filter((l: any) => l.status !== "CANCELLED" && l.status !== "EXPIRED").length,
+        paidLinkCount: links.filter((l: any) => l.status === "PAID").length,
+        paidBasePaise: (prev?.paidBasePaise ?? 0) + paidBase,
+        openLinkCount: (prev?.openLinkCount ?? 0) + open,
+      };
+    } else {
+      prev.paidBasePaise += paidBase;
+      prev.openLinkCount += open;
+    }
+  }
+  return out;
+}
+
 /* ───────────────────────── cancel hook (Steps 2/3) ───────────────────────── */
 
 export type CancelOpenLinksReport = {
@@ -851,6 +936,28 @@ export async function cancelOpenLinksForSubject(subject: PaymentRequestSubject, 
     await saveRequest(doc);
   }
   return report;
+}
+
+/**
+ * Called after a ManualBooking is saved as CANCELLED (routes/manualBookings.ts
+ * PUT /:id and POST /:id/cancel, services/visaBillingSync.ts). Never throws:
+ * the booking is already cancelled, and a Razorpay hiccup must not turn that
+ * into an error. Returns null when there was nothing to do or it failed (the
+ * failure is logged; the links can still be cancelled from the booking panel).
+ */
+export async function cancelLinksAfterBookingCancelled(bookingId: unknown, actor: Actor): Promise<CancelOpenLinksReport | null> {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(String(bookingId))) return null;
+    if (!(await PaymentRequest.exists({ subject: "BOOKING", subjectId: oid(bookingId) }))) return null;
+    const report = await cancelOpenLinksForSubject("BOOKING", bookingId, actor);
+    if (report.failed.length) {
+      paymentLogger.error("[payment-links] booking cancelled but some links could not be cancelled", { bookingId: String(bookingId), failed: report.failed });
+    }
+    return report;
+  } catch (err: any) {
+    paymentLogger.error("[payment-links] cancelling links after booking cancel failed", { bookingId: String(bookingId), error: err?.message });
+    return null;
+  }
 }
 
 /** Shape for API responses. */

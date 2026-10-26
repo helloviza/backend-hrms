@@ -666,6 +666,10 @@ export async function syncVisaApplicationBilling(
   if (quotedPrice <= 0) {
     existing.status = "CANCELLED";
     await existing.save();
+    // Its open payment links go with it (never throws). Imported lazily so
+    // this service doesn't pull the payments graph in at load time.
+    const { cancelLinksAfterBookingCancelled } = await import("./paymentRequests.js");
+    await cancelLinksAfterBookingCancelled(existing._id, { id: "system:visa-billing-sync" });
     visaBillingLogger.info("booking cancelled — zero cost at outcome", {
       applicationId,
       manualBookingId: String(existing._id),

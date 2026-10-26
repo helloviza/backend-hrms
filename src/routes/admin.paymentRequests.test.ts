@@ -535,6 +535,64 @@ describe("cancelOpenLinksForSubject (exported for Steps 2/3)", () => {
   });
 });
 
+describe("dry run (the confirm screen's figures)", () => {
+  it("returns the server's plan, saves nothing and never calls Razorpay", async () => {
+    const res = await create(bookingBody({ dryRun: true, split: { mode: "PERCENT", percents: [40, 40, 20] } }));
+    expect(res.status).toBe(200);
+    expect(res.body.dryRun).toBe(true);
+    expect(res.body.plan.links).toEqual([
+      { seq: 1, basePaise: 40000, pgChargePaise: 800, totalPaise: 40800 },
+      { seq: 2, basePaise: 40000, pgChargePaise: 800, totalPaise: 40800 },
+      { seq: 3, basePaise: 20001, pgChargePaise: 400, totalPaise: 20401 },
+    ]);
+    expect(res.body.plan.customerTotalPaise).toBe(102001);
+    expect(res.body.plan.targetBasePaise).toBe(100001);
+    expect(await PaymentRequest.countDocuments()).toBe(0);
+    expect(rz.calls).toHaveLength(0);
+  });
+
+  it("refuses exactly what creation refuses", async () => {
+    expect((await create(bookingBody({ dryRun: true, split: { mode: "AMOUNTS", amountsPaise: [1, 100000] } }))).body.code).toBe("LINK_TOO_SMALL");
+    await create(bookingBody());
+    expect((await create(bookingBody({ dryRun: true }))).body.code).toBe("OPEN_REQUEST_EXISTS");
+  });
+});
+
+describe("GET /summary (list chips, one query)", () => {
+  it("summarises a page of bookings; bookings without a request are absent", async () => {
+    const r = (await create(bookingBody())).body.request;
+    await PaymentRequest.updateOne({ _id: r.id }, { $set: { "links.0.status": "PAID", status: "PARTLY_PAID" } });
+    const res = await request(app)
+      .get(`/api/admin/payment-requests/summary?bookingIds=${BOOKING},${BOOKING_STUDENT},not-an-id`)
+      .set("x-test-user", staff());
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body.summaries)).toEqual([String(BOOKING)]);
+    expect(res.body.summaries[String(BOOKING)]).toMatchObject({
+      requestId: r.id, status: "PARTLY_PAID", linkCount: 2, paidLinkCount: 1, paidBasePaise: 50000, openLinkCount: 1,
+    });
+  });
+
+  it("an open request describes the booking even when a newer cancelled one exists, and paid money adds up across requests", async () => {
+    const r = (await create(bookingBody({ split: { mode: "EQUAL", parts: 1 } }))).body.request;
+    await PaymentRequest.updateOne({ _id: r.id }, { $set: { "links.0.status": "PAID", status: "PAID", isOpen: false } });
+    const second = (await create(bookingBody())).body.request;
+    const res = await request(app).get(`/api/admin/payment-requests/summary?bookingIds=${BOOKING}`).set("x-test-user", staff());
+    expect(res.body.summaries[String(BOOKING)]).toMatchObject({ requestId: second.id, status: "OPEN", paidBasePaise: 100001, openLinkCount: 2 });
+  });
+
+  it("is staff-only and capped at 100 ids", async () => {
+    expect((await request(app).get(`/api/admin/payment-requests/summary?bookingIds=${BOOKING}`).set("x-test-user", tenantAdmin)).status).toBe(403);
+    const many = Array.from({ length: 101 }, () => String(new mongoose.Types.ObjectId())).join(",");
+    expect((await request(app).get(`/api/admin/payment-requests/summary?bookingIds=${many}`).set("x-test-user", staff())).body.code).toBe("TOO_MANY");
+  });
+
+  it("leaves out bookings the caller can't reach (OWN scope)", async () => {
+    await create(bookingBody());
+    const res = await request(app).get(`/api/admin/payment-requests/summary?bookingIds=${BOOKING}`).set("x-test-user", staff(STAFF_OWN));
+    expect(res.body.summaries).toEqual({});
+  });
+});
+
 describe("refresh", () => {
   it("pulls a paid state from Razorpay through the guards; a second refresh changes nothing", async () => {
     const r = (await create(bookingBody())).body.request;

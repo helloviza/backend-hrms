@@ -50,6 +50,10 @@ import { isPartnerLeadCase } from "../services/partnerLeadCase.js";
 import { partnerCaseForBooking, partnerRequiredErrors, recordPartnerBookingStatus } from "../services/partnerLeadBooking.js";
 import { isNcLead, ncLeadRequiredErrors } from "../utils/ncLead.js";
 import { countedBookingMatch, countedStatusClause, countsInMetrics } from "../utils/bookingMetrics.js";
+import { cancelLinksAfterBookingCancelled } from "../services/paymentRequests.js";
+
+/** Who cancelled a booking's payment links (services/paymentRequests.ts). */
+const paymentLinkActor = (req: any) => ({ id: String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? ""), email: req.user?.email });
 
 const router = express.Router();
 const xlsxUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -2092,7 +2096,11 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
     // WIP → it stays "Booking in progress". services/bookingDocuments.ts.
     const requestSync = await syncRequestFromManualBooking(booking, req.user);
     if (partnerCase) await recordPartnerBookingStatus(booking, { status: before.status, subStatus: before.subStatus }, req.user);
-    res.json({ ok: true, booking, requestSync });
+    // Cancelled by edit → cancel its open payment links (never throws).
+    const paymentLinks = before.status !== "CANCELLED" && booking.status === "CANCELLED"
+      ? await cancelLinksAfterBookingCancelled(booking._id, paymentLinkActor(req))
+      : null;
+    res.json({ ok: true, booking, requestSync, paymentLinks });
   } catch (err: any) {
     console.error("[ManualBookings PUT]", err.message);
     res.status(500).json({ error: err.message });
@@ -2142,8 +2150,9 @@ router.post("/:id/cancel", requirePermission("manualBookings", "FULL"), async (r
     booking.cancellationNote = reasonNote ? String(reasonNote).trim() : undefined;
     await booking.save();
     await recordPartnerBookingStatus(booking, prev, req.user); // partner lead bookings only
+    const paymentLinks = await cancelLinksAfterBookingCancelled(booking._id, paymentLinkActor(req)); // never throws
 
-    res.json({ ok: true, booking });
+    res.json({ ok: true, booking, paymentLinks });
   } catch (err: any) {
     console.error("[ManualBookings CANCEL]", err.message);
     res.status(500).json({ error: err.message });

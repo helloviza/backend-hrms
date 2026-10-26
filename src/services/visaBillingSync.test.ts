@@ -209,9 +209,16 @@ vi.mock("../models/TravelBooking.js", () => ({
 vi.mock("../models/VisaActivityLog.js", () => ({
   logVisaActivity: vi.fn().mockResolvedValue(undefined),
 }));
+// A zero-cost cancel also cancels the booking's open payment links
+// (services/paymentRequests.ts) — mocked for the same unconnected-collection
+// reason; the calls are asserted in the zero-cost cases below.
+vi.mock("./paymentRequests.js", () => ({
+  cancelLinksAfterBookingCancelled: vi.fn().mockResolvedValue(null),
+}));
 
 import { syncVisaApplicationBilling, createVisaWorkStartBooking } from "./visaBillingSync.js";
 import { syncManualBookingToMirror } from "../models/ManualBooking.js";
+import { cancelLinksAfterBookingCancelled } from "./paymentRequests.js";
 
 function visaRequestFixture(overrides: Record<string, any> = {}) {
   return _requests.insert({
@@ -651,6 +658,11 @@ describe("syncVisaApplicationBilling — zero cost at outcome cancels (Phase 9e)
 
     expect(result.action).toBe("cancelled_zero_cost");
     expect(_manualBookings.get(workStart.manualBookingId!).status).toBe("CANCELLED");
+    // ...and its open payment links go with it.
+    expect(vi.mocked(cancelLinksAfterBookingCancelled)).toHaveBeenCalledWith(
+      _manualBookings.get(workStart.manualBookingId!)._id,
+      { id: "system:visa-billing-sync" },
+    );
   });
 
   it("cancels by COST, not by outcome value — an APPROVED case totalling zero also cancels", async () => {

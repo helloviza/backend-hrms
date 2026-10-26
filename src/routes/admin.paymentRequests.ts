@@ -41,6 +41,7 @@ import {
   replaceLink,
   refreshFromRazorpay,
   paymentSummaryForBookings,
+  paymentSummaryByBooking,
   serializeRequest,
   PaymentRequestError,
   type Actor,
@@ -182,6 +183,26 @@ router.get("/preview", async (req: Request, res: Response) => {
 });
 
 /* ── GET /?bookingId= | ?invoiceId= ─────────────────────────────────── */
+/* ── GET /summary?bookingIds=a,b,c — the list page's Payment chips ──────
+ * One query for a whole page (≤ 100 ids). Bookings the caller can't reach are
+ * left out of the answer, exactly as if they had no request. */
+const SUMMARY_MAX = 100;
+router.get("/summary", async (req: Request, res: Response) => {
+  try {
+    const raw = String(req.query.bookingIds || "");
+    const ids = [...new Set(raw.split(",").map((s) => s.trim()).filter((s) => mongoose.Types.ObjectId.isValid(s)))];
+    if (ids.length > SUMMARY_MAX) return res.status(400).json({ error: `At most ${SUMMARY_MAX} bookings at a time.`, code: "TOO_MANY" });
+    if (!(await gate(req, res, "BOOKING", "READ"))) return;
+    if (!ids.length) return res.json({ summaries: {} });
+    const bookings: any[] = await ManualBooking.find({ _id: { $in: ids } }).select("workspaceId createdBy assignPerson assignmentStatus").lean();
+    const ctx = accessCtx(req);
+    const allowed = bookings.filter((b) => canAccessBooking(ctx, b, "READ")).map((b) => new mongoose.Types.ObjectId(String(b._id)));
+    res.json({ summaries: await paymentSummaryByBooking(allowed) });
+  } catch (err) {
+    sendError(res, err, "summary");
+  }
+});
+
 router.get("/", async (req: Request, res: Response) => {
   try {
     const subject: Subject | null = req.query.bookingId ? "BOOKING" : req.query.invoiceId ? "INVOICE" : null;
@@ -229,11 +250,12 @@ router.post("/", writeLimiter, async (req: Request, res: Response) => {
     const resolved = await resolveSubject(subject, body.subjectId);
     const actor = actorOf(req);
     const result = await createPaymentRequest(
-      { subject, subjectId: body.subjectId, split: body.split, pgChargePct: body.pgChargePct, expireBy: body.expireBy, recipient: body.recipient || {}, confirm: body.confirm === true },
+      { subject, subjectId: body.subjectId, split: body.split, pgChargePct: body.pgChargePct, expireBy: body.expireBy, recipient: body.recipient || {}, confirm: body.confirm === true, dryRun: body.dryRun === true },
       resolved,
       actor,
     );
     if (result.kind === "WARNING") return res.status(409).json({ error: result.warning.message, code: result.warning.code, needsConfirm: true, summary: result.warning.summary });
+    if (result.kind === "DRY_RUN") return res.json({ dryRun: true, plan: result.plan });
 
     const doc = result.request;
     let email: any = null;
