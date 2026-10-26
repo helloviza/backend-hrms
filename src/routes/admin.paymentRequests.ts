@@ -42,6 +42,7 @@ import {
   refreshFromRazorpay,
   paymentSummaryForBookings,
   paymentSummaryByBooking,
+  paymentSummaryByInvoice,
   serializeRequest,
   PaymentRequestError,
   type Actor,
@@ -189,6 +190,7 @@ router.get("/preview", async (req: Request, res: Response) => {
 const SUMMARY_MAX = 100;
 router.get("/summary", async (req: Request, res: Response) => {
   try {
+    if (req.query.invoiceIds !== undefined) return invoiceSummary(req, res);
     const raw = String(req.query.bookingIds || "");
     const ids = [...new Set(raw.split(",").map((s) => s.trim()).filter((s) => mongoose.Types.ObjectId.isValid(s)))];
     if (ids.length > SUMMARY_MAX) return res.status(400).json({ error: `At most ${SUMMARY_MAX} bookings at a time.`, code: "TOO_MANY" });
@@ -202,6 +204,21 @@ router.get("/summary", async (req: Request, res: Response) => {
     sendError(res, err, "summary");
   }
 });
+
+/* GET /summary?invoiceIds=a,b,c — the invoice list's Payment chips: each
+ * invoice's own request, plus what its bookings already collected by booking
+ * link (R6). Invoices outside the caller's scope are left out. */
+async function invoiceSummary(req: Request, res: Response) {
+  const raw = String(req.query.invoiceIds || "");
+  const ids = [...new Set(raw.split(",").map((s) => s.trim()).filter((s) => mongoose.Types.ObjectId.isValid(s)))];
+  if (ids.length > SUMMARY_MAX) return res.status(400).json({ error: `At most ${SUMMARY_MAX} invoices at a time.`, code: "TOO_MANY" });
+  if (!(await gate(req, res, "INVOICE", "READ"))) return;
+  if (!ids.length) return res.json({ summaries: {} });
+  const invoices: any[] = await Invoice.find({ _id: { $in: ids } }).select("workspaceId bookingIds createdBy").lean();
+  const allowed: any[] = [];
+  for (const inv of invoices) if (await invoiceInCallerScope(req, inv)) allowed.push(inv);
+  res.json({ summaries: await paymentSummaryByInvoice(allowed) });
+}
 
 router.get("/", async (req: Request, res: Response) => {
   try {

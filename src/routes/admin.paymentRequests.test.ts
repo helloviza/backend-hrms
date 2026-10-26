@@ -593,6 +593,63 @@ describe("GET /summary (list chips, one query)", () => {
   });
 });
 
+describe("invoice links (Step 3)", () => {
+  const invBody = (extra: any = {}) => ({ subject: "INVOICE", subjectId: String(INVOICE), split: { mode: "EQUAL", parts: 1 }, recipient: { email: "ap@client.com" }, ...extra });
+
+  it("the invoice target is Invoice.grandTotal and the default recipient its bill-to contact", async () => {
+    const res = await request(app).get(`/api/admin/payment-requests/preview?subject=INVOICE&id=${INVOICE}`).set("x-test-user", staff());
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ subjectRef: "INV-2026FY0041", targetBasePaise: 100001, blockedReason: null });
+    expect(res.body.defaultRecipient).toEqual({ name: "Accounts", email: "ap@client.com" });
+  });
+
+  it("already collected by booking link: the preview names the booking ref, and creation needs confirm", async () => {
+    const b = (await create(bookingBody({ split: { mode: "EQUAL", parts: 1 } }))).body.request;
+    await PaymentRequest.updateOne({ _id: b.id }, { $set: { "links.0.status": "PAID", status: "PAID", isOpen: false } });
+    const prev = await request(app).get(`/api/admin/payment-requests/preview?subject=INVOICE&id=${INVOICE}`).set("x-test-user", staff());
+    expect(prev.body.bookingLinks.paidBasePaise).toBe(100001);
+    expect(prev.body.bookingLinks.paidLinks[0].bookingRefs).toEqual(["MB-1001"]);
+    // The dry run (the confirm screen) is refused the same way until confirm: true.
+    expect((await create(invBody({ dryRun: true }))).body.code).toBe("BOOKINGS_ALREADY_PAID_BY_LINK");
+    expect((await create(invBody({ dryRun: true, confirm: true }))).body.dryRun).toBe(true);
+    expect((await create(invBody({ confirm: true }))).status).toBe(201);
+    expect((await subjectStatuses()).invoice).toBe("SENT");
+  });
+
+  it("a non-SENT invoice keeps its request readable", async () => {
+    const r = (await create(invBody())).body.request;
+    await Invoice.collection.updateOne({ _id: INVOICE }, { $set: { status: "PAID" } });
+    const list = await request(app).get(`/api/admin/payment-requests?invoiceId=${INVOICE}`).set("x-test-user", staff());
+    expect(list.status).toBe(200);
+    expect(list.body.requests.map((x: any) => x.id)).toEqual([r.id]);
+    // ...but no new links on a non-SENT invoice.
+    expect((await create(invBody())).body.code).toBe("SUBJECT_NOT_ELIGIBLE");
+  });
+
+  it("GET /summary?invoiceIds= — the invoice's own request plus what its bookings collected", async () => {
+    const b = (await create(bookingBody({ split: { mode: "EQUAL", parts: 1 } }))).body.request;
+    await PaymentRequest.updateOne({ _id: b.id }, { $set: { "links.0.status": "PAID", status: "PAID", isOpen: false } });
+    const i = (await create(invBody({ confirm: true, split: { mode: "EQUAL", parts: 2 } }))).body.request;
+    await PaymentRequest.updateOne({ _id: i.id }, { $set: { "links.0.status": "PAID", status: "PARTLY_PAID" } });
+    const other = new mongoose.Types.ObjectId();
+    const res = await request(app).get(`/api/admin/payment-requests/summary?invoiceIds=${INVOICE},${other}`).set("x-test-user", staff());
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body.summaries)).toEqual([String(INVOICE)]);
+    expect(res.body.summaries[String(INVOICE)]).toMatchObject({ requestId: i.id, status: "PARTLY_PAID", paidLinkCount: 1, linkCount: 2, bookingPaidBasePaise: 100001 });
+  });
+
+  it("an invoice with only booking-link money still gets a summary", async () => {
+    const b = (await create(bookingBody({ split: { mode: "EQUAL", parts: 1 } }))).body.request;
+    await PaymentRequest.updateOne({ _id: b.id }, { $set: { "links.0.status": "PAID", status: "PAID", isOpen: false } });
+    const res = await request(app).get(`/api/admin/payment-requests/summary?invoiceIds=${INVOICE}`).set("x-test-user", staff());
+    expect(res.body.summaries[String(INVOICE)]).toEqual({ bookingPaidBasePaise: 100001 });
+  });
+
+  it("invoice summary is staff-only and tenant-scoped", async () => {
+    expect((await request(app).get(`/api/admin/payment-requests/summary?invoiceIds=${INVOICE}`).set("x-test-user", tenantAdmin)).status).toBe(403);
+  });
+});
+
 describe("refresh", () => {
   it("pulls a paid state from Razorpay through the guards; a second refresh changes nothing", async () => {
     const r = (await create(bookingBody())).body.request;

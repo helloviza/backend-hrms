@@ -221,6 +221,7 @@ import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { buildInvoiceQueryFilter } from "./invoices.filters.js";
 import { partnerBookingIds } from "../services/partnerLeadBooking.js";
 import { normalizeGstStatus } from "../utils/customerGst.js";
+import { cancelLinksAfterSubjectCancelled } from "../services/paymentRequests.js";
 import {
   billingOwnUserId, bookingCreatorClause, ownInvoiceClause, invoiceOwnedBy, bookingRefsNotCreatedBy,
 } from "../utils/billingOwnScope.js";
@@ -1468,9 +1469,11 @@ router.post("/:id/cancel", requirePermission("invoices", "FULL"), async (req: an
       await clearPartnerShareSafe(invoice.bookingIds, "invoice.cancel");
     }
     loyaltyTouch({ invoiceId: invoice._id });
+    // Its open payment links go with it (never throws, never blocks).
+    const paymentLinks = await cancelLinksAfterSubjectCancelled("INVOICE", invoice._id, { id: String(req.user?._id ?? req.user?.id ?? ""), email: req.user?.email });
 
     const updated = await Invoice.findById(req.params.id).lean();
-    res.json({ ok: true, invoice: updated });
+    res.json({ ok: true, invoice: updated, paymentLinks });
   } catch (err: any) {
     console.error("[Invoices cancel]", err.message);
     res.status(500).json({ error: err.message });

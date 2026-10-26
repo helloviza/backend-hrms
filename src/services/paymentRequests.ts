@@ -227,8 +227,9 @@ export async function resolveSubject(subject: unknown, id: unknown): Promise<Res
 
 export type BookingPaymentSummary = {
   paidBasePaise: number;
-  paidLinks: Array<{ requestId: string; linkId: string; bookingIds: string[]; basePaise: number; pgChargePaise: number; paidAt?: Date }>;
-  openLinks: Array<{ requestId: string; linkId: string; bookingIds: string[]; basePaise: number; expireBy: Date }>;
+  /** bookingRefs: the bookings' MB-… refs, for "₹X already collected by link on MB-…". */
+  paidLinks: Array<{ requestId: string; linkId: string; bookingIds: string[]; bookingRefs: string[]; basePaise: number; pgChargePaise: number; paidAt?: Date }>;
+  openLinks: Array<{ requestId: string; linkId: string; bookingIds: string[]; bookingRefs: string[]; basePaise: number; expireBy: Date }>;
 };
 
 /** What BOOKING-subject requests on these bookings have collected or still
@@ -237,9 +238,14 @@ export async function paymentSummaryForBookings(bookingIds: mongoose.Types.Objec
   const out: BookingPaymentSummary = { paidBasePaise: 0, paidLinks: [], openLinks: [] };
   if (!bookingIds.length) return out;
   const reqs: any[] = await PaymentRequest.find({ subject: "BOOKING", bookingIds: { $in: bookingIds } }).lean();
+  // One lookup for every ref this summary will name.
+  const ids = [...new Set(reqs.flatMap((r) => (r.bookingIds || []).map(String)))];
+  const refRows: any[] = ids.length ? await ManualBooking.find({ _id: { $in: ids } }).select("bookingRef").lean() : [];
+  const refOf = new Map(refRows.map((b) => [String(b._id), String(b.bookingRef || "")]));
   for (const r of reqs) {
     for (const l of r.links || []) {
-      const base = { requestId: String(r._id), linkId: String(l._id), bookingIds: (r.bookingIds || []).map(String) };
+      const rBookingIds: string[] = (r.bookingIds || []).map(String);
+      const base = { requestId: String(r._id), linkId: String(l._id), bookingIds: rBookingIds, bookingRefs: rBookingIds.map((id) => refOf.get(id) || "").filter(Boolean) };
       if (l.status === "PAID") {
         out.paidBasePaise += l.basePaise;
         out.paidLinks.push({ ...base, basePaise: l.basePaise, pgChargePaise: l.pgChargePaise, paidAt: l.paidAt });
@@ -865,10 +871,45 @@ export type BookingLinkSummary = {
 };
 
 /** One query for a page of bookings — the list's Payment chip, without N+1. */
-export async function paymentSummaryByBooking(bookingIds: mongoose.Types.ObjectId[]): Promise<Record<string, BookingLinkSummary>> {
+export function paymentSummaryByBooking(bookingIds: mongoose.Types.ObjectId[]): Promise<Record<string, BookingLinkSummary>> {
+  return paymentSummaryBySubject("BOOKING", bookingIds);
+}
+
+export type InvoiceLinkSummary = Partial<BookingLinkSummary> & {
+  /** Paid on BOOKING-subject links of the invoice's bookings (R6) — may exist with no invoice request. */
+  bookingPaidBasePaise: number;
+};
+
+/**
+ * One page of invoices: each invoice's own request summary, plus what its
+ * bookings already collected by booking links. Two queries, whatever the page
+ * size. An invoice with neither is left out.
+ */
+export async function paymentSummaryByInvoice(invoices: Array<{ _id: unknown; bookingIds?: unknown[] }>): Promise<Record<string, InvoiceLinkSummary>> {
+  const out: Record<string, InvoiceLinkSummary> = {};
+  if (!invoices.length) return out;
+  const own = await paymentSummaryBySubject("INVOICE", invoices.map((i) => oid(i._id)));
+  const allBookingIds = [...new Set(invoices.flatMap((i) => (i.bookingIds || []).map(String)))].filter((s) => mongoose.Types.ObjectId.isValid(s));
+  const bookingReqs: any[] = allBookingIds.length
+    ? await PaymentRequest.find({ subject: "BOOKING", subjectId: { $in: allBookingIds.map(oid) } }).select("subjectId links.status links.basePaise").lean()
+    : [];
+  const paidByBooking = new Map<string, number>();
+  for (const r of bookingReqs) {
+    const paid = (r.links || []).filter((l: any) => l.status === "PAID").reduce((s: number, l: any) => s + l.basePaise, 0);
+    if (paid) paidByBooking.set(String(r.subjectId), (paidByBooking.get(String(r.subjectId)) ?? 0) + paid);
+  }
+  for (const inv of invoices) {
+    const key = String(inv._id);
+    const bookingPaidBasePaise = (inv.bookingIds || []).reduce<number>((s, b) => s + (paidByBooking.get(String(b)) ?? 0), 0);
+    if (own[key] || bookingPaidBasePaise) out[key] = { ...(own[key] || {}), bookingPaidBasePaise };
+  }
+  return out;
+}
+
+async function paymentSummaryBySubject(subject: PaymentRequestSubject, subjectIds: mongoose.Types.ObjectId[]): Promise<Record<string, BookingLinkSummary>> {
   const out: Record<string, BookingLinkSummary> = {};
-  if (!bookingIds.length) return out;
-  const reqs: any[] = await PaymentRequest.find({ subject: "BOOKING", subjectId: { $in: bookingIds } })
+  if (!subjectIds.length) return out;
+  const reqs: any[] = await PaymentRequest.find({ subject, subjectId: { $in: subjectIds } })
     .select("subjectId status isOpen targetBasePaise links.status links.basePaise createdAt")
     .sort({ createdAt: -1 })
     .lean();
@@ -945,17 +986,25 @@ export async function cancelOpenLinksForSubject(subject: PaymentRequestSubject, 
  * into an error. Returns null when there was nothing to do or it failed (the
  * failure is logged; the links can still be cancelled from the booking panel).
  */
-export async function cancelLinksAfterBookingCancelled(bookingId: unknown, actor: Actor): Promise<CancelOpenLinksReport | null> {
+export function cancelLinksAfterBookingCancelled(bookingId: unknown, actor: Actor): Promise<CancelOpenLinksReport | null> {
+  return cancelLinksAfterSubjectCancelled("BOOKING", bookingId, actor);
+}
+
+/**
+ * The same for any subject — routes/invoices.ts POST /:id/cancel calls it with
+ * INVOICE after the invoice is saved CANCELLED. Never throws, never blocks.
+ */
+export async function cancelLinksAfterSubjectCancelled(subject: PaymentRequestSubject, subjectId: unknown, actor: Actor): Promise<CancelOpenLinksReport | null> {
   try {
-    if (!mongoose.Types.ObjectId.isValid(String(bookingId))) return null;
-    if (!(await PaymentRequest.exists({ subject: "BOOKING", subjectId: oid(bookingId) }))) return null;
-    const report = await cancelOpenLinksForSubject("BOOKING", bookingId, actor);
+    if (!mongoose.Types.ObjectId.isValid(String(subjectId))) return null;
+    if (!(await PaymentRequest.exists({ subject, subjectId: oid(subjectId) }))) return null;
+    const report = await cancelOpenLinksForSubject(subject, subjectId, actor);
     if (report.failed.length) {
-      paymentLogger.error("[payment-links] booking cancelled but some links could not be cancelled", { bookingId: String(bookingId), failed: report.failed });
+      paymentLogger.error(`[payment-links] ${subject.toLowerCase()} cancelled but some links could not be cancelled`, { subjectId: String(subjectId), failed: report.failed });
     }
     return report;
   } catch (err: any) {
-    paymentLogger.error("[payment-links] cancelling links after booking cancel failed", { bookingId: String(bookingId), error: err?.message });
+    paymentLogger.error(`[payment-links] cancelling links after ${subject.toLowerCase()} cancel failed`, { subjectId: String(subjectId), error: err?.message });
     return null;
   }
 }
