@@ -34,7 +34,10 @@
 // path ignores the links without the field; a partial index does not (it
 // indexes the missing ones as null and rejects the second document) — checked
 // against mongod. So: sparse, and these fields are never written as null.
-import { Schema, model, models, type Document, type Model, type Types } from "mongoose";
+// Default import for mongoose.models: under Node's native ESM loader (prod runs
+// dist/ with plain node) `models` is not a named export of the CommonJS
+// mongoose package, and importing it by name crashes the server at boot.
+import mongoose, { Schema, model, type Document, type Model, type Types } from "mongoose";
 
 export const PAYMENT_REQUEST_SUBJECTS = ["BOOKING", "INVOICE"] as const;
 export type PaymentRequestSubject = (typeof PAYMENT_REQUEST_SUBJECTS)[number];
@@ -190,6 +193,6 @@ PaymentRequestSchema.index({ "links.razorpayPaymentId": 1 }, { unique: true, spa
 PaymentRequestSchema.index({ "links.razorpayOrderId": 1 }, { sparse: true, name: "link_order_id" });
 
 const PaymentRequest: Model<IPaymentRequest> =
-  (models.PaymentRequest as Model<IPaymentRequest>) || model<IPaymentRequest>("PaymentRequest", PaymentRequestSchema);
+  (mongoose.models.PaymentRequest as Model<IPaymentRequest>) || model<IPaymentRequest>("PaymentRequest", PaymentRequestSchema);
 
 export default PaymentRequest;
