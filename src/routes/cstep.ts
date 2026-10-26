@@ -1499,6 +1499,12 @@ function recomputeSettlementTotals(
  *     source "SEEDED" is already represented by the arrangement it was
  *     seeded from, so it is deliberately NOT seeded again here — doing so
  *     would double-count the same expense under both streams.
+ *   - #7: a booked leg removed and restored before "+ Add back" sent its
+ *     arrangementId came back as source "ADDED". A CSTEP-paid ADDED leg
+ *     that carries an arrangement's exact booking fingerprint (mode + fare +
+ *     currency — what the frontend's add-back matches on) while that
+ *     arrangement has no SEEDED leg left is that same booking, so it pairs
+ *     with the arrangement line rather than becoming a second OFFICIAL line.
  */
 async function buildSeedSettlementLines(
   workspaceId: any,
@@ -1560,9 +1566,22 @@ async function buildSeedSettlementLines(
     noBill?: boolean;
   }> = [];
 
+  // #7 — CSTEP-paid ADDED legs that are a restored booking. Each one is
+  // claimed at most once, by an arrangement that has no SEEDED leg to pair.
+  const addedCstepLegs = (legs as any[]).filter((l) => l.source === "ADDED" && l.paidBy === "CSTEP");
+  const restoredLegIds = new Set<string>();
+  const sameBooking = (a: any, l: any) =>
+    l.travelMode === a.arrangedType &&
+    String(l.currency || "INR").toUpperCase() === String(a.currency || "INR").toUpperCase() &&
+    (l.fare ?? null) === (a.amount ?? null);
+
   for (const a of arrangements as any[]) {
     if (!arrangementIsReal(a)) continue; // F6 — never seeded a leg either, so nothing to pair
-    const pairedLeg = seededCstepLegsByMode.get(a.arrangedType)?.shift();
+    let pairedLeg = seededCstepLegsByMode.get(a.arrangedType)?.shift();
+    if (!pairedLeg) {
+      pairedLeg = addedCstepLegs.find((l) => !restoredLegIds.has(String(l._id)) && sameBooking(a, l));
+      if (pairedLeg) restoredLegIds.add(String(pairedLeg._id));
+    }
     lines.push({
       source: "ARRANGEMENT",
       sourceId: a._id,
@@ -1595,7 +1614,7 @@ async function buildSeedSettlementLines(
         attachmentId: leg.attachmentId,
         noBill: !leg.attachmentId && leg.noBill === true,
       });
-    } else if (leg.paidBy === "CSTEP" && leg.source === "ADDED") {
+    } else if (leg.paidBy === "CSTEP" && leg.source === "ADDED" && !restoredLegIds.has(String(leg._id))) {
       lines.push({
         source: "REPORT_LEG",
         sourceId: leg._id,
@@ -4837,6 +4856,47 @@ router.post("/requests/:id/report/legs", async (req: any, res: any) => {
     const direction: CstepReportDirection | null =
       body.direction === "ONWARD" || body.direction === "RETURN" ? body.direction : null;
     if (!direction) return res.status(400).json({ error: "direction must be ONWARD or RETURN" });
+
+    // "+ Add back" (#7): restoring a removed "Booked by CSTEP" leg names the
+    // booked service it came from. The leg is rebuilt from that arrangement
+    // exactly as report/start seeded it — SEEDED, not ADDED — so settlement
+    // pairs it with the arrangement's own OFFICIAL line instead of adding a
+    // second one for the same booking.
+    if (body.arrangementId !== undefined && body.arrangementId !== null && body.arrangementId !== "") {
+      if (!mongoose.isValidObjectId(String(body.arrangementId))) {
+        return res.status(400).json({ error: "Invalid arrangement id" });
+      }
+      const arrangements: any[] = await CstepArrangement.find({ workspaceId: req.workspaceObjectId, requestId: doc._id })
+        .sort({ createdAt: 1, _id: 1 })
+        .lean();
+      const a = arrangements.find((x) => String(x._id) === String(body.arrangementId));
+      if (!a || !arrangementIsReal(a)) {
+        return res.status(404).json({ error: "Booked service not found on this request" });
+      }
+      // One seeded leg per booked service of that mode — refuse a second
+      // add-back (a double click) rather than stack an extra booked leg.
+      const bookedOfMode = arrangements.filter((x) => arrangementIsReal(x) && x.arrangedType === a.arrangedType).length;
+      const seededOfMode = await CstepReportLeg.countDocuments({
+        workspaceId: req.workspaceObjectId,
+        requestId: doc._id,
+        source: "SEEDED",
+        paidBy: "CSTEP",
+        travelMode: a.arrangedType,
+      });
+      if (seededOfMode >= bookedOfMode) {
+        return res.status(409).json({ error: "This booked service is already on the travel report" });
+      }
+      const [seed] = buildSeedReportLegs([a]);
+      const restored = await CstepReportLeg.create({
+        workspaceId: req.workspaceObjectId,
+        requestId: doc._id,
+        ...seed,
+        direction,
+        createdBy: new mongoose.Types.ObjectId(uid),
+      });
+      return res.status(201).json({ ok: true, leg: restored.toObject() });
+    }
+
     if (!CSTEP_SERVICE_TYPES.includes(body.travelMode)) {
       return res.status(400).json({ error: "travelMode is required and must be a recognized service type" });
     }
