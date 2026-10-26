@@ -104,6 +104,7 @@ import businessServicesRouter from "./routes/businessServices.js";
 import vendorsRouter from "./routes/vendors.js";
 import customersRouter from "./routes/customers.js";
 import directCustomersRouter from "./routes/directCustomers.js";
+import adminBusinessMsaRouter from "./routes/admin.businessMsa.js";
 import vendorCustomerSelfRouter from "./routes/vendorCustomerSelf.js";
 
 // ✅ Workspace (customer/vendor/business logo + workspace meta)
@@ -746,6 +747,7 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/vendors", vendorsRouter);
   app.use("/api/customers", customersRouter);
   app.use("/api/admin/direct-customers", directCustomersRouter);
+  app.use("/api/admin/businesses", adminBusinessMsaRouter);
   app.use("/api/customer/users", customerUsersRouter);
   app.use("/api", vendorCustomerSelfRouter);
 }
