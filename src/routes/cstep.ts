@@ -511,6 +511,17 @@ async function loadRequest(req: any, id: string) {
   });
 }
 
+/**
+ * P2 — flags a request's travel packet for one rebuild on its next view
+ * (GET /requests/:id/packet). For the packet's inputs that live outside the
+ * request doc — report legs, travel proof, the Desk's booking documents, the
+ * settlement; a save of the request doc itself flags it in the model's
+ * pre-save hook. Leaves updatedAt alone.
+ */
+async function markPacketStale(workspaceId: any, requestId: any, session?: any) {
+  await CstepTravelRequest.updateOne({ _id: requestId, workspaceId }, { $set: { packetStale: true } }, { timestamps: false, session });
+}
+
 function isValidDateStr(s: any): boolean {
   return typeof s === "string" && s.trim() !== "" && !Number.isNaN(new Date(s).getTime());
 }
@@ -5041,6 +5052,7 @@ router.post("/requests/:id/report/start", async (req: any, res: any) => {
             createdBy: new mongoose.Types.ObjectId(uid),
           })),
         );
+        await markPacketStale(req.workspaceObjectId, doc._id);
       }
     }
 
@@ -5204,6 +5216,7 @@ router.post("/requests/:id/report/legs", async (req: any, res: any) => {
         direction,
         createdBy: new mongoose.Types.ObjectId(uid),
       });
+      await markPacketStale(req.workspaceObjectId, doc._id);
       return res.status(201).json({ ok: true, leg: restored.toObject() });
     }
 
@@ -5253,6 +5266,7 @@ router.post("/requests/:id/report/legs", async (req: any, res: any) => {
       source: "ADDED",
       createdBy: new mongoose.Types.ObjectId(uid),
     });
+    await markPacketStale(req.workspaceObjectId, doc._id);
 
     res.status(201).json({ ok: true, leg: leg.toObject() });
   } catch (err: any) {
@@ -5381,6 +5395,7 @@ router.patch("/requests/:id/report/legs/:legId", async (req: any, res: any) => {
     }
 
     await leg.save();
+    await markPacketStale(req.workspaceObjectId, doc._id);
     res.json({ ok: true, leg: leg.toObject() });
   } catch (err: any) {
     console.error("[CSTEP requests report legs PATCH]", err?.message);
@@ -5416,6 +5431,7 @@ router.delete("/requests/:id/report/legs/:legId", async (req: any, res: any) => 
       requestId: doc._id,
     });
     if (!leg) return res.status(404).json({ error: "Report leg not found" });
+    await markPacketStale(req.workspaceObjectId, doc._id);
 
     res.json({ ok: true });
   } catch (err: any) {
@@ -5496,6 +5512,7 @@ router.post(
       leg.attachmentId = attachment._id;
       leg.noBill = false; // a document replaces a "No bill available" tick
       await leg.save();
+      await markPacketStale(req.workspaceObjectId, doc._id);
 
       const url = await presignGetObject({
         bucket: env.S3_BUCKET,
@@ -5608,6 +5625,7 @@ router.post("/requests/:id/report/legs/:legId/travel-proof", reportAttachmentUpl
     leg.set(field, [...(leg.get(field) || []), attachment._id]);
     if (field === "boardingPassAttachmentIds") leg.boardingPassUnavailable = false; // a pass replaces the tick
     await leg.save();
+    await markPacketStale(req.workspaceObjectId, leg.requestId);
 
     const presigned = await presignAttachmentsById(req.workspaceObjectId, [attachment._id]);
     res.status(201).json({ ok: true, leg: leg.toObject(), attachment: presigned.get(String(attachment._id)) });
@@ -5627,6 +5645,7 @@ router.delete("/requests/:id/report/legs/:legId/travel-proof/:attachmentId", asy
     if (next.length === current.length) return res.status(404).json({ error: "That document is not on this leg" });
     leg.set(field, next.length ? next : undefined);
     await leg.save();
+    await markPacketStale(req.workspaceObjectId, leg.requestId);
     res.json({ ok: true, leg: leg.toObject() });
   } catch (err: any) {
     console.error("[CSTEP requests report legs travel-proof DELETE]", err?.message);
@@ -5695,6 +5714,7 @@ router.post("/requests/:id/arrangements/:lineId/attachment", reportAttachmentUpl
     );
     line.attachmentIds = [...(line.attachmentIds || []), attachment._id];
     await line.save();
+    await markPacketStale(req.workspaceObjectId, doc._id);
 
     await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
@@ -5727,6 +5747,7 @@ router.delete("/requests/:id/arrangements/:lineId/attachment/:attachmentId", asy
     const next = current.filter((x) => String(x) !== String(removed));
     line.attachmentIds = next.length ? next : undefined;
     await line.save();
+    await markPacketStale(req.workspaceObjectId, doc._id);
 
     const att: any = await CstepAttachment.findOne({ _id: removed, workspaceId: req.workspaceObjectId }).select("originalName").lean();
     await CstepApproval.create({
@@ -5939,6 +5960,7 @@ router.patch("/requests/:id/report/legs/:legId/reduce", async (req: any, res: an
     leg.claimedFare = ceiling;
     leg.fare = next;
     await leg.save();
+    await markPacketStale(req.workspaceObjectId, doc._id);
 
     await CstepApproval.create({
       workspaceId: req.workspaceObjectId,
@@ -6537,11 +6559,11 @@ router.get("/requests/:id/declaration-pdf", async (req: any, res: any) => {
  * (callerCanArrangeForTraveller) — the packet is meant for whoever can act
  * on this traveller's request, not just the Tour Approver alone.
  *
- * Cached on the request doc (packetS3Key/packetGeneratedAt), regenerated
- * when stale — no cached key yet, the request has been edited since, or
- * any report leg has changed since (legs are only mutable while
- * REPORT_PENDING, i.e. before a packet would ever be requested, so this
- * only ever fires once per submitted report in practice).
+ * Cached on the request doc (packetS3Key/packetGeneratedAt). P2 — rebuilt
+ * only when there is no cached key yet or packetStale is set (see
+ * markPacketStale and the model's pre-save hook); a plain view serves the
+ * stored object. Before P2 this compared packetGeneratedAt with updatedAt,
+ * and saving the new key bumped updatedAt past it — every view re-rendered.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/requests/:id/packet", async (req: any, res: any) => {
   try {
@@ -6560,105 +6582,99 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
       return res.status(409).json({ error: "The travel packet applies to tour proposals and event requests only" });
     }
 
-    const legs = await CstepReportLeg.find({
-      workspaceId: req.workspaceObjectId,
-      requestId: doc._id,
-    })
-      .sort({ createdAt: 1 })
-      .lean();
-    // P1 — the booked legs' booking documents live on their arrangements, so
-    // a Desk upload there makes the packet stale too.
-    const packetArrangements: any[] = await CstepArrangement.find({ workspaceId: req.workspaceObjectId, requestId: doc._id })
-      .select("attachmentIds updatedAt")
-      .lean();
+    if (!doc.packetS3Key || doc.packetStale !== false) {
+      // Cleared BEFORE rendering: an input change landing mid-render sets
+      // it again, so the next view rebuilds rather than keeping this one.
+      const scope = { _id: doc._id, workspaceId: req.workspaceObjectId };
+      await CstepTravelRequest.updateOne(scope, { $set: { packetStale: false } }, { timestamps: false });
+      try {
+        const legs = await CstepReportLeg.find({
+          workspaceId: req.workspaceObjectId,
+          requestId: doc._id,
+        })
+          .sort({ createdAt: 1 })
+          .lean();
+        // P1 — the booked legs' booking documents live on their arrangements.
+        const packetArrangements: any[] = await CstepArrangement.find({ workspaceId: req.workspaceObjectId, requestId: doc._id })
+          .select("attachmentIds")
+          .lean();
+        const settlement: any = await CstepSettlement.findOne({
+          workspaceId: req.workspaceObjectId,
+          requestId: doc._id,
+        }).lean();
 
-    const latestLegUpdate = ([...legs, ...packetArrangements] as any[]).reduce<Date | null>((max, l) => {
-      const t = l.updatedAt ? new Date(l.updatedAt) : null;
-      if (!t) return max;
-      return !max || t > max ? t : max;
-    }, null);
+        const traveller: any = await TravellerProfile.findOne({
+          _id: doc.travelerProfileId,
+          workspaceId: req.workspaceObjectId,
+        })
+          .select("firstName lastName gender travelerId")
+          .lean();
 
-    // Step 5 addition — same settlement lookup + staleness check as GET /pdf.
-    const settlement: any = await CstepSettlement.findOne({
-      workspaceId: req.workspaceObjectId,
-      requestId: doc._id,
-    }).lean();
+        const approvals = await CstepApproval.find({
+          workspaceId: req.workspaceObjectId,
+          entityType: "REQUEST",
+          entityId: doc._id,
+        })
+          .populate("actor", "firstName lastName name email")
+          .sort({ at: 1 })
+          .lean();
 
-    const stale =
-      !doc.packetS3Key ||
-      !doc.packetGeneratedAt ||
-      doc.packetGeneratedAt < doc.updatedAt ||
-      (latestLegUpdate ? doc.packetGeneratedAt < latestLegUpdate : false) ||
-      (settlement && doc.packetGeneratedAt < settlement.updatedAt);
+        const trail: CstepApprovalTrailEntry[] = (approvals as any[]).map((a) => ({
+          action: a.action,
+          actorName:
+            a.actor?.name || [a.actor?.firstName, a.actor?.lastName].filter(Boolean).join(" ").trim() || a.actor?.email || "—",
+          at: a.at,
+          comment: a.comment,
+        }));
 
-    if (stale) {
-      const traveller: any = await TravellerProfile.findOne({
-        _id: doc.travelerProfileId,
-        workspaceId: req.workspaceObjectId,
-      })
-        .select("firstName lastName gender travelerId")
-        .lean();
+        const travellerInfo = {
+          name: traveller ? [traveller.firstName, traveller.lastName].filter(Boolean).join(" ") : "—",
+          gender: traveller?.gender,
+          travelerId: traveller?.travelerId,
+        };
 
-      const approvals = await CstepApproval.find({
-        workspaceId: req.workspaceObjectId,
-        entityType: "REQUEST",
-        entityId: doc._id,
-      })
-        .populate("actor", "firstName lastName name email")
-        .sort({ at: 1 })
-        .lean();
+        const bookingIdsByArrangement = new Map(packetArrangements.map((a) => [String(a._id), (a.attachmentIds || []) as any[]]));
+        const attachmentIds = (legs as any[]).flatMap((l) => [
+          l.attachmentId,
+          ...(l.boardingPassAttachmentIds || []),
+          ...(l.travelProofAttachmentIds || []),
+          ...(isLinkedBookedLeg(l) ? bookingIdsByArrangement.get(String(l.arrangementId)) || [] : []),
+        ]).filter(Boolean);
+        const attachments = attachmentIds.length
+          ? await CstepAttachment.find({ _id: { $in: attachmentIds }, workspaceId: req.workspaceObjectId }).lean()
+          : [];
+        const attachmentById = new Map((attachments as any[]).map((a) => [String(a._id), a]));
+        const pick = (ids: any[] | undefined) => (ids || []).map((id) => attachmentById.get(String(id))).filter(Boolean) as any[];
 
-      const trail: CstepApprovalTrailEntry[] = (approvals as any[]).map((a) => ({
-        action: a.action,
-        actorName:
-          a.actor?.name || [a.actor?.firstName, a.actor?.lastName].filter(Boolean).join(" ").trim() || a.actor?.email || "—",
-        at: a.at,
-        comment: a.comment,
-      }));
+        // P1 — a booked (linked) leg carries the Desk's booking documents and
+        // the traveller's boarding passes / ticket proof alongside.
+        const packetLegs: CstepPacketReportLeg[] = (legs as any[]).map((l) => ({
+          leg: l,
+          attachment: l.attachmentId ? attachmentById.get(String(l.attachmentId)) || null : null,
+          ...(isLinkedBookedLeg(l)
+            ? {
+                bookingDocuments: pick(bookingIdsByArrangement.get(String(l.arrangementId))),
+                travelProofs: pick([...(l.boardingPassAttachmentIds || []), ...(l.travelProofAttachmentIds || [])]),
+              }
+            : {}),
+        }));
 
-      const travellerInfo = {
-        name: traveller ? [traveller.firstName, traveller.lastName].filter(Boolean).join(" ") : "—",
-        gender: traveller?.gender,
-        travelerId: traveller?.travelerId,
-      };
+        const settlementPdfData: CstepSettlementPdfData | undefined = settlement
+          ? { buckets: settlement.buckets, totalCostOfTour: settlement.totalCostOfTour, amountClaimed: settlement.amountClaimed }
+          : undefined;
 
-      const bookingIdsByArrangement = new Map(packetArrangements.map((a) => [String(a._id), (a.attachmentIds || []) as any[]]));
-      const attachmentIds = (legs as any[]).flatMap((l) => [
-        l.attachmentId,
-        ...(l.boardingPassAttachmentIds || []),
-        ...(l.travelProofAttachmentIds || []),
-        ...(isLinkedBookedLeg(l) ? bookingIdsByArrangement.get(String(l.arrangementId)) || [] : []),
-      ]).filter(Boolean);
-      const attachments = attachmentIds.length
-        ? await CstepAttachment.find({ _id: { $in: attachmentIds }, workspaceId: req.workspaceObjectId }).lean()
-        : [];
-      const attachmentById = new Map((attachments as any[]).map((a) => [String(a._id), a]));
-      const pick = (ids: any[] | undefined) => (ids || []).map((id) => attachmentById.get(String(id))).filter(Boolean) as any[];
-
-      // P1 — a booked (linked) leg carries the Desk's booking documents and
-      // the traveller's boarding passes / ticket proof alongside.
-      const packetLegs: CstepPacketReportLeg[] = (legs as any[]).map((l) => ({
-        leg: l,
-        attachment: l.attachmentId ? attachmentById.get(String(l.attachmentId)) || null : null,
-        ...(isLinkedBookedLeg(l)
-          ? {
-              bookingDocuments: pick(bookingIdsByArrangement.get(String(l.arrangementId))),
-              travelProofs: pick([...(l.boardingPassAttachmentIds || []), ...(l.travelProofAttachmentIds || [])]),
-            }
-          : {}),
-      }));
-
-      const settlementPdfData: CstepSettlementPdfData | undefined = settlement
-        ? { buckets: settlement.buckets, totalCostOfTour: settlement.totalCostOfTour, amountClaimed: settlement.amountClaimed }
-        : undefined;
-
-      // A leg marked "No bill available" gets its self-declaration in the
-      // packet, after the supporting documents (claimDeclarationItems).
-      const declaration = claimDeclarationItems(doc, legs as any[]);
-      const { key } = await uploadCstepPacketPdf(doc.toObject(), travellerInfo, trail, packetLegs, settlementPdfData, declaration);
-      doc.packetS3Key = key;
-      doc.packetGeneratedAt = new Date();
-      await doc.save();
+        // A leg marked "No bill available" gets its self-declaration in the
+        // packet, after the supporting documents (claimDeclarationItems).
+        const declaration = claimDeclarationItems(doc, legs as any[]);
+        const { key } = await uploadCstepPacketPdf(doc.toObject(), travellerInfo, trail, packetLegs, settlementPdfData, declaration);
+        const packetGeneratedAt = new Date();
+        await CstepTravelRequest.updateOne(scope, { $set: { packetS3Key: key, packetGeneratedAt } }, { timestamps: false });
+        doc.packetS3Key = key;
+        doc.packetGeneratedAt = packetGeneratedAt;
+      } catch (err) {
+        await CstepTravelRequest.updateOne(scope, { $set: { packetStale: true } }, { timestamps: false });
+        throw err;
+      }
     }
 
     const mode = req.query?.mode === "download" ? "download" : "view";
@@ -6773,6 +6789,7 @@ router.post("/requests/:id/settlement/start", async (req: any, res: any) => {
       settlement.totalCostOfTour = totalCostOfTour;
       settlement.amountClaimed = amountClaimed;
       await settlement.save();
+      await markPacketStale(req.workspaceObjectId, doc._id);
 
       await CstepApproval.create({
         workspaceId: req.workspaceObjectId,
@@ -7028,6 +7045,7 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
     }).lean();
     applySettlementTotals(settlement, allLines as any[], doc);
     await settlement.save();
+    await markPacketStale(req.workspaceObjectId, doc._id);
 
     const stage = isClaim ? "ADMIN" : "OFFICIAL";
     const actor = new mongoose.Types.ObjectId(ownerId(req));
@@ -7176,6 +7194,7 @@ router.patch("/requests/:id/settlement/perdiem", async (req: any, res: any) => {
     settlement.totalCostOfTour = totalCostOfTour;
     settlement.amountClaimed = amountClaimed;
     await settlement.save();
+    await markPacketStale(req.workspaceObjectId, doc._id);
 
     const after = {
       days,
@@ -7339,7 +7358,7 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
     await settlement.save();
 
     doc.status = outcome === "TO_FINANCE" ? "TRANSFERRED_TO_FINANCE" : "SETTLED";
-    await doc.save();
+    await doc.save(); // the status change flags the packet stale (model pre-save hook)
 
     // The claim (what the TIN points at, opened at approve time) mirrors the
     // finalized figures — it is the record anything outside this settlement
@@ -7617,7 +7636,7 @@ export async function settleFinanceCase(
 
       const flipped = await CstepTravelRequest.updateOne(
         { _id: doc._id, workspaceId, status: "TRANSFERRED_TO_FINANCE" },
-        { $set: { status: endStatus } },
+        { $set: { status: endStatus, packetStale: true } },
         { session },
       );
       if (flipped.modifiedCount !== 1) throw new Error("ALREADY_SETTLED");
@@ -7939,7 +7958,7 @@ async function runFinanceAdjustment(req: any, res: any, plan: (ctx: FinancePlanC
         settlement.financeClosedBy = uid;
         const flipped = await CstepTravelRequest.updateOne(
           { _id: doc._id, workspaceId, status: "TRANSFERRED_TO_FINANCE" },
-          { $set: { status: "SETTLED" } },
+          { $set: { status: "SETTLED", packetStale: true } },
           { session },
         );
         if (flipped.modifiedCount !== 1) throw new CstepHttpError(409, "This case is no longer with Finance");
@@ -8001,6 +8020,7 @@ async function runFinanceAdjustment(req: any, res: any, plan: (ctx: FinancePlanC
   }
 
   if (!out.change) return res.json({ ok: true, changed: false, request: doc.toObject() });
+  await markPacketStale(req.workspaceObjectId, doc._id);
   if (out.closed) doc.status = "SETTLED";
   await notifyCstep("FINANCE_ADJUSTED", doc, {
     logEntryId: out.entryIds![0],
