@@ -97,14 +97,18 @@ export async function searchHotelCatalog(
   ).slice(0, opts.cityCap);
 
   // Hotels — same hybrid, separate cap so a hotel-name query still surfaces.
-  const [hotelPrefix, hotelText] = await Promise.all([
-    (TBOHotelMaster as any).find({ searchName: { $gte: nq, $lt: upper } }).limit(POOL).lean(),
-    (TBOHotelMaster as any)
-      .find({ $text: { $search: nq } })
-      .limit(POOL)
-      .lean()
-      .catch(() => [] as any[]),
-  ]);
+  // hotelCap 0 (a cities-only caller — the CSTEP city fields) skips them.
+  const [hotelPrefix, hotelText] =
+    opts.hotelCap > 0
+      ? await Promise.all([
+          (TBOHotelMaster as any).find({ searchName: { $gte: nq, $lt: upper } }).limit(POOL).lean(),
+          (TBOHotelMaster as any)
+            .find({ $text: { $search: nq } })
+            .limit(POOL)
+            .lean()
+            .catch(() => [] as any[]),
+        ])
+      : [[], []];
   const rankedHotels = rankByMatch(
     [...hotelPrefix, ...hotelText],
     nq,

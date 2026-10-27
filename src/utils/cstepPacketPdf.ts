@@ -111,7 +111,8 @@ function fmtAmount(n?: number): string {
 
 function legCaption(leg: ICstepReportLeg): string {
   const mode = MODE_LABELS[leg.travelMode] || leg.travelMode;
-  const route = [leg.fromLocation, leg.toLocation].filter(Boolean).join(" → ");
+  // NotoSans has no "→" glyph (it printed as a box) — the route says "to".
+  const route = [leg.fromLocation, leg.toLocation].filter(Boolean).join(" to ");
   return [DIRECTION_LABELS[leg.direction], mode, route].filter(Boolean).join(" · ");
 }
 
@@ -185,7 +186,7 @@ function generateItineraryPdf(request: ICstepTravelRequest, orderedLegs: CstepPa
   y += 24;
 
   const COLS = [
-    { label: "FROM → TO", w: Math.round(CW * 0.32) },
+    { label: "FROM – TO", w: Math.round(CW * 0.32) }, // en dash: NotoSans has no "→"
     { label: "DATE", w: Math.round(CW * 0.18) },
     { label: "MODE", w: Math.round(CW * 0.14) },
     { label: "FARE", w: Math.round(CW * 0.18) },
@@ -217,12 +218,9 @@ function generateItineraryPdf(request: ICstepTravelRequest, orderedLegs: CstepPa
     y += HEADER_H;
 
     for (const { leg, attachment, bookingDocuments } of rows) {
-      if (y + ROW_H > PG_H - M) {
-        doc.addPage();
-        y = M;
-      }
-      const route = [leg.fromLocation, leg.toLocation].filter(Boolean).join(" → ") || "—";
-      const dateRange = [fmtDate(leg.fromDate), fmtDate(leg.toDate)].filter(Boolean).join(" – ") || "—";
+      const route = [leg.fromLocation, leg.toLocation].filter(Boolean).join(" to ") || "—";
+      // A same-day leg shows its one date, not "10/11/2026 – 10/11/2026".
+      const dateRange = [...new Set([fmtDate(leg.fromDate), fmtDate(leg.toDate)].filter(Boolean))].join(" – ") || "—";
       const fare = leg.fare ? `${fmtAmount(leg.fare)} ${leg.currency || ""}`.trim() : "—";
       const docNote = bookingDocuments
         ? bookingDocuments.length
@@ -235,17 +233,30 @@ function generateItineraryPdf(request: ICstepTravelRequest, orderedLegs: CstepPa
             : " · no document";
       const paidBy = (leg.paidBy === "CSTEP" ? "Booked by CSTEP" : "Self Paid") + docNote;
 
+      const cells: Array<{ text: string; size: number; align: "left" | "center" | "right" }> = [
+        { text: route + (leg.remarks ? `\n${leg.remarks}` : ""), size: 8, align: "left" },
+        { text: dateRange, size: 8, align: "center" },
+        { text: MODE_LABELS[leg.travelMode] || leg.travelMode, size: 8, align: "center" },
+        { text: fare, size: 8, align: "right" },
+        { text: paidBy, size: 7, align: "center" },
+      ];
+      // The row grows to fit its tallest cell: a fixed height silently
+      // dropped a wrapped second line (a stay's end date, a long remark, the
+      // "· awaiting Travel Desk document" note).
+      const rowH = Math.max(
+        ROW_H,
+        ...cells.map((c, i) => Math.ceil(doc.font(fn).fontSize(c.size).heightOfString(c.text, { width: COLS[i].w - 8 })) + 10),
+      );
+      if (y + rowH > PG_H - M) {
+        doc.addPage();
+        y = M;
+      }
       x = M;
-      drawCell(doc, fn, fb, x, y, COLS[0].w, ROW_H, route + (leg.remarks ? `\n${leg.remarks}` : ""), { size: 8 });
-      x += COLS[0].w;
-      drawCell(doc, fn, fb, x, y, COLS[1].w, ROW_H, dateRange, { size: 8, align: "center" });
-      x += COLS[1].w;
-      drawCell(doc, fn, fb, x, y, COLS[2].w, ROW_H, MODE_LABELS[leg.travelMode] || leg.travelMode, { size: 8, align: "center" });
-      x += COLS[2].w;
-      drawCell(doc, fn, fb, x, y, COLS[3].w, ROW_H, fare, { size: 8, align: "right" });
-      x += COLS[3].w;
-      drawCell(doc, fn, fb, x, y, COLS[4].w, ROW_H, paidBy, { size: 7, align: "center" });
-      y += ROW_H;
+      cells.forEach((c, i) => {
+        drawCell(doc, fn, fb, x, y, COLS[i].w, rowH, c.text, { size: c.size, align: c.align });
+        x += COLS[i].w;
+      });
+      y += rowH;
     }
     y += 14;
   }

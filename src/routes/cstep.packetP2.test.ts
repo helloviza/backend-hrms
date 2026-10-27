@@ -244,10 +244,9 @@ describe("a plain view never rebuilds the packet", () => {
     const after = await requestDoc(id);
     expect(after.packetS3Key).toBe(before.packetS3Key);
     expect(after.packetGeneratedAt).toEqual(before.packetGeneratedAt);
-    // GET /pdf re-caches the approval form on every view (its own updatedAt
-    // comparison — not the packet's), so updatedAt moves; its cache paths
-    // are packet-neutral and leave the packet fresh.
-    expect(after.updatedAt.getTime()).toBeGreaterThan(before.updatedAt.getTime());
+    // Cleanup #5 — GET /pdf no longer re-caches on every view either, so a
+    // run of plain reads leaves the request untouched.
+    expect(after.updatedAt).toEqual(before.updatedAt);
     expect(after.packetStale).toBe(false);
   });
 

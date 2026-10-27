@@ -135,7 +135,7 @@ function stationLines(stations?: ICstepStationEntry[]): string[] {
   return stations
     .filter((s) => s.from || s.to)
     .map((s) => {
-      const route = [s.from, s.to].filter(Boolean).join(" → ");
+      const route = [s.from, s.to].filter(Boolean).join(" to "); // NotoSans has no "→" glyph
       return s.durationOfStay ? `${route} · ${s.durationOfStay}` : route;
     });
 }
@@ -145,7 +145,7 @@ function countryLines(countries?: ICstepCountryEntry[]): string[] {
   return countries
     .filter((c) => c.country)
     .map((c) => {
-      const range = [fmtDate(c.fromDate), fmtDate(c.toDate)].filter(Boolean).join(" → ");
+      const range = [fmtDate(c.fromDate), fmtDate(c.toDate)].filter(Boolean).join(" – ");
       return range ? `${c.country} · ${range}` : String(c.country);
     });
 }

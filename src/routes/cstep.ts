@@ -30,6 +30,7 @@
 // follow the existing utils/travelFormPdf.ts pattern in a later phase — do
 // not implement them here.
 
+import crypto from "crypto";
 import { Router } from "express";
 import multer from "multer";
 import mongoose from "mongoose";
@@ -67,6 +68,7 @@ import {
   arrangementAmountGap,
   type CstepServiceType,
   type CstepRateSource,
+  type CstepArrangerRole,
 } from "../models/cstep/CstepArrangement.js";
 import type { CstepReportDirection, CstepReportPaidBy } from "../models/cstep/CstepReportLeg.js";
 import { SERVICE_LABEL } from "./cstep.vendorPayables.js";
@@ -116,6 +118,7 @@ import { uploadCstepPacketPdf, type CstepPacketReportLeg } from "../utils/cstepP
 import { presignGetObject } from "../utils/s3Presign.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { getLiveRate } from "../utils/exchangeRate.js";
+import { searchHotelCatalog } from "../services/hotelCatalogSearch.js";
 import {
   nextCstepSerial,
   seedCstepSerial,
@@ -350,6 +353,44 @@ function adminOverrideMark(req: any): { adminOverride?: true } {
 }
 
 /**
+ * Cleanup #4 — the role a Travel Desk action is taken in, for labelling the
+ * line it adds: this traveller's assigned Official, else the workspace
+ * Travel Desk (grant holder), else a CSTEP Admin override — the same order
+ * callerCanArrangeForTraveller admits them in.
+ */
+async function arrangerRole(req: any, travelerProfileId: any): Promise<CstepArrangerRole> {
+  const traveller: any = await TravellerProfile.findOne({ _id: travelerProfileId, workspaceId: req.workspaceObjectId })
+    .select("officialUserId")
+    .lean();
+  if (traveller?.officialUserId && String(traveller.officialUserId) === ownerId(req)) return "OFFICIAL";
+  if (await holdsTravelDeskGrant(req)) return "TRAVEL_DESK";
+  return "ADMIN";
+}
+
+/** The same, read back for an ADDED line stamped before addedByRole existed:
+ * its creator was this traveller's Official, or held a Travel Desk grant
+ * active when the line was added, or else acted as an Admin. */
+async function withAddedByRole(workspaceId: any, travelerProfileId: any, rows: any[]): Promise<any[]> {
+  const unstamped = rows.filter((a) => a.source === "ADDED" && !a.addedByRole && a.createdBy);
+  if (!unstamped.length) return rows;
+  const traveller: any = await TravellerProfile.findOne({ _id: travelerProfileId, workspaceId }).select("officialUserId").lean();
+  const grants: any[] = await CstepTravelDeskGrant.find({ workspaceId, userId: { $in: unstamped.map((a) => a.createdBy) } }).lean();
+  const heldGrantAt = (uid: string, at: Date) =>
+    grants.some((g) => String(g.userId) === uid && new Date(g.grantedAt) <= at && (!g.revokedAt || new Date(g.revokedAt) > at));
+  return rows.map((a) => {
+    if (a.source !== "ADDED" || a.addedByRole || !a.createdBy) return a;
+    const uid = String(a.createdBy);
+    const role: CstepArrangerRole =
+      traveller?.officialUserId && String(traveller.officialUserId) === uid
+        ? "OFFICIAL"
+        : heldGrantAt(uid, new Date(a.createdAt))
+          ? "TRAVEL_DESK"
+          : "ADMIN";
+    return { ...a, addedByRole: role };
+  });
+}
+
+/**
  * Step 6 — per-request FINANCE authority: a CSTEP Admin (any request), or
  * the specific User this traveller has assigned as their Finance user
  * (TravellerProfile.financeUserId) — only that traveller's requests. Same
@@ -520,6 +561,32 @@ async function loadRequest(req: any, id: string) {
  */
 async function markPacketStale(workspaceId: any, requestId: any, session?: any) {
   await CstepTravelRequest.updateOne({ _id: requestId, workspaceId }, { $set: { packetStale: true } }, { timestamps: false, session });
+}
+
+/**
+ * Cleanup #5 — a settlement change: the approval-form PDF (GET /pdf) prints
+ * the settlement's figures as well as the packet, so both are flagged.
+ */
+async function markRenderedStale(workspaceId: any, requestId: any, session?: any) {
+  await CstepTravelRequest.updateOne(
+    { _id: requestId, workspaceId },
+    { $set: { packetStale: true, pdfStale: true } },
+    { timestamps: false, session },
+  );
+}
+
+/**
+ * Both PDFs print the traveller's name, gender and traveller id, which live
+ * on TravellerProfile (edited from many places, none of which touch the
+ * request). A short hash of them is stamped when a PDF renders; a
+ * different one on the next view means the PDF is out of date.
+ */
+function travellerSignature(traveller: any): string {
+  return crypto
+    .createHash("sha1")
+    .update(JSON.stringify([traveller?.firstName || "", traveller?.lastName || "", traveller?.gender || "", traveller?.travelerId || ""]))
+    .digest("hex")
+    .slice(0, 16);
 }
 
 function isValidDateStr(s: any): boolean {
@@ -1360,8 +1427,39 @@ async function resolveArrangementVendor(
  * arrange step, alongside choosing the vendor). */
 const VENDOR_PAYABLE_STATUSES = new Set<string>(CSTEP_VENDOR_PAYABLE_STATUSES);
 
+/** Cleanup #2 — the services that run one way (out or back). An arrangement
+ * row carries no direction, route or date of its own, so its order is the
+ * only signal: of two or more lines of one of these modes, the LAST (by
+ * creation) is the return leg and the earlier ones are onward — a round
+ * trip's two flights read Onward then Return. A single line of a mode, and
+ * every hotel / cab / visa / other line, stays Onward, as before. */
+const DIRECTIONAL_SERVICE_TYPES = new Set<CstepServiceType>(["FLIGHT", "TRAIN", "BUS"]);
+
+function seededLegDirections(arrangements: any[]): Array<CstepReportDirection> {
+  const lastIndexOfMode = new Map<string, number>();
+  const countOfMode = new Map<string, number>();
+  arrangements.forEach((a, i) => {
+    lastIndexOfMode.set(a.arrangedType, i);
+    countOfMode.set(a.arrangedType, (countOfMode.get(a.arrangedType) || 0) + 1);
+  });
+  return arrangements.map((a, i) =>
+    DIRECTIONAL_SERVICE_TYPES.has(a.arrangedType) && (countOfMode.get(a.arrangedType) || 0) > 1 && lastIndexOfMode.get(a.arrangedType) === i
+      ? "RETURN"
+      : "ONWARD",
+  );
+}
+
+/** Arrangements in creation order — the order seededLegDirections reads. */
+function seedReportLegs(arrangements: any[]) {
+  const real = [...arrangements]
+    .filter(arrangementIsReal)
+    .sort((x, y) => new Date(x.createdAt).getTime() - new Date(y.createdAt).getTime() || String(x._id).localeCompare(String(y._id)));
+  const directions = seededLegDirections(real);
+  return buildSeedReportLegs(real).map((row, i) => ({ ...row, direction: directions[i] }));
+}
+
 function buildSeedReportLegs(arrangements: any[]): Array<{
-  direction: "ONWARD";
+  direction: CstepReportDirection;
   travelMode: CstepServiceType;
   fare?: number;
   currency: string;
@@ -2080,12 +2178,16 @@ router.get("/requests/:id", async (req: any, res: any) => {
 
     const arrangementRows: any[] = isClaim
       ? []
-      : await CstepArrangement.find({
-          workspaceId: req.workspaceObjectId,
-          requestId: doc._id,
-        })
-          .sort({ createdAt: 1 })
-          .lean();
+      : await withAddedByRole(
+          req.workspaceObjectId,
+          doc.travelerProfileId,
+          await CstepArrangement.find({
+            workspaceId: req.workspaceObjectId,
+            requestId: doc._id,
+          })
+            .sort({ createdAt: 1 })
+            .lean(),
+        );
     // P1 — each line's Travel Desk booking documents, presigned for viewing.
     const bookingDocs = await presignAttachmentsById(
       req.workspaceObjectId,
@@ -4157,6 +4259,30 @@ router.get("/fx-rate", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
+ * GET /cities?q= — P4: city suggestions for the CSTEP city / location
+ * fields (tour legs, event location, report legs, Event Master). Same local
+ * catalogue as the SBT hotel search (services/hotelCatalogSearch.ts —
+ * tbocities, a database read, never a live TBO call), cities only, from the
+ * FIRST character (SBT's /sbt/hotels/cities keeps its own 2-letter floor).
+ * Suggestions only: the fields stay free text, so a city missing from the
+ * catalogue never blocks a form. A failed lookup answers an empty list.
+ * ───────────────────────────────────────────────────────────────────── */
+router.get("/cities", async (req: any, res: any) => {
+  const q = String(req.query?.q || "").trim().slice(0, 80);
+  if (!q) return res.json({ ok: true, results: [] });
+  try {
+    const { cities } = await searchHotelCatalog(q, { priorityCode: "IN", cityCap: 10, hotelCap: 0 });
+    res.json({
+      ok: true,
+      results: cities.map((c) => ({ name: c.name, countryCode: c.countryCode, countryName: c.countryName })),
+    });
+  } catch (err: any) {
+    console.error("[CSTEP cities GET]", err?.message);
+    res.json({ ok: true, results: [] });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
  * POST /requests/:id/start-arranging — Official/Admin opens an APPROVED
  * request for arranging: APPROVED -> ARRANGING, seeds the REQUESTED
  * arrangement rows if not already seeded, logs START_ARRANGING. Idempotent
@@ -4396,6 +4522,7 @@ router.post("/requests/:id/arrangements", async (req: any, res: any) => {
       details: details || undefined,
       status: "PENDING",
       createdBy: new mongoose.Types.ObjectId(uid),
+      addedByRole: await arrangerRole(req, doc.travelerProfileId),
       ...(amountResult.touched ? amountResult.fields : {}),
       ...vendorFields,
     });
@@ -5042,7 +5169,7 @@ router.post("/requests/:id/report/start", async (req: any, res: any) => {
         workspaceId: req.workspaceObjectId,
         requestId: doc._id,
       }).lean();
-      const seedRows = buildSeedReportLegs(arrangements);
+      const seedRows = seedReportLegs(arrangements);
       if (seedRows.length > 0) {
         await CstepReportLeg.insertMany(
           seedRows.map((row) => ({
@@ -6270,10 +6397,14 @@ router.get("/requests/:id/activity", async (req: any, res: any) => {
  * traveller's Tour Approver, or a CSTEP Admin — same authority as
  * GET /requests/:id/activity.
  *
- * Cached on the request doc (pdfS3Key/pdfGeneratedAt) and regenerated only
- * when stale (no cached key yet, or the request has been edited/acted on
- * since the last generation) — avoids re-rendering on every click while
- * still reflecting the latest status/TIN/activity after it changes.
+ * Cached on the request doc (pdfS3Key/pdfGeneratedAt). Cleanup #5 — rebuilt
+ * only when there is no cached key, pdfStale is set (any edit of the
+ * request — its fields, status, reference, the signatures that come with
+ * each status move — via the model's pre-save hook; a settlement change via
+ * markRenderedStale), or the traveller's name / gender / id changed
+ * (pdfTravellerSig). A plain view serves the stored object. Before #5 this
+ * compared pdfGeneratedAt with updatedAt, and saving the new key bumped
+ * updatedAt past it — every view re-rendered (P2 fixed the packet's twin).
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/requests/:id/pdf", async (req: any, res: any) => {
   try {
@@ -6286,86 +6417,91 @@ router.get("/requests/:id/pdf", async (req: any, res: any) => {
       return res.status(403).json({ error: "Not authorized to view this proposal" });
     }
 
-    // Step 5 addition — the settlement (if one has been started) feeds the
-    // Office table; its own updatedAt also has to be checked for staleness,
-    // same as the request's own updatedAt, so a settlement edit after the
-    // PDF was cached actually regenerates it.
-    const settlement: any = await CstepSettlement.findOne({
+    // The traveller block is read on every view — its signature is part of
+    // what makes the stored PDF current (travellerSignature).
+    const traveller: any = await TravellerProfile.findOne({
+      _id: doc.travelerProfileId,
       workspaceId: req.workspaceObjectId,
-      requestId: doc._id,
-    }).lean();
+    })
+      .select("firstName lastName gender travelerId")
+      .lean();
+    const travellerSig = travellerSignature(traveller);
 
-    const stale =
-      !doc.pdfS3Key ||
-      !doc.pdfGeneratedAt ||
-      doc.pdfGeneratedAt < doc.updatedAt ||
-      (settlement && doc.pdfGeneratedAt < settlement.updatedAt);
-    if (stale) {
-      const traveller: any = await TravellerProfile.findOne({
-        _id: doc.travelerProfileId,
-        workspaceId: req.workspaceObjectId,
-      })
-        .select("firstName lastName gender travelerId")
-        .lean();
+    if (!doc.pdfS3Key || doc.pdfStale !== false || doc.pdfTravellerSig !== travellerSig) {
+      // Cleared BEFORE rendering: an input change landing mid-render sets
+      // it again, so the next view rebuilds rather than keeping this one.
+      const scope = { _id: doc._id, workspaceId: req.workspaceObjectId };
+      await CstepTravelRequest.updateOne(scope, { $set: { pdfStale: false } }, { timestamps: false });
+      try {
+        // Step 5 — the settlement (if one has been started) feeds the Office table.
+        const settlement: any = await CstepSettlement.findOne({
+          workspaceId: req.workspaceObjectId,
+          requestId: doc._id,
+        }).lean();
 
-      const approvals = await CstepApproval.find({
-        workspaceId: req.workspaceObjectId,
-        entityType: "REQUEST",
-        entityId: doc._id,
-      })
-        .populate("actor", "firstName lastName name email")
-        .sort({ at: 1 })
-        .lean();
+        const approvals = await CstepApproval.find({
+          workspaceId: req.workspaceObjectId,
+          entityType: "REQUEST",
+          entityId: doc._id,
+        })
+          .populate("actor", "firstName lastName name email")
+          .sort({ at: 1 })
+          .lean();
 
-      const trail: CstepApprovalTrailEntry[] = (approvals as any[]).map((a) => ({
-        action: a.action,
-        actorName:
-          a.actor?.name || [a.actor?.firstName, a.actor?.lastName].filter(Boolean).join(" ").trim() || a.actor?.email || "—",
-        at: a.at,
-        comment: a.comment,
-      }));
+        const trail: CstepApprovalTrailEntry[] = (approvals as any[]).map((a) => ({
+          action: a.action,
+          actorName:
+            a.actor?.name || [a.actor?.firstName, a.actor?.lastName].filter(Boolean).join(" ").trim() || a.actor?.email || "—",
+          at: a.at,
+          comment: a.comment,
+        }));
 
-      const travellerInfo = {
-        name: traveller ? [traveller.firstName, traveller.lastName].filter(Boolean).join(" ") : "—",
-        gender: traveller?.gender,
-        travelerId: traveller?.travelerId,
-      };
+        const travellerInfo = {
+          name: traveller ? [traveller.firstName, traveller.lastName].filter(Boolean).join(" ") : "—",
+          gender: traveller?.gender,
+          travelerId: traveller?.travelerId,
+        };
 
-      const settlementPdfData: CstepSettlementPdfData | undefined = settlement
-        ? { buckets: settlement.buckets, totalCostOfTour: settlement.totalCostOfTour, amountClaimed: settlement.amountClaimed }
-        : undefined;
+        const settlementPdfData: CstepSettlementPdfData | undefined = settlement
+          ? { buckets: settlement.buckets, totalCostOfTour: settlement.totalCostOfTour, amountClaimed: settlement.amountClaimed }
+          : undefined;
 
-      let key: string;
-      switch (doc.formType) {
-        case "EVENT_REQUEST":
-          ({ key } = await uploadCstepEventRequestPdf(doc.toObject(), travellerInfo, trail));
-          break;
-        case "LOCAL_TRAVEL_CLAIM":
-        case "EXPENSE_CLAIM": {
-          const claimSettlement: CstepClaimSettlementPdfData | undefined = settlement
-            ? {
-                status: settlement.status,
-                amountClaimed: settlement.amountClaimed,
-                advanceTaken: settlement.advanceTaken,
-                amountDueByCstep: settlement.amountDueByCstep,
-                amountDueToCstep: settlement.amountDueToCstep,
-              }
-            : undefined;
-          ({ key } =
-            doc.formType === "EXPENSE_CLAIM"
-              ? await uploadCstepExpenseClaimPdf(doc.toObject(), travellerInfo, trail, claimSettlement)
-              : await uploadCstepLocalTravelClaimPdf(doc.toObject(), travellerInfo, trail, claimSettlement));
-          break;
+        let key: string;
+        switch (doc.formType) {
+          case "EVENT_REQUEST":
+            ({ key } = await uploadCstepEventRequestPdf(doc.toObject(), travellerInfo, trail));
+            break;
+          case "LOCAL_TRAVEL_CLAIM":
+          case "EXPENSE_CLAIM": {
+            const claimSettlement: CstepClaimSettlementPdfData | undefined = settlement
+              ? {
+                  status: settlement.status,
+                  amountClaimed: settlement.amountClaimed,
+                  advanceTaken: settlement.advanceTaken,
+                  amountDueByCstep: settlement.amountDueByCstep,
+                  amountDueToCstep: settlement.amountDueToCstep,
+                }
+              : undefined;
+            ({ key } =
+              doc.formType === "EXPENSE_CLAIM"
+                ? await uploadCstepExpenseClaimPdf(doc.toObject(), travellerInfo, trail, claimSettlement)
+                : await uploadCstepLocalTravelClaimPdf(doc.toObject(), travellerInfo, trail, claimSettlement));
+            break;
+          }
+          case "TOUR_PROPOSAL":
+            ({ key } = await uploadCstepTourProposalPdf(doc.toObject(), travellerInfo, trail, settlementPdfData));
+            break;
+          default:
+            throw new CstepHttpError(409, "No PDF is available for this form type");
         }
-        case "TOUR_PROPOSAL":
-          ({ key } = await uploadCstepTourProposalPdf(doc.toObject(), travellerInfo, trail, settlementPdfData));
-          break;
-        default:
-          return res.status(409).json({ error: "No PDF is available for this form type" });
+        const pdfGeneratedAt = new Date();
+        await CstepTravelRequest.updateOne(scope, { $set: { pdfS3Key: key, pdfGeneratedAt, pdfTravellerSig: travellerSig } }, { timestamps: false });
+        doc.pdfS3Key = key;
+        doc.pdfGeneratedAt = pdfGeneratedAt;
+      } catch (err) {
+        await CstepTravelRequest.updateOne(scope, { $set: { pdfStale: true } }, { timestamps: false });
+        throw err;
       }
-      doc.pdfS3Key = key;
-      doc.pdfGeneratedAt = new Date();
-      await doc.save();
     }
 
     const mode = req.query?.mode === "download" ? "download" : "view";
@@ -6387,6 +6523,7 @@ router.get("/requests/:id/pdf", async (req: any, res: any) => {
 
     res.json({ ok: true, url });
   } catch (err: any) {
+    if (err instanceof CstepHttpError) return res.status(err.status).json({ error: err.message });
     console.error("[CSTEP requests pdf]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to generate PDF" });
   }
@@ -6582,7 +6719,17 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
       return res.status(409).json({ error: "The travel packet applies to tour proposals and event requests only" });
     }
 
-    if (!doc.packetS3Key || doc.packetStale !== false) {
+    // The traveller block is read on every view — its signature is part of
+    // what makes the stored packet current (travellerSignature).
+    const traveller: any = await TravellerProfile.findOne({
+      _id: doc.travelerProfileId,
+      workspaceId: req.workspaceObjectId,
+    })
+      .select("firstName lastName gender travelerId")
+      .lean();
+    const travellerSig = travellerSignature(traveller);
+
+    if (!doc.packetS3Key || doc.packetStale !== false || doc.packetTravellerSig !== travellerSig) {
       // Cleared BEFORE rendering: an input change landing mid-render sets
       // it again, so the next view rebuilds rather than keeping this one.
       const scope = { _id: doc._id, workspaceId: req.workspaceObjectId };
@@ -6602,13 +6749,6 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
           workspaceId: req.workspaceObjectId,
           requestId: doc._id,
         }).lean();
-
-        const traveller: any = await TravellerProfile.findOne({
-          _id: doc.travelerProfileId,
-          workspaceId: req.workspaceObjectId,
-        })
-          .select("firstName lastName gender travelerId")
-          .lean();
 
         const approvals = await CstepApproval.find({
           workspaceId: req.workspaceObjectId,
@@ -6668,7 +6808,7 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
         const declaration = claimDeclarationItems(doc, legs as any[]);
         const { key } = await uploadCstepPacketPdf(doc.toObject(), travellerInfo, trail, packetLegs, settlementPdfData, declaration);
         const packetGeneratedAt = new Date();
-        await CstepTravelRequest.updateOne(scope, { $set: { packetS3Key: key, packetGeneratedAt } }, { timestamps: false });
+        await CstepTravelRequest.updateOne(scope, { $set: { packetS3Key: key, packetGeneratedAt, packetTravellerSig: travellerSig } }, { timestamps: false });
         doc.packetS3Key = key;
         doc.packetGeneratedAt = packetGeneratedAt;
       } catch (err) {
@@ -6789,7 +6929,7 @@ router.post("/requests/:id/settlement/start", async (req: any, res: any) => {
       settlement.totalCostOfTour = totalCostOfTour;
       settlement.amountClaimed = amountClaimed;
       await settlement.save();
-      await markPacketStale(req.workspaceObjectId, doc._id);
+      await markRenderedStale(req.workspaceObjectId, doc._id);
 
       await CstepApproval.create({
         workspaceId: req.workspaceObjectId,
@@ -7045,7 +7185,7 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
     }).lean();
     applySettlementTotals(settlement, allLines as any[], doc);
     await settlement.save();
-    await markPacketStale(req.workspaceObjectId, doc._id);
+    await markRenderedStale(req.workspaceObjectId, doc._id);
 
     const stage = isClaim ? "ADMIN" : "OFFICIAL";
     const actor = new mongoose.Types.ObjectId(ownerId(req));
@@ -7194,7 +7334,7 @@ router.patch("/requests/:id/settlement/perdiem", async (req: any, res: any) => {
     settlement.totalCostOfTour = totalCostOfTour;
     settlement.amountClaimed = amountClaimed;
     await settlement.save();
-    await markPacketStale(req.workspaceObjectId, doc._id);
+    await markRenderedStale(req.workspaceObjectId, doc._id);
 
     const after = {
       days,
@@ -7636,7 +7776,7 @@ export async function settleFinanceCase(
 
       const flipped = await CstepTravelRequest.updateOne(
         { _id: doc._id, workspaceId, status: "TRANSFERRED_TO_FINANCE" },
-        { $set: { status: endStatus, packetStale: true } },
+        { $set: { status: endStatus, packetStale: true, pdfStale: true } },
         { session },
       );
       if (flipped.modifiedCount !== 1) throw new Error("ALREADY_SETTLED");
@@ -7958,7 +8098,7 @@ async function runFinanceAdjustment(req: any, res: any, plan: (ctx: FinancePlanC
         settlement.financeClosedBy = uid;
         const flipped = await CstepTravelRequest.updateOne(
           { _id: doc._id, workspaceId, status: "TRANSFERRED_TO_FINANCE" },
-          { $set: { status: "SETTLED", packetStale: true } },
+          { $set: { status: "SETTLED", packetStale: true, pdfStale: true } },
           { session },
         );
         if (flipped.modifiedCount !== 1) throw new CstepHttpError(409, "This case is no longer with Finance");
@@ -8020,7 +8160,7 @@ async function runFinanceAdjustment(req: any, res: any, plan: (ctx: FinancePlanC
   }
 
   if (!out.change) return res.json({ ok: true, changed: false, request: doc.toObject() });
-  await markPacketStale(req.workspaceObjectId, doc._id);
+  await markRenderedStale(req.workspaceObjectId, doc._id);
   if (out.closed) doc.status = "SETTLED";
   await notifyCstep("FINANCE_ADJUSTED", doc, {
     logEntryId: out.entryIds![0],

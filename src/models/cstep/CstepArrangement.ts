@@ -59,6 +59,13 @@ export const CSTEP_PAYMENT_STATUSES = ["UNPAID", "PAID"] as const;
 export type CstepPaymentStatus = (typeof CSTEP_PAYMENT_STATUSES)[number];
 export type CstepPaymentSource = "MANUAL" | "IMPORT";
 
+/** Cleanup #4 — who added an ADDED line: the workspace Travel Desk (grant
+ * holder), this traveller's assigned Official, or a CSTEP Admin acting as an
+ * override (routes/cstep.ts arrangerRole). Lines added before it was
+ * stamped have none; the request detail derives it from createdBy. */
+export const CSTEP_ARRANGER_ROLES = ["TRAVEL_DESK", "OFFICIAL", "ADMIN"] as const;
+export type CstepArrangerRole = (typeof CSTEP_ARRANGER_ROLES)[number];
+
 /** Request statuses from ARRANGING onwards — where an arrangement line's
  * vendor can be paid (by hand on the request page — the Official at the
  * arrange step, or Finance/Admin — or by the Finance payment import), and
@@ -137,6 +144,7 @@ export interface ICstepArrangement extends Document {
   attachmentIds?: mongoose.Types.ObjectId[];
 
   createdBy: mongoose.Types.ObjectId; // ref User — who created this row (seeding, or the Official who added it)
+  addedByRole?: CstepArrangerRole; // source: "ADDED" only — see CSTEP_ARRANGER_ROLES
   arrangedBy?: mongoose.Types.ObjectId; // ref User — who last marked it ARRANGED
   arrangedAt?: Date;
 
@@ -180,6 +188,7 @@ const CstepArrangementSchema = new Schema<ICstepArrangement>(
     attachmentIds: { type: [{ type: Schema.Types.ObjectId, ref: "CstepAttachment" }], default: undefined },
 
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    addedByRole: { type: String, enum: CSTEP_ARRANGER_ROLES },
     arrangedBy: { type: Schema.Types.ObjectId, ref: "User" },
     arrangedAt: { type: Date },
   },
