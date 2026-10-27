@@ -76,6 +76,7 @@ import type {
   CstepSettlementLineSource,
 } from "../models/cstep/CstepSettlementLine.js";
 import CstepProject from "../models/cstep/CstepProject.js";
+import CstepEvent from "../models/cstep/CstepEvent.js";
 import TravellerProfile from "../models/TravellerProfile.js";
 import User from "../models/User.js";
 import CstepTravelDeskGrant from "../models/cstep/CstepTravelDeskGrant.js";
@@ -130,6 +131,7 @@ import {
 import {
   buildTravelRegisterWorkbook,
   istDate,
+  eventLabel,
   resolveRegisterPeriod,
   type RegisterTrip,
 } from "../utils/cstepTravelRegister.js";
@@ -137,6 +139,7 @@ import { env } from "../config/env.js";
 import { notifyCstep } from "../services/cstepNotifications.js";
 import { sendSheet } from "../utils/sheetImport.js";
 import {
+  CSTEP_EXPENSE_CATEGORIES,
   CSTEP_EXPENSE_CATEGORY_LABEL,
   categoryOfClaimTravelMode,
   categoryOfExpenseLine,
@@ -144,6 +147,7 @@ import {
   isExpenseLineHead,
   type CstepExpenseCategory,
 } from "../models/cstep/expenseCategories.js";
+import { buildEventSpendRows, UNCATEGORISED, type EventSpendCase, type EventSpendRow } from "../utils/cstepEventSpend.js";
 
 const router = Router();
 
@@ -710,6 +714,44 @@ async function applyProjectSelection(req: any, fields: any, current?: any): Prom
   return null;
 }
 
+/** The request's event snapshot — cleared together when "Related to an
+ * event?" goes to No. */
+const EVENT_SNAPSHOT_FIELDS = ["eventId", "eventCode", "eventName"] as const;
+
+/**
+ * Event Master (#15) — mirrors applyProjectSelection. "Related to an event?"
+ * (eventRelated) plus the picked eventId resolve into the request's
+ * snapshot: eventRelated, eventId, eventCode, eventName. Yes needs an event
+ * in this workspace that is active (an inactive one only if it is the
+ * request's own current event); No sets eventRelated false and the snapshot
+ * fields to null, which create drops and edit unsets. An eventId sent
+ * without eventRelated reads as Yes. Neither key in the body -> nothing
+ * changes. Mutates `fields`; returns an error message or null.
+ */
+async function applyEventSelection(req: any, fields: any, current?: any): Promise<string | null> {
+  if (fields.eventRelated === undefined && fields.eventId === undefined) return null;
+  const related = fields.eventRelated === undefined ? true : fields.eventRelated === true;
+  fields.eventRelated = related;
+  if (!related) {
+    for (const k of EVENT_SNAPSHOT_FIELDS) fields[k] = null;
+    return null;
+  }
+  const raw = fields.eventId == null ? "" : String(fields.eventId).trim();
+  if (!raw) {
+    delete fields.eventId;
+    return "Choose an event";
+  }
+  if (!mongoose.Types.ObjectId.isValid(raw)) return "Unknown event";
+  const event: any = await CstepEvent.findOne({ _id: raw, workspaceId: req.workspaceObjectId }).lean();
+  if (!event) return "Unknown event";
+  const unchanged = current?.eventId && String(current.eventId) === raw;
+  if (!event.isActive && !unchanged) return `Event ${event.eventCode} is inactive — choose another`;
+  fields.eventId = event._id;
+  fields.eventCode = event.eventCode;
+  fields.eventName = event.eventName;
+  return null;
+}
+
 /** Fields the request/update payload may set — everything except workspaceId,
  * createdBy, status, claimReference, formType, fundsConfirmedBy/At
  * (server-controlled). formType is deliberately NOT in this allowlist — it's
@@ -725,6 +767,10 @@ function pickFields(body: any) {
     // it survives only, untouched, on requests made before the master.
     projectId,
     projectDebitable,
+    // Event Master (#15) — "Related to an event?" and the picked event's id;
+    // the server snapshots it (applyEventSelection).
+    eventRelated,
+    eventId,
     stations,
     countries,
     departureDate,
@@ -781,6 +827,8 @@ function pickFields(body: any) {
     purpose,
     projectId,
     projectDebitable,
+    eventRelated,
+    eventId,
     stations,
     countries,
     departureDate,
@@ -838,6 +886,8 @@ const CLAIM_HEADER_FIELDS = [
   "purpose",
   "projectId",
   "projectDebitable",
+  "eventRelated",
+  "eventId",
   "departureDate",
   "returnDate",
   "otherInstructions",
@@ -1675,6 +1725,9 @@ router.post("/requests", async (req: any, res: any) => {
     const admin = isCstepAdmin(req);
     const projectError = await applyProjectSelection(req, fields);
     if (projectError) return res.status(400).json({ error: projectError });
+    const eventError = await applyEventSelection(req, fields);
+    if (eventError) return res.status(400).json({ error: eventError });
+    for (const k of EVENT_SNAPSHOT_FIELDS) if (fields[k] === null) delete fields[k];
 
     if (!admin) {
       const own = await resolveOwnTravellerProfile(req.workspaceObjectId, req.user);
@@ -2057,6 +2110,8 @@ router.patch("/requests/:id", async (req: any, res: any) => {
     const before: any = doc.toObject();
     const projectError = await applyProjectSelection(req, fields, before);
     if (projectError) return res.status(400).json({ error: projectError });
+    const eventError = await applyEventSelection(req, fields, before);
+    if (eventError) return res.status(400).json({ error: eventError });
 
     // Merge onto the existing doc so validation sees the full, post-update
     // shape. Keys the body left out (undefined) keep their stored value —
@@ -2069,6 +2124,8 @@ router.patch("/requests/:id", async (req: any, res: any) => {
     Object.keys(fields).forEach((k) => {
       if ((fields as any)[k] !== undefined) (doc as any)[k] = (fields as any)[k];
     });
+    // "Related to an event?" -> No: the old snapshot is removed, not nulled.
+    for (const k of EVENT_SNAPSHOT_FIELDS) if (fields[k] === null) doc.set(k, undefined);
 
     const validationError = validatePayload(merged);
     if (validationError) return res.status(400).json({ error: validationError });
@@ -2834,9 +2891,11 @@ router.get("/finance-queue", async (req: any, res: any) => {
  *   DESK_VERIFIED         still being settled; the Desk has verified the line
  *   IN_VERIFICATION       still being settled; not verified yet (and the per diem)
  *
- * Query: status, traveller (TravellerProfile id), from / to (YYYY-MM-DD, on
+ * Query: status, traveller (TravellerProfile id), event (CstepEvent id —
+ * #15: only items of cases tagged to that event), from / to (YYYY-MM-DD, on
  * the item's date — its own date, else the case's start). format=csv sends
- * the same rows as a UTF-8 (BOM) CSV.
+ * the same rows as a UTF-8 (BOM) CSV. Every item carries its case's event
+ * snapshot (eventId + "CODE — Name"), blank when the case has none.
  * ───────────────────────────────────────────────────────────────────── */
 export const FINANCE_EXPENSE_STATUSES = [
   "IN_VERIFICATION",
@@ -2862,6 +2921,8 @@ type FinanceExpenseItem = {
   formType: string;
   travelerProfileId: string;
   traveller: string;
+  eventId: string;
+  event: string;
   date: string;
   category: CstepExpenseCategory | null;
   description: string;
@@ -2904,7 +2965,7 @@ async function financeExpenseItems(req: any): Promise<{ items: FinanceExpenseIte
     .lean();
   if (!settlements.length) return { items: [] };
   const docs: any[] = await CstepTravelRequest.find({ ...requestFilter, _id: { $in: settlements.map((s) => s.requestId) } })
-    .select("_id claimReference formType status travelerProfileId departureDate")
+    .select("_id claimReference formType status travelerProfileId departureDate eventId eventCode eventName")
     .lean();
   if (!docs.length) return { items: [] };
   const docById = new Map(docs.map((d) => [String(d._id), d]));
@@ -2930,6 +2991,8 @@ async function financeExpenseItems(req: any): Promise<{ items: FinanceExpenseIte
     formType: doc.formType,
     travelerProfileId: String(doc.travelerProfileId),
     traveller: nameOf.get(String(doc.travelerProfileId)) || "",
+    eventId: doc.eventId ? String(doc.eventId) : "",
+    event: eventLabel(doc),
   });
 
   for (const l of lines as any[]) {
@@ -2979,6 +3042,7 @@ router.get("/finance-expenses", async (req: any, res: any) => {
   try {
     const status = String(req.query.status || "").trim();
     const traveller = String(req.query.traveller || "").trim();
+    const event = String(req.query.event || "").trim();
     const from = String(req.query.from || "").trim();
     const to = String(req.query.to || "").trim();
     if (status && !(FINANCE_EXPENSE_STATUSES as readonly string[]).includes(status)) {
@@ -2995,10 +3059,15 @@ router.get("/finance-expenses", async (req: any, res: any) => {
     const travellers = [...new Map(all.items.map((i) => [i.travelerProfileId, i.traveller])).entries()]
       .map(([id, name]) => ({ id, name }))
       .sort((a, b) => a.name.localeCompare(b.name));
+    // …and the event filter's, likewise (cases with no event are not a choice).
+    const events = [...new Map(all.items.filter((i) => i.eventId).map((i) => [i.eventId, i.event])).entries()]
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
     const items = all.items.filter(
       (i) =>
         (!status || i.status === status) &&
         (!traveller || i.travelerProfileId === traveller) &&
+        (!event || i.eventId === event) &&
         (!from || i.date >= from) &&
         (!to || i.date <= to),
     );
@@ -3009,21 +3078,136 @@ router.get("/finance-expenses", async (req: any, res: any) => {
         filename: `cstep-traveller-paid-expenses-${istDate(new Date())}`,
         sheetName: "Traveller-paid expenses",
         columns: [
-          "Reference", "Traveller", "Date", "Category", "Description", "Amount claimed (INR)", "Amount now (INR)",
+          "Reference", "Traveller", "Event", "Date", "Category", "Description", "Amount claimed (INR)", "Amount now (INR)",
           "Status", "Paid on", "Payment ref", "Reason",
         ],
         rows: items.map((i) => [
-          i.reference, i.traveller, i.date, i.category ? CSTEP_EXPENSE_CATEGORY_LABEL[i.category] : "Not categorised yet",
+          i.reference, i.traveller, i.event, i.date, i.category ? CSTEP_EXPENSE_CATEGORY_LABEL[i.category] : "Not categorised yet",
           i.description, i.amountClaimedInr, i.amountNowInr, FINANCE_EXPENSE_STATUS_LABEL[i.status],
           i.paidOn || "", i.paymentRef || "", i.reason || "",
         ]),
       });
       return;
     }
-    res.json({ ok: true, items, travellers });
+    res.json({ ok: true, items, travellers, events });
   } catch (err: any) {
     console.error("[CSTEP finance-expenses GET]", err?.message);
     if (!res.headersSent) res.status(500).json({ error: err?.message || "Failed to list the traveller-paid expenses" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * GET /reports/event-spend — per-event spend (#15): one row per Event
+ * Master event with the cases tagged to it ("Related to an event? Yes"),
+ * across all four form types. The arithmetic (settled vs provisional, the
+ * CSTEP-paid / traveller-paid split, the category breakdown) is in
+ * utils/cstepEventSpend.ts.
+ *
+ * Scope, as GET /finance-expenses: a CSTEP Admin sees every case; anyone
+ * else sees the cases of the travellers they are the Finance user of
+ * (TravellerProfile.financeUserId). Nobody else — 403.
+ *
+ * A case is a tagged request that got somewhere: DRAFT, REJECTED and
+ * CANCELLED requests are left out (no spend to report, as the Finance
+ * views leave cancelled cases out).
+ *
+ * Query: event (CstepEvent id — that event's row only). format=csv sends
+ * the rows plus an "All events" total as a UTF-8 (BOM) CSV, one column per
+ * expense category.
+ * ───────────────────────────────────────────────────────────────────── */
+const EVENT_SPEND_EXCLUDED_STATUSES = ["DRAFT", "REJECTED", "CANCELLED"];
+const EVENT_SPEND_CATEGORIES = [...CSTEP_EXPENSE_CATEGORIES, UNCATEGORISED] as const;
+const eventSpendCategoryLabel = (c: (typeof EVENT_SPEND_CATEGORIES)[number]) =>
+  c === UNCATEGORISED ? "Not categorised yet" : CSTEP_EXPENSE_CATEGORY_LABEL[c];
+
+router.get("/reports/event-spend", async (req: any, res: any) => {
+  try {
+    const workspaceId = req.workspaceObjectId;
+    const event = String(req.query.event || "").trim();
+    if (event && !mongoose.isValidObjectId(event)) return res.status(400).json({ error: "Unknown event" });
+
+    const filter: any = {
+      workspaceId,
+      eventId: event ? new mongoose.Types.ObjectId(event) : { $exists: true, $ne: null },
+      status: { $nin: EVENT_SPEND_EXCLUDED_STATUSES },
+    };
+    if (!isCstepAdmin(req)) {
+      const uid = ownerId(req);
+      const mine = mongoose.isValidObjectId(uid)
+        ? await TravellerProfile.find({ workspaceId, financeUserId: new mongoose.Types.ObjectId(uid) }).select("_id").lean()
+        : [];
+      if (!mine.length) return res.status(403).json({ error: "Event spend is open to CSTEP Admin and Finance users" });
+      filter.travelerProfileId = { $in: mine.map((t: any) => t._id) };
+    }
+
+    const docs: any[] = await CstepTravelRequest.find(filter).select("_id eventId eventCode eventName").lean();
+    const requestIds = docs.map((d) => d._id);
+    const [arrangements, settlements, lines, events] = await Promise.all([
+      CstepArrangement.find({ workspaceId, requestId: { $in: requestIds } })
+        .select("requestId arrangedType amount currency amountInr status")
+        .lean(),
+      CstepSettlement.find({ workspaceId, requestId: { $in: requestIds } }).select("_id requestId status totalCostOfTour perDiem").lean(),
+      CstepSettlementLine.find({ workspaceId, requestId: { $in: requestIds } }).select("settlementId classification amountInr category").lean(),
+      CstepEvent.find({ workspaceId, _id: { $in: [...new Set(docs.map((d) => String(d.eventId)))] } })
+        .select("_id eventCode eventName")
+        .lean(),
+    ]);
+
+    const settlementBy = new Map((settlements as any[]).map((s) => [String(s.requestId), s]));
+    const arrangementsBy = new Map<string, any[]>();
+    for (const a of arrangements as any[]) {
+      if (!arrangementIsReal(a)) continue;
+      const k = String(a.requestId);
+      arrangementsBy.set(k, [...(arrangementsBy.get(k) || []), a]);
+    }
+    const linesBy = new Map<string, any[]>();
+    for (const l of lines as any[]) {
+      const k = String(l.settlementId);
+      linesBy.set(k, [...(linesBy.get(k) || []), l]);
+    }
+    const cases: EventSpendCase[] = docs.map((d) => {
+      const settlement = settlementBy.get(String(d._id));
+      return {
+        eventId: String(d.eventId),
+        eventCode: d.eventCode,
+        eventName: d.eventName,
+        arrangements: arrangementsBy.get(String(d._id)) || [],
+        settlement: settlement
+          ? { status: settlement.status, totalCostOfTour: settlement.totalCostOfTour, perDiem: settlement.perDiem }
+          : undefined,
+        settlementLines: settlement ? linesBy.get(String(settlement._id)) || [] : [],
+      };
+    });
+    const { rows, total } = buildEventSpendRows(
+      cases,
+      new Map((events as any[]).map((e) => [String(e._id), { eventCode: e.eventCode, eventName: e.eventName }])),
+    );
+
+    if (String(req.query.format || "") === "csv") {
+      const line = (r: EventSpendRow) => [
+        r.eventCode, r.eventName, r.cases, r.settledCases, r.provisionalCases,
+        r.totalInr, r.settledInr, r.provisionalInr, r.cstepPaidInr, r.travellerPaidInr,
+        ...EVENT_SPEND_CATEGORIES.map((c) => r.byCategory[c] || 0),
+        r.unpricedBookings,
+      ];
+      await sendSheet(res, {
+        format: "csv",
+        filename: `cstep-event-spend-${istDate(new Date())}`,
+        sheetName: "Event spend",
+        columns: [
+          "Event Code", "Event Name", "Cases", "Settled", "Provisional",
+          "Total cost (INR)", "Settled (INR)", "Provisional (INR)", "CSTEP-paid (INR)", "Traveller-paid (INR)",
+          ...EVENT_SPEND_CATEGORIES.map((c) => `${eventSpendCategoryLabel(c)} (INR)`),
+          "Bookings without an INR rate",
+        ],
+        rows: [...rows.map(line), ...(rows.length ? [line(total)] : [])],
+      });
+      return;
+    }
+    res.json({ ok: true, rows, total });
+  } catch (err: any) {
+    console.error("[CSTEP event-spend GET]", err?.message);
+    if (!res.headersSent) res.status(500).json({ error: err?.message || "Failed to build the event spend report" });
   }
 });
 
@@ -3221,9 +3405,10 @@ router.get("/approver-report", async (req: any, res: any) => {
  *
  * Query: period=week|month|quarter|fy|custom (default fy), anchor=YYYY-MM-DD
  * (any day inside the wanted period; default today IST), from/to for custom
- * (max 24 months), includeDrafts=1 to add DRAFT trips (left out by default).
- * A trip falls in the period by its departureDate — or, if it has none yet,
- * by the IST date it was created.
+ * (max 24 months), includeDrafts=1 to add DRAFT trips (left out by default),
+ * event=<CstepEvent id> to keep only the trips tagged to that event (#15 —
+ * column S carries every trip's event). A trip falls in the period by its
+ * departureDate — or, if it has none yet, by the IST date it was created.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/reports/travel-register", async (req: any, res: any) => {
   try {
@@ -3252,6 +3437,8 @@ router.get("/reports/travel-register", async (req: any, res: any) => {
     const period = resolveRegisterPeriod(req.query, generatedAt);
     if ("error" in period) return res.status(400).json({ error: period.error });
     const includeDrafts = ["1", "true"].includes(String(req.query.includeDrafts || "").toLowerCase());
+    const eventFilter = String(req.query.event || "").trim();
+    if (eventFilter && !mongoose.isValidObjectId(eventFilter)) return res.status(400).json({ error: "Unknown event" });
 
     const filter: any = {
       workspaceId: req.workspaceObjectId,
@@ -3271,6 +3458,7 @@ router.get("/reports/travel-register", async (req: any, res: any) => {
     // Claims addition — Local Travel Claims are travel and belong in the
     // register; Expense Claims are not travel and stay out of it.
     filter.formType = { $ne: "EXPENSE_CLAIM" };
+    if (eventFilter) filter.eventId = new mongoose.Types.ObjectId(eventFilter);
 
     const requests: any[] = await CstepTravelRequest.find(filter).lean();
     const requestIds = requests.map((r) => r._id);
@@ -5430,6 +5618,9 @@ const AMENDABLE_FIELDS = new Set(Object.keys(pickFields({})));
 // The project is a snapshot of a Project Master entry — set by the
 // traveller's create / edit (applyProjectSelection), not amended raw.
 AMENDABLE_FIELDS.delete("projectId");
+// The event is a snapshot of an Event Master entry the same way (#15).
+AMENDABLE_FIELDS.delete("eventRelated");
+AMENDABLE_FIELDS.delete("eventId");
 
 /* Reduce-only claim amounts — the Manager corrects a claim at approval
  * through /amend, and its amount fields may only go down. The ceiling is

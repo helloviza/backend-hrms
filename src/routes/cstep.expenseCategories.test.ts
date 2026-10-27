@@ -495,7 +495,7 @@ describe("B — GET /finance-expenses", () => {
     expect([...buf.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
     const text = buf.subarray(3).toString("utf8");
     const [header, ...data] = text.trim().split("\n");
-    expect(header).toBe("Reference,Traveller,Date,Category,Description,Amount claimed (INR),Amount now (INR),Status,Paid on,Payment ref,Reason");
+    expect(header).toBe("Reference,Traveller,Event,Date,Category,Description,Amount claimed (INR),Amount now (INR),Status,Paid on,Payment ref,Reason");
     expect(data.length).toBe((await rows(ACT.finance, "?status=DISALLOWED")).items.length);
     expect(text).toContain("Client → Mall");
     expect(text).toContain("Disallowed by Finance — No pre-approval");

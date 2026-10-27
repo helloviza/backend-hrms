@@ -40,6 +40,10 @@
 // recomputeSettlementTotals stores). A gap over ₹0.01 is highlighted with a
 // note carrying both figures — never silently resolved either way.
 //
+// Event (#15) — one column appended after the sample's A:R, column S: the
+// request's event snapshot ("CODE — Name"), blank when the request isn't
+// related to an event. A:R (and the merged title over them) are untouched.
+//
 // Dates follow the sample's convention: day.month typed as a number (5.04 =
 // 5 April), shown with a 0.00 format so 30.10 doesn't collapse to 30.1.
 
@@ -93,6 +97,8 @@ export interface RegisterRequest {
   purpose?: string;
   project?: string;
   projectDebitable?: string;
+  eventCode?: string; // #15 — the request's event snapshot
+  eventName?: string;
   stations?: Array<{ from?: string; to?: string }>;
   countries?: Array<{ country?: string }>;
   departureDate?: string;
@@ -372,6 +378,11 @@ function tripType(r: RegisterRequest): string {
   }
 }
 
+/** #15 — the request's event snapshot as "CODE — Name", or "". */
+export function eventLabel(r: { eventCode?: string; eventName?: string }): string {
+  return [r.eventCode, r.eventName].filter((p) => p && String(p).trim()).join(" — ");
+}
+
 function tripRoute(r: RegisterRequest): { from: string; to: string } {
   if (r.formType === "EVENT_REQUEST") {
     return { from: "", to: r.eventLocation || r.eventVenue || "" };
@@ -403,6 +414,10 @@ const WIDTHS: Array<number | undefined> = [
   14.109375, undefined, 22.21875, undefined, 5.44140625, 5.44140625, undefined, undefined,
 ];
 const COLS = 18;
+// #15 — "Event", appended after the sample's A:R (COLS) as column S.
+const EVENT_HEADER = "Event";
+const EVENT_WIDTH = 24;
+const ALL_COLS = COLS + 1;
 const FONT = "Trebuchet MS";
 const RED = "FFFF0000";
 const YELLOW = "FFFFFF00";
@@ -416,6 +431,7 @@ const DAY_MONTH_FMT = "0.00";
 const C = {
   month: 1, tin: 2, type: 3, name: 4, reason: 5, from: 6, dest: 7, fromDate: 8, toDate: 9, mode: 10,
   agency: 11, invDate: 12, invNo: 13, amount: 14, tds: 15, paid: 16, project: 17, cheque: 18,
+  event: 19,
 } as const;
 
 type SummaryKind = "total" | "provisional" | "status";
@@ -471,6 +487,7 @@ export function buildTravelRegisterWorkbook(
   WIDTHS.forEach((w, i) => {
     if (w !== undefined) ws.getColumn(i + 1).width = w;
   });
+  ws.getColumn(C.event).width = EVENT_WIDTH;
 
   // Row 1 — merged title.
   const title = ws.getRow(1);
@@ -482,7 +499,7 @@ export function buildTravelRegisterWorkbook(
 
   // Row 2 — blue header. NAME / REASON / Destination are not wrapped in the sample.
   const header = ws.getRow(2);
-  HEADERS.forEach((h, i) => {
+  [...HEADERS, EVENT_HEADER].forEach((h, i) => {
     const cell = header.getCell(i + 1);
     cell.value = h;
     cell.font = { name: FONT, size: 10, bold: true, ...(i + 1 === C.name ? { color: { argb: "FF000000" } } : {}) };
@@ -520,6 +537,7 @@ export function buildTravelRegisterWorkbook(
       name: trip.travellerName,
       reason: r.purpose || "",
       project: [r.project, r.projectDebitable].filter((p) => p && String(p).trim()).join(" / "),
+      event: eventLabel(r),
     };
     const route = tripRoute(r);
     const tripCols = { from: route.from, to: route.to, fromDate: r.departureDate, toDate: r.returnDate };
@@ -683,7 +701,7 @@ export function buildTravelRegisterWorkbook(
 function writeRow(
   row: ExcelJS.Row,
   spec: RowSpec,
-  identity: { month: string; tin: string; type: string; name: string; reason: string; project: string },
+  identity: { month: string; tin: string; type: string; name: string; reason: string; project: string; event: string },
   firstOfTrip: boolean,
   trip: RegisterTrip,
   generatedAt: Date,
@@ -705,6 +723,7 @@ function writeRow(
   set(C.invDate, spec.invDate);
   set(C.invNo, spec.invNo);
   set(C.project, identity.project);
+  set(C.event, identity.event);
   set(C.paid, spec.paid);
   set(C.cheque, spec.cheque);
 
@@ -727,8 +746,9 @@ function writeRow(
   }
   if (spec.amount !== undefined && spec.amount !== null) row.getCell(C.amount).value = spec.amount;
 
-  // Base style — every cell A..R, as the sample formats the whole row.
-  for (let c = 1; c <= COLS; c++) {
+  // Base style — every cell A..R as the sample formats the whole row, and
+  // the appended Event column the same way.
+  for (let c = 1; c <= ALL_COLS; c++) {
     const cell = row.getCell(c);
     const bold = c === C.type || (firstOfTrip && (c === C.month || c === C.tin));
     const red = firstOfTrip && (c === C.month || c === C.tin);

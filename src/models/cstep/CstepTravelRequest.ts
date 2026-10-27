@@ -162,6 +162,14 @@ export interface ICstepTravelRequest extends Document {
   projectName?: string;
   projectTallyCC?: string;
   projectDebitable?: string;
+  // Event Master (#15) — "Related to an event?" on every form type. Yes needs
+  // a picked event (CstepEvent); the request keeps a snapshot of its code and
+  // name, as it does a project's, so a rename never rewrites history. A
+  // missing eventRelated (requests made before the master) reads as No.
+  eventRelated?: boolean;
+  eventId?: mongoose.Types.ObjectId;
+  eventCode?: string;
+  eventName?: string;
 
   stations: ICstepStationEntry[]; // domestic
   countries: ICstepCountryEntry[]; // international
@@ -472,6 +480,10 @@ const CstepTravelRequestSchema = new Schema<ICstepTravelRequest>(
     projectName: { type: String, trim: true },
     projectTallyCC: { type: String, trim: true },
     projectDebitable: { type: String, trim: true },
+    eventRelated: { type: Boolean },
+    eventId: { type: Schema.Types.ObjectId, ref: "CstepEvent" },
+    eventCode: { type: String, trim: true },
+    eventName: { type: String, trim: true },
 
     stations: { type: [CstepStationSchema], default: [] },
     countries: { type: [CstepCountrySchema], default: [] },

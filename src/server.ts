@@ -803,6 +803,9 @@ app.use("/api/cstep/vendors", requireAuth, requireWorkspace, requireFeature("cst
 // Project Master — own file, same chain.
 import cstepProjectsRouter from "./routes/cstep.projects.js";
 app.use("/api/cstep/projects", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepProjectsRouter);
+// Event Master (#15) — own file, same chain.
+import cstepEventsRouter from "./routes/cstep.events.js";
+app.use("/api/cstep/events", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepEventsRouter);
 // Vendor payables + Finance payment upload — own file, same chain.
 import cstepVendorPayablesRouter from "./routes/cstep.vendorPayables.js";
 app.use("/api/cstep/vendor-payables", requireAuth, requireWorkspace, requireFeature("cstepEnabled"), cstepVendorPayablesRouter);
