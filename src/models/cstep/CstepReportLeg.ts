@@ -61,6 +61,24 @@ export interface ICstepReportLeg extends Document {
   noBill?: boolean;
   source: CstepReportLegSource;
 
+  /** P1 — the booked service (CstepArrangement) this leg was seeded from, or
+   * restored from by "+ Add back". Set ⇒ a booked (linked) leg: the Travel
+   * Desk's booking document on that arrangement covers it, its
+   * travelMode/fare/currency/paidBy are locked, and the traveller adds only
+   * travel proof (a boarding pass for a flight). Absent on a leg the
+   * traveller added and on every leg seeded before P1 — those keep the
+   * attach-a-bill-or-tick-no-bill rule. */
+  arrangementId?: mongoose.Types.ObjectId; // ref CstepArrangement
+  /** P1 — a linked FLIGHT leg's boarding pass(es), ref CstepAttachment
+   * (BOARDING_PASS) — several for a return or connecting flight. */
+  boardingPassAttachmentIds?: mongoose.Types.ObjectId[];
+  /** P1 — a linked FLIGHT leg ticked "Boarding pass not available": passes
+   * report/submit without one and is listed on the self-declaration. Never
+   * set alongside a boarding pass. */
+  boardingPassUnavailable?: boolean;
+  /** P1 — a linked TRAIN / BUS leg's optional travel proof, ref CstepAttachment. */
+  travelProofAttachmentIds?: mongoose.Types.ObjectId[];
+
   createdBy: mongoose.Types.ObjectId; // ref User — the traveller (or whoever is filing on their behalf)
 
   createdAt: Date;
@@ -91,6 +109,11 @@ const CstepReportLegSchema = new Schema<ICstepReportLeg>(
     attachmentId: { type: Schema.Types.ObjectId, ref: "CstepAttachment" },
     noBill: { type: Boolean, default: false },
     source: { type: String, enum: ["SEEDED", "ADDED"], required: true },
+
+    arrangementId: { type: Schema.Types.ObjectId, ref: "CstepArrangement" },
+    boardingPassAttachmentIds: { type: [{ type: Schema.Types.ObjectId, ref: "CstepAttachment" }], default: undefined },
+    boardingPassUnavailable: { type: Boolean },
+    travelProofAttachmentIds: { type: [{ type: Schema.Types.ObjectId, ref: "CstepAttachment" }], default: undefined },
 
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   },

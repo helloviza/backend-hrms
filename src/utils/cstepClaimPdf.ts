@@ -117,7 +117,8 @@ function inr(n?: number): string {
 export const CLAIM_DECLARATION_TEXT =
   "I hereby declare that the expenses listed above were genuinely incurred by me for official purposes, and that no bill or invoice is available for them.";
 
-export type CstepClaimDeclarationKind = "TRAVEL" | "FOOD" | "OTHER" | "EXPENSE" | "REPORT_LEG";
+// BOARDING_PASS (P1): a booked flight leg ticked "Boarding pass not available".
+export type CstepClaimDeclarationKind = "TRAVEL" | "FOOD" | "OTHER" | "EXPENSE" | "REPORT_LEG" | "BOARDING_PASS";
 
 const SERVICE_LABELS: Record<string, string> = {
   FLIGHT: "Flight",
@@ -144,7 +145,20 @@ export interface CstepClaimDeclarationEntry {
 /** The report-leg fields the Declaration reads. */
 export type CstepDeclarationReportLeg = Pick<
   ICstepReportLeg,
-  "_id" | "direction" | "travelMode" | "fromLocation" | "toLocation" | "fromDate" | "fare" | "currency" | "remarks" | "attachmentId" | "noBill"
+  | "_id"
+  | "direction"
+  | "travelMode"
+  | "fromLocation"
+  | "toLocation"
+  | "fromDate"
+  | "fare"
+  | "currency"
+  | "remarks"
+  | "attachmentId"
+  | "noBill"
+  | "arrangementId"
+  | "boardingPassAttachmentIds"
+  | "boardingPassUnavailable"
 >;
 
 /**
@@ -159,7 +173,10 @@ export type CstepDeclarationReportLeg = Pick<
  *     claim-level tax invoice either (submit requires one, so normally none).
  * Tours / Events: every travel-report leg marked "No bill available" (and
  *   with no document) — report/submit requires one or the other on every
- *   leg. Onward legs first, then Return, each in the order given.
+ *   leg the traveller files a bill for — and (P1) every flight booked by the
+ *   Travel Desk ticked "Boarding pass not available" (kind BOARDING_PASS). A
+ *   booked (linked) leg is never "no bill": the Desk's document covers it.
+ *   Onward legs first, then Return, each in the order given.
  */
 export function claimDeclarationItems(
   request: Pick<ICstepTravelRequest, "formType" | "travelLines" | "foodLines" | "otherExpenses" | "expenseLines" | "invoiceAttachmentIds">,
@@ -201,16 +218,19 @@ export function claimDeclarationItems(
         amount: Number(l.amount) || 0,
       }));
   }
-  const declared = reportLegs.filter((l) => l.noBill === true && !l.attachmentId);
+  const noPass = (l: CstepDeclarationReportLeg) =>
+    !!l.arrangementId && l.travelMode === "FLIGHT" && l.boardingPassUnavailable === true && !(l.boardingPassAttachmentIds || []).length;
+  const declared = reportLegs.filter((l) => (!l.arrangementId && l.noBill === true && !l.attachmentId) || noPass(l));
   return [...declared.filter((l) => l.direction === "ONWARD"), ...declared.filter((l) => l.direction !== "ONWARD")].map((l) => {
     // A booked leg seeded from its arrangement often has no route of its own —
     // its remarks (the arranged details) say what it was instead.
     const route = [l.fromLocation, l.toLocation].filter(Boolean).join(" → ");
+    const pass = noPass(l);
     return {
       lineId: String(l._id || ""),
-      kind: "REPORT_LEG" as const,
+      kind: pass ? ("BOARDING_PASS" as const) : ("REPORT_LEG" as const),
       date: l.fromDate,
-      particulars: `${l.direction === "ONWARD" ? "Onward" : "Return"} ${SERVICE_LABELS[l.travelMode] || l.travelMode}${route ? `: ${route}` : ""}${l.remarks ? ` — ${l.remarks}` : ""}`,
+      particulars: `${pass ? "Boarding pass not available — " : ""}${l.direction === "ONWARD" ? "Onward" : "Return"} ${SERVICE_LABELS[l.travelMode] || l.travelMode}${route ? `: ${route}` : ""}${l.remarks ? ` — ${l.remarks}` : ""}`,
       amount: Number(l.fare) || 0,
       currency: (l.currency || "INR").toUpperCase(),
     };

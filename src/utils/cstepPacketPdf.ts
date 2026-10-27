@@ -16,6 +16,9 @@
 //      gets a plain "Document unavailable" placeholder page instead —
 //      never aborts the whole packet over one bad file. A leg the traveller
 //      marked "No bill available" says so instead, and
+//      (P1) a booked leg linked to its arrangement carries the Travel Desk's
+//      booking document(s) and the traveller's boarding pass(es) instead of
+//      a bill — "Boarding pass not available" is declared like no-bill —
 //   2b. its self-declaration — the SAME Declaration form GET
 //      /requests/:id/declaration-pdf serves — follows the documents.
 //   3. The approval form — the SAME generator GET /requests/:id/pdf already
@@ -87,6 +90,11 @@ const DIRECTION_LABELS: Record<CstepReportDirection, string> = { ONWARD: "Onward
 export type CstepPacketReportLeg = {
   leg: ICstepReportLeg;
   attachment: ICstepAttachment | null;
+  /** P1 — a booked (linked) leg: the Travel Desk's booking documents, read
+   * from its arrangement, and the traveller's boarding passes / ticket proof.
+   * Present (possibly empty) only on a linked leg. */
+  bookingDocuments?: ICstepAttachment[];
+  travelProofs?: ICstepAttachment[];
 };
 
 function fmtDate(d?: string): string {
@@ -208,7 +216,7 @@ function generateItineraryPdf(request: ICstepTravelRequest, orderedLegs: CstepPa
     }
     y += HEADER_H;
 
-    for (const { leg, attachment } of rows) {
+    for (const { leg, attachment, bookingDocuments } of rows) {
       if (y + ROW_H > PG_H - M) {
         doc.addPage();
         y = M;
@@ -216,7 +224,16 @@ function generateItineraryPdf(request: ICstepTravelRequest, orderedLegs: CstepPa
       const route = [leg.fromLocation, leg.toLocation].filter(Boolean).join(" → ") || "—";
       const dateRange = [fmtDate(leg.fromDate), fmtDate(leg.toDate)].filter(Boolean).join(" – ") || "—";
       const fare = leg.fare ? `${fmtAmount(leg.fare)} ${leg.currency || ""}`.trim() : "—";
-      const paidBy = (leg.paidBy === "CSTEP" ? "Booked by CSTEP" : "Self Paid") + (attachment ? "" : leg.noBill ? " · no bill (declared)" : " · no document");
+      const docNote = bookingDocuments
+        ? bookingDocuments.length
+          ? ""
+          : " · awaiting Travel Desk document"
+        : attachment
+          ? ""
+          : leg.noBill
+            ? " · no bill (declared)"
+            : " · no document";
+      const paidBy = (leg.paidBy === "CSTEP" ? "Booked by CSTEP" : "Self Paid") + docNote;
 
       x = M;
       drawCell(doc, fn, fb, x, y, COLS[0].w, ROW_H, route + (leg.remarks ? `\n${leg.remarks}` : ""), { size: 8 });
@@ -367,7 +384,44 @@ async function appendAttachment(
     appendPlaceholderMessage(pdf, font, boldFont, "No supporting document was uploaded for this leg.");
     return;
   }
+  await embedDocument(pdf, font, boldFont, attachment);
+}
 
+/** P1 — a booked (linked) leg's documents: each of the Travel Desk's
+ * booking documents and each boarding pass / ticket proof the traveller
+ * added, every one behind its own caption page. A Desk that attached nothing, or a flight ticked
+ * "Boarding pass not available", says so instead. */
+async function appendBookedLegDocuments(pdf: PdfLibDocument, font: PDFFont, boldFont: PDFFont, entry: CstepPacketReportLeg): Promise<void> {
+  const { leg } = entry;
+  const booking = entry.bookingDocuments || [];
+  const proofs = entry.travelProofs || [];
+  if (booking.length === 0) {
+    appendCaptionPage(pdf, font, boldFont, legCaption(leg), "Booked by CSTEP");
+    appendPlaceholderMessage(pdf, font, boldFont, "The Travel Desk has not attached the booking document for this service.");
+  }
+  for (const doc of booking) {
+    appendCaptionPage(pdf, font, boldFont, `${legCaption(leg)} — booking document`, doc.originalName);
+    await embedDocument(pdf, font, boldFont, doc);
+  }
+  for (const doc of proofs) {
+    const label = doc.documentType === "BOARDING_PASS" ? "boarding pass" : "travel proof";
+    appendCaptionPage(pdf, font, boldFont, `${legCaption(leg)} — ${label}`, doc.originalName);
+    await embedDocument(pdf, font, boldFont, doc);
+  }
+  if (leg.travelMode === "FLIGHT" && proofs.length === 0 && leg.boardingPassUnavailable) {
+    appendPlaceholderMessage(
+      pdf,
+      font,
+      boldFont,
+      "The traveller marked this flight \"Boarding pass not available\" — it is listed on the self-declaration at the end of the supporting documents.",
+      "Boarding pass not available",
+    );
+  }
+}
+
+/** Merges one stored document into the packet: a PDF's pages, or a JPG/PNG
+ * as a full page; anything else (or a fetch/embed failure) as a placeholder. */
+async function embedDocument(pdf: PdfLibDocument, font: PDFFont, boldFont: PDFFont, attachment: ICstepAttachment): Promise<void> {
   let bytes: Buffer;
   try {
     bytes = await getObjectBuffer(attachment.s3Key);
@@ -447,7 +501,8 @@ export async function generateCstepPacketPdf(
   // 2. Supporting documents, in leg order (Onward, then Return) — never
   // let one bad/missing document fail the whole packet.
   for (const entry of orderedLegs) {
-    await appendAttachment(pdf, font, boldFont, entry.leg, entry.attachment);
+    if (entry.bookingDocuments) await appendBookedLegDocuments(pdf, font, boldFont, entry);
+    else await appendAttachment(pdf, font, boldFont, entry.leg, entry.attachment);
   }
 
   // 2b. The self-declaration for the legs marked "No bill available".

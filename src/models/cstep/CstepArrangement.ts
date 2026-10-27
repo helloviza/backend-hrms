@@ -129,6 +129,13 @@ export interface ICstepArrangement extends Document {
   // paid line goes out in an "Export to Tally" sheet and reused after.
   tallyVoucherNo?: number;
 
+  /** P1 — the booking document(s) the Travel Desk attached to this service
+   * (e-ticket, hotel folio, cab voucher…), ref CstepAttachment. The booked
+   * report leg linked to this line (CstepReportLeg.arrangementId) and its
+   * ARRANGEMENT settlement line read them from here, live — never copied —
+   * so a voucher attached after the report started still shows. */
+  attachmentIds?: mongoose.Types.ObjectId[];
+
   createdBy: mongoose.Types.ObjectId; // ref User — who created this row (seeding, or the Official who added it)
   arrangedBy?: mongoose.Types.ObjectId; // ref User — who last marked it ARRANGED
   arrangedAt?: Date;
@@ -169,6 +176,8 @@ const CstepArrangementSchema = new Schema<ICstepArrangement>(
     vendorInvoiceNo: { type: String, trim: true },
 
     tallyVoucherNo: { type: Number },
+
+    attachmentIds: { type: [{ type: Schema.Types.ObjectId, ref: "CstepAttachment" }], default: undefined },
 
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     arrangedBy: { type: Schema.Types.ObjectId, ref: "User" },

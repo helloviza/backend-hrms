@@ -196,8 +196,8 @@ describe("a travel report with a leg that has no bill", () => {
     expect(r.status).toBe(400);
     expect(r.body.error).toMatch(/No bill available/);
     expect(r.body.missingLegs).toEqual([
-      { direction: "ONWARD", travelMode: "CAB" },
-      { direction: "RETURN", travelMode: "HOTEL" },
+      { direction: "ONWARD", travelMode: "CAB", need: "DOCUMENT" },
+      { direction: "RETURN", travelMode: "HOTEL", need: "DOCUMENT" },
     ]);
     expect((await reqDoc(id))!.status).toBe("REPORT_PENDING");
   });
@@ -216,7 +216,7 @@ describe("a travel report with a leg that has no bill", () => {
     expect(r.body.leg.noBill).toBe(true);
     const s = await post(ACT.traveller, `/requests/${id}/report/submit`);
     expect(s.status).toBe(400);
-    expect(s.body.missingLegs).toEqual([{ direction: "RETURN", travelMode: "HOTEL" }]);
+    expect(s.body.missingLegs).toEqual([{ direction: "RETURN", travelMode: "HOTEL", need: "DOCUMENT" }]);
   });
 
   it("while the report is in progress the detail lists what will be declared, but there's no form yet", async () => {
@@ -296,12 +296,15 @@ describe("a report where every leg has a bill", () => {
     await col("cstepreportlegs").updateOne({ _id: new mongoose.Types.ObjectId(leg) }, { $unset: { noBill: 1 } });
     const r = await post(ACT.traveller, `/requests/${id}/report/submit`);
     expect(r.status).toBe(400);
-    expect(r.body.missingLegs).toEqual([{ direction: "ONWARD", travelMode: "BUS" }]);
+    expect(r.body.missingLegs).toEqual([{ direction: "ONWARD", travelMode: "BUS", need: "DOCUMENT" }]);
   });
 });
 
 describe("settlement lines carry the tick", () => {
-  it("a ticked booked leg's ARRANGEMENT line, and a ticked self-paid leg's line, read as declared; a billed one doesn't", async () => {
+  // P1 — a booked (linked) leg is covered by the Travel Desk's booking
+  // document, so it is never "No bill"; a booked flight declares "Boarding
+  // pass not available" instead.
+  it("a booked flight ticked 'Boarding pass not available', and a ticked self-paid leg's line, read as declared; a billed one doesn't", async () => {
     const id = String(ok(await post(ACT.traveller, "/requests", { ...TOUR, purpose: "QC booked no-bill" })).body.request._id);
     ok(await post(ACT.manager, `/requests/${id}/approve`));
     const [flight] = ok(await post(ACT.official, `/requests/${id}/start-arranging`)).body.arrangements;
@@ -311,7 +314,8 @@ describe("settlement lines carry the tick", () => {
     expect(booked).toMatchObject({ source: "SEEDED", paidBy: "CSTEP" });
     const cab = await addLeg(id, { direction: "RETURN", travelMode: "CAB", fare: 700, paidBy: "SELF" });
     const train = await addLeg(id, { direction: "RETURN", travelMode: "TRAIN", fare: 500, paidBy: "SELF" });
-    ok(await patch(ACT.traveller, `/requests/${id}/report/legs/${booked._id}`, { noBill: true }));
+    expect((await patch(ACT.traveller, `/requests/${id}/report/legs/${booked._id}`, { noBill: true })).status).toBe(409);
+    ok(await patch(ACT.traveller, `/requests/${id}/report/legs/${booked._id}`, { boardingPassUnavailable: true }));
     ok(await patch(ACT.traveller, `/requests/${id}/report/legs/${cab}`, { noBill: true }));
     ok(await uploadDoc(id, train));
     ok(await post(ACT.traveller, `/requests/${id}/report/submit`));
@@ -320,7 +324,7 @@ describe("settlement lines carry the tick", () => {
 
     const lines = ok(await get(ACT.official, `/requests/${id}/settlement`)).body.lines;
     const by = (source: string, sourceId: string) => lines.find((l: any) => l.source === source && String(l.sourceId) === sourceId);
-    expect(by("ARRANGEMENT", String(flight._id))).toMatchObject({ noBill: true });
+    expect(by("ARRANGEMENT", String(flight._id))).toMatchObject({ noBill: false, boardingPassUnavailable: true });
     expect(by("ARRANGEMENT", String(flight._id)).attachmentId).toBeUndefined();
     expect(by("REPORT_LEG", cab)).toMatchObject({ noBill: true });
     expect(by("REPORT_LEG", train)).toMatchObject({ noBill: false });

@@ -180,6 +180,61 @@ const REPORT_DOCUMENT_TYPE_BY_MODE: Record<CstepServiceType, CstepDocumentType> 
   OTHER: "OTHER",
 };
 
+/** P1 — a booked (linked) report leg: seeded from, or added back to, one of
+ * the Travel Desk's arrangement lines (CstepReportLeg.arrangementId). The
+ * Desk's booking document on that line covers it. A leg without the link —
+ * one the traveller added, or one seeded before P1 — keeps the old rule. */
+function isLinkedBookedLeg(leg: any): boolean {
+  return !!leg?.arrangementId;
+}
+
+/** P1 — the travel proof a linked leg takes from the traveller: a FLIGHT's
+ * boarding pass (required, or ticked not available), a TRAIN / BUS ticket
+ * (optional). Any other booked service needs nothing from them. */
+const TRAVEL_PROOF_FIELD_BY_MODE: Partial<Record<CstepServiceType, "boardingPassAttachmentIds" | "travelProofAttachmentIds">> = {
+  FLIGHT: "boardingPassAttachmentIds",
+  TRAIN: "travelProofAttachmentIds",
+  BUS: "travelProofAttachmentIds",
+};
+
+/** What a report leg still needs before report/submit, or null when it is
+ * covered. A linked leg never needs a bill (the Desk's document covers it,
+ * and a Desk that hasn't attached one never blocks the traveller); a linked
+ * flight needs its boarding pass or the "not available" tick. An unlinked
+ * leg needs a document or the "No bill available" tick, as before. */
+function reportLegDocumentGap(leg: any): "DOCUMENT" | "BOARDING_PASS" | null {
+  if (isLinkedBookedLeg(leg)) {
+    if (leg.travelMode !== "FLIGHT") return null;
+    return (leg.boardingPassAttachmentIds || []).length > 0 || leg.boardingPassUnavailable === true ? null : "BOARDING_PASS";
+  }
+  return leg.attachmentId || leg.noBill === true ? null : "DOCUMENT";
+}
+
+type PresignedAttachment = { _id: any; originalName?: string; mime?: string; documentType?: string; url: string };
+
+/** Presigned view links for a set of CstepAttachment ids, keyed by id. */
+async function presignAttachmentsById(workspaceId: any, ids: any[]): Promise<Map<string, PresignedAttachment>> {
+  const unique = [...new Set(ids.filter(Boolean).map(String))];
+  const out = new Map<string, PresignedAttachment>();
+  if (unique.length === 0) return out;
+  const atts: any[] = await CstepAttachment.find({ workspaceId, _id: { $in: unique } }).lean();
+  for (const a of atts) {
+    out.set(String(a._id), {
+      _id: a._id,
+      originalName: a.originalName,
+      mime: a.mime,
+      documentType: a.documentType,
+      url: await presignGetObject({ bucket: env.S3_BUCKET, key: a.s3Key, filename: a.originalName, view: true, contentType: a.mime }),
+    });
+  }
+  return out;
+}
+
+/** The presigned entries for ids, in their order, skipping any not found. */
+function pickPresigned(byId: Map<string, PresignedAttachment>, ids: any[] | undefined): PresignedAttachment[] {
+  return (ids || []).map((id) => byId.get(String(id))).filter((a): a is PresignedAttachment => !!a);
+}
+
 const TIME_BANDS = ["BEFORE_6AM", "6AM_12PM", "12PM_6PM", "AFTER_6PM"];
 const MODES = ["AIR", "RAIL", "ROAD", "OTHER"];
 const EDITABLE_STATUSES = new Set(["DRAFT", "RETURNED"]);
@@ -1302,6 +1357,7 @@ function buildSeedReportLegs(arrangements: any[]): Array<{
   paidBy: "CSTEP";
   remarks?: string;
   source: "SEEDED";
+  arrangementId: any;
 }> {
   return arrangements.filter(arrangementIsReal).map((a) => ({
     direction: "ONWARD" as const,
@@ -1311,6 +1367,7 @@ function buildSeedReportLegs(arrangements: any[]): Array<{
     paidBy: "CSTEP" as const,
     remarks: a.details || undefined,
     source: "SEEDED" as const,
+    arrangementId: a._id, // P1 — the link the Desk's booking document flows through
   }));
 }
 
@@ -1593,9 +1650,21 @@ async function buildSeedSettlementLines(
   // each leg consumed at most once. A SEEDED leg the traveller has since
   // re-typed, deleted, or flipped to SELF simply does not pair (SELF legs
   // become their own PERSONAL line, attachment included, further down).
+  //
+  // P1 — a leg seeded (or added back) since P1 carries that link itself
+  // (arrangementId), so it pairs on the id. The Desk's booking documents
+  // are not copied onto the line: GET /settlement reads them live from the
+  // arrangement (sourceId), with the linked leg's boarding passes. The
+  // order + mode guess below now runs only over legs WITHOUT a link — the
+  // legacy legs seeded before P1.
+  const linkedLegByArrangement = new Map<string, any>();
+  for (const leg of legs as any[]) {
+    if (!isLinkedBookedLeg(leg) || leg.paidBy !== "CSTEP") continue;
+    if (!linkedLegByArrangement.has(String(leg.arrangementId))) linkedLegByArrangement.set(String(leg.arrangementId), leg);
+  }
   const seededCstepLegsByMode = new Map<string, any[]>();
   for (const leg of legs as any[]) {
-    if (leg.source !== "SEEDED" || leg.paidBy !== "CSTEP") continue;
+    if (leg.source !== "SEEDED" || leg.paidBy !== "CSTEP" || isLinkedBookedLeg(leg)) continue;
     const bucket = seededCstepLegsByMode.get(leg.travelMode) ?? [];
     bucket.push(leg);
     seededCstepLegsByMode.set(leg.travelMode, bucket);
@@ -1618,7 +1687,7 @@ async function buildSeedSettlementLines(
 
   // #7 — CSTEP-paid ADDED legs that are a restored booking. Each one is
   // claimed at most once, by an arrangement that has no SEEDED leg to pair.
-  const addedCstepLegs = (legs as any[]).filter((l) => l.source === "ADDED" && l.paidBy === "CSTEP");
+  const addedCstepLegs = (legs as any[]).filter((l) => l.source === "ADDED" && l.paidBy === "CSTEP" && !isLinkedBookedLeg(l));
   const restoredLegIds = new Set<string>();
   const sameBooking = (a: any, l: any) =>
     l.travelMode === a.arrangedType &&
@@ -1627,6 +1696,22 @@ async function buildSeedSettlementLines(
 
   for (const a of arrangements as any[]) {
     if (!arrangementIsReal(a)) continue; // F6 — never seeded a leg either, so nothing to pair
+    if (linkedLegByArrangement.has(String(a._id))) {
+      // P1 — the linked booked leg: its document is the Desk's, read live.
+      lines.push({
+        source: "ARRANGEMENT",
+        sourceId: a._id,
+        description: a.details || undefined,
+        mode: a.arrangedType,
+        category: categoryOfServiceType(a.arrangedType),
+        amountInr: a.amountInr || 0,
+        classification: "OFFICIAL",
+        classificationOverridden: false,
+        verified: false,
+        noBill: false,
+      });
+      continue;
+    }
     let pairedLeg = seededCstepLegsByMode.get(a.arrangedType)?.shift();
     if (!pairedLeg) {
       pairedLeg = addedCstepLegs.find((l) => !restoredLegIds.has(String(l._id)) && sameBooking(a, l));
@@ -1890,6 +1975,9 @@ router.get("/requests/:id", async (req: any, res: any) => {
     const travelDeskOverride = deskAuthority && !isTravelDesk;
     // A claim is never arranged — it has no arrangement stage at all.
     const canArrange = !isClaim && (doc.status === "APPROVED" || doc.status === "ARRANGING") && deskAuthority;
+    // P1 — the Travel Desk attaches booking documents to its lines from
+    // arranging until the settlement is finalized (late vouchers).
+    const canAttachBookingDocs = !isClaim && deskAuthority && BOOKING_DOCUMENT_STATUSES.has(doc.status);
     // Step 5 — same authority as canArrange (callerCanArrangeForTraveller):
     // the Official who arranges services also settles accounts. Covers both
     // "may open the settlement card" and "may act on it while VERIFYING" —
@@ -1979,7 +2067,7 @@ router.get("/requests/:id", async (req: any, res: any) => {
       financeSettlement = await financeSettlementView(req.workspaceObjectId, doc);
     }
 
-    const arrangements = isClaim
+    const arrangementRows: any[] = isClaim
       ? []
       : await CstepArrangement.find({
           workspaceId: req.workspaceObjectId,
@@ -1987,6 +2075,12 @@ router.get("/requests/:id", async (req: any, res: any) => {
         })
           .sort({ createdAt: 1 })
           .lean();
+    // P1 — each line's Travel Desk booking documents, presigned for viewing.
+    const bookingDocs = await presignAttachmentsById(
+      req.workspaceObjectId,
+      arrangementRows.flatMap((a) => a.attachmentIds || []),
+    );
+    const arrangements = arrangementRows.map((a) => ({ ...a, attachments: pickPresigned(bookingDocs, a.attachmentIds) }));
 
     // Change requests — this trip's cancel / rebook requests (newest first),
     // whether the caller may raise one now, and whether they handle them
@@ -2036,6 +2130,7 @@ router.get("/requests/:id", async (req: any, res: any) => {
       isTravelDesk,
       travelDeskOverride,
       canArrange,
+      canAttachBookingDocs,
       canSettle,
       canFinance,
       canFinanceDecide,
@@ -5015,7 +5110,32 @@ router.get("/requests/:id/report", async (req: any, res: any) => {
       }),
     );
 
-    res.json({ ok: true, legs: legsWithAttachments });
+    // P1 — a linked booked leg shows the Travel Desk's booking documents,
+    // read live from its arrangement (a voucher attached after report/start
+    // still appears), and the traveller's own travel proof.
+    const linkedArrangementIds = (legs as any[]).filter(isLinkedBookedLeg).map((l) => l.arrangementId);
+    const linkedArrangements: any[] = linkedArrangementIds.length
+      ? await CstepArrangement.find({ workspaceId: req.workspaceObjectId, requestId: doc._id, _id: { $in: linkedArrangementIds } })
+          .select("attachmentIds")
+          .lean()
+      : [];
+    const bookingDocIdsByArrangement = new Map(linkedArrangements.map((a) => [String(a._id), a.attachmentIds || []]));
+    const presigned = await presignAttachmentsById(req.workspaceObjectId, [
+      ...linkedArrangements.flatMap((a) => a.attachmentIds || []),
+      ...(legs as any[]).flatMap((l) => [...(l.boardingPassAttachmentIds || []), ...(l.travelProofAttachmentIds || [])]),
+    ]);
+    const withBooking = legsWithAttachments.map((leg: any) =>
+      isLinkedBookedLeg(leg)
+        ? {
+            ...leg,
+            bookingDocuments: pickPresigned(presigned, bookingDocIdsByArrangement.get(String(leg.arrangementId))),
+            boardingPasses: pickPresigned(presigned, leg.boardingPassAttachmentIds),
+            travelProofs: pickPresigned(presigned, leg.travelProofAttachmentIds),
+          }
+        : leg,
+    );
+
+    res.json({ ok: true, legs: withBooking });
   } catch (err: any) {
     console.error("[CSTEP requests report GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load the travel report" });
@@ -5071,7 +5191,9 @@ router.post("/requests/:id/report/legs", async (req: any, res: any) => {
         paidBy: "CSTEP",
         travelMode: a.arrangedType,
       });
-      if (seededOfMode >= bookedOfMode) {
+      // P1 — and never a second leg linked to the same booking.
+      const linkedAlready = await CstepReportLeg.exists({ workspaceId: req.workspaceObjectId, requestId: doc._id, arrangementId: a._id });
+      if (seededOfMode >= bookedOfMode || linkedAlready) {
         return res.status(409).json({ error: "This booked service is already on the travel report" });
       }
       const [seed] = buildSeedReportLegs([a]);
@@ -5169,6 +5291,25 @@ router.patch("/requests/:id/report/legs/:legId", async (req: any, res: any) => {
 
     const body = req.body || {};
 
+    // P1 — a booked (linked) leg is the Travel Desk's booking: its mode,
+    // fare, currency and "Booked by CSTEP" are locked, so it can't be turned
+    // into a self-paid claim. Re-sending the value it already has is fine.
+    if (isLinkedBookedLeg(leg)) {
+      const fareSent = "fare" in body ? (body.fare === null || body.fare === "" ? undefined : Number(body.fare)) : leg.fare;
+      const curSent = "currency" in body ? String(body.currency || "INR").trim().toUpperCase() || "INR" : leg.currency || "INR";
+      if (
+        ("travelMode" in body && body.travelMode !== leg.travelMode) ||
+        ("paidBy" in body && body.paidBy !== leg.paidBy) ||
+        (fareSent ?? null) !== (leg.fare ?? null) ||
+        curSent !== (leg.currency || "INR")
+      ) {
+        return res.status(409).json({ error: "This leg is a Travel Desk booking — its mode, fare and Booked by CSTEP can't be changed" });
+      }
+      if ("noBill" in body && body.noBill === true) {
+        return res.status(409).json({ error: "This leg is covered by the Travel Desk's booking document — it needs no bill" });
+      }
+    }
+
     if ("direction" in body) {
       if (body.direction !== "ONWARD" && body.direction !== "RETURN") {
         return res.status(400).json({ error: "direction must be ONWARD or RETURN" });
@@ -5223,6 +5364,20 @@ router.patch("/requests/:id/report/legs/:legId", async (req: any, res: any) => {
         return res.status(409).json({ error: "This leg already has a supporting document" });
       }
       leg.noBill = body.noBill;
+    }
+    // P1 — "Boarding pass not available", a linked flight's own tick:
+    // declared instead of uploaded, never alongside a boarding pass.
+    if ("boardingPassUnavailable" in body) {
+      if (typeof body.boardingPassUnavailable !== "boolean") {
+        return res.status(400).json({ error: "boardingPassUnavailable must be true or false" });
+      }
+      if (!isLinkedBookedLeg(leg) || leg.travelMode !== "FLIGHT") {
+        return res.status(409).json({ error: "Only a flight booked by the Travel Desk takes a boarding pass" });
+      }
+      if (body.boardingPassUnavailable && (leg.boardingPassAttachmentIds || []).length > 0) {
+        return res.status(409).json({ error: "This leg already has a boarding pass" });
+      }
+      leg.boardingPassUnavailable = body.boardingPassUnavailable;
     }
 
     await leg.save();
@@ -5302,6 +5457,11 @@ router.post(
         requestId: doc._id,
       });
       if (!leg) return res.status(404).json({ error: "Report leg not found" });
+      // P1 — a booked leg's bill is the Travel Desk's booking document; the
+      // traveller adds only travel proof (POST …/travel-proof).
+      if (isLinkedBookedLeg(leg)) {
+        return res.status(409).json({ error: "This leg is covered by the Travel Desk's booking document — add a boarding pass or ticket as travel proof instead" });
+      }
 
       const file = req.file;
       if (!file || !file.buffer) return res.status(400).json({ error: "File is required" });
@@ -5356,6 +5516,236 @@ router.post(
     }
   },
 );
+
+/** P1 — stores one uploaded file for a request (same S3 + CstepAttachment
+ * pattern as the leg upload above) and returns the CstepAttachment. */
+async function storeRequestAttachment(
+  req: any,
+  doc: any,
+  file: any,
+  documentType: CstepDocumentType,
+  keyPrefix: string,
+): Promise<any> {
+  const uid = ownerId(req);
+  const uploaded = await uploadBufferToS3({
+    buffer: file.buffer,
+    mime: file.mimetype,
+    originalName: file.originalname,
+    customerId: String(req.workspaceObjectId),
+    createdBy: uid,
+    keyPrefix,
+  });
+  const claim: any = await CstepClaim.findOne({ workspaceId: req.workspaceObjectId, travelRequestId: doc._id }).select("_id").lean();
+  return CstepAttachment.create({
+    workspaceId: req.workspaceObjectId,
+    ...(claim ? { claimId: claim._id } : {}),
+    travelRequestId: doc._id,
+    s3Key: uploaded.key,
+    originalName: file.originalname,
+    mime: file.mimetype,
+    documentType,
+    createdBy: new mongoose.Types.ObjectId(uid),
+  });
+}
+
+/** P1 — loads a report leg for the traveller's travel-proof routes: creator
+ * only, REPORT_PENDING only, and only a booked (linked) FLIGHT / TRAIN / BUS
+ * leg. Sends the refusal itself and returns null when it refuses. */
+async function loadTravelProofLeg(req: any, res: any): Promise<{ doc: any; leg: any; field: "boardingPassAttachmentIds" | "travelProofAttachmentIds" } | null> {
+  const doc = await loadRequest(req, req.params.id);
+  if (!doc) {
+    res.status(404).json({ error: "Travel request not found" });
+    return null;
+  }
+  if (String(doc.createdBy) !== ownerId(req)) {
+    res.status(403).json({ error: "Only the creator can edit this travel report" });
+    return null;
+  }
+  if (doc.status !== "REPORT_PENDING") {
+    res.status(409).json({ error: "The travel report can only be edited while it is in progress" });
+    return null;
+  }
+  if (!mongoose.Types.ObjectId.isValid(req.params.legId)) {
+    res.status(400).json({ error: "Invalid report leg id" });
+    return null;
+  }
+  const leg = await CstepReportLeg.findOne({ _id: req.params.legId, workspaceId: req.workspaceObjectId, requestId: doc._id });
+  if (!leg) {
+    res.status(404).json({ error: "Report leg not found" });
+    return null;
+  }
+  const field = TRAVEL_PROOF_FIELD_BY_MODE[leg.travelMode as CstepServiceType];
+  if (!isLinkedBookedLeg(leg) || !field) {
+    res.status(409).json({ error: "Travel proof is added only to a flight, train or bus booked by the Travel Desk" });
+    return null;
+  }
+  return { doc, leg, field };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /requests/:id/report/legs/:legId/travel-proof — P1. The traveller's
+ * only input on a booked leg: a FLIGHT's boarding pass (BOARDING_PASS, into
+ * boardingPassAttachmentIds — several for a return / connecting flight; it
+ * clears "Boarding pass not available"), or a TRAIN / BUS ticket as
+ * optional proof (travelProofAttachmentIds). One file per call, appended.
+ * DELETE …/travel-proof/:attachmentId takes one off again.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/requests/:id/report/legs/:legId/travel-proof", reportAttachmentUpload.single("file"), async (req: any, res: any) => {
+  try {
+    const loaded = await loadTravelProofLeg(req, res);
+    if (!loaded) return;
+    const { doc, leg, field } = loaded;
+    const file = req.file;
+    if (!file || !file.buffer) return res.status(400).json({ error: "File is required" });
+
+    const attachment = await storeRequestAttachment(
+      req,
+      doc,
+      file,
+      field === "boardingPassAttachmentIds" ? "BOARDING_PASS" : "ETICKET",
+      `cstep/report-legs/${req.workspaceObjectId}/${doc._id}`,
+    );
+    leg.set(field, [...(leg.get(field) || []), attachment._id]);
+    if (field === "boardingPassAttachmentIds") leg.boardingPassUnavailable = false; // a pass replaces the tick
+    await leg.save();
+
+    const presigned = await presignAttachmentsById(req.workspaceObjectId, [attachment._id]);
+    res.status(201).json({ ok: true, leg: leg.toObject(), attachment: presigned.get(String(attachment._id)) });
+  } catch (err: any) {
+    console.error("[CSTEP requests report legs travel-proof]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to upload the travel proof" });
+  }
+});
+
+router.delete("/requests/:id/report/legs/:legId/travel-proof/:attachmentId", async (req: any, res: any) => {
+  try {
+    const loaded = await loadTravelProofLeg(req, res);
+    if (!loaded) return;
+    const { leg, field } = loaded;
+    const current: any[] = leg.get(field) || [];
+    const next = current.filter((x) => String(x) !== String(req.params.attachmentId));
+    if (next.length === current.length) return res.status(404).json({ error: "That document is not on this leg" });
+    leg.set(field, next.length ? next : undefined);
+    await leg.save();
+    res.json({ ok: true, leg: leg.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests report legs travel-proof DELETE]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to remove the travel proof" });
+  }
+});
+
+/** P1 — request statuses where the Travel Desk may attach (or remove) a
+ * booking document on an arrangement line: while arranging, and on through
+ * the report and its approval to the settlement's finalize (late vouchers —
+ * a hotel folio arrives after the stay). Finalize moves the request out of
+ * REPORT_SUBMITTED, so the window closes there. */
+const BOOKING_DOCUMENT_STATUSES = new Set(["ARRANGING", "ARRANGED", "REPORT_PENDING", "REPORT_UNDER_APPROVAL", "REPORT_SUBMITTED"]);
+
+/** P1 — loads an arrangement line for the Desk's booking-document routes.
+ * Sends the refusal itself and returns null when it refuses. */
+async function loadBookingDocumentLine(req: any, res: any): Promise<{ doc: any; line: any } | null> {
+  const doc = await loadRequest(req, req.params.id);
+  if (!doc) {
+    res.status(404).json({ error: "Travel request not found" });
+    return null;
+  }
+  if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
+    res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
+    return null;
+  }
+  if (!mongoose.Types.ObjectId.isValid(req.params.lineId)) {
+    res.status(400).json({ error: "Invalid arrangement line id" });
+    return null;
+  }
+  const open = BOOKING_DOCUMENT_STATUSES.has(doc.status) || (await lineOpenForChange(req, doc, req.params.lineId));
+  if (!open) {
+    res.status(409).json({ error: "A booking document can be attached from arranging until the settlement is finalized" });
+    return null;
+  }
+  const line = await CstepArrangement.findOne({ _id: req.params.lineId, workspaceId: req.workspaceObjectId, requestId: doc._id });
+  if (!line) {
+    res.status(404).json({ error: "Arrangement line not found" });
+    return null;
+  }
+  return { doc, line };
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * POST /requests/:id/arrangements/:lineId/attachment — P1. The Travel Desk
+ * attaches a booking document (e-ticket, hotel folio, cab voucher…) to the
+ * service it arranged; documentType follows the arranged type. One file per
+ * call, appended to attachmentIds. The booked report leg linked to this line
+ * and its settlement line read them from here, live. Logged as
+ * ARRANGE_SERVICE. DELETE …/attachment/:attachmentId takes one off.
+ * ───────────────────────────────────────────────────────────────────── */
+router.post("/requests/:id/arrangements/:lineId/attachment", reportAttachmentUpload.single("file"), async (req: any, res: any) => {
+  try {
+    const loaded = await loadBookingDocumentLine(req, res);
+    if (!loaded) return;
+    const { doc, line } = loaded;
+    const file = req.file;
+    if (!file || !file.buffer) return res.status(400).json({ error: "File is required" });
+
+    const attachment = await storeRequestAttachment(
+      req,
+      doc,
+      file,
+      REPORT_DOCUMENT_TYPE_BY_MODE[line.arrangedType as CstepServiceType] || "OTHER",
+      `cstep/arrangements/${req.workspaceObjectId}/${doc._id}`,
+    );
+    line.attachmentIds = [...(line.attachmentIds || []), attachment._id];
+    await line.save();
+
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "OFFICIAL",
+      actor: new mongoose.Types.ObjectId(ownerId(req)),
+      action: "ARRANGE_SERVICE",
+      ...adminOverrideMark(req),
+      comment: `Booking document attached to ${SERVICE_LABEL[line.arrangedType] || line.arrangedType}${line.details ? ` — ${line.details}` : ""}: ${file.originalname}`,
+      at: new Date().toISOString(),
+    });
+
+    const presigned = await presignAttachmentsById(req.workspaceObjectId, [attachment._id]);
+    res.status(201).json({ ok: true, line: line.toObject(), attachment: presigned.get(String(attachment._id)) });
+  } catch (err: any) {
+    console.error("[CSTEP requests arrangements attachment]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to attach the booking document" });
+  }
+});
+
+router.delete("/requests/:id/arrangements/:lineId/attachment/:attachmentId", async (req: any, res: any) => {
+  try {
+    const loaded = await loadBookingDocumentLine(req, res);
+    if (!loaded) return;
+    const { doc, line } = loaded;
+    const current: any[] = line.attachmentIds || [];
+    const removed: any = current.find((x) => String(x) === String(req.params.attachmentId));
+    if (!removed) return res.status(404).json({ error: "That document is not on this service" });
+    const next = current.filter((x) => String(x) !== String(removed));
+    line.attachmentIds = next.length ? next : undefined;
+    await line.save();
+
+    const att: any = await CstepAttachment.findOne({ _id: removed, workspaceId: req.workspaceObjectId }).select("originalName").lean();
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "OFFICIAL",
+      actor: new mongoose.Types.ObjectId(ownerId(req)),
+      action: "ARRANGE_SERVICE",
+      ...adminOverrideMark(req),
+      comment: `Booking document removed from ${SERVICE_LABEL[line.arrangedType] || line.arrangedType}${line.details ? ` — ${line.details}` : ""}: ${att?.originalName || "document"}`,
+      at: new Date().toISOString(),
+    });
+    res.json({ ok: true, line: line.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests arrangements attachment DELETE]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to remove the booking document" });
+  }
+});
 
 /* ─────────────────────────────────────────────────────────────────────
  * POST /attachments/staging — claims addition. Uploads a claim receipt
@@ -5454,22 +5844,26 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
       return res.status(409).json({ error: "Only a travel report in progress can be submitted" });
     }
 
-    const legsWithoutDocument = await CstepReportLeg.find({
-      workspaceId: req.workspaceObjectId,
-      requestId: doc._id,
-      attachmentId: { $exists: false },
-      noBill: { $ne: true }, // also matches a leg from before the field existed
-    })
-      .select("direction travelMode")
+    // P1 — a booked (linked) leg is covered by the Travel Desk's booking
+    // document; a linked flight still needs its boarding pass or the "not
+    // available" tick (reportLegDocumentGap). Unlinked legs — the
+    // traveller's own, and legacy seeded ones — need a document or "No bill
+    // available" as before (a missing noBill reads as unticked).
+    const reportLegs = await CstepReportLeg.find({ workspaceId: req.workspaceObjectId, requestId: doc._id })
+      .sort({ createdAt: 1, _id: 1 })
+      .select("direction travelMode attachmentId noBill arrangementId boardingPassAttachmentIds boardingPassUnavailable")
       .lean();
+    const legsWithoutDocument = (reportLegs as any[])
+      .map((l) => ({ leg: l, need: reportLegDocumentGap(l) }))
+      .filter((x) => x.need !== null);
     if (legsWithoutDocument.length > 0) {
       return res.status(400).json({
         error:
-          'Every leg needs a supporting document, or "No bill available" ticked, before the report can be submitted. Missing on: ' +
+          'Every leg needs a supporting document, or "No bill available" ticked — and a flight booked by the Travel Desk its boarding pass, or "Boarding pass not available" ticked — before the report can be submitted. Missing on: ' +
           legsWithoutDocument
-            .map((l: any) => `${l.direction === "ONWARD" ? "Onward" : "Return"} ${l.travelMode}`)
+            .map(({ leg: l, need }) => `${l.direction === "ONWARD" ? "Onward" : "Return"} ${l.travelMode}${need === "BOARDING_PASS" ? " (boarding pass)" : ""}`)
             .join(", "),
-        missingLegs: legsWithoutDocument.map((l: any) => ({ direction: l.direction, travelMode: l.travelMode })),
+        missingLegs: legsWithoutDocument.map(({ leg: l, need }) => ({ direction: l.direction, travelMode: l.travelMode, need })),
       });
     }
 
@@ -6172,8 +6566,13 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
     })
       .sort({ createdAt: 1 })
       .lean();
+    // P1 — the booked legs' booking documents live on their arrangements, so
+    // a Desk upload there makes the packet stale too.
+    const packetArrangements: any[] = await CstepArrangement.find({ workspaceId: req.workspaceObjectId, requestId: doc._id })
+      .select("attachmentIds updatedAt")
+      .lean();
 
-    const latestLegUpdate = (legs as any[]).reduce<Date | null>((max, l) => {
+    const latestLegUpdate = ([...legs, ...packetArrangements] as any[]).reduce<Date | null>((max, l) => {
       const t = l.updatedAt ? new Date(l.updatedAt) : null;
       if (!t) return max;
       return !max || t > max ? t : max;
@@ -6223,15 +6622,30 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
         travelerId: traveller?.travelerId,
       };
 
-      const attachmentIds = (legs as any[]).map((l) => l.attachmentId).filter(Boolean);
+      const bookingIdsByArrangement = new Map(packetArrangements.map((a) => [String(a._id), (a.attachmentIds || []) as any[]]));
+      const attachmentIds = (legs as any[]).flatMap((l) => [
+        l.attachmentId,
+        ...(l.boardingPassAttachmentIds || []),
+        ...(l.travelProofAttachmentIds || []),
+        ...(isLinkedBookedLeg(l) ? bookingIdsByArrangement.get(String(l.arrangementId)) || [] : []),
+      ]).filter(Boolean);
       const attachments = attachmentIds.length
         ? await CstepAttachment.find({ _id: { $in: attachmentIds }, workspaceId: req.workspaceObjectId }).lean()
         : [];
       const attachmentById = new Map((attachments as any[]).map((a) => [String(a._id), a]));
+      const pick = (ids: any[] | undefined) => (ids || []).map((id) => attachmentById.get(String(id))).filter(Boolean) as any[];
 
+      // P1 — a booked (linked) leg carries the Desk's booking documents and
+      // the traveller's boarding passes / ticket proof alongside.
       const packetLegs: CstepPacketReportLeg[] = (legs as any[]).map((l) => ({
         leg: l,
         attachment: l.attachmentId ? attachmentById.get(String(l.attachmentId)) || null : null,
+        ...(isLinkedBookedLeg(l)
+          ? {
+              bookingDocuments: pick(bookingIdsByArrangement.get(String(l.arrangementId))),
+              travelProofs: pick([...(l.boardingPassAttachmentIds || []), ...(l.travelProofAttachmentIds || [])]),
+            }
+          : {}),
       }));
 
       const settlementPdfData: CstepSettlementPdfData | undefined = settlement
@@ -6435,7 +6849,40 @@ router.get("/requests/:id/settlement", async (req: any, res: any) => {
       }),
     );
 
-    res.json({ ok: true, settlement, lines: linesWithAttachments });
+    // P1 — an ARRANGEMENT line reads its arrangement's booking documents
+    // live (a late voucher still lands), plus the boarding pass / ticket
+    // proof and the "not available" tick of the booked leg linked to it.
+    const arrangementIds = (lines as any[]).filter((l) => l.source === "ARRANGEMENT").map((l) => l.sourceId);
+    const [lineArrangements, linkedLegs]: [any[], any[]] = arrangementIds.length
+      ? await Promise.all([
+          CstepArrangement.find({ workspaceId: req.workspaceObjectId, requestId: doc._id, _id: { $in: arrangementIds } })
+            .select("attachmentIds")
+            .lean(),
+          CstepReportLeg.find({ workspaceId: req.workspaceObjectId, requestId: doc._id, arrangementId: { $in: arrangementIds } })
+            .sort({ createdAt: 1, _id: 1 })
+            .select("arrangementId travelMode boardingPassAttachmentIds boardingPassUnavailable travelProofAttachmentIds")
+            .lean(),
+        ])
+      : [[], []];
+    const bookingIdsByArrangement = new Map(lineArrangements.map((a) => [String(a._id), a.attachmentIds || []]));
+    const linkedLegByArrangement = new Map<string, any>();
+    for (const l of linkedLegs) if (!linkedLegByArrangement.has(String(l.arrangementId))) linkedLegByArrangement.set(String(l.arrangementId), l);
+    const presigned = await presignAttachmentsById(req.workspaceObjectId, [
+      ...lineArrangements.flatMap((a) => a.attachmentIds || []),
+      ...linkedLegs.flatMap((l) => [...(l.boardingPassAttachmentIds || []), ...(l.travelProofAttachmentIds || [])]),
+    ]);
+    const withBooking = linesWithAttachments.map((line: any) => {
+      if (line.source !== "ARRANGEMENT") return line;
+      const leg = linkedLegByArrangement.get(String(line.sourceId));
+      return {
+        ...line,
+        bookingDocuments: pickPresigned(presigned, bookingIdsByArrangement.get(String(line.sourceId))),
+        travelProofs: leg ? pickPresigned(presigned, [...(leg.boardingPassAttachmentIds || []), ...(leg.travelProofAttachmentIds || [])]) : [],
+        boardingPassUnavailable: leg?.travelMode === "FLIGHT" && leg.boardingPassUnavailable === true && !(leg.boardingPassAttachmentIds || []).length,
+      };
+    });
+
+    res.json({ ok: true, settlement, lines: withBooking });
   } catch (err: any) {
     console.error("[CSTEP requests settlement GET]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to load the settlement" });

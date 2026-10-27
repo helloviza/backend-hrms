@@ -155,8 +155,9 @@ async function tourWithFinance(
     ).body.leg;
     await col("cstepreportlegs").updateOne({ _id: id$(leg._id) }, { $set: { attachmentId: oid() } });
   }
-  // Every leg the report carries needs its document; the seeded flight leg too.
-  await col("cstepreportlegs").updateMany({ requestId: id$(id), attachmentId: { $exists: false } }, { $set: { attachmentId: oid() } });
+  // Every leg the report carries needs its document; the seeded (booked) flight
+  // its boarding pass (P1).
+  await col("cstepreportlegs").updateMany({ requestId: id$(id), attachmentId: { $exists: false } }, { $set: { attachmentId: oid(), boardingPassAttachmentIds: [oid()] } });
   ok(await post(as, `/requests/${id}/report/submit`));
   ok(await post(ACT.manager, `/requests/${id}/report/approve`));
   ok(await post(ACT.official, `/requests/${id}/settlement/start`));

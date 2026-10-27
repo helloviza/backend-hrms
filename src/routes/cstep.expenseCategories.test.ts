@@ -132,7 +132,8 @@ async function tourSettling(as: any, purpose: string, legs: Leg[]): Promise<stri
       fromLocation: l.from, toLocation: l.to, fromDate: l.date, toDate: l.date,
     }));
   }
-  await col("cstepreportlegs").updateMany({ requestId: id$(id), attachmentId: { $exists: false } }, { $set: { attachmentId: oid() } });
+  // A bill on every leg the traveller files one for; a booked (linked) flight takes its boarding pass instead (P1).
+  await col("cstepreportlegs").updateMany({ requestId: id$(id), attachmentId: { $exists: false } }, { $set: { attachmentId: oid(), boardingPassAttachmentIds: [oid()] } });
   ok(await post(as, `/requests/${id}/report/submit`));
   ok(await post(ACT.manager, `/requests/${id}/report/approve`));
   ok(await post(ACT.official, `/requests/${id}/settlement/start`));
@@ -400,7 +401,7 @@ describe("B — GET /finance-expenses", () => {
     ok(await post(ACT.official, `/requests/${id}/mark-arranged`));
     ok(await post(ACT.traveller, `/requests/${id}/report/start`));
     ok(await post(ACT.traveller, `/requests/${id}/report/legs`, { direction: "ONWARD", travelMode: "CAB", paidBy: "SELF", fare: 99, currency: "INR", fromLocation: "A", toLocation: "B", fromDate: "2026-11-02", toDate: "2026-11-02" }));
-    await col("cstepreportlegs").updateMany({ requestId: id$(id) }, { $set: { attachmentId: oid() } });
+    await col("cstepreportlegs").updateMany({ requestId: id$(id) }, { $set: { attachmentId: oid(), boardingPassAttachmentIds: [oid()] } });
     ok(await post(ACT.traveller, `/requests/${id}/report/submit`));
     ok(await post(ACT.manager, `/requests/${id}/report/approve`));
     cases.noSettlement = id;

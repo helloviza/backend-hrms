@@ -99,6 +99,12 @@ const uploadDoc = (id: string, legId: string) =>
     .post(`/api/cstep/requests/${id}/report/legs/${legId}/attachment`)
     .set("x-test-user", JSON.stringify(ACT.traveller))
     .attach("file", Buffer.from("%PDF-1.4 qc boarding pass"), { filename: "boarding-pass.pdf", contentType: "application/pdf" });
+/** P1 — a booked (linked) flight takes the traveller's boarding pass, not a bill. */
+const boardingPass = (id: string, legId: string) =>
+  request(app)
+    .post(`/api/cstep/requests/${id}/report/legs/${legId}/travel-proof`)
+    .set("x-test-user", JSON.stringify(ACT.traveller))
+    .attach("file", Buffer.from("%PDF-1.4 qc boarding pass"), { filename: "boarding-pass.pdf", contentType: "application/pdf" });
 
 const TOUR = {
   type: "DOMESTIC",
@@ -166,7 +172,7 @@ let control: { settlement: any; lines: any[] };
 describe("control — the booked leg is never removed", () => {
   it("counts the booking once", async () => {
     const { id, flightId, seeded } = await bookedTour("QC control");
-    ok(await uploadDoc(id, String(seeded._id)));
+    ok(await boardingPass(id, String(seeded._id)));
     control = await submitAndSettle(id);
     const s = control.settlement;
     expect(control.lines.filter((l) => l.mode === "FLIGHT")).toHaveLength(1);
@@ -187,26 +193,29 @@ describe("remove a booked leg → + Add back → settle", () => {
     expect(again.status).toBe(409);
     expect(await col("cstepreportlegs").countDocuments({ requestId: new mongoose.Types.ObjectId(id), travelMode: "FLIGHT" })).toBe(1);
 
-    ok(await uploadDoc(id, String(back._id)));
+    expect(String(back.arrangementId)).toBe(flightId); // P1 — the add-back keeps the link
+    ok(await boardingPass(id, String(back._id)));
     const { settlement: s, lines } = await submitAndSettle(id);
     expect(lines.filter((l) => l.mode === "FLIGHT")).toHaveLength(1);
     const flightLine = lines.find((l) => l.mode === "FLIGHT");
     expect(flightLine).toMatchObject({ source: "ARRANGEMENT", sourceId: flightId, amountInr: FARE });
-    expect(flightLine.attachmentId).toBeTruthy(); // the restored leg's boarding pass reaches the booked line
+    // P1 — the restored leg's boarding pass reaches the booked line (as travel proof, paired by the link).
+    expect(flightLine.travelProofs.map((d: any) => d.originalName)).toEqual(["boarding-pass.pdf"]);
     expect(s.buckets.airRailBus).toBe(FARE); // not 18,800
     expect(s.totalCostOfTour).toBe(control.settlement.totalCostOfTour); // the control's figure, not + 9,400
     expect(s.amountClaimed).toBe(control.settlement.amountClaimed);
     expect(s.amountDueByCstep).toBe(control.settlement.amountDueByCstep);
   });
 
-  it("a restored leg ticked No bill keeps Requestor-a's declared line", async () => {
+  it("a restored leg ticked 'Boarding pass not available' keeps its declared line (P1: a booked leg is never No bill)", async () => {
     const { id, flightId, seeded } = await bookedTour("QC add-back no-bill");
     await removeLeg(id, String(seeded._id));
     const back = ok(await send("post", ACT.traveller, `/requests/${id}/report/legs`, addBackBody(flightId))).body.leg;
-    ok(await send("patch", ACT.traveller, `/requests/${id}/report/legs/${back._id}`, { noBill: true }));
+    expect((await send("patch", ACT.traveller, `/requests/${id}/report/legs/${back._id}`, { noBill: true })).status).toBe(409);
+    ok(await send("patch", ACT.traveller, `/requests/${id}/report/legs/${back._id}`, { boardingPassUnavailable: true }));
     const { settlement: s, lines } = await submitAndSettle(id);
     expect(lines.filter((l) => l.mode === "FLIGHT")).toHaveLength(1);
-    expect(lines.find((l) => l.mode === "FLIGHT")).toMatchObject({ source: "ARRANGEMENT", noBill: true });
+    expect(lines.find((l) => l.mode === "FLIGHT")).toMatchObject({ source: "ARRANGEMENT", noBill: false, boardingPassUnavailable: true });
     expect(s.totalCostOfTour).toBe(control.settlement.totalCostOfTour);
   });
 
@@ -239,7 +248,7 @@ describe("a leg restored as ADDED before #7 (legacy add-back / in-flight prod ro
 describe("a genuinely traveller-added CSTEP-paid leg (never booked)", () => {
   it("still seeds its own OFFICIAL line, once, alongside the booking", async () => {
     const { id, flightId, seeded } = await bookedTour("QC traveller-added");
-    ok(await uploadDoc(id, String(seeded._id)));
+    ok(await boardingPass(id, String(seeded._id)));
     const train = String(ok(await send("post", ACT.traveller, `/requests/${id}/report/legs`, { direction: "RETURN", travelMode: "TRAIN", fare: 1200, currency: "INR", paidBy: "CSTEP", fromLocation: "Delhi", toLocation: "Agra" })).body.leg._id);
     ok(await uploadDoc(id, train));
     const { settlement: s, lines } = await submitAndSettle(id);
