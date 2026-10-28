@@ -19,7 +19,7 @@
 //   Mongo REPLICA SET on a fresh database, cstep_qc_p4_cleanup.
 // Stubbed: the S3 client (every PutObject is recorded), mail, the
 //   presigner, the attachment store, auth (x-test-user), the workspace.
-import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import express from "express";
 import request from "supertest";
 import mongoose from "mongoose";
@@ -39,6 +39,9 @@ process.env.S3_BUCKET ||= "qc-unused";
 process.env.GEMINI_API_KEY ||= "qc-unused";
 delete process.env.TBO_ENV;
 delete process.env.CSTEP_NOTIFICATIONS_ENABLED;
+// No Google here (cstep.citySearch.test.ts covers it with a fake): a blank key
+// keeps .env.test's from loading, and any fetch fails the test.
+process.env.GOOGLE_PLACES_API_KEY = "";
 vi.setConfig({ testTimeout: 60_000 });
 
 const puts = vi.hoisted(() => [] as Array<{ Key: string; Body: any }>);
@@ -167,6 +170,14 @@ beforeAll(async () => {
   ]);
   await (TBOHotelMaster as any).insertMany([{ hotelCode: "H1", hotelName: "Marriott Mumbai", cityCode: "IN100", countryCode: "IN", searchName: normalizeSearch("Marriott Mumbai") }]);
 }, 240_000);
+beforeEach(() => {
+  vi.stubGlobal("fetch", () => {
+    throw new Error("no network in this suite");
+  });
+});
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 afterAll(async () => {
   await mongoose.disconnect();
   await replSet?.stop();

@@ -118,7 +118,7 @@ import { uploadCstepPacketPdf, type CstepPacketReportLeg } from "../utils/cstepP
 import { presignGetObject } from "../utils/s3Presign.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { getLiveRate } from "../utils/exchangeRate.js";
-import { searchHotelCatalog } from "../services/hotelCatalogSearch.js";
+import { searchCstepCities } from "../services/cstepCitySearch.js";
 import {
   nextCstepSerial,
   seedCstepSerial,
@@ -4279,23 +4279,22 @@ router.get("/fx-rate", async (req: any, res: any) => {
 });
 
 /* ─────────────────────────────────────────────────────────────────────
- * GET /cities?q= — P4: city suggestions for the CSTEP city / location
- * fields (tour legs, event location, report legs, Event Master). Same local
- * catalogue as the SBT hotel search (services/hotelCatalogSearch.ts —
- * tbocities, a database read, never a live TBO call), cities only, from the
- * FIRST character (SBT's /sbt/hotels/cities keeps its own 2-letter floor).
- * Suggestions only: the fields stay free text, so a city missing from the
- * catalogue never blocks a form. A failed lookup answers an empty list.
+ * GET /cities?q= — city suggestions for the CSTEP city / location fields
+ * (tour legs, event location, report legs, Event Master). A hybrid
+ * (services/cstepCitySearch.ts): the local city catalogue the SBT hotel
+ * search reads plus the CSTEP city cache, from the FIRST character; Google
+ * Places only when that is thin and 2+ characters are typed, its cities
+ * cached for next time (CSTEP's cache only — SBT's catalogue is never
+ * written). SBT's /sbt/hotels/cities keeps its own 2-letter floor.
+ * Suggestions only: the fields stay free text, so a city nobody knows never
+ * blocks a form. A failed lookup answers an empty list.
  * ───────────────────────────────────────────────────────────────────── */
 router.get("/cities", async (req: any, res: any) => {
   const q = String(req.query?.q || "").trim().slice(0, 80);
   if (!q) return res.json({ ok: true, results: [] });
   try {
-    const { cities } = await searchHotelCatalog(q, { priorityCode: "IN", cityCap: 10, hotelCap: 0 });
-    res.json({
-      ok: true,
-      results: cities.map((c) => ({ name: c.name, countryCode: c.countryCode, countryName: c.countryName })),
-    });
+    const sessionKey = String(req.user?._id || req.user?.id || req.user?.sub || req.ip || "");
+    res.json({ ok: true, results: await searchCstepCities(q, { sessionKey }) });
   } catch (err: any) {
     console.error("[CSTEP cities GET]", err?.message);
     res.json({ ok: true, results: [] });
