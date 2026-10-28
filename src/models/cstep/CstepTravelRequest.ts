@@ -68,6 +68,17 @@ export function isClaimFormType(formType: any): boolean {
   return (CSTEP_CLAIM_FORM_TYPES as readonly string[]).includes(formType);
 }
 
+/** P3 — the travel report's paper copy, Traveller → Admin → Finance
+ * (utils/cstepHardCopy.ts). RECEIVED_AT_FINANCE closes it. */
+export const CSTEP_HARD_COPY_STATUSES = [
+  "PENDING",
+  "SUBMITTED_TO_ADMIN",
+  "RECEIVED_AT_ADMIN",
+  "SUBMITTED_TO_FINANCE",
+  "RECEIVED_AT_FINANCE",
+] as const;
+export type CstepHardCopyStatus = (typeof CSTEP_HARD_COPY_STATUSES)[number];
+
 // ── Local Travel Claim (claims addition) — additive, sibling fields ─────────
 
 export const CSTEP_LOCAL_TRAVEL_MODES = ["CAB", "LOCAL_TAXI", "METRO", "BUS", "OWN_VEHICLE"] as const;
@@ -314,6 +325,13 @@ export interface ICstepTravelRequest extends Document {
   // series. count: reminders sent in this round (max 3). Claimed by a
   // conditional update before each send, so two instances never both send.
   reportReminder?: { round: string; count: number; lastSentAt: Date };
+
+  // P3 — where the paper copy of the travel report is (utils/cstepHardCopy.ts):
+  // the current status, and who set it when. The history is the HARD_COPY
+  // entries in CstepApproval. Absent = not captured (a report submitted
+  // before P3, or a claim) — never backfilled. Record-only: nothing reads it
+  // to allow or refuse an action.
+  hardCopy?: { status: CstepHardCopyStatus; updatedBy?: mongoose.Types.ObjectId; updatedAt?: Date };
 
   createdBy: mongoose.Types.ObjectId; // ref User
 
@@ -604,6 +622,17 @@ const CstepTravelRequestSchema = new Schema<ICstepTravelRequest>(
       type: new Schema({ round: { type: String }, count: { type: Number }, lastSentAt: { type: Date } }, { _id: false }),
     },
 
+    hardCopy: {
+      type: new Schema(
+        {
+          status: { type: String, enum: CSTEP_HARD_COPY_STATUSES, required: true },
+          updatedBy: { type: Schema.Types.ObjectId, ref: "User" },
+          updatedAt: { type: Date },
+        },
+        { _id: false },
+      ),
+    },
+
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   },
   { timestamps: true },
@@ -635,6 +664,8 @@ const PACKET_NEUTRAL_PATHS = new Set([
   "declarationHash",
   "declarationGeneratedAt",
   "reportReminder",
+  // P3 — the paper copy's status is printed on neither PDF.
+  "hardCopy",
   "updatedAt",
 ]);
 CstepTravelRequestSchema.pre("save", function (next) {

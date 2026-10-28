@@ -140,6 +140,24 @@ import {
 } from "../utils/cstepTravelRegister.js";
 import { env } from "../config/env.js";
 import { notifyCstep } from "../services/cstepNotifications.js";
+import {
+  adminPrompted,
+  CSTEP_HARD_COPY_STATUSES,
+  financePrompted,
+  HARD_COPY_ADMIN_ANSWERS,
+  HARD_COPY_FINANCE_ANSWERS,
+  HARD_COPY_TRAVELLER_ANSWERS,
+  hardCopyStatusOf,
+  parseHardCopyAnswer,
+  planAdmin,
+  planFinance,
+  planTraveller,
+  recordHardCopy,
+  tracksHardCopy,
+  travellerPrompted,
+  type CstepHardCopyStatus,
+  type HardCopyFinanceAnswer,
+} from "../utils/cstepHardCopy.js";
 import { sendSheet } from "../utils/sheetImport.js";
 import {
   CSTEP_EXPENSE_CATEGORIES,
@@ -2268,6 +2286,8 @@ router.get("/requests/:id", async (req: any, res: any) => {
       // is available (once the claim / report is submitted: GET /declaration-pdf).
       claimDeclaration: declarationItems,
       hasDeclarationForm: declarationFormDue(doc) && declarationItems.length > 0,
+      // P3 — may this caller set the hard-copy status directly (PATCH /hard-copy).
+      canEditHardCopy: await callerCanEditHardCopy(req, doc),
     });
   } catch (err: any) {
     console.error("[CSTEP requests GET one]", err?.message);
@@ -5991,6 +6011,10 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
     if (doc.status !== "REPORT_PENDING") {
       return res.status(409).json({ error: "Only a travel report in progress can be submitted" });
     }
+    // P3 — the traveller's hard-copy answer (utils/cstepHardCopy.ts). Optional
+    // and record-only: the submit goes ahead whatever it says.
+    const hardCopy = parseHardCopyAnswer(req.body?.hardCopy, HARD_COPY_TRAVELLER_ANSWERS);
+    if ("error" in hardCopy) return res.status(400).json({ error: hardCopy.error });
 
     // P1 — a booked (linked) leg is covered by the Travel Desk's booking
     // document; a linked flight still needs its boarding pass or the "not
@@ -6036,6 +6060,14 @@ router.post("/requests/:id/report/submit", async (req: any, res: any) => {
     });
     // REPORT_SUBMITTED is the email event's name: it goes to the Manager.
     await notifyCstep("REPORT_SUBMITTED", doc, { logEntryId: entry._id });
+    // Asked only while the paper is not yet with anyone — a resubmit after a
+    // send-back keeps what Admin / Finance recorded. No mail reaches the
+    // traveller here, so a "No" sends L1 on its own.
+    if (hardCopy.answer && travellerPrompted(hardCopyStatusOf(doc))) {
+      const plan = planTraveller(hardCopy.answer);
+      const hcEntry = await recordHardCopy(doc, { actor: uid, stage: "TRAVELER", source: "TRAVELLER_SUBMIT", to: plan.to, answer: hardCopy.answer });
+      if (plan.mail && hcEntry) await notifyCstep("HARD_COPY_PENDING", doc, { logEntryId: hcEntry._id, hardCopyStage: "TRAVELLER" });
+    }
     await ensureClaimDeclarationQuietly(req, doc);
 
     res.json({ ok: true, request: doc.toObject() });
@@ -7465,6 +7497,9 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
     if (doc.status !== "REPORT_SUBMITTED") {
       return res.status(409).json({ error: "Only a request awaiting settlement can be finalized" });
     }
+    // P3 — the Admin's hard-copy answer; record-only, as at report submit.
+    const hardCopy = parseHardCopyAnswer(req.body?.hardCopy, HARD_COPY_ADMIN_ANSWERS);
+    if ("error" in hardCopy) return res.status(400).json({ error: hardCopy.error });
 
     const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id });
     if (!settlement) return res.status(404).json({ error: "Settlement not started yet" });
@@ -7555,6 +7590,18 @@ router.post("/requests/:id/settlement/finalize", async (req: any, res: any) => {
       await notifyCstep("TRANSFERRED_TO_FINANCE", doc, { logEntryId: entry._id, amountInr: amountClaimed });
     } else {
       await notifyCstep("SETTLED", doc, { logEntryId: settleEntry._id });
+    }
+
+    // Asked only while the Desk has not confirmed it (PENDING /
+    // SUBMITTED_TO_ADMIN) — not when the traveller went straight to Finance.
+    // The transfer mail goes to Finance, so a "No" sends L2 to the traveller
+    // on its own — only when the case did go to Finance (L2 says it has).
+    if (hardCopy.answer && adminPrompted(hardCopyStatusOf(doc))) {
+      const plan = planAdmin(hardCopy.answer);
+      const hcEntry = await recordHardCopy(doc, { actor: uid, stage: "OFFICIAL", source: "ADMIN_FINALIZE", to: plan.to, answer: hardCopy.answer });
+      if (plan.mail && hcEntry && outcome === "TO_FINANCE") {
+        await notifyCstep("HARD_COPY_PENDING", doc, { logEntryId: hcEntry._id, hardCopyStage: "ADMIN" });
+      }
     }
 
     res.json({ ok: true, settlement: settlement.toObject(), request: doc.toObject() });
@@ -7676,10 +7723,14 @@ router.post("/requests/:id/finance/settle", async (req: any, res: any) => {
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     const refusal = await callerPaymentRefusal(req, doc.travelerProfileId);
     if (refusal) return res.status(403).json({ error: refusal });
+    // P3 — Finance's hard-copy answer; record-only, the payment goes ahead.
+    const hardCopy = parseHardCopyAnswer(req.body?.hardCopy, HARD_COPY_FINANCE_ANSWERS);
+    if ("error" in hardCopy) return res.status(400).json({ error: hardCopy.error });
     const result = await settleFinanceCase(req, doc, {
       reference: String(req.body?.reference || "").trim(),
       note: String(req.body?.note || "").trim(),
       source: "MANUAL",
+      hardCopy: hardCopy.answer,
     });
     if ("error" in result) return res.status(result.status).json({ error: result.error });
     res.json({ ok: true, request: doc.toObject() });
@@ -7736,6 +7787,9 @@ export async function settleFinanceCase(
     paidOn?: Date;
     source: "MANUAL" | "IMPORT";
     batchId?: mongoose.Types.ObjectId;
+    /** P3 — Finance's answer to the hard-copy prompt (manual settle only;
+     * an import asks nothing). Recorded after the payment commits. */
+    hardCopy?: HardCopyFinanceAnswer;
   },
 ): Promise<FinanceSettleResult> {
   if (doc.status !== "TRANSFERRED_TO_FINANCE") {
@@ -7848,12 +7902,20 @@ export async function settleFinanceCase(
   }
 
   doc.status = endStatus;
+  // P3 — asked whenever Finance has not received the paper yet. A "No" (or
+  // "pending with Admin") adds L3 to the closing mail below — no mail of its own.
+  let hardCopyPending = false;
+  if (opts.hardCopy && tracksHardCopy(doc) && financePrompted(hardCopyStatusOf(doc))) {
+    const plan = planFinance(hardCopyStatusOf(doc), opts.hardCopy);
+    await recordHardCopy(doc, { actor: uid, stage: "FINANCE", source: "FINANCE_SETTLE", to: plan.to, answer: opts.hardCopy });
+    hardCopyPending = plan.pendingLine;
+  }
   if (endStatus === "REIMBURSED") {
-    await notifyCstep("REIMBURSED", doc, { logEntryId: entryId, amountInr: amount, reference });
+    await notifyCstep("REIMBURSED", doc, { logEntryId: entryId, amountInr: amount, reference, hardCopyPending });
   } else {
     // SETTLED here is a claimant's repayment received (COLLECT), never
     // "nothing owed" — the copy says so from the direction.
-    await notifyCstep("SETTLED", doc, { logEntryId: entryId, amountInr: amount, direction, reference });
+    await notifyCstep("SETTLED", doc, { logEntryId: entryId, amountInr: amount, direction, reference, hardCopyPending });
   }
   return { ok: true, endStatus, direction, amount };
 }
@@ -8272,6 +8334,55 @@ router.patch("/requests/:id/finance/perdiem", async (req: any, res: any) => {
   } catch (err: any) {
     console.error("[CSTEP requests finance perdiem]", err?.message);
     res.status(500).json({ error: err?.message || "Failed to update per diem" });
+  }
+});
+
+/* ─────────────────────────────────────────────────────────────────────
+ * P3 — PATCH /requests/:id/hard-copy — set the travel report's hard-copy
+ * status directly: a correction of a wrong answer, or the paper reaching
+ * Finance after the case closed (REIMBURSED / SETTLED included). Body
+ * { status, note? }. The traveller's Travel Desk (the "Admin" of the
+ * prompts) or their Finance user, or a CSTEP Admin — the same set as
+ * canEditHardCopy on GET /requests/:id. Once a report has been submitted,
+ * Tours and Events only. Logs a HARD_COPY entry (CORRECTION) with from → to;
+ * sends no mail. Never touches the case's status.
+ * ───────────────────────────────────────────────────────────────────── */
+const HARD_COPY_EDITABLE_STATUSES = new Set(["REPORT_UNDER_APPROVAL", "REPORT_SUBMITTED", "TRANSFERRED_TO_FINANCE", "SETTLED", "REIMBURSED"]);
+
+async function callerCanEditHardCopy(req: any, doc: any): Promise<boolean> {
+  if (!tracksHardCopy(doc) || !HARD_COPY_EDITABLE_STATUSES.has(doc.status)) return false;
+  return (await callerIsTravelDesk(req, doc.travelerProfileId)) || (await callerCanFinanceForTraveller(req, doc.travelerProfileId));
+}
+
+router.patch("/requests/:id/hard-copy", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (!tracksHardCopy(doc)) return res.status(409).json({ error: "A claim has no travel report hard copy" });
+    if (!HARD_COPY_EDITABLE_STATUSES.has(doc.status)) {
+      return res.status(409).json({ error: "The hard copy can be updated once the travel report is submitted" });
+    }
+    if (!(await callerCanEditHardCopy(req, doc))) {
+      return res.status(403).json({ error: "Only this traveller's Travel Desk, their Finance user or a CSTEP Admin can update the hard copy" });
+    }
+    const next = req.body?.status;
+    if (!(CSTEP_HARD_COPY_STATUSES as readonly string[]).includes(next)) {
+      return res.status(400).json({ error: `status must be one of ${CSTEP_HARD_COPY_STATUSES.join(", ")}` });
+    }
+    if (next === hardCopyStatusOf(doc)) return res.status(400).json({ error: "The hard copy status is unchanged" });
+    const finance = await callerIsTravellerFinanceUser(req, doc.travelerProfileId);
+    const entry = await recordHardCopy(doc, {
+      actor: ownerId(req),
+      stage: finance ? "FINANCE" : "OFFICIAL",
+      source: "CORRECTION",
+      to: next as CstepHardCopyStatus,
+      note: String(req.body?.note || "").trim().slice(0, 500),
+    });
+    if (!entry) return res.status(500).json({ error: "Failed to update the hard copy" });
+    res.json({ ok: true, request: doc.toObject() });
+  } catch (err: any) {
+    console.error("[CSTEP requests hard copy]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to update the hard copy" });
   }
 });
 

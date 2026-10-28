@@ -79,7 +79,12 @@ export type CstepApprovalAction =
   // Change requests — a cancel / rebook raised against an arranged service
   // (CstepChangeRequest), and the Official's DONE / DECLINED resolution.
   | "CHANGE_REQUEST"
-  | "CHANGE_RESOLVE";
+  | "CHANGE_RESOLVE"
+  // P3 — the paper (hard copy) of a travel report: every answer to a
+  // hard-copy prompt (traveller at report submit, Desk at finalize, Finance
+  // at reimburse) and every correction. Record-only — hardCopyChange carries
+  // from → to; it never gates the action it rides on.
+  | "HARD_COPY";
 
 export interface ICstepApproval extends Document {
   workspaceId: mongoose.Types.ObjectId;
@@ -98,6 +103,14 @@ export interface ICstepApproval extends Document {
    * Allowed — the Admin is top authority — but marked, so it reads as an
    * override, not a desk action. Unset on every other entry. */
   adminOverride?: boolean;
+  /** HARD_COPY entries only — the request's hard-copy status before and
+   * after (from "NOT_CAPTURED" when none was recorded yet; equal when the
+   * answer left it as it was), and what wrote it. */
+  hardCopyChange?: {
+    from: string;
+    to: string;
+    source: "TRAVELLER_SUBMIT" | "ADMIN_FINALIZE" | "FINANCE_SETTLE" | "CORRECTION";
+  };
   at: string; // ISO string, not Date — see module note
 }
 
@@ -145,12 +158,23 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "FINANCE_REJECT",
       "CHANGE_REQUEST",
       "CHANGE_RESOLVE",
+      "HARD_COPY",
     ],
     required: true,
   },
   comment: { type: String, trim: true },
   documentHash: { type: String, trim: true },
   adminOverride: { type: Boolean },
+  hardCopyChange: {
+    type: new Schema(
+      {
+        from: { type: String, required: true },
+        to: { type: String, required: true },
+        source: { type: String, enum: ["TRAVELLER_SUBMIT", "ADMIN_FINALIZE", "FINANCE_SETTLE", "CORRECTION"], required: true },
+      },
+      { _id: false },
+    ),
+  },
   at: { type: String, required: true },
 });
 

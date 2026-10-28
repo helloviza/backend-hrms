@@ -48,6 +48,13 @@
 //                            payout while the case was with it (routes/cstep.ts
 //                            runFinanceAdjustment): the item, the reason, the
 //                            new figure, and whether that closed the case
+//   HARD_COPY_PENDING        owner — P3: the paper copy of the travel report is
+//                            still to come. stage TRAVELLER (L1: the traveller
+//                            said No at report submit) or ADMIN (L2: the Desk
+//                            had not received it when it sent the case to
+//                            Finance). L3 is not an event of its own: a
+//                            REIMBURSED mail with ctx.hardCopyPending carries
+//                            the line (utils/cstepHardCopy.ts)
 import mongoose from "mongoose";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import TravellerProfile from "../models/TravellerProfile.js";
@@ -81,7 +88,8 @@ export type CstepNotifyEvent =
   | "CHANGE_RAISED"
   | "CHANGE_RESOLVED"
   | "REPORT_REMINDER"
-  | "FINANCE_ADJUSTED";
+  | "FINANCE_ADJUSTED"
+  | "HARD_COPY_PENDING";
 
 type Role = "APPROVER" | "OFFICIAL" | "FINANCE" | "ADMIN" | "OWNER" | "REMINDER";
 
@@ -104,6 +112,7 @@ const RECIPIENT: Record<CstepNotifyEvent, Role> = {
   CHANGE_RESOLVED: "OWNER",
   REPORT_REMINDER: "REMINDER",
   FINANCE_ADJUSTED: "OWNER",
+  HARD_COPY_PENDING: "OWNER",
 };
 
 export type CstepNotifyCtx = {
@@ -150,6 +159,11 @@ export type CstepNotifyCtx = {
     beforeDirection: "PAY_OUT" | "COLLECT";
     closed: boolean;
   };
+  /** HARD_COPY_PENDING — which prompt the "No" came from: L1 (TRAVELLER) or L2 (ADMIN). */
+  hardCopyStage?: "TRAVELLER" | "ADMIN";
+  /** REIMBURSED / SETTLED — P3 L3: Finance closed the case without the paper
+   * copy, so the mail asks the traveller to send it to Finance. */
+  hardCopyPending?: boolean;
 };
 
 export type CstepNotifyResult =
@@ -227,6 +241,14 @@ function destinationOf(r: any): string {
   if (countries.length) return countries.join(", ");
   return (r.stations || []).map((s: any) => s?.to).filter(Boolean).join(", ");
 }
+
+/** P3 — the hard-copy lines, word for word as CSTEP gave them. */
+export const HARD_COPY_L1 =
+  "Your travel report has been submitted to Admin. Please submit the hard copy of your travel report on priority to avoid delay in closure.";
+export const HARD_COPY_L2 =
+  "The Admin team has submitted your travel report to the Finance team for final processing. Please submit your hard copy of the travel report to the Finance team on priority to avoid delay in closure.";
+export const HARD_COPY_L3 =
+  "The hard copy of your travel report is still pending. Please submit it to the Finance team on priority to avoid delay in closure.";
 
 type Copy = { subject: string; badge: string; tone: CstepTone; headline: string; instruction: string; note?: string; noteLabel?: string };
 
@@ -306,6 +328,10 @@ function copyFor(event: CstepNotifyEvent, who: string, kind: string, claim: bool
         note: reason,
       };
     }
+    case "HARD_COPY_PENDING":
+      return ctx.hardCopyStage === "ADMIN"
+        ? { subject: "Your travel report is with Finance — hard copy pending", badge: "Hard copy pending", tone: "orange", headline: "Your travel report is with the Finance team", instruction: HARD_COPY_L2 }
+        : { subject: "Travel report submitted — hard copy pending", badge: "Hard copy pending", tone: "orange", headline: "Your travel report has been submitted", instruction: HARD_COPY_L1 };
     case "REPORT_REMINDER": {
       const n = ctx.reminder?.count || 1;
       const day = fmtDate(ctx.reminder?.anchorDay);
@@ -331,7 +357,7 @@ function copyFor(event: CstepNotifyEvent, who: string, kind: string, claim: bool
  * gets the photo.
  */
 function bandFor(event: CstepNotifyEvent, ctx: CstepNotifyCtx): CstepEmailInput["band"] {
-  if (["RETURN", "RETURN_REPORT", "RETURN_TO_OFFICIAL", "RETURN_TO_ADMIN", "REJECTED", "REPORT_REMINDER", "FINANCE_ADJUSTED"].includes(event)) return "plain";
+  if (["RETURN", "RETURN_REPORT", "RETURN_TO_OFFICIAL", "RETURN_TO_ADMIN", "REJECTED", "REPORT_REMINDER", "FINANCE_ADJUSTED", "HARD_COPY_PENDING"].includes(event)) return "plain";
   if (event === "CHANGE_RESOLVED" && ctx.change?.outcome === "DECLINED") return "plain";
   if (event === "TRANSFERRED_TO_FINANCE" && ctx.direction === "COLLECT") return "plain";
   return "photo";
@@ -411,6 +437,7 @@ function nextStepsFor(event: CstepNotifyEvent, claim: boolean, ctx: CstepNotifyC
       ];
     case "REIMBURSED":
     case "SETTLED":
+      if (ctx.hardCopyPending) return [{ title: "Submit the hard copy", detail: "Hand the paper copy of your travel report to the Finance team." }];
       return [{ title: "Nothing more to do", detail: `This ${claim ? "claim" : "trip's claim"} is settled and closed.` }];
     case "CHANGE_RAISED":
       return [
@@ -429,6 +456,11 @@ function nextStepsFor(event: CstepNotifyEvent, claim: boolean, ctx: CstepNotifyC
               ? { title: "Repay", detail: "Finance records your repayment and closes the claim." }
               : { title: "Payment", detail: "Finance pays the revised amount; you are emailed when it is paid." },
           ];
+    case "HARD_COPY_PENDING":
+      return [
+        { title: "Submit the hard copy", detail: `Hand the paper copy of your travel report to the ${ctx.hardCopyStage === "ADMIN" ? "Finance" : "Admin"} team.` },
+        { title: "Recorded", detail: "The team marks it received in the portal." },
+      ];
     case "REPORT_REMINDER":
       return [
         { title: "Open", detail: "Open the request in the portal and go to its travel report." },
@@ -478,6 +510,13 @@ export function renderCstepEmail(event: CstepNotifyEvent, request: any, travelle
   ];
   const href = `${frontendBaseUrl()}/cstep/requests/${String(request._id)}`;
   const role = RECIPIENT[event];
+  // P3 L3 — appended to the closing mail, never a mail of its own. It takes
+  // the note box: neither closing event carries a reason.
+  const note = c.note
+    ? { label: c.noteLabel || "Reason", text: c.note }
+    : ctx.hardCopyPending && (event === "REIMBURSED" || event === "SETTLED")
+      ? { label: "Hard copy pending", text: HARD_COPY_L3 }
+      : undefined;
 
   const { html, text } = renderCstepEmailLayout({
     title: c.subject,
@@ -487,7 +526,7 @@ export function renderCstepEmail(event: CstepNotifyEvent, request: any, travelle
     greeting: role === "OWNER" ? (who === "A traveller" ? "traveller" : who) : GREETING[role],
     intro: c.instruction,
     facts,
-    note: c.note ? { label: c.noteLabel || "Reason", text: c.note } : undefined,
+    note,
     cta: { label: "Open request", href },
     nextSteps: nextStepsFor(event, claim, ctx),
     contactEmail,
