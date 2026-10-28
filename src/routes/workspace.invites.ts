@@ -64,12 +64,21 @@ function requireInviteAdmin(req: Request, res: Response, next: NextFunction) {
 export const INVITABLE_ROLES = new Set(["EMPLOYEE", "MANAGER", "HR", "ADMIN", "APPROVER", "REQUESTER"]);
 
 /**
+ * ADMIN and HR are platform roles, not workspace roles: requireAdmin
+ * (middleware/rbac.ts) and many inline checks admit them with no workspace or
+ * HOUSE filter — cross-tenant billing, orphan refunds, other companies' users.
+ * So only a SuperAdmin may invite someone into them, and /join (auth.signup.ts)
+ * re-checks that the inviter of a stored ADMIN/HR invite was a SuperAdmin.
+ */
+export const SUPERADMIN_ONLY_INVITE_ROLES = new Set(["ADMIN", "HR"]);
+
+/**
  * Core invite processor — shared by POST /send and POST /bulk-csv.
  * Returns { sent, skipped, alreadyMembers, errors }.
  */
 async function processInvites(
   rows: Array<{ email: string; name?: string; role?: string; department?: string; designation?: string }>,
-  ctx: { workspaceObjectId: any; invitedById: string; inviterName: string; companyName: string },
+  ctx: { workspaceObjectId: any; invitedById: string; inviterName: string; companyName: string; inviterIsSuperAdmin: boolean },
 ): Promise<{ sent: string[]; skipped: string[]; alreadyMembers: string[]; errors: string[] }> {
   const sent: string[] = [];
   const skipped: string[] = [];
@@ -114,6 +123,10 @@ async function processInvites(
       const role = normStr(row.role).toUpperCase() || "EMPLOYEE";
       if (!INVITABLE_ROLES.has(role)) {
         errors.push(`${email}: role '${role}' can't be granted by invite`);
+        continue;
+      }
+      if (SUPERADMIN_ONLY_INVITE_ROLES.has(role) && !ctx.inviterIsSuperAdmin) {
+        errors.push(`${email}: only Plumtrips can invite someone as ${role} — invite them as EMPLOYEE, MANAGER, APPROVER or REQUESTER`);
         continue;
       }
 
@@ -206,6 +219,7 @@ router.post(
         invitedById: user._id ?? user.id ?? user.sub,
         inviterName: normStr(user.name) || normEmail(user.email),
         companyName: workspace.companyName || "your company",
+        inviterIsSuperAdmin: isSuperAdmin(req),
       });
 
       res.json(result);
@@ -261,6 +275,7 @@ router.post(
         invitedById: user._id ?? user.id ?? user.sub,
         inviterName: normStr(user.name) || normEmail(user.email),
         companyName: workspace.companyName || "your company",
+        inviterIsSuperAdmin: isSuperAdmin(req),
       });
 
       res.json(result);

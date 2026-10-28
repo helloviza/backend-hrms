@@ -4,11 +4,12 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { z } from "zod";
+import mongoose from "mongoose";
 
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
-import { INVITABLE_ROLES } from "./workspace.invites.js";
+import { INVITABLE_ROLES, SUPERADMIN_ONLY_INVITE_ROLES } from "./workspace.invites.js";
 import { requireAuth } from "../middleware/auth.js";
 import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import { sendWelcomeEmail, sendEmailVerification } from "../services/email.service.js";
@@ -377,6 +378,26 @@ r.post("/accept-invite", async (req, res) => {
       return res
         .status(400)
         .json({ error: "Invite token is invalid, already used, or expired." });
+    }
+    // ADMIN / HR reach beyond the workspace (see SUPERADMIN_ONLY_INVITE_ROLES):
+    // honour such an invite only if a SuperAdmin sent it. Covers invites a
+    // tenant admin sent before /send started refusing them.
+    if (SUPERADMIN_ONLY_INVITE_ROLES.has(inviteRole)) {
+      const inviter: any = mongoose.isValidObjectId(String(invite.invitedBy))
+        ? await User.findById(invite.invitedBy).select("roles").lean()
+        : null;
+      const inviterRoles = (Array.isArray(inviter?.roles) ? inviter.roles : []).map((r: unknown) =>
+        String(r).toUpperCase().replace(/[\s\-_]/g, ""),
+      );
+      if (!inviterRoles.includes("SUPERADMIN")) {
+        console.warn("[auth.signup] accept-invite refused: ADMIN/HR invite not sent by a SuperAdmin", {
+          inviteId: String(invite._id),
+          role: inviteRole,
+        });
+        return res
+          .status(400)
+          .json({ error: "Invite token is invalid, already used, or expired." });
+      }
     }
 
     // 3. This path only ever CREATES a login — an existing account is never

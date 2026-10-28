@@ -139,8 +139,8 @@ const scoreLogger = logger.child({ module: "visaScore" });
  *      with the request. (Read that as: three endpoints have the absence
  *      of a writer, which is the strongest guarantee; the fourth has a
  *      writer that has never been given the sensitive values.)
- *   2. THE ACCESS LOG CANNOT SEE THEM. server.ts's morgan format is
- *      ":request-id :method :url :status :response-time ms" — no body, and
+ *   2. THE ACCESS LOG CANNOT SEE THEM. server.ts's access log (utils/requestLogger.ts) is
+ *      ":request-id :method :safe-url :status :response-time ms" — no body, and
  *      these arrive in a POST body rather than a query string, so they
  *      never reach the URL either.
  *   3. ANYTHING THIS FILE LOGS GOES THROUGH redactAnswers(). That is the

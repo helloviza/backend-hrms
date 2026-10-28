@@ -117,6 +117,7 @@ router.post("/change", requireAuth, async (req: any, res, next) => {
 
     const hash = await bcrypt.hash(newPassword, 10);
     (user as any).passwordHash = hash;
+    (user as any).tempPassword = false; // the person chose this one
     await user.save();
 
     return res.json({ ok: true });

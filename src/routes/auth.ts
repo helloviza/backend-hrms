@@ -1285,6 +1285,7 @@ r.post("/change-password", async (req, res) => {
     if (!ok) return res.status(400).json({ error: "Current password is incorrect" });
 
     user.passwordHash = await bcrypt.hash(newPassword, 12);
+    user.tempPassword = false; // the person chose this one
     await user.save();
 
     res.json({ message: "Password updated successfully" });
@@ -1393,6 +1394,7 @@ r.post("/reset-password", async (req, res) => {
     }
 
     user.passwordHash = await bcrypt.hash(newPassword, 12);
+    user.tempPassword = false; // the person chose this one
     user.resetTokenHash = undefined;
     user.resetTokenExpiry = undefined;
     await user.save();

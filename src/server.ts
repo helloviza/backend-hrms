@@ -16,7 +16,7 @@ import express from "express";
 // self-execution guard (isMainModule) is false under `node dist/server.js`.
 import { ensureGeoipDatabase } from "./services/geoipProvision.js";
 import cookieParser from "cookie-parser";
-import morgan from "morgan";
+import { requestLogger } from "./utils/requestLogger.js";
 import compression from "compression";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -190,14 +190,8 @@ app.use((req: any, res, next) => {
 });
 
 // Logging first
-morgan.token("request-id", (req: any) => req.requestId);
-app.use(
-  morgan(
-    process.env.NODE_ENV === "production"
-      ? ":request-id :method :url :status :response-time ms"
-      : ":request-id :method :url :status :response-time ms"
-  )
-);
+// Query-string credentials (?token=…, ?key=…) are redacted — see utils/requestLogger.ts.
+app.use(requestLogger());
 
 // Security headers
 app.use(helmetMiddleware);
