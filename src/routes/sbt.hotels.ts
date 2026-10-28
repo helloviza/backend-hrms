@@ -3,6 +3,7 @@ import { userNames, isRawId, TRAVEL_DESK_NAME } from "../services/actorNames.js"
 import { randomUUID } from "crypto";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
@@ -3019,7 +3020,7 @@ router.post("/bookings/:id/sync-status", requireAuth, async (req: any, res: any)
 // ─── 9d. POST /bookings/refund-orphaned ──────────────────────────────────────
 // ADMIN ONLY — one-time use for orphaned payment recovery
 
-router.post("/bookings/refund-orphaned", requireAdmin, async (req: any, res: any) => {
+router.post("/bookings/refund-orphaned", requirePlatformAdmin, async (req: any, res: any) => {
   try {
     const keyId = process.env.RAZORPAY_KEY_ID;
     const keySecret = process.env.RAZORPAY_KEY_SECRET;
@@ -3136,7 +3137,7 @@ router.post("/bookings/:id/mark-failed", requireAdmin, async (req: any, res: any
 // ─── 9f. POST /admin/refresh-static-data ─────────────────────────────────────
 // BUCKET-C-1: Manual trigger for static data refresh (admin only).
 
-router.post("/admin/refresh-static-data", requireAdmin, async (_req: any, res: any) => {
+router.post("/admin/refresh-static-data", requirePlatformAdmin, async (_req: any, res: any) => {
   try {
     const { runStaticDataRefresh } = await import("../jobs/static-data-refresh.js");
     const result = await runStaticDataRefresh("manual");
@@ -3870,7 +3871,7 @@ function resolvedByName(stored: any, names: Map<string, string>): string {
   return v;
 }
 
-router.get("/admin/date-change-requests", requireAdmin, async (req: any, res: any) => {
+router.get("/admin/date-change-requests", requirePlatformAdmin, async (req: any, res: any) => {
   try {
     const { status, bookingId, from, to, page = "1", limit = "50" } = req.query as Record<string, string>;
     const filter: Record<string, any> = {};
@@ -3912,7 +3913,7 @@ router.get("/admin/date-change-requests", requireAdmin, async (req: any, res: an
 
 // ─── 13. POST /admin/date-change-requests/:id/update ─────────────────────────
 
-router.post("/admin/date-change-requests/:id/update", requireAdmin, async (req: any, res: any) => {
+router.post("/admin/date-change-requests/:id/update", requirePlatformAdmin, async (req: any, res: any) => {
   try {
     const dcr = await ManualDateChangeRequest.findById(req.params.id);
     if (!dcr) return res.status(404).json({ error: "Request not found" });

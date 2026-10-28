@@ -3,7 +3,7 @@ import express from "express";
 import multer from "multer";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/rbac.js";
+import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import CompanySettings, { getCompanySettings, validateGstProfiles, validateD2CSellerGstin } from "../models/CompanySettings.js";
 import Counter from "../models/Counter.js";
@@ -16,7 +16,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 *
 const router = express.Router();
 
 router.use(requireAuth);
-router.use(requireAdmin);
+router.use(requirePlatformAdmin); // Plumtrips staff only — see docs/audits/admin-gates-classification.md
 
 // GET /api/admin/company-settings
 router.get("/", requirePermission("companySettings", "READ"), async (_req: any, res: any) => {

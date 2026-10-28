@@ -2,7 +2,7 @@ import express from "express";
 import multer from "multer";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/rbac.js";
+import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
 import SBTConfig from "../models/SBTConfig.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
@@ -30,7 +30,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 *
 const router = express.Router();
 
 router.use(requireAuth);
-router.use(requireAdmin);
+router.use(requirePlatformAdmin); // Plumtrips staff only — see docs/audits/admin-gates-classification.md
 
 // GET /api/admin/sbt/offers — multi-offer config (flight + hotel arrays)
 router.get("/offers", async (_req: any, res: any) => {

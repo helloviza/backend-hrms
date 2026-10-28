@@ -1,11 +1,11 @@
 import { Router, type Request, type Response } from "express";
 import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/rbac.js";
+import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
 import SessionLog from "../models/SessionLog.js";
 
 const router = Router();
 router.use(requireAuth);
-router.use(requireAdmin);
+router.use(requirePlatformAdmin); // Plumtrips staff only — see docs/audits/admin-gates-classification.md
 
 // GET /api/admin/sessions
 router.get("/", async (req: Request, res: Response) => {

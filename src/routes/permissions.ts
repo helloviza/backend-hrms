@@ -15,6 +15,17 @@ import { MODULE_GROUP_MAP } from '../utils/moduleGroups.js'
 import CustomerWorkspace from '../models/CustomerWorkspace.js'
 import { allowedModuleKeysFor } from '../utils/featureToModules.js'
 
+// The login a UserPermission row belongs to, for the role / SBT sync writes:
+// by its userId (and workspace), never by bare email — duplicate-email User
+// docs exist, and an email match could write roles onto another workspace's login.
+function userSyncFilter(perm: any): Record<string, any> {
+  if (perm?.userId && mongoose.isValidObjectId(String(perm.userId))) {
+    return { _id: perm.userId }
+  }
+  const ws = perm?.workspaceId && mongoose.isValidObjectId(String(perm.workspaceId)) ? { workspaceId: perm.workspaceId } : {}
+  return { email: String(perm?.email || '').toLowerCase(), ...ws }
+}
+
 const router = express.Router()
 
 // Plumtrips/HOUSE internal workspace. The SBT module row in the Access Console
@@ -404,7 +415,7 @@ router.post('/grant', requireAccessConsoleWrite, async (req: any, res: any) => {
     const grantRole = levelToRole(levelCode)
     try {
       await User.findOneAndUpdate(
-        { email: normalizedEmail },
+        { _id: userId }, // the login checked above — an email can match a second, other-workspace doc
         { $set: { hrmsAccessRole: grantRole, roles: roleToRolesArray(grantRole) } }
       )
     } catch (syncErr) {
@@ -417,7 +428,7 @@ router.post('/grant', requireAccessConsoleWrite, async (req: any, res: any) => {
     if (isHouseGrant) {
       try {
         await User.findOneAndUpdate(
-          { email: normalizedEmail },
+          { _id: userId },
           { $set: { sbtEnabled: grantEnableSbt, canRaiseRequest: !grantEnableSbt } }
         )
       } catch (sbtErr) {
@@ -515,7 +526,7 @@ router.patch('/update', requireAccessConsoleWrite, async (req: any, res: any) =>
     const updateRole = levelToRole(existing.level.code)
     try {
       await User.findOneAndUpdate(
-        { email: existing.email.toLowerCase() },
+        userSyncFilter(existing),
         { $set: { hrmsAccessRole: updateRole, roles: roleToRolesArray(updateRole) } }
       )
     } catch (syncErr) {
@@ -526,7 +537,7 @@ router.patch('/update', requireAccessConsoleWrite, async (req: any, res: any) =>
     if (isHouseUpd) {
       try {
         await User.findOneAndUpdate(
-          { email: existing.email.toLowerCase() },
+          userSyncFilter(existing),
           { $set: { sbtEnabled: updEnableSbt, canRaiseRequest: !updEnableSbt } }
         )
       } catch (sbtErr) {
@@ -766,7 +777,7 @@ router.post('/apply-template', requireAccessConsoleWrite, async (req: any, res: 
     const templateRole = levelToRole(levelCode)
     try {
       await User.findOneAndUpdate(
-        { email: existing.email.toLowerCase() },
+        userSyncFilter(existing),
         { $set: { hrmsAccessRole: templateRole, roles: roleToRolesArray(templateRole) } }
       )
     } catch (syncErr) {
@@ -777,7 +788,7 @@ router.post('/apply-template', requireAccessConsoleWrite, async (req: any, res: 
     if (isHouseTpl) {
       try {
         await User.findOneAndUpdate(
-          { email: existing.email.toLowerCase() },
+          userSyncFilter(existing),
           { $set: { sbtEnabled: tplEnableSbt, canRaiseRequest: !tplEnableSbt } }
         )
       } catch (sbtErr) {

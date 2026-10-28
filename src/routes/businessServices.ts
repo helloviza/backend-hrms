@@ -1,7 +1,10 @@
 // apps/backend/src/routes/businessServices.ts
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
+import mongoose from "mongoose";
 import ServiceCapability from "../models/ServiceCapability.js";
+import { Onboarding } from "../models/Onboarding.js";
+import { isHouseUser } from "../middleware/requirePlatformAdmin.js";
 
 const router = Router();
 
@@ -19,6 +22,10 @@ function isHrmsAdmin(currentUser: any): boolean {
   if (currentUser.hrmsAccessRole) roles.push(currentUser.hrmsAccessRole);
 
   const upper = roles.map((r) => String(r).toUpperCase());
+  if (!currentUser._demoImpersonation && (upper.includes("SUPERADMIN") || upper.includes("SUPER_ADMIN"))) return true;
+  // Vendor / business capabilities are Plumtrips' records: a customer
+  // company's own ADMIN cannot edit them.
+  if (!isHouseUser(currentUser)) return false;
   return (
     upper.includes("ADMIN") ||
     upper.includes("SUPER_ADMIN") ||
@@ -32,6 +39,21 @@ function isHrmsAdmin(currentUser: any): boolean {
 /* -------------------------------------------------------------------------- */
 
 /**
+ * Every ownerId a business's mappings may be stored under. Business Profiles
+ * used to key an onboarding-sourced business by its invite token (the
+ * master-data list returned it); the list no longer exposes tokens, so the
+ * page now sends the onboarding _id — rows saved under the token stay found.
+ */
+async function ownerAliases(ownerId: string): Promise<string[]> {
+  const ids = [String(ownerId)];
+  if (mongoose.isValidObjectId(ownerId)) {
+    const ob: any = await Onboarding.findById(ownerId).select("token").lean();
+    if (ob?.token) ids.push(String(ob.token));
+  }
+  return ids;
+}
+
+/**
  * GET /api/business-services/:ownerId
  * List all service mappings for a business customer.
  */
@@ -40,7 +62,7 @@ router.get("/:ownerId", requireAuth, async (req, res, next) => {
     const { ownerId } = req.params;
     const items = await ServiceCapability.find({
       ownerType: "BUSINESS",
-      ownerId: String(ownerId),
+      ownerId: { $in: await ownerAliases(String(ownerId)) },
     })
       .sort({ kind: 1 })
       .lean()
@@ -71,12 +93,23 @@ router.post("/:ownerId", requireAuth, async (req: any, res, next) => {
       return res.status(400).json({ error: "Service kind is required" });
     }
 
+    // Update the row already stored under an alias (token) instead of
+    // creating a second one for the same kind.
+    const existing: any = await ServiceCapability.findOne({
+      ownerType: "BUSINESS",
+      ownerId: { $in: await ownerAliases(String(ownerId)) },
+      kind: String(kind),
+    })
+      .select("_id")
+      .lean();
     const doc = await ServiceCapability.findOneAndUpdate(
-      {
-        ownerType: "BUSINESS",
-        ownerId: String(ownerId),
-        kind: String(kind),
-      },
+      existing
+        ? { _id: existing._id }
+        : {
+            ownerType: "BUSINESS",
+            ownerId: String(ownerId),
+            kind: String(kind),
+          },
       {
         $set: {
           enabled: enabled !== false,
@@ -118,7 +151,7 @@ router.patch("/:ownerId/:id", requireAuth, async (req: any, res, next) => {
       {
         _id: id,
         ownerType: "BUSINESS",
-        ownerId: String(ownerId),
+        ownerId: { $in: await ownerAliases(String(ownerId)) },
       },
       { $set: update },
       { new: true },

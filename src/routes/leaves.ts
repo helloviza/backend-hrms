@@ -19,6 +19,7 @@ import {
 } from "../services/leavePolicy.service.js";
 import { executeLeaveAccrual } from "../workers/leaveAccrual.worker.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
+import { isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
 
 const r = Router();
 
@@ -581,6 +582,9 @@ r.get(
         status: "APPROVED",
         $or: [{ from: { $lte: monthEnd }, to: { $gte: monthStart } }],
         ...userFilter,
+        // The caller's own workspace only — this used to return every
+        // company's approved leaves (with names and emails) to anyone.
+        ...(wsId ? { workspaceId: wsId } : {}),
       };
 
       const leaves = await Leave.find(leaveQuery)
@@ -685,6 +689,10 @@ r.post(
     try {
       if (!hasRole(req, "ADMIN"))
         return res.status(403).json({ error: "Not authorized" });
+      // Runs accrual for EVERY workspace and reports on all of them:
+      // Plumtrips staff only, not a customer company's admin.
+      if (!isPlatformStaff(req))
+        return res.status(403).json({ error: "Plumtrips staff access required" });
 
       const result = await executeLeaveAccrual();
       return res.json({ ok: true, ...result });
@@ -782,7 +790,15 @@ r.post(
           });
 
           if (!balance) {
-            const user = await User.findById(uid).select("dateOfJoining").lean();
+            // Only a person in the caller's own workspace — never plant a
+            // balance row for another company's user.
+            const user = await User.findOne({ _id: uid, ...(wsId ? { workspaceId: wsId } : {}) })
+              .select("dateOfJoining")
+              .lean();
+            if (!user) {
+              failed.push({ userId: uid, reason: "User not found in this workspace" });
+              continue;
+            }
             const joinDate = user?.dateOfJoining
               ? new Date(user.dateOfJoining as string)
               : new Date();

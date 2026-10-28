@@ -10,6 +10,7 @@ import { readCapability } from "../services/capabilityProbe.js";
 import { hasAccess } from "../models/UserPermission.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import { isSuperAdmin as isSuperAdminReq } from "../middleware/isSuperAdmin.js";
+import { isHouseUser } from "../middleware/requirePlatformAdmin.js";
 
 export type AnyObj = Record<string, any>;
 export type EmailAction = "approved" | "declined" | "on_hold" | "resend_email";
@@ -57,6 +58,10 @@ export function collectRoles(u: any): string[] {
 
 export function isStaffAdmin(u: any): boolean {
   const r = collectRoles(u);
+  if (!u?._demoImpersonation && (r.includes("SUPERADMIN") || r.includes("SUPER_ADMIN") || u?.isSuperAdmin === true)) return true;
+  // A customer company's own ADMIN / OPS is not Plumtrips staff: it gets the
+  // masked (customer) view of prices and passports.
+  if (!isHouseUser(u)) return false;
   // ✅ STRICT: Only internal ops roles
   return (
     r.includes("ADMIN") ||

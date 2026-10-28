@@ -2,6 +2,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
 import { requireWorkspace, isCustomerUser } from "../middleware/requireWorkspace.js";
 import { requireRoles } from "../middleware/roles.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
@@ -276,7 +277,8 @@ router.patch(
           if (emp) {
             const empEmail = (emp.officialEmail || emp.companyEmail || emp.email || "").toLowerCase();
             if (empEmail) {
-              u = await User.findOne({ email: empEmail })
+              // Same workspace as the Employee row it came from — never another company's login.
+              u = await User.findOne({ email: empEmail, ...(req.workspaceObjectId ? { workspaceId: req.workspaceObjectId } : {}) })
                 .select("name fullName firstName lastName email phone mobile contactNo personalContact")
                 .lean()
                 .exec();
@@ -351,6 +353,9 @@ router.patch(
   requireAuth,
   requireWorkspace,
   requireRoles("ADMIN", "SUPERADMIN", "HR") as any,
+  // Edits ANY company's record: Plumtrips staff only (requireRoles' ADMIN
+  // alias also admits a customer company's TENANT_ADMIN / WORKSPACE_ADMIN).
+  requirePlatformAdmin as any,
   async (req: any, res, next) => {
     try {
       const { id } = req.params;

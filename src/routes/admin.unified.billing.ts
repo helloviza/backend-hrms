@@ -9,6 +9,7 @@ import TravelBooking from "../models/TravelBooking.js";
 import User from "../models/User.js";
 import Employee from "../models/Employee.js";
 import CustomerMember from "../models/CustomerMember.js";
+import { isHouseUser } from "../middleware/requirePlatformAdmin.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -77,11 +78,12 @@ function resolveAccessScope(user: any): AccessScope {
     .toUpperCase()
     .replace(/[\s_-]+/g, "");
 
-  // ADMIN / SUPERADMIN → GLOBAL (all records)
+  // SUPERADMIN, or a Plumtrips (HOUSE) ADMIN → GLOBAL (all records). A
+  // customer company's own ADMIN falls through to the ORG / OWN rules below.
   if (
-    normRoles.includes("ADMIN") ||
-    normRoles.includes("SUPERADMIN") ||
-    String(user?.accountType || "").toUpperCase() === "ADMIN"
+    (normRoles.includes("SUPERADMIN") && !user?._demoImpersonation) ||
+    (isHouseUser(user) &&
+      (normRoles.includes("ADMIN") || String(user?.accountType || "").toUpperCase() === "ADMIN"))
   ) {
     return { matchFilter: {}, accessLevel: "GLOBAL" };
   }

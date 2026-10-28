@@ -2,6 +2,7 @@
 import express from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
+import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
 import Employee from "../models/Employee.js";
 import Attendance from "../models/Attendance.js";
 import Leave from "../models/Leave.js";
@@ -84,7 +85,7 @@ function parseDateRange(query: any) {
  *   - from=YYYY-MM-DD&to=YYYY-MM-DD (when mode=range)
  *   - dimension=overall|manager|department  (currently only overall is used)
  */
-router.get("/analytics", async (req, res, next) => {
+router.get("/analytics", requirePlatformAdmin, async (req, res, next) => {
   try {
     const { mode, from, to } = parseDateRange(req.query);
     const dimension = String(req.query.dimension || "overall").toLowerCase();

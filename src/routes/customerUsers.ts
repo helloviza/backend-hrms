@@ -22,6 +22,7 @@ import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMe
 import { generateTravelerId } from "../utils/travelerId.js";
 import { parseCsv as parseCsvRaw } from "../utils/csv.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
+import { isHouseUser, isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
 
 const router = Router();
 
@@ -178,7 +179,15 @@ export function isStaffPrivileged(u: any) {
   if (u?.staff === true) return true;
   if (u?.isStaff === true) return true;
 
-  // Admit 3: existing role-token admit list (preserved as fallback)
+  // Super Admin (never while impersonating a demo user).
+  if (!u?._demoImpersonation && (r.includes("SUPERADMIN") || r.includes("SUPER_ADMIN") || u?.isSuperAdmin === true)) {
+    return true;
+  }
+
+  // Admit 3: the role-token admit list — only for a HOUSE login. A customer
+  // company's own ADMIN / HR (its workspaceId is not HOUSE) is never platform
+  // staff: before this, it could pass ?customerId= of any company here.
+  if (!isHouseUser(u)) return false;
   return (
     r.includes("STAFF") ||
     r.includes("INTERNAL") ||
@@ -2478,7 +2487,7 @@ router.get("/workspace/available-bookers", requireAuth, async (req: any, res: an
     const actor = req.user || {};
     const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role])
       .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
-    const isAdmin = actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    const isAdmin = isPlatformStaff(req) && actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
     const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
 
     if (!isAdmin && !isLeader) {
@@ -2531,7 +2540,7 @@ router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => 
     const actor = req.user || {};
     const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role])
       .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
-    const isAdmin = actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    const isAdmin = isPlatformStaff(req) && actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
     const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
 
     if (!isAdmin && !isLeader) {
@@ -2605,7 +2614,7 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
 
     const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role])
       .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
-    const isAdmin = actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    const isAdmin = isPlatformStaff(req) && actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
     const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
 
     if (!isAdmin && !isLeader) {
@@ -2759,7 +2768,7 @@ router.post("/workspace/invite", requireAuth, async (req: any, res: any) => {
     const callerRoles: string[] = (Array.isArray(req.user?.roles) ? req.user.roles : [req.user?.role])
       .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
 
-    const isAdmin = callerRoles.some((r) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    const isAdmin = isPlatformStaff(req) && callerRoles.some((r) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
     const isLeader = callerRoles.some((r) => r === "WORKSPACELEADER");
 
     if (!isAdmin && !isLeader) {

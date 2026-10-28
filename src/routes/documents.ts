@@ -9,6 +9,7 @@ import requireAuth from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import DocumentModel from "../models/Document.js";
+import User from "../models/User.js";
 
 const router = Router();
 
@@ -126,6 +127,16 @@ router.post(
       if (!isSelf && !admin) {
         res.status(403).json({ error: "Forbidden" });
         return;
+      }
+      // An admin files documents only for people in its own workspace.
+      if (!isSelf && !isSuperAdmin(req)) {
+        const inWorkspace =
+          mongoose.isValidObjectId(String(userId)) &&
+          (await User.exists({ _id: userId, workspaceId: (req as any).workspaceObjectId }));
+        if (!inWorkspace) {
+          res.status(404).json({ error: "Employee not found in this workspace" });
+          return;
+        }
       }
 
       const wsId = String(req.workspaceObjectId);

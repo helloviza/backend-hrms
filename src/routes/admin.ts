@@ -1,7 +1,8 @@
 // apps/backend/src/routes/admin.ts
 import { Router, Request, Response } from "express";
 import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/rbac.js";
+// Every route here reads all companies (no workspace filter): Plumtrips staff only.
+import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
 import Vendor from "../models/Vendor.js";
 import Attendance from "../models/Attendance.js";
 import Employee from "../models/Employee.js";
@@ -73,7 +74,7 @@ function parseRange(q: any): { from?: Date; to?: Date } {
 /* /api/admin/reports/vendors.csv                                             */
 /* -------------------------------------------------------------------------- */
 
-router.get("/reports/vendors.csv", requireAuth, requireAdmin, async (_req: Request, res: Response) => {
+router.get("/reports/vendors.csv", requireAuth, requirePlatformAdmin, async (_req: Request, res: Response) => {
   try {
     const vendors = await Vendor.find({}).lean().exec();
 
@@ -154,7 +155,7 @@ router.get("/reports/vendors.csv", requireAuth, requireAdmin, async (_req: Reque
 router.get(
   "/reports/attendance.csv",
   requireAuth,
-  requireAdmin,
+  requirePlatformAdmin,
   async (req: Request, res: Response) => {
     try {
       const { from, to } = parseRange(req.query);
@@ -363,7 +364,7 @@ router.get(
 /* /api/admin/reports/leaves.csv – uses LeaveRequest (all statuses)          */
 /* -------------------------------------------------------------------------- */
 
-router.get("/reports/leaves.csv", requireAuth, requireAdmin, async (_req: Request, res: Response) => {
+router.get("/reports/leaves.csv", requireAuth, requirePlatformAdmin, async (_req: Request, res: Response) => {
   try {
     // Export ALL leave requests in LeaveRequest collection
     const leaveRecords: any[] = await LeaveRequest.find({})

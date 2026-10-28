@@ -8,6 +8,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { requireAuth } from "../middleware/auth.js";
 import { requireBillingStaff } from "../middleware/requireBillingStaff.js";
+import { requirePlatformStaff } from "../middleware/requirePlatformAdmin.js";
 import { requirePermission, requireAnyPermission } from "../middleware/requirePermission.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireInvoiceAccess } from "../middleware/requireInvoiceAccess.js";
@@ -134,7 +135,7 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
     );
 
     await Invoice.collection.updateOne(
-      { _id: new mongoose.Types.ObjectId(req.params.id) },
+      { _id: new mongoose.Types.ObjectId(req.params.id), workspaceId: req.workspaceObjectId },
       { $set: { pdfUrl } },
     );
 
@@ -242,6 +243,14 @@ const router = express.Router();
 router.use(requireAuth);
 // Staff door only; the per-route requirePermission grant decides access.
 router.use(requireBillingStaff);
+// A customer company's admin (requireBillingStaff still admits one through
+// requireAdmin) is READ-ONLY here, on its own workspace's invoices: every
+// write — generate / bulk-generate (the Plumtrips invoice series), edit,
+// status, cancel, reverts, bulk marks, PDF — is Plumtrips staff only.
+router.use((req, res, next) => {
+  if (req.method === "GET" || req.method === "HEAD") return next();
+  return requirePlatformStaff(req, res, next);
+});
 
 /* ── Admin read-path scoping ──────────────────────────────────────────
  *
@@ -675,7 +684,9 @@ const DOCUMENT_SETTING_FIELDS = [
   "bankName", "bankAccountHolder", "bankAccountNumber", "bankIfsc",
 ] as const;
 
-router.get("/document-settings", requireAnyPermission(["invoices", "creditnotes"], "READ"), async (_req: any, res: any) => {
+// Plumtrips' own bank / GST / seller settings: Plumtrips staff only (written
+// via /api/admin/company-settings, which is requirePlatformAdmin).
+router.get("/document-settings", requirePlatformStaff, requireAnyPermission(["invoices", "creditnotes"], "READ"), async (_req: any, res: any) => {
   try {
     const cs: any = await getCompanySettings();
     const settings: Record<string, unknown> = {};

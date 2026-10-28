@@ -4,6 +4,14 @@ import TaskAutomation from '../models/TaskAutomation.js'
 import User from '../models/User.js'
 import logger from '../utils/logger.js'
 import { TRIGGER_KEY_ALIASES } from '../config/defaultTaskAutomations.js'
+import { HOUSE_WORKSPACE_ID } from '../middleware/requirePlatformAdmin.js'
+
+const PLUMTRIPS_ADMIN_FILTER = {
+  $or: [
+    { roles: 'SUPERADMIN' },
+    { roles: 'ADMIN', workspaceId: new mongoose.Types.ObjectId(HOUSE_WORKSPACE_ID) },
+  ],
+}
 
 export interface TriggerContext {
   workspaceId: string
@@ -35,7 +43,9 @@ async function resolveAssignee(
   }
 
   // Fallback: first ADMIN or SUPERADMIN user
-  const admin = await (User as any).findOne({ roles: { $in: ['ADMIN', 'SUPERADMIN'] } })
+  // Plumtrips' own admins only — never a customer company's ADMIN, who would
+  // then be handed Plumtrips' internal (lead / booking) tasks.
+  const admin = await (User as any).findOne(PLUMTRIPS_ADMIN_FILTER)
     .select('_id')
     .lean()
   if (admin) return admin._id as mongoose.Types.ObjectId
@@ -129,7 +139,7 @@ export async function runTaskAutomation(
 
     // Use first admin as createdBy for auto-tasks
     const systemUser = await (User as any)
-      .findOne({ roles: { $in: ['ADMIN', 'SUPERADMIN'] } })
+      .findOne(PLUMTRIPS_ADMIN_FILTER)
       .select('_id')
       .lean()
     const createdById = systemUser?._id ?? assigneeId

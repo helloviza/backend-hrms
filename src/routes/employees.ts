@@ -6,6 +6,7 @@ import bcrypt from "bcryptjs";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { isPlatformStaff, roleAssignmentRefusal } from "../middleware/requirePlatformAdmin.js";
 import User from "../models/User.js";
 import Employee from "../models/Employee.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
@@ -1245,6 +1246,9 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       });
     }
 
+    const roleRefusal = roleAssignmentRefusal(req, [...(Array.isArray(body.roles) ? body.roles : []), body.role, body.hrmsAccessRole]);
+    if (roleRefusal) return res.status(403).json({ error: roleRefusal });
+
     // Try to find existing user by company email — scoped to workspace to prevent cross-tenant contamination
     let user: AnyUser | null = await User.findOne({ email: officialEmail, workspaceId: req.workspaceObjectId }).exec();
 
@@ -1612,6 +1616,17 @@ router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async 
 
     // Never allow passwordHash updates from this endpoint
     delete (body as any).passwordHash;
+
+    // A customer company's admin edits people inside its own workspace only:
+    // it may not move them to another workspace / customer (HOUSE included)
+    // or give them a Plumtrips role. Super Admin and HOUSE staff unchanged.
+    if (!isPlatformStaff(req)) {
+      for (const k of ["workspaceId", "customerId", "businessId", "vendorId", "accountType", "userType", "isSuperAdmin", "staff", "isStaff"]) {
+        delete (body as any)[k];
+      }
+      const refusal = roleAssignmentRefusal(req, body.hrmsAccessRole);
+      if (refusal) return res.status(403).json({ error: refusal });
+    }
 
     // First try to find by Employee doc to get ownerId
     const empQuery: any = { _id: id };

@@ -13,6 +13,7 @@ import logger from "../utils/logger.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
+import { isHouseUser, isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
 
 const router = express.Router();
 
@@ -131,6 +132,14 @@ function isValidObjectId(v: any) {
 }
 
 function isStaffish(user: AnyObj): boolean {
+  // Plumtrips staff only. A customer company's own ADMIN / HR / MANAGER sits
+  // in its own workspace and must not read or write another company's
+  // workspace via ?customerId= (Super Admin passes, never while impersonating).
+  const all = [user?.roles, user?.role].flat().filter(Boolean).map((r: any) => String(r).toUpperCase());
+  if (!user?._demoImpersonation && (all.includes("SUPERADMIN") || all.includes("SUPER_ADMIN") || user?.isSuperAdmin === true)) {
+    return true;
+  }
+  if (!isHouseUser(user)) return false;
   if (user?.staff === true) return true;
   const rolesRaw =
     user?.roles || user?.role || user?.hrmsAccessRole || user?.hrmsAccessLevel;
@@ -639,6 +648,10 @@ router.patch("/config/travel-flow", async (req: AnyObj, res) => {
   const roles = roleList(user);
   if (!roles.includes("SUPERADMIN") && !roles.includes("ADMIN")) {
     return res.status(403).json({ error: "Admin access required" });
+  }
+  // Sets any company's travel flow by body.customerId — Plumtrips staff only.
+  if (!isPlatformStaff({ user })) {
+    return res.status(403).json({ error: "Plumtrips staff access required" });
   }
 
   try {

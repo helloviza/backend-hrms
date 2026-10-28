@@ -15,6 +15,7 @@ import { ensureCustomerWorkspace } from "../services/customerWorkspace.service.j
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { requireAnyPermission } from "../middleware/requirePermission.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { validateObjectId } from "../middleware/validateObjectId.js";
 import { sendMail } from "../utils/mailer.js";
@@ -26,6 +27,7 @@ import { UserPermission } from "../models/UserPermission.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { generateTravelerId } from "../utils/travelerId.js";
 import { GST_STATE_CODES } from "../utils/gstDetection.js";
+import { isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
 import {
   GST_STATUSES,
   normalizeGstStatus,
@@ -351,6 +353,9 @@ const NON_STAFF_ROLES = ["CUSTOMER", "VENDOR", "WORKSPACE_LEADER", "BUSINESS", "
 async function findUserForEmployeePromote(
   onboardingId: any,
   email: string,
+  // Set for a customer company's admin: a login in any other workspace is
+  // refused, never overwritten (unset for Plumtrips staff — unchanged).
+  ownWorkspaceId?: any,
 ): Promise<{ existing: any; conflict?: PromoteConflict }> {
   const byOnboarding = await User.findOne({ onboardingId }).exec();
   const byEmail = await User.findOne({ email }).exec();
@@ -374,6 +379,19 @@ async function findUserForEmployeePromote(
   }
 
   if (!byEmail) return { existing: null };
+
+  if (ownWorkspaceId && String(byEmail.workspaceId || "") !== String(ownWorkspaceId)) {
+    return {
+      existing: null,
+      conflict: {
+        status: 409,
+        body: {
+          error: `${email} already has a login in another workspace — use a different official email for this employee.`,
+          code: "EMAIL_IN_OTHER_WORKSPACE",
+        },
+      },
+    };
+  }
 
   const otherOnboarding =
     byEmail.onboardingId && String(byEmail.onboardingId) !== String(onboardingId);
@@ -655,7 +673,12 @@ function buildBusinessFormPayload(
 /**
  * List approved onboardings (Master Data)
  */
-router.get("/", requireAuth, requireWorkspace, async (req, res, next) => {
+// The HR / ops master list. Needs the master-data page's grant
+// (vendorManagement) or the onboarding grant HR / Admin levels and tenant
+// admins hold. It never returns onboarding invite tokens: a token opens the
+// public onboarding form. Pages key records by `id` (the _id), which every
+// follow-up route (/onboarding/:id/details, promote, services) accepts.
+router.get("/", requireAuth, requireWorkspace, requireAnyPermission(["vendorManagement", "onboarding"], "READ"), async (req, res, next) => {
   try {
     const { type, status } = req.query as Record<string, string>;
     const wsFilter = isSuperAdmin(req)
@@ -685,7 +708,6 @@ router.get("/", requireAuth, requireWorkspace, async (req, res, next) => {
       isActive: d.isActive !== false,
       updatedAt: d.updatedAt,
       submittedAt: d.submittedAt,
-      token: d.token || "",
       source: "onboarding" as const,
     }));
 
@@ -710,7 +732,6 @@ router.get("/", requireAuth, requireWorkspace, async (req, res, next) => {
       isActive: d.isActive !== false,
       updatedAt: d.updatedAt,
       submittedAt: d.submittedAt,
-      token: d.token || "",
       source: "masterdata" as const,
     }));
 
@@ -1348,7 +1369,11 @@ router.post(
         });
       }
 
-      const userMatch = await findUserForEmployeePromote(onboardingDoc._id, email);
+      const userMatch = await findUserForEmployeePromote(
+        onboardingDoc._id,
+        email,
+        isPlatformStaff(req) ? undefined : workspaceId,
+      );
       if (userMatch.conflict) {
         return res.status(userMatch.conflict.status).json(userMatch.conflict.body);
       }
@@ -1649,6 +1674,11 @@ router.post(
           .status(403)
           .json({ error: "Only HR Admin / Admin can promote vendors" });
       }
+      // Creates / rewrites Plumtrips' own vendor records (matched by email
+      // across every workspace): Plumtrips staff only.
+      if (!isPlatformStaff(req)) {
+        return res.status(403).json({ error: "Only Plumtrips staff can promote vendors" });
+      }
 
       const { id } = req.params;
       const workspaceId = await resolveWorkspaceId(req);
@@ -1867,6 +1897,11 @@ router.post(
         return res
           .status(403)
           .json({ error: "Only HR Admin / Admin can promote customers" });
+      }
+      // Creates / rewrites Plumtrips' own customer records (matched by email
+      // across every workspace): Plumtrips staff only.
+      if (!isPlatformStaff(req)) {
+        return res.status(403).json({ error: "Only Plumtrips staff can promote customers" });
       }
 
       const { id } = req.params;

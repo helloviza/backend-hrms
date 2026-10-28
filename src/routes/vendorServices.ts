@@ -2,6 +2,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import ServiceCapability from "../models/ServiceCapability.js";
+import { isHouseUser } from "../middleware/requirePlatformAdmin.js";
 
 const router = Router();
 
@@ -19,6 +20,10 @@ function isHrmsAdmin(currentUser: any): boolean {
   if (currentUser.hrmsAccessRole) roles.push(currentUser.hrmsAccessRole);
 
   const upper = roles.map((r) => String(r).toUpperCase());
+  if (!currentUser._demoImpersonation && (upper.includes("SUPERADMIN") || upper.includes("SUPER_ADMIN"))) return true;
+  // Vendor / business capabilities are Plumtrips' records: a customer
+  // company's own ADMIN cannot edit them.
+  if (!isHouseUser(currentUser)) return false;
   return (
     upper.includes("ADMIN") ||
     upper.includes("SUPER_ADMIN") ||

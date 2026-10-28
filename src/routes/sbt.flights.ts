@@ -5,7 +5,7 @@ import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import path from "path";
 import { requireAuth } from "../middleware/auth.js";
-import { requireAdmin } from "../middleware/rbac.js";
+import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTBooking from "../models/SBTBooking.js";
@@ -426,24 +426,24 @@ async function requireFlightAccess(req: any, res: any, next: any) {
 }
 
 // GET /api/sbt/flights/token/status — show current TBO token state (ADMIN only)
-router.get("/token/status", requireAdmin, (_req: any, res: any) => {
+router.get("/token/status", requirePlatformAdmin, (_req: any, res: any) => {
   res.json({ ok: true, ...getTBOTokenStatus() });
 });
 
 // POST /api/sbt/flights/token/clear — clear in-memory cache (ADMIN only)
-router.post("/token/clear", requireAdmin, (_req: any, res: any) => {
+router.post("/token/clear", requirePlatformAdmin, (_req: any, res: any) => {
   clearTBOToken();
   res.json({ ok: true, message: "TBO token cache cleared. Will re-authenticate on next search." });
 });
 
 // POST /api/sbt/flights/token/logout — kill token on TBO side + clear cache (ADMIN only)
-router.post("/token/logout", requireAdmin, async (_req: any, res: any) => {
+router.post("/token/logout", requirePlatformAdmin, async (_req: any, res: any) => {
   await logoutTBO();
   res.json({ ok: true, message: "TBO token logged out and cache cleared." });
 });
 
 // GET /api/sbt/flights/agency-balance — TBO wallet balance (ADMIN only)
-router.get("/agency-balance", requireAdmin, async (_req: any, res: any) => {
+router.get("/agency-balance", requirePlatformAdmin, async (_req: any, res: any) => {
   try {
     const data = await getAgencyBalance();
     res.json({ ok: true, ...(data as object) });
@@ -454,7 +454,7 @@ router.get("/agency-balance", requireAdmin, async (_req: any, res: any) => {
 });
 
 // GET /api/sbt/flights/logs/:traceId — list TBO API logs for a session (ADMIN only)
-router.get("/logs/:traceId", requireAdmin, async (req: any, res: any) => {
+router.get("/logs/:traceId", requirePlatformAdmin, async (req: any, res: any) => {
   try {
     const { traceId } = req.params;
     const logs = await listTBOLogs(traceId);
@@ -465,7 +465,7 @@ router.get("/logs/:traceId", requireAdmin, async (req: any, res: any) => {
 });
 
 // GET /api/sbt/flights/logs/:traceId/:filename — read a single TBO log file (ADMIN only)
-router.get("/logs/:traceId/:filename", requireAdmin, async (req: any, res: any) => {
+router.get("/logs/:traceId/:filename", requirePlatformAdmin, async (req: any, res: any) => {
   try {
     const { traceId, filename } = req.params;
     if (!filename.endsWith(".json")) {
@@ -2123,7 +2123,7 @@ router.get("/bookings", requireSBT, async (req: any, res: any) => {
 
 // GET /api/sbt/flights/bookings/fix-zero-fares — one-time admin backfill for ₹0 bookings
 // Must be registered BEFORE /bookings/:id to avoid ":id" catching "fix-zero-fares"
-router.get("/bookings/fix-zero-fares", requireAuth, requireAdmin, async (req: any, res: any) => {
+router.get("/bookings/fix-zero-fares", requireAuth, requirePlatformAdmin, async (req: any, res: any) => {
   try {
     const docs = await SBTBooking.find({ totalFare: 0 }).lean();
     let fixed = 0;
@@ -2168,7 +2168,7 @@ router.get("/bookings/fix-zero-fares", requireAuth, requireAdmin, async (req: an
 });
 
 // GET /api/sbt/flights/bookings/orphaned — list orphaned flight bookings (ADMIN)
-router.get("/bookings/orphaned", requireAuth, requireAdmin, async (_req: any, res: any) => {
+router.get("/bookings/orphaned", requireAuth, requirePlatformAdmin, async (_req: any, res: any) => {
   try {
     const docs = await SBTBooking.find({
       status: { $in: ["FAILED", "PENDING"] },
@@ -2184,7 +2184,7 @@ router.get("/bookings/orphaned", requireAuth, requireAdmin, async (_req: any, re
 });
 
 // POST /api/sbt/flights/bookings/refund-orphaned — refund orphaned flight payments (ADMIN)
-router.post("/bookings/refund-orphaned", requireAuth, requireAdmin, async (req: any, res: any) => {
+router.post("/bookings/refund-orphaned", requireAuth, requirePlatformAdmin, async (req: any, res: any) => {
   try {
     const keyId = process.env.RAZORPAY_KEY_ID;
     const keySecret = process.env.RAZORPAY_KEY_SECRET;

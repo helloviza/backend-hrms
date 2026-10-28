@@ -7,6 +7,7 @@ import { requirePermission } from "../middleware/requirePermission.js";
 import { requireRoles } from "../middleware/roles.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { isPlatformStaff, roleAssignmentRefusal } from "../middleware/requirePlatformAdmin.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import mongoose from "mongoose";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
@@ -450,6 +451,8 @@ r.post(
       if (!name || !email || !password || !role) {
         return res.status(400).json({ error: "name, email, password and role are required." });
       }
+      const roleRefusal = roleAssignmentRefusal(req, role);
+      if (roleRefusal) return res.status(403).json({ error: roleRefusal });
       if (password.length < 6) {
         return res.status(400).json({ error: "Password must be at least 6 characters." });
       }
@@ -554,6 +557,8 @@ r.post(
       if (!role) {
         return res.status(400).json({ error: "role is required." });
       }
+      const roleRefusal = roleAssignmentRefusal(req, role);
+      if (roleRefusal) return res.status(403).json({ error: roleRefusal });
 
       const hashed = await bcrypt.hash(crypto.randomBytes(32).toString("hex"), 10);
 
@@ -649,7 +654,9 @@ r.patch("/admin/users/:id/sbt", requireAuth, requireWorkspace, async (req: any, 
     const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role]).map((r: any) =>
       String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, "")
     );
-    const isAdmin = actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
+    // The "anyone" branch is Plumtrips staff only: a customer company's own
+    // ADMIN / HR falls to the leader rules below (own company only).
+    const isAdmin = isPlatformStaff(req) && actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
     const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
 
     if (!isAdmin && !isLeader) {

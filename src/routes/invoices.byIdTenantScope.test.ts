@@ -4,8 +4,13 @@
 // on generation. Same rule as the invoice list (invoiceTenantClause): Super
 // Admin and Plumtrips (HOUSE) staff act on every workspace; a tenant user only
 // on its own workspace's invoices (CustomerWorkspace._id or legacy Customer._id
-// space). Another workspace's invoice answers exactly like a missing one — 404,
-// or "not found" in a bulk result — and is never touched.
+// space). Another workspace's invoice answers exactly like a missing one — 404
+// — and is never touched.
+//
+// 2026-10-29: a tenant (customer-company) admin is READ-ONLY on this console.
+// Every write — generate / bulk-generate (Plumtrips invoice series), edit,
+// status, cancel, reverts, bulk marks, PDF — and document-settings are
+// Plumtrips staff only (403); see docs/audits/admin-gates-classification.md.
 //
 // Real: invoices router, requireBillingStaff, requirePermission, models,
 //   in-memory Mongo REPLICA SET (PATCH runs in a transaction).
@@ -116,9 +121,7 @@ beforeEach(async () => {
   tenantA = await person(["TENANT_ADMIN"], String(WS_A), { invoices: "FULL" }, String(CUST_A));
 });
 
-describe("tenant admin (FULL): another workspace's invoice is 404 on every by-id route", () => {
-  const routes: Array<[string, (id: string) => (w: Who) => request.Test, keyof typeof B]> = [
-    ["GET /:id", (id) => (w) => call(w, request(app).get(`/api/admin/invoices/${id}`)), "sent"],
+const writeRoutes: Array<[string, (id: string) => (w: Who) => request.Test, keyof typeof B]> = [
     ["POST /:id/pdf", (id) => (w) => call(w, request(app).post(`/api/admin/invoices/${id}/pdf`)), "sent"],
     ["PATCH /:id", (id) => (w) => call(w, request(app).patch(`/api/admin/invoices/${id}`)).send({ notes: "hijack" }), "draft"],
     ["POST /:id/cancel", (id) => (w) => call(w, request(app).post(`/api/admin/invoices/${id}/cancel`)).send({ reason: "x" }), "sent"],
@@ -126,70 +129,96 @@ describe("tenant admin (FULL): another workspace's invoice is 404 on every by-id
     ["POST /:id/revert-to-sent", (id) => (w) => call(w, request(app).post(`/api/admin/invoices/${id}/revert-to-sent`)).send({ reason: "x" }), "paid"],
     ["POST /:id/revert-to-draft", (id) => (w) => call(w, request(app).post(`/api/admin/invoices/${id}/revert-to-draft`)).send({ reason: "x" }), "sent"],
     ["POST /:id/add-bookings", (id) => (w) => call(w, request(app).post(`/api/admin/invoices/${id}/add-bookings`)).send({ bookingIds: [String(BOOK_B)] }), "draft"],
+];
+
+describe("tenant admin (FULL): another workspace's invoice is 404 on every by-id read", () => {
+  const reads: Array<[string, (id: string) => (w: Who) => request.Test, keyof typeof B]> = [
+    ["GET /:id", (id) => (w) => call(w, request(app).get(`/api/admin/invoices/${id}`)), "sent"],
     ["GET /:id/eligible-bookings", (id) => (w) => call(w, request(app).get(`/api/admin/invoices/${id}/eligible-bookings`)), "draft"],
   ];
 
-  it.each(routes)("%s → 404 and the invoice is untouched", async (_name, make, state) => {
+  it.each(reads)("%s → 404", async (_name, make, state) => {
+    expect((await make(String(B[state]))(tenantA)).status).toBe(404);
+  });
+});
+
+describe("tenant admin (FULL) is read-only: every write is 403 and touches nothing", () => {
+  it.each(writeRoutes)("%s on ANOTHER workspace's invoice → 403, untouched", async (_name, make, state) => {
     const id = B[state];
     const before = await col("invoices").findOne({ _id: id });
     const r = await make(String(id))(tenantA);
-    expect(r.status).toBe(404);
-    const after = await col("invoices").findOne({ _id: id });
-    expect(after).toEqual(before);
+    expect(r.status, JSON.stringify(r.body)).toBe(403);
+    expect(await col("invoices").findOne({ _id: id })).toEqual(before);
     expect((await col("manualbookings").findOne({ _id: BOOK_B }))!.invoiceId).toBeUndefined();
   });
 
-  it("a malformed id is 404 on the raw-collection routes too (was a 500)", async () => {
-    expect((await call(tenantA, request(app).post("/api/admin/invoices/not-an-id/pdf"))).status).toBe(404);
-    expect((await call(tenantA, request(app).post("/api/admin/invoices/not-an-id/add-bookings")).send({ bookingIds: [String(BOOK_A)] })).status).toBe(404);
+  it.each(writeRoutes)("%s on its OWN invoice → 403, untouched", async (_name, make, state) => {
+    const id = A[state as keyof typeof A];
+    const before = await col("invoices").findOne({ _id: id });
+    const r = await make(String(id))(tenantA);
+    expect(r.status, JSON.stringify(r.body)).toBe(403);
+    expect(await col("invoices").findOne({ _id: id })).toEqual(before);
+  });
+
+  it("generate / bulk-generate (Plumtrips invoice series) → 403, nothing created, even for its own bookings", async () => {
+    const before = await col("invoices").countDocuments();
+    for (const path of ["generate", "bulk-generate"]) {
+      for (const ids of [[String(BOOK_A)], [String(BOOK_B)]]) {
+        const r = await call(tenantA, request(app).post(`/api/admin/invoices/${path}`)).send({ bookingIds: ids });
+        expect(r.status, `${path} ${ids}`).toBe(403);
+      }
+    }
+    expect(await col("invoices").countDocuments()).toBe(before);
+    expect((await col("manualbookings").findOne({ _id: BOOK_A }))!.invoiceId).toBeUndefined();
+  });
+
+  it("bulk-mark-sent / bulk-mark-paid → 403, statuses unchanged", async () => {
+    const s = await call(tenantA, request(app).post("/api/admin/invoices/bulk-mark-sent")).send({ ids: [String(A.draft), String(B.draft)] });
+    expect(s.status).toBe(403);
+    const p = await call(tenantA, request(app).post("/api/admin/invoices/bulk-mark-paid"))
+      .send({ ids: [String(A.sent), String(B.sent)], paidAt: new Date().toISOString() });
+    expect(p.status).toBe(403);
+    expect(await statusOf(A.draft)).toBe("DRAFT");
+    expect(await statusOf(B.draft)).toBe("DRAFT");
+    expect(await statusOf(A.sent)).toBe("SENT");
+  });
+
+  it("GET /document-settings (Plumtrips bank / GST) → 403", async () => {
+    expect((await call(tenantA, request(app).get("/api/admin/invoices/document-settings"))).status).toBe(403);
   });
 });
 
-describe("tenant admin (FULL): own invoices work, in both id-spaces", () => {
-  it("detail, eligible-bookings, edit, status, reverts, cancel on own invoices", async () => {
+describe("tenant admin (FULL): own invoices are readable, in both id-spaces", () => {
+  it("detail, eligible-bookings, list (own workspace only)", async () => {
     expect((await call(tenantA, request(app).get(`/api/admin/invoices/${A.sent}`))).status).toBe(200);
     expect((await call(tenantA, request(app).get(`/api/admin/invoices/${A.legacy}`))).status).toBe(200);
     expect((await call(tenantA, request(app).get(`/api/admin/invoices/${A.draft}/eligible-bookings`))).status).toBe(200);
-    expect((await call(tenantA, request(app).patch(`/api/admin/invoices/${A.draft}`)).send({ notes: "own" })).status).toBe(200);
-    expect((await col("invoices").findOne({ _id: A.draft }))!.notes).toBe("own");
-    expect((await call(tenantA, request(app).post(`/api/admin/invoices/${A.paid}/revert-to-sent`)).send({ reason: "x" })).status).toBe(200);
-    expect(await statusOf(A.paid)).toBe("SENT");
-    expect((await call(tenantA, request(app).post(`/api/admin/invoices/${A.sent}/revert-to-draft`)).send({ reason: "x" })).status).toBe(200);
-    expect(await statusOf(A.sent)).toBe("DRAFT");
-    expect((await call(tenantA, request(app).put(`/api/admin/invoices/${A.legacy}/status`)).send({ status: "PAID", paidAt: new Date().toISOString() })).status).toBe(200);
-    expect(await statusOf(A.legacy)).toBe("PAID");
-    expect((await call(tenantA, request(app).post(`/api/admin/invoices/${A.paid}/cancel`)).send({ reason: "x" })).status).toBe(200);
+    const list = await call(tenantA, request(app).get("/api/admin/invoices"));
+    expect(list.status).toBe(200);
+    expect(JSON.stringify(list.body)).toContain("A-SENT");
+    expect(JSON.stringify(list.body)).not.toContain("B-SENT");
   });
 });
 
-describe("bulk routes touch nothing outside scope", () => {
-  it("bulk-mark-sent: other tenant's DRAFT reads 'not found', stays DRAFT; own DRAFT is sent", async () => {
-    const r = await call(tenantA, request(app).post("/api/admin/invoices/bulk-mark-sent")).send({ ids: [String(A.draft), String(B.draft)] });
-    expect(r.status).toBe(200);
-    expect(r.body.updated).toEqual([String(A.draft)]);
-    expect(r.body.blocked).toEqual([{ id: String(B.draft), reason: "not found" }]);
-    expect(await statusOf(B.draft)).toBe("DRAFT");
-    expect(await statusOf(A.draft)).toBe("SENT");
-  });
-
-  it("bulk-mark-paid: other tenant's SENT reads 'not found', stays SENT", async () => {
-    const r = await call(tenantA, request(app).post("/api/admin/invoices/bulk-mark-paid"))
+describe("HOUSE staff keep every write", () => {
+  it("edit, status, cancel, bulk marks and document-settings", async () => {
+    const staff = await person(["EMPLOYEE"], HOUSE, { invoices: "FULL" });
+    expect((await call(staff, request(app).patch(`/api/admin/invoices/${A.draft}`)).send({ notes: "ops" })).status).toBe(200);
+    expect((await col("invoices").findOne({ _id: A.draft }))!.notes).toBe("ops");
+    expect((await call(staff, request(app).put(`/api/admin/invoices/${A.legacy}/status`)).send({ status: "PAID", paidAt: new Date().toISOString() })).status).toBe(200);
+    expect(await statusOf(A.legacy)).toBe("PAID");
+    const bulk = await call(staff, request(app).post("/api/admin/invoices/bulk-mark-paid"))
       .send({ ids: [String(A.sent), String(B.sent)], paidAt: new Date().toISOString() });
-    expect(r.body.updated).toEqual([String(A.sent)]);
-    expect(r.body.blocked).toEqual([{ id: String(B.sent), reason: "not found" }]);
-    expect(await statusOf(B.sent)).toBe("SENT");
+    expect(bulk.body.updated.sort()).toEqual([String(A.sent), String(B.sent)].sort());
+    expect((await call(staff, request(app).post(`/api/admin/invoices/${B.paid}/revert-to-sent`)).send({ reason: "x" })).status).toBe(200);
+    expect((await call(staff, request(app).post(`/api/admin/invoices/${B.paid}/cancel`)).send({ reason: "x" })).status).toBe(200);
+    expect((await call(staff, request(app).get("/api/admin/invoices/document-settings"))).status).toBe(200);
   });
 
-  it("generate / bulk-generate refuse another workspace's bookings (404) and create nothing", async () => {
-    const before = await col("invoices").countDocuments();
-    for (const path of ["generate", "bulk-generate"]) {
-      const r = await call(tenantA, request(app).post(`/api/admin/invoices/${path}`)).send({ bookingIds: [String(BOOK_B)] });
-      expect(r.status, path).toBe(404);
-      const mixed = await call(tenantA, request(app).post(`/api/admin/invoices/${path}`)).send({ bookingIds: [String(BOOK_A), String(BOOK_B)] });
-      expect(mixed.status, `${path} mixed`).toBe(404);
-    }
-    expect(await col("invoices").countDocuments()).toBe(before);
-    expect((await col("manualbookings").findOne({ _id: BOOK_B }))!.invoiceId).toBeUndefined();
+  it("a malformed id is 404 on the raw-collection routes (was a 500)", async () => {
+    const staff = await person(["EMPLOYEE"], HOUSE, { invoices: "FULL" });
+    expect((await call(staff, request(app).post("/api/admin/invoices/not-an-id/pdf"))).status).toBe(404);
+    expect((await call(staff, request(app).post("/api/admin/invoices/not-an-id/add-bookings")).send({ bookingIds: [String(BOOK_A)] })).status).toBe(404);
   });
 });
 

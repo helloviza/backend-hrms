@@ -8,6 +8,7 @@ import Policy from "../models/Policy.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
+import { isHouseUser } from "../middleware/requirePlatformAdmin.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { env } from "../config/env.js";
@@ -30,7 +31,22 @@ function normRoles(user: any): string[] {
 
 function isStaffAdmin(user: any): boolean {
   const nr = normRoles(user);
-  return nr.includes("HR") || nr.includes("ADMIN") || nr.includes("SUPERADMIN");
+  if (!user?._demoImpersonation && nr.includes("SUPERADMIN")) return true;
+  // Plumtrips HR / ADMIN only: a customer company's own HR / ADMIN sees and
+  // writes its own company's policies, not every company's.
+  if (!isHouseUser(user)) return false;
+  return nr.includes("HR") || nr.includes("ADMIN");
+}
+
+/**
+ * A customer company's admin (canManage "ADMIN" without being Plumtrips staff)
+ * writes ORG / WORKSPACE policies for its own company only — never GLOBAL and
+ * never another company's customerId taken from the body.
+ */
+function pinTenantScope(req: any, scope: string, customerId: string | null): { scope: string; customerId: string | null } {
+  if (isStaffAdmin(req.user)) return { scope, customerId };
+  const own = req.workspace?.customerId ? String(req.workspace.customerId) : resolveUserCustomerId(req.user);
+  return { scope: scope === "WORKSPACE" ? "WORKSPACE" : "ORG", customerId: own || null };
 }
 
 function isL0(user: any): boolean {
@@ -223,6 +239,8 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
       finalScope = "ORG";
     }
 
+    if (mgmt === "ADMIN") ({ scope: finalScope, customerId: finalCustomerId } = pinTenantScope(req, finalScope, finalCustomerId));
+
     // SaaS tenants are forced to WORKSPACE scope so policies never leak
     // across tenants. Must run before the ORG/customerId validation below.
     const isSaasTenant = req.workspace?.tenantType === "SAAS_HRMS";
@@ -315,7 +333,9 @@ router.post(
         finalScope = "ORG";
       }
 
-      // SaaS tenants are forced to WORKSPACE scope so policies never leak
+      if (mgmt === "ADMIN") ({ scope: finalScope, customerId: finalCustomerId } = pinTenantScope(req, finalScope, finalCustomerId));
+
+    // SaaS tenants are forced to WORKSPACE scope so policies never leak
       // across tenants. Must run before any ORG/customerId validation.
       const isSaasTenant = req.workspace?.tenantType === "SAAS_HRMS";
       if (isSaasTenant) {
@@ -470,7 +490,9 @@ router.put("/:id", requireAuth, requireWorkspace, async (req: any, res, next) =>
     }
 
     // L0 cannot change scope to GLOBAL or reassign to another org
-    if (mgmt === "ADMIN") {
+    // Plumtrips staff only: a customer company's admin cannot move its policy
+    // to GLOBAL or to another company.
+    if (mgmt === "ADMIN" && isStaffAdmin(req.user)) {
       if (scope !== undefined) policy.scope = scope;
       if (customerId !== undefined) policy.customerId = customerId;
     }

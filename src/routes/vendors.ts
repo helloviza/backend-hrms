@@ -3,6 +3,7 @@ import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import MasterData from "../models/MasterData.js";
 import Vendor from "../models/Vendor.js";
+import { isHouseUser, isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
 
 const router = Router();
 
@@ -26,6 +27,9 @@ function upperRoles(user: any): string[] {
 
 function isHrmsAdmin(user: any): boolean {
   const r = upperRoles(user);
+  if (!user?._demoImpersonation && (r.includes("SUPERADMIN") || r.includes("SUPER_ADMIN"))) return true;
+  // Plumtrips HR / admin only — vendors are Plumtrips' records.
+  if (!isHouseUser(user)) return false;
   return (
     r.includes("ADMIN") ||
     r.includes("SUPER_ADMIN") ||
@@ -203,6 +207,11 @@ router.get("/:id", requireAuth, async (req: any, res, next) => {
 
     // Vendor should never be able to fetch arbitrary vendor by id
     if (isVendorUser(user) && !isHrmsAdmin(user)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    // Any vendor's record, unscoped: Plumtrips staff only. Before this every
+    // non-vendor login (customers included) could read any vendor by id.
+    if (!isPlatformStaff(req)) {
       return res.status(403).json({ error: "Forbidden" });
     }
 

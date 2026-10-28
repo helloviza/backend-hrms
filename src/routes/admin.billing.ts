@@ -9,6 +9,7 @@ import User from "../models/User.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { toCustomerSafeFlight, toCustomerSafeHotel } from "../utils/customerSafeBooking.js";
+import { isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -25,7 +26,9 @@ async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction
   ].map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""));
 
   const adminRoles = ["ADMIN", "SUPERADMIN", "HR", "HRADMIN", "OPS"];
-  if (roles.some((r) => adminRoles.includes(r))) return next(); // admin — full access
+  // Plumtrips admin — full access to every company. A customer company's own
+  // ADMIN / HR falls through to the own-company rules below.
+  if (roles.some((r) => adminRoles.includes(r)) && isPlatformStaff(req)) return next();
 
   // Detect WORKSPACE_LEADER via roles array or JWT customerMemberRole claim
   const isWL =

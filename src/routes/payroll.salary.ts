@@ -61,6 +61,12 @@ r.post(
         return res.status(400).json({ error: "userId, effectiveFrom, ctcAnnual, and earnings are required" });
       }
 
+      // The employee must be in this workspace — never write a salary
+      // structure against another company's user id.
+      if (!mongoose.isValidObjectId(String(userId)) || !(await User.exists({ _id: userId, workspaceId }))) {
+        return res.status(404).json({ error: "Employee not found in this workspace" });
+      }
+
       if (ctcAnnual <= 0) {
         return res.status(400).json({ error: "ctcAnnual must be > 0" });
       }
@@ -232,6 +238,9 @@ r.get(
 /* ─── GET /structures — List ALL workspace users with their salary structures ─── */
 r.get(
   "/structures",
+  // Every employee's CTC: the same HR / ADMIN gate as the salary writes.
+  // Ordinary members read only their own structure (GET /structure/:userId).
+  requireRoles("HR", "ADMIN"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const workspaceId = await resolveWorkspaceId(req);

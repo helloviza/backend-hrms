@@ -5,7 +5,7 @@ import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { blockTravelForSaas } from "../middleware/blockTravelForSaas.js";
-import { requireAdmin } from "../middleware/rbac.js";
+import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import ManualBooking from "../models/ManualBooking.js";
 import Invoice from "../models/Invoice.js";
@@ -26,6 +26,8 @@ router.use(requireAuth);
 // before any handler (which aggregates booking/invoice data globally) runs.
 router.use(requireWorkspace);
 router.use(blockTravelForSaas);
+// All-company booking / invoice reports and schedules — Plumtrips staff only.
+router.use(requirePlatformAdmin);
 
 /* ── Types ─────────────────────────────────────────────────────── */
 
