@@ -14,6 +14,7 @@ import logger from '../utils/logger.js'
 import { MODULE_GROUP_MAP } from '../utils/moduleGroups.js'
 import CustomerWorkspace from '../models/CustomerWorkspace.js'
 import { allowedModuleKeysFor } from '../utils/featureToModules.js'
+import { syncMembershipFromUser } from '../services/workspaceMembership.service.js'
 
 // The login a UserPermission row belongs to, for the role / SBT sync writes:
 // by its userId (and workspace), never by bare email — duplicate-email User
@@ -24,6 +25,16 @@ function userSyncFilter(perm: any): Record<string, any> {
   }
   const ws = perm?.workspaceId && mongoose.isValidObjectId(String(perm.workspaceId)) ? { workspaceId: perm.workspaceId } : {}
   return { email: String(perm?.email || '').toLowerCase(), ...ws }
+}
+
+// Shadow WorkspaceMembership write-through after a role sync — non-fatal.
+async function syncMembershipForPermission(perm: any, source: string) {
+  try {
+    const u: any = await User.findOne(userSyncFilter(perm)).select('_id').lean()
+    if (u) await syncMembershipFromUser(u._id, { source })
+  } catch (err) {
+    logger.warn(`[${source}] membership sync failed:`, err)
+  }
 }
 
 const router = express.Router()
@@ -436,6 +447,8 @@ router.post('/grant', requireAccessConsoleWrite, async (req: any, res: any) => {
       }
     }
 
+    await syncMembershipFromUser(userId, { source: 'permissions/grant' })
+
     logger.info(`[PERMISSION] GRANT ${normalizedEmail} → ${levelCode} by ${adminEmail}`)
     return res.json({ success: true, data: saved })
   } catch (err: any) {
@@ -544,6 +557,8 @@ router.patch('/update', requireAccessConsoleWrite, async (req: any, res: any) =>
         logger.warn('[permissions/update] HOUSE sbtEnabled sync failed:', sbtErr)
       }
     }
+
+    await syncMembershipForPermission(existing, 'permissions/update')
 
     logger.info(`[PERMISSION] UPDATE ${existing.email} by ${adminEmail}`)
     return res.json({ success: true, data: existing })
@@ -795,6 +810,8 @@ router.post('/apply-template', requireAccessConsoleWrite, async (req: any, res: 
         logger.warn('[permissions/apply-template] HOUSE sbtEnabled sync failed:', sbtErr)
       }
     }
+
+    await syncMembershipForPermission(existing, 'permissions/apply-template')
 
     logger.info(`[PERMISSION] TEMPLATE ${existing.email} → ${levelCode} by ${adminEmail}`)
     return res.json({ success: true, data: existing })

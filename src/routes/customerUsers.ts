@@ -23,6 +23,7 @@ import { generateTravelerId } from "../utils/travelerId.js";
 import { parseCsv as parseCsvRaw } from "../utils/csv.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import { isHouseUser, isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 
 const router = Router();
 
@@ -849,6 +850,7 @@ export async function ensureAuthUserForCustomer(params: {
           }
         : {}),
     });
+    await syncMembershipFromUser(user._id, { source: "customerUsers:ensureAuthUser:create" });
     return { user, created: true, tempPassword: finalPassword };
   }
 
@@ -873,6 +875,7 @@ export async function ensureAuthUserForCustomer(params: {
   }
 
   await user.save();
+  await syncMembershipFromUser(user._id, { source: "customerUsers:ensureAuthUser:adopt" });
   return { user, created: false, tempPassword: passwordPlain ? finalPassword : null };
 }
 
@@ -2229,6 +2232,8 @@ router.post("/", requireAuth, async (req: any, res) => {
       if (sbtAssignedBookerId) user.sbtAssignedBookerId = sbtAssignedBookerId;
       await user.save();
     }
+    // Again after the member row + SBT fields (the helper ran before both).
+    if (user) await syncMembershipFromUser(user._id, { source: "customerUsers:create", invitedBy: actor.sub || actor.id });
 
     const setAsDefaultApprover = normBool(req.body?.setAsDefaultApprover);
     if (role === "APPROVER" && setAsDefaultApprover) {
@@ -2731,6 +2736,7 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
     const updated: any = await User.findByIdAndUpdate(req.params.userId, { $set }, { new: true })
       .select("sbtEnabled sbtRole sbtAssignedBookerId canRaiseRequest canViewBilling canManageUsers")
       .lean();
+    await syncMembershipFromUser(req.params.userId, { source: "customerUsers:workspace/permissions" });
 
     console.info("Permission changed", {
       changedBy: String(actor.sub || actor.id || actor._id || actor.email || ""),
@@ -2806,6 +2812,8 @@ router.post("/workspace/invite", requireAuth, async (req: any, res: any) => {
       { $set: { role: memberRole, customerId, email: normEmail(email), userId: String(targetUser._id), isActive: true } },
       { upsert: true, new: true },
     );
+    // Again after the member row (the helper ran before it).
+    await syncMembershipFromUser(targetUser._id, { source: "customerUsers:workspace/invite", invitedBy: req.user?.sub || req.user?.id });
 
     // An invited APPROVER joins the workspace's approver list (appended, so
     // an existing defaultApproverEmails[0] keeps first place).

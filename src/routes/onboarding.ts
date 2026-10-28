@@ -25,6 +25,7 @@ import { sendRejectionEmail } from "../utils/credentialsEmail.js";
 import { sendEmployeeWelcomeEmail } from "../utils/employeeWelcomeEmail.js";
 import { issueSetPasswordLink, ONBOARDING_LINK_TTL_MS } from "../utils/setPasswordLink.js";
 import { syncCustomerFromOnboarding } from "../services/syncCustomerFromOnboarding.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 
 const router = Router();
 const _require = createRequire(import.meta.url);
@@ -341,6 +342,7 @@ async function syncEmployeeFromOnboarding(
         passwordHash,
         tempPassword: true,
       });
+      await syncMembershipFromUser(user._id, { source: "onboarding:sync-employee" });
 
       // The random password is never handed out; the welcome email carries a
       // set-password link for this new login instead.

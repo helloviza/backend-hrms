@@ -137,6 +137,16 @@ export async function setUserActiveStatus(args: SetUserActiveStatusArgs): Promis
 
   await User.updateOne({ _id: userOid, ...wsScope }, { $set: { status } });
 
+  // Shadow WorkspaceMembership (company switcher Phase 1): mirror the status
+  // onto the person's membership. Lazy import for the same reason as the
+  // re-route below. Must never fail the deactivation itself.
+  try {
+    const { syncMembershipFromUser } = await import("../services/workspaceMembership.service.js");
+    await syncMembershipFromUser(userOid, { source: "userActiveStatus" });
+  } catch (err: any) {
+    console.error("[userActiveStatus] membership sync failed:", err?.message);
+  }
+
   // Mirrors are re-stamped even when User.status was already right — that is
   // how a drifted Employee row gets pulled back into line.
   const empResult = await Employee.updateMany(

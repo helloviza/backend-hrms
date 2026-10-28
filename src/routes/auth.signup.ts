@@ -14,6 +14,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import { sendWelcomeEmail, sendEmailVerification } from "../services/email.service.js";
 import { seedTaskAutomations } from "../services/taskAutomationSeed.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 
 const r = Router();
 
@@ -155,6 +156,7 @@ r.post("/signup", async (req, res) => {
       passwordHash,
       status: "ACTIVE",
     });
+    await syncMembershipFromUser(user._id, { source: "auth.signup:register" });
 
     // 6. Generate email verification token (24h expiry)
     const emailVerificationToken = crypto.randomBytes(32).toString("hex");
@@ -449,6 +451,7 @@ r.post("/accept-invite", async (req, res) => {
       );
       throw createErr;
     }
+    await syncMembershipFromUser(user._id, { source: "auth.signup:invite-accept" });
 
     // 6. Sign JWT tokens
     const accessToken = signAccessToken({

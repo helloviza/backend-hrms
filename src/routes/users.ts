@@ -25,6 +25,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { stripTravelFields } from "../utils/stripTravelFields.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 
 const r = Router();
 
@@ -474,6 +475,7 @@ r.post(
         isActive: true,
         workspaceId: (req as any).workspaceObjectId,
       });
+      await syncMembershipFromUser(newUser._id, { source: "users:admin-create", invitedBy: (req as any).user?.sub });
 
       return res.status(201).json({
         success: true,
@@ -623,6 +625,7 @@ r.post(
       if (existing) {
         Object.assign(existing, activation, ...(officialEmail ? [{ officialEmail }] : []));
         await (existing as any).save();
+        await syncMembershipFromUser(existing._id, { source: "users:grant-access" });
         sendStaffSetPasswordEmail(existing, officialEmail || (existing as any).email, (req as any).workspaceObjectId);
         return res.json({
           success: true,
@@ -631,6 +634,7 @@ r.post(
       }
 
       const newUser = await User.create({ name, email, isActive: true, ...activation, ...(officialEmail && { officialEmail }), workspaceId: (req as any).workspaceObjectId });
+      await syncMembershipFromUser(newUser._id, { source: "users:grant-access", invitedBy: (req as any).user?.sub });
       sendStaffSetPasswordEmail(newUser, (newUser as any).officialEmail || (newUser as any).email, (req as any).workspaceObjectId);
 
       return res.status(201).json({
@@ -716,6 +720,7 @@ r.patch("/admin/users/:id/sbt", requireAuth, requireWorkspace, async (req: any, 
       { new: true }
     ).select("name email sbtEnabled sbtBookingType");
     if (!user) return res.status(404).json({ error: "User not found" });
+    await syncMembershipFromUser(user._id, { source: "users:admin-sbt" });
     res.json({ success: true, user });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

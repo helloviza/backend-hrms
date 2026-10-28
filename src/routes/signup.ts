@@ -14,6 +14,7 @@ import {
   provisionNewTenant,
 } from "../services/tenantProvisioning.js";
 import { seedTaskAutomations } from "../services/taskAutomationSeed.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 import { LEVEL_TEMPLATES } from "../config/levelTemplates.js";
 import { env } from "../config/env.js";
 import { sbtLogger } from "../utils/logger.js";
@@ -140,6 +141,7 @@ router.post("/", async (req, res) => {
       accountType: "STAFF",
       status: "ACTIVE",
     });
+    await syncMembershipFromUser(user._id, { source: "signup:register" });
 
     workspace.adminUserId = user._id as any;
     await workspace.save();

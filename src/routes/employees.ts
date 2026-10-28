@@ -37,6 +37,7 @@ import {
   USER_STATUS_INACTIVE,
 } from "../utils/userActiveStatus.js";
 import { collectPendingWork, summarizePendingWork } from "../services/pendingWork.service.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 
 const router = Router();
 
@@ -1055,6 +1056,7 @@ router.post(
             }
             await user.save();
           }
+          await syncMembershipFromUser(user._id, { source: "employees:bulk" });
 
           // Track this email's user id for Pass 2 manager resolution.
           emailToUserId.set(email, String(user._id));
@@ -1348,6 +1350,7 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
     };
 
     const created = await User.create(payload);
+    await syncMembershipFromUser(created._id, { source: "employees:create", invitedBy: req.user?.sub });
 
     // ── Auto-create UserPermission with L1 (Employee) defaults ──
     try {
@@ -1795,6 +1798,7 @@ router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async 
     }
 
     const saved = await existing.save();
+    if (body.hrmsAccessRole) await syncMembershipFromUser(existing._id, { source: "employees:update-role" });
 
     // Employment Status coupling (value-based): a terminal value left on an
     // ACTIVE user deactivates them through the one write path — even when

@@ -16,6 +16,7 @@ import {
 } from "../utils/saasInviteEmail.js";
 import logger, { sbtLogger } from "../utils/logger.js";
 import { seedTaskAutomations } from "../services/taskAutomationSeed.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 import requireAuth from "../middleware/auth.js";
 import { env } from "../config/env.js";
 import {
@@ -260,6 +261,7 @@ router.post("/workspaces", async (req: any, res) => {
       status: "ACTIVE",
       tempPassword: true,
     });
+    await syncMembershipFromUser(adminUser._id, { source: "superadmin.workspaces:create", invitedBy: req.user?.sub || req.user?.id });
 
     // Full HRMS module access — mirrors saas.signup.ts:90-127
     const fullAccess = { access: "FULL", scope: "ALL" } as const;

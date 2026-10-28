@@ -28,6 +28,7 @@ import CustomerMember from "../models/CustomerMember.js";
 import { generateTravelerId } from "../utils/travelerId.js";
 import { GST_STATE_CODES } from "../utils/gstDetection.js";
 import { isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 import {
   GST_STATUSES,
   normalizeGstStatus,
@@ -1557,6 +1558,7 @@ router.post(
   }
 
   await onboardingDoc.save();
+  await syncMembershipFromUser(saved._id, { source: "masterData:promote-employee:adopt" });
 
   return res.json({
     ok: true,
@@ -1579,6 +1581,7 @@ router.post(
       };
 
       const user = await User.create(newPayload);
+      await syncMembershipFromUser(user._id, { source: "masterData:promote-employee" });
       await syncEmployeeRecord({
   user,
   onboardingDoc,
@@ -1823,6 +1826,7 @@ if (email) {
       workspaceId:    workspaceId || req.workspaceObjectId,
       tempPassword:   true,
     })
+    await syncMembershipFromUser(vendorUser._id, { source: 'masterData:promote-vendor' })
 
     try {
       await sendClientWelcomeEmail({
@@ -2316,6 +2320,7 @@ if (email) {
       }
     }
   }
+  await syncMembershipFromUser((clientUser as any)._id, { source: 'masterData:promote-customer' })
 
   try {
     await UserPermission.findOneAndUpdate(

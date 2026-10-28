@@ -129,6 +129,7 @@ import { isCstepAdmin } from "../utils/cstepAccess.js";
 // same account-creation machinery the "add customer user" flow already
 // uses, rather than a parallel auth path. See ensureCstepTravellerLogin below.
 import { ensureAuthUserForCustomer, trySendInviteEmailSafe } from "./customerUsers.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 
 const router = Router();
 router.use(requireAuth, requireWorkspace);
@@ -741,6 +742,8 @@ export async function ensureCstepTravellerLogin(params: {
     },
     { upsert: true },
   ).exec();
+  // Again after the member row (ensureAuthUserForCustomer synced before it).
+  await syncMembershipFromUser(user._id, { source: "workspace.travellers:cstepTravellerLogin" });
 
   if (created && params.sendInvite !== false) {
     // Best-effort, same mechanism the existing "add customer user" flow

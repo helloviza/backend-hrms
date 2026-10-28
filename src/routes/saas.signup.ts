@@ -14,6 +14,7 @@ import { generateSlug, ensureUniqueSlug, provisionNewTenant } from "../services/
 import { LEVEL_TEMPLATES } from "../config/levelTemplates.js";
 import { env } from "../config/env.js";
 import TenantSetupProgress from "../models/TenantSetupProgress.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 
 const r = Router();
 
@@ -86,6 +87,7 @@ r.post("/signup", async (req, res) => {
       accountType: "STAFF",
       status: "ACTIVE",
     });
+    await syncMembershipFromUser(user._id, { source: "saas.signup" });
 
     // 7. Create UserPermission from the TENANT_ADMIN template.
     //

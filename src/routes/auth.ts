@@ -27,6 +27,7 @@ import TenantSetupProgress from "../models/TenantSetupProgress.js";
 import { stripTravelFields } from "../utils/stripTravelFields.js";
 import { signLogoUrl } from "../utils/signLogoUrl.js";
 import { isUserActive } from "../utils/userActiveStatus.js";
+import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 
 const r = Router();
 
@@ -809,6 +810,7 @@ r.post("/register", async (req, res) => {
       passwordHash,
       workspaceId: resolvedWsId,
     });
+    await syncMembershipFromUser(user._id, { source: "auth:register" });
 
     res.json({ id: user._id });
   } catch (err) {
