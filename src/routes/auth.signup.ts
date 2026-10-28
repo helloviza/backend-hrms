@@ -8,6 +8,7 @@ import { z } from "zod";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
+import { INVITABLE_ROLES } from "./workspace.invites.js";
 import { requireAuth } from "../middleware/auth.js";
 import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import { sendWelcomeEmail, sendEmailVerification } from "../services/email.service.js";
@@ -364,37 +365,75 @@ r.post("/accept-invite", async (req, res) => {
       return res.status(400).json({ error: "Workspace is not active." });
     }
 
-    // 3. Check email not already registered
-    const normalizedEmail = normalizeEmail(invite.email);
-    const existingUser = await User.findOne({ email: normalizedEmail });
-    if (existingUser) {
+    // 2b. The new login gets roles: [invite.role] verbatim — refuse any role an
+    // invite may not confer (an invite stored before the /send allow-list
+    // could carry SUPERADMIN).
+    const inviteRole = String(invite.role || "").toUpperCase();
+    if (!INVITABLE_ROLES.has(inviteRole)) {
+      console.warn("[auth.signup] accept-invite refused: role not invitable", {
+        inviteId: String(invite._id),
+        role: inviteRole,
+      });
       return res
-        .status(409)
-        .json({ error: "An account with this email already exists." });
+        .status(400)
+        .json({ error: "Invite token is invalid, already used, or expired." });
+    }
+
+    // 3. This path only ever CREATES a login — an existing account is never
+    // touched (its password is not set here). Same answer whoever owns the
+    // email, so the link is not an account-existence oracle.
+    const normalizedEmail = normalizeEmail(invite.email);
+    const existingUser = await User.findOne({
+      $or: [
+        { email: normalizedEmail },
+        { officialEmail: normalizedEmail },
+        { personalEmail: normalizedEmail },
+      ],
+    });
+    if (existingUser) {
+      return res.status(409).json({
+        error: "This invite can't be used to create a new login. If you already have a Plumbox login, sign in instead.",
+      });
+    }
+
+    // 3b. Claim the invite atomically, so one token creates at most one login.
+    const claimed = await WorkspaceInvite.findOneAndUpdate(
+      { _id: invite._id, status: "pending" },
+      { $set: { status: "accepted", acceptedAt: new Date() } },
+    );
+    if (!claimed) {
+      return res
+        .status(400)
+        .json({ error: "Invite token is invalid, already used, or expired." });
     }
 
     // 4. Create User
     const passwordHash = bcrypt.hashSync(password, 10);
-    const user = await User.create({
-      workspaceId: workspace._id,
-      roles: [invite.role],
-      name,
-      email: normalizedEmail,
-      phone: phone || undefined,
-      passwordHash,
-      status: "ACTIVE",
-    });
-
-    // 5. Mark invite as accepted
-    invite.status = "accepted";
-    invite.acceptedAt = new Date();
-    await invite.save();
+    let user;
+    try {
+      user = await User.create({
+        workspaceId: workspace._id,
+        roles: [inviteRole],
+        name,
+        email: normalizedEmail,
+        phone: phone || undefined,
+        passwordHash,
+        status: "ACTIVE",
+      });
+    } catch (createErr) {
+      // No login was made — give the invite back so the link still works.
+      await WorkspaceInvite.updateOne(
+        { _id: invite._id, status: "accepted" },
+        { $set: { status: "pending" }, $unset: { acceptedAt: 1 } },
+      );
+      throw createErr;
+    }
 
     // 6. Sign JWT tokens
     const accessToken = signAccessToken({
       userId: String(user._id),
       email: normalizedEmail,
-      roles: [invite.role],
+      roles: [inviteRole],
       customerId: workspace.customerId,
       businessId: workspace.customerId,
     });

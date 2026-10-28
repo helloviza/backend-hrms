@@ -2158,6 +2158,28 @@ router.post("/", requireAuth, async (req: any, res) => {
       }
     }
 
+    const passwordPlain = req.body?.password ? String(req.body.password) : null;
+    const ensured = await ensureAuthUserForCustomer({
+      email,
+      name,
+      customerId,
+      workspaceId: ws._id,
+      memberRole: role,
+      passwordPlain,
+      managerUser,
+    });
+
+    // Checked BEFORE the CustomerMember upsert: a refused add must leave no
+    // member row behind — login's customer resolution reads CustomerMember by
+    // email, so an orphan row here could later pull the other company's user
+    // into this workspace.
+    if ((ensured as any).conflict) {
+      return res.status(409).json({
+        error: "A user with this email already exists in a different workspace.",
+        code: "CROSS_WORKSPACE_EMAIL_CONFLICT",
+      });
+    }
+
     const now = new Date();
     const postCompanyName = business?.legalName || business?.name || "PLUM";
     const postTravelerId = await generateTravelerId(customerId, postCompanyName);
@@ -2187,24 +2209,6 @@ router.post("/", requireAuth, async (req: any, res) => {
       } else {
         throw err;
       }
-    }
-
-    const passwordPlain = req.body?.password ? String(req.body.password) : null;
-    const ensured = await ensureAuthUserForCustomer({
-      email,
-      name,
-      customerId,
-      workspaceId: ws._id,
-      memberRole: role,
-      passwordPlain,
-      managerUser,
-    });
-
-    if ((ensured as any).conflict) {
-      return res.status(409).json({
-        error: "A user with this email already exists in a different workspace.",
-        code: "CROSS_WORKSPACE_EMAIL_CONFLICT",
-      });
     }
 
     const { user, created, tempPassword } = ensured;

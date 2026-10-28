@@ -2072,6 +2072,33 @@ router.post(
         return res.status(conflict.status).json(conflict.body);
       }
 
+      // An existing login with this email may only be linked here if it
+      // already belongs to THIS customer (a re-promotion). Anyone else's
+      // account — staff, or another company's user — used to be moved into
+      // the new tenant and have its roles rewritten. Checked before any
+      // write, so a refusal leaves no half-promoted customer behind.
+      {
+        const existingLogin: any = await User.findOne({ email: email.toLowerCase() })
+          .select("_id workspaceId customerId")
+          .lean();
+        if (existingLogin) {
+          const ownWs: any = existingCustomer
+            ? await CustomerWorkspace.findOne({ customerId: String(existingCustomer._id) }).select("_id").lean()
+            : null;
+          const belongsHere =
+            !!existingCustomer &&
+            (String(existingLogin.customerId || "") === String(existingCustomer._id) ||
+              (!!ownWs && String(existingLogin.workspaceId || "") === String(ownWs._id)));
+          if (!belongsHere) {
+            return res.status(409).json({
+              error:
+                "This email already has a Plumbox login in another company. Use a different contact email for this customer.",
+              code: "EMAIL_IN_OTHER_WORKSPACE",
+            });
+          }
+        }
+      }
+
       let customer: any;
       if (existingCustomer) {
         Object.assign(existingCustomer, {
@@ -2164,25 +2191,18 @@ if (email) {
       await CustomerMember.findOneAndUpdate(
         {
           email: emailRaw,
-          customerId: String(existingCustomer._id),
+          customerId: String(customer._id),
         },
         { $set: { role: customerRole } },
         { new: true },
       )
     }
 
-    // Self-healing: same class of bug as Customer.workspaceId above — reconcile
-    // an existing client contact's User.workspaceId to the real tenant
-    // workspace on every re-promotion, not just at first creation (blast-radius
-    // checked: nothing reads a customer-role User.workspaceId as an identity
-    // source — resolveWorkspaceForUser always resolves customer users via
-    // customerId instead — and empirically only 2 real accounts across 2
-    // tenants were ever affected, neither with any overlapping staff population).
-    if (String((clientUser as any).workspaceId || "") !== String(tenantWorkspace._id)) {
-      await User.findByIdAndUpdate((clientUser as any)._id, {
-        $set: { workspaceId: tenantWorkspace._id },
-      })
-    }
+    // An existing login is never moved to another workspace here. The
+    // ownership check above already refused anyone outside this customer;
+    // the old "self-healing" $set of User.workspaceId is gone because it also
+    // moved staff and other companies' users. Customer users resolve their
+    // workspace by customerId (resolveWorkspaceForUser), not this field.
   } else {
     const tempPassword =
       'PLMX-' + Math.random().toString(36).slice(2, 10).toUpperCase()

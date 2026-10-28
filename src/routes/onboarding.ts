@@ -346,10 +346,23 @@ async function syncEmployeeFromOnboarding(
       // set-password link for this new login instead.
       return { userId: String(user._id), email };
     } else {
-      Object.assign(user, update);
-      if (!user.workspaceId && resolvedWorkspaceId) {
-        user.workspaceId = resolvedWorkspaceId;
+      // The lookup above is by email across every workspace, and this runs
+      // from the PUBLIC submit route. Only a login that already belongs to
+      // this onboarding's workspace may take the submitted identity, contact,
+      // bank and ID fields — anyone else's account is left exactly as it is.
+      if (
+        !resolvedWorkspaceId ||
+        !user.workspaceId ||
+        String(user.workspaceId) !== String(resolvedWorkspaceId)
+      ) {
+        console.warn("[onboarding:sync] skipped: email belongs to a user in another workspace", {
+          onboardingId: String(doc._id),
+          onboardingWorkspaceId: resolvedWorkspaceId ? String(resolvedWorkspaceId) : null,
+          userId: String(user._id),
+        });
+        return null;
       }
+      Object.assign(user, update);
       if (!user.employeeCode) {
         user.employeeCode = await generateNextEmployeeCode();
       }

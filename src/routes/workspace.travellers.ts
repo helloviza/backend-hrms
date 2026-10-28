@@ -710,6 +710,24 @@ export async function ensureCstepTravellerLogin(params: {
   const email = normalizeEmail(params.email);
   if (!email) return { userId: null, created: false, note: "No email — login not created" };
 
+  const { user, created, conflict } = await ensureAuthUserForCustomer({
+    email,
+    name: params.name,
+    customerId: params.customerId,
+    workspaceId: params.workspaceId,
+    memberRole: "REQUESTER",
+    passwordPlain: null,
+    managerUser: null,
+  });
+
+  // Checked BEFORE the CustomerMember upsert: an email whose login belongs to
+  // another workspace gets no member row here — login's customer resolution
+  // reads CustomerMember by email, so an orphan row could later pull that
+  // person's session into this workspace.
+  if (conflict || !user) {
+    return { userId: null, created: false, note: "This email already has a login in a different workspace — not linked" };
+  }
+
   await CustomerMember.findOneAndUpdate(
     { customerId: params.customerId, email },
     {
@@ -723,20 +741,6 @@ export async function ensureCstepTravellerLogin(params: {
     },
     { upsert: true },
   ).exec();
-
-  const { user, created, conflict } = await ensureAuthUserForCustomer({
-    email,
-    name: params.name,
-    customerId: params.customerId,
-    workspaceId: params.workspaceId,
-    memberRole: "REQUESTER",
-    passwordPlain: null,
-    managerUser: null,
-  });
-
-  if (conflict || !user) {
-    return { userId: null, created: false, note: "This email already has a login in a different workspace — not linked" };
-  }
 
   if (created && params.sendInvite !== false) {
     // Best-effort, same mechanism the existing "add customer user" flow

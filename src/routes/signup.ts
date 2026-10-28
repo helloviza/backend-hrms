@@ -266,18 +266,41 @@ router.post("/invite/accept", async (req, res) => {
       return res.status(400).json({ error: "This invite link has expired" });
     }
 
-    const user = await User.findOne({ email: invite.email });
-    if (!user) {
-      return res.status(400).json({ error: "No account found for this invite" });
+    // This sets the password of an EXISTING login (one created by HR with a
+    // random temp password). It used to set it on whichever user owned
+    // invite.email, in any workspace — so anyone holding an invite token
+    // could take over any account. Proceed only for a login that belongs to
+    // the inviting workspace, is active, and has never had a password of its
+    // own. Every refusal is the same generic answer: an invite link must not
+    // reveal whether an account exists.
+    const user: any = await User.findOne({ email: invite.email });
+    const ws: any = await CustomerWorkspace.findById(invite.workspaceId).select("customerId").lean();
+    const inInviteWorkspace =
+      !!user &&
+      (String(user.workspaceId || "") === String(invite.workspaceId) ||
+        (!!ws?.customerId && String(user.customerId || "") === String(ws.customerId)));
+    const hasOwnPassword = !!user?.passwordHash && user?.tempPassword !== true;
+    if (!user || !inInviteWorkspace || hasOwnPassword || String(user.status || "ACTIVE") !== "ACTIVE") {
+      sbtLogger.warn("[INVITE ACCEPT] refused", {
+        inviteId: String(invite._id),
+        reason: !user ? "no_user" : !inInviteWorkspace ? "other_workspace" : hasOwnPassword ? "has_password" : "inactive",
+      });
+      return res.status(400).json({ error: "Invalid or expired invite link" });
+    }
+
+    // Claim the invite atomically before touching the password, so one token
+    // can never be redeemed twice.
+    const claimed = await WorkspaceInvite.findOneAndUpdate(
+      { _id: invite._id, status: "pending" },
+      { $set: { status: "accepted", acceptedAt: new Date() } },
+    );
+    if (!claimed) {
+      return res.status(400).json({ error: "This invite has already been used or revoked" });
     }
 
     user.passwordHash = await bcrypt.hash(String(password), 12);
-    (user as any).status = "ACTIVE";
+    user.tempPassword = false;
     await user.save();
-
-    invite.status = "accepted";
-    invite.acceptedAt = new Date();
-    await invite.save();
 
     return res.json({ ok: true, email: invite.email });
   } catch (err: any) {

@@ -1,8 +1,9 @@
-import { Router, type Request, type Response } from "express";
+import { Router, type Request, type Response, type NextFunction } from "express";
 import crypto from "crypto";
 
 import requireAuth from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
@@ -23,6 +24,44 @@ function normEmail(v: unknown): string {
 function normStr(v: unknown): string {
   return String(v ?? "").trim();
 }
+
+/**
+ * Invites are workspace administration. Same role set and normalisation as
+ * workspace.branding.ts's requireBrandingRole, plus WORKSPACE_ADMIN (the role
+ * auth.signup.ts gives a self-signup owner). Roles come from the session
+ * token, and requireWorkspace (mounted first) pins the workspace from that
+ * same token — so this is "admin of THIS workspace". It used to be any
+ * logged-in user, and GET / handed back every invite's token: any user could
+ * invite any email and read the link that sets its password.
+ */
+const INVITE_ADMIN_ROLES = new Set([
+  "TENANT_ADMIN",
+  "WORKSPACE_LEADER",
+  "WORKSPACE_ADMIN",
+  "SUPERADMIN",
+]);
+
+function requireInviteAdmin(req: Request, res: Response, next: NextFunction) {
+  if (isSuperAdmin(req)) return next();
+  const user = (req as any).user;
+  const roles: string[] = Array.isArray(user?.roles)
+    ? user.roles.map((r: string) => String(r).toUpperCase().replace(/[\s\-]/g, "_"))
+    : [];
+  const memberRole = String(user?.customerMemberRole || "").toUpperCase();
+  if (roles.some((r) => INVITE_ADMIN_ROLES.has(r)) || memberRole === "WORKSPACE_LEADER") {
+    return next();
+  }
+  res.status(403).json({ error: "Inviting people requires Tenant Admin or Workspace Leader." });
+}
+
+/**
+ * The roles an invite may confer. POST /api/auth/accept-invite creates the
+ * login with `roles: [invite.role]` verbatim, so an unchecked role was a
+ * straight path to SUPERADMIN. These are the roles the invite screens offer
+ * (TeamTab, WorkspaceSettings, employees.ts's HR invite). Shared with the
+ * accept paths so an invite already in the DB with any other role is refused.
+ */
+export const INVITABLE_ROLES = new Set(["EMPLOYEE", "MANAGER", "HR", "ADMIN", "APPROVER", "REQUESTER"]);
 
 /**
  * Core invite processor — shared by POST /send and POST /bulk-csv.
@@ -56,6 +95,28 @@ async function processInvites(
         continue;
       }
 
+      /* ── 1b. A login elsewhere? Refuse until memberships exist ──── */
+      // One email = one User today. Accepting this invite would either
+      // collide with that login or (signup.ts invite/accept) reset its
+      // password — so a person who already has a login in another workspace
+      // cannot be invited here.
+      const elsewhere = await User.findOne({
+        $or: [{ email }, { officialEmail: email }, { personalEmail: email }],
+        workspaceId: { $ne: ctx.workspaceObjectId },
+      })
+        .select("_id")
+        .lean();
+      if (elsewhere) {
+        errors.push(`${email}: already has a Plumbox login in another company and can't be invited here yet`);
+        continue;
+      }
+
+      const role = normStr(row.role).toUpperCase() || "EMPLOYEE";
+      if (!INVITABLE_ROLES.has(role)) {
+        errors.push(`${email}: role '${role}' can't be granted by invite`);
+        continue;
+      }
+
       /* ── 2. Pending invite already exists? ────────────────────── */
       const existingInvite = await WorkspaceInvite.findOne({
         workspaceId: ctx.workspaceObjectId,
@@ -77,7 +138,7 @@ async function processInvites(
         workspaceId: ctx.workspaceObjectId,
         email,
         name: normStr(row.name) || undefined,
-        role: normStr(row.role).toUpperCase() || "EMPLOYEE",
+        role,
         department: normStr(row.department) || undefined,
         designation: normStr(row.designation) || undefined,
         invitedBy: ctx.invitedById,
@@ -110,6 +171,7 @@ router.post(
   "/send",
   requireAuth,
   requireWorkspace,
+  requireInviteAdmin,
   async (req: Request, res: Response) => {
     try {
       const { emails, role, department, designation } = req.body as {
@@ -163,6 +225,7 @@ router.post(
   "/bulk-csv",
   requireAuth,
   requireWorkspace,
+  requireInviteAdmin,
   async (req: Request, res: Response) => {
     try {
       const { rows } = req.body as {
@@ -213,6 +276,7 @@ router.get(
   "/",
   requireAuth,
   requireWorkspace,
+  requireInviteAdmin,
   async (req: Request, res: Response) => {
     try {
       const { status } = req.query as { status?: string };
@@ -234,7 +298,10 @@ router.get(
       }
 
       const [invites, total] = await Promise.all([
+        // Explicit projection: the token is the credential that sets the
+        // invitee's password — it goes to their inbox, never to this list.
         WorkspaceInvite.find(filter)
+          .select("-token")
           .sort({ createdAt: -1 })
           .skip(skip)
           .limit(limit)
@@ -255,6 +322,7 @@ router.delete(
   "/:inviteId",
   requireAuth,
   requireWorkspace,
+  requireInviteAdmin,
   async (req: Request, res: Response) => {
     try {
       const { inviteId } = req.params;
