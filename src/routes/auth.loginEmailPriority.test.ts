@@ -112,8 +112,11 @@ describe("login: which account an address signs in to", () => {
     expect(amb.status).toBe(unknown.status);
     expect(amb.body).toEqual(unknown.body);
     expect(amb.body.accessToken).toBeUndefined();
-    const failed = await col("sessionlogs").findOne({ email: "amb@x.test", event: "LOGIN_FAILED" });
-    expect(failed?.failureReason).toBe("ambiguous_email");
+    // SessionLog is written fire-and-forget — wait for it rather than race it
+    await vi.waitFor(async () => {
+      const failed = await col("sessionlogs").findOne({ email: "amb@x.test", event: "LOGIN_FAILED" });
+      expect(failed?.failureReason).toBe("ambiguous_email");
+    }, { timeout: 5000 });
     // each account still signs in by its own email
     expect(loggedInAs(await login("a1@x.test", "pw-amb"))).toBe(String(U.amb1));
   });

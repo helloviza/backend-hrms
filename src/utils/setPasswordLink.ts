@@ -2,6 +2,7 @@
 import crypto from "crypto";
 import User from "../models/User.js";
 import { publicAppUrl } from "./publicAppUrl.js";
+import { LoginDisabledError, loginEnabledFilter } from "./loginDisabled.js";
 
 /** Forgot-password links. */
 export const RESET_LINK_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -19,11 +20,16 @@ export async function issueSetPasswordLink(userId: unknown, ttlMs: number): Prom
   const rawToken = crypto.randomBytes(32).toString("hex");
   const hash = crypto.createHash("sha256").update(rawToken).digest("hex");
 
+  // A disabled login (utils/loginDisabled.ts) never gets a link. Every caller
+  // already treats a throw as "email not sent".
   const r = await User.updateOne(
-    { _id: userId },
+    { _id: userId, ...loginEnabledFilter() },
     { $set: { resetTokenHash: hash, resetTokenExpiry: new Date(Date.now() + ttlMs) } },
   );
-  if (r.matchedCount !== 1) throw new Error("issueSetPasswordLink: user not found");
+  if (r.matchedCount !== 1) {
+    if (await User.exists({ _id: userId })) throw new LoginDisabledError();
+    throw new Error("issueSetPasswordLink: user not found");
+  }
 
   return `${publicAppUrl()}/reset-password?token=${rawToken}`;
 }

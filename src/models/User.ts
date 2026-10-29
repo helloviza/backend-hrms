@@ -81,6 +81,16 @@ const UserSchema = new Schema(
     resetTokenHash:   { type: String },
     resetTokenExpiry: { type: Date },
 
+    /**
+     * Sign-in block, independent of `status` (utils/loginDisabled.ts). The
+     * person stays ACTIVE for HR; only this login is closed — login, refresh,
+     * forgot/reset-password and every set-password link refuse it.
+     */
+    loginDisabled:       { type: Boolean },
+    loginDisabledAt:     { type: Date },
+    loginDisabledBy:     { type: String, trim: true },
+    loginDisabledReason: { type: String, trim: true },
+
     name: { type: String, trim: true },
     firstName: { type: String, trim: true },
     middleName: { type: String, trim: true },

@@ -8,6 +8,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { findUserByLoginEmail } from "../utils/loginEmailLookup.js";
+import { isLoginDisabled } from "../utils/loginDisabled.js";
 
 const router = Router();
 
@@ -201,7 +202,9 @@ router.post("/admin-set", requireAuth, requireWorkspace, async (req: any, res, n
             context: "password-admin-set",
           })
         ).user;
-    if (!user) {
+    // A disabled login (utils/loginDisabled.ts) cannot be given a password —
+    // same reply as a user that is not there.
+    if (!user || isLoginDisabled(user)) {
       return res.status(404).json({ error: "User not found in the target workspace" });
     }
 

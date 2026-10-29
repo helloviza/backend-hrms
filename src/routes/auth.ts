@@ -28,6 +28,7 @@ import { stripTravelFields } from "../utils/stripTravelFields.js";
 import { signLogoUrl } from "../utils/signLogoUrl.js";
 import { isUserActive } from "../utils/userActiveStatus.js";
 import { findUserByLoginEmail } from "../utils/loginEmailLookup.js";
+import { isLoginDisabled, loginEnabledFilter } from "../utils/loginDisabled.js";
 import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 
 const r = Router();
@@ -859,8 +860,15 @@ r.post("/login", loginLimiter, async (req, res) => {
     const lookup = await findUserByLoginEmail(normalizedEmail, { context: "login" });
     const user: any = lookup.user;
 
-    if (!user || !user.passwordHash) {
-      const reason = lookup.ambiguous ? "ambiguous_email" : "user_not_found_or_no_password";
+    // A disabled login (utils/loginDisabled.ts) answers exactly like an
+    // unknown address — before the status / permission gates, whose distinct
+    // replies would otherwise say the account exists.
+    if (!user || !user.passwordHash || isLoginDisabled(user)) {
+      const reason = lookup.ambiguous
+        ? "ambiguous_email"
+        : user && isLoginDisabled(user)
+        ? "login_disabled"
+        : "user_not_found_or_no_password";
       authLogger.warn("Failed login attempt", { email: normalizedEmail, ip: req.ip, reason });
       SessionLog.create({
         email: normalizedEmail,
@@ -1089,7 +1097,9 @@ r.post("/refresh", async (req, res) => {
 
     // NOTE: pre-auth lookup, workspace not yet available
     const user: any = await User.findById(payload.sub);
-    if (!user) return res.status(401).json({ error: "User not found" });
+    // Disabled login: same reply as a deleted user, and the cookie goes.
+    if (user && isLoginDisabled(user)) clearRefreshCookie(res);
+    if (!user || isLoginDisabled(user)) return res.status(401).json({ error: "User not found" });
 
     // A refresh cookie outlives deactivation (7d). Refuse to mint a new
     // access token for an INACTIVE person — same gate as /login.
@@ -1334,8 +1344,9 @@ r.post("/forgot-password", async (req, res) => {
     // Same account login would pick; ambiguous → treated as unknown.
     const { user } = await findUserByLoginEmail(normalizedEmail, { context: "forgot-password" });
 
-    // Always return ok — never reveal whether the email exists
-    if (!user) return res.json({ ok: true });
+    // Always return ok — never reveal whether the email exists, or that its
+    // login is disabled (no link is issued for it either way).
+    if (!user || isLoginDisabled(user)) return res.json({ ok: true });
 
     const resetLink = await issueSetPasswordLink(user._id, RESET_LINK_TTL_MS);
 
@@ -1383,6 +1394,8 @@ r.post("/reset-password", async (req, res) => {
     const user: any = await User.findOne({
       resetTokenHash: hash,
       resetTokenExpiry: { $gt: new Date() },
+      // a link issued before the login was disabled is dead too
+      ...loginEnabledFilter(),
     });
 
     if (!user) {
