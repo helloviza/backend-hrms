@@ -7,6 +7,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { findUserByLoginEmail } from "../utils/loginEmailLookup.js";
 
 const router = Router();
 
@@ -190,20 +191,16 @@ router.post("/admin-set", requireAuth, requireWorkspace, async (req: any, res, n
       effectiveWorkspaceId = req.workspaceObjectId;
     }
 
-    const identifierFilter = userId
-      ? { _id: userId }
-      : {
-          $or: [
-            { email: String(email).toLowerCase() },
-            { officialEmail: String(email).toLowerCase() },
-            { personalEmail: String(email).toLowerCase() },
-          ],
-        };
-
-    const user = await User.findOne({
-      ...identifierFilter,
-      workspaceId: effectiveWorkspaceId,
-    }).exec();
+    // By email: the same email → officialEmail → personalEmail order as
+    // login, inside the target workspace; an ambiguous match is a 404.
+    const user = userId
+      ? await User.findOne({ _id: userId, workspaceId: effectiveWorkspaceId }).exec()
+      : (
+          await findUserByLoginEmail(String(email).toLowerCase(), {
+            scope: { workspaceId: effectiveWorkspaceId },
+            context: "password-admin-set",
+          })
+        ).user;
     if (!user) {
       return res.status(404).json({ error: "User not found in the target workspace" });
     }

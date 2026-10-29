@@ -27,6 +27,7 @@ import TenantSetupProgress from "../models/TenantSetupProgress.js";
 import { stripTravelFields } from "../utils/stripTravelFields.js";
 import { signLogoUrl } from "../utils/signLogoUrl.js";
 import { isUserActive } from "../utils/userActiveStatus.js";
+import { findUserByLoginEmail } from "../utils/loginEmailLookup.js";
 import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 
 const r = Router();
@@ -853,23 +854,21 @@ r.post("/login", loginLimiter, async (req, res) => {
 
     const normalizedEmail = normalizeEmail(email);
 
-    const user: any = await User.findOne({
-      $or: [
-        { email: normalizedEmail },
-        { officialEmail: normalizedEmail },
-        { personalEmail: normalizedEmail },
-      ],
-    });
+    // email first, then officialEmail, then personalEmail; an ambiguous
+    // fallback is refused like an unknown address (utils/loginEmailLookup).
+    const lookup = await findUserByLoginEmail(normalizedEmail, { context: "login" });
+    const user: any = lookup.user;
 
     if (!user || !user.passwordHash) {
-      authLogger.warn("Failed login attempt", { email: normalizedEmail, ip: req.ip, reason: "user_not_found_or_no_password" });
+      const reason = lookup.ambiguous ? "ambiguous_email" : "user_not_found_or_no_password";
+      authLogger.warn("Failed login attempt", { email: normalizedEmail, ip: req.ip, reason });
       SessionLog.create({
         email: normalizedEmail,
         event: "LOGIN_FAILED",
         ipAddress: req.ip || req.headers["x-forwarded-for"] as string,
         userAgent: req.headers["user-agent"],
         success: false,
-        failureReason: "user_not_found_or_no_password",
+        failureReason: reason,
       }).catch(() => {});
       return res.status(400).json({ error: "Invalid credentials or password not set" });
     }
@@ -1332,13 +1331,8 @@ r.post("/forgot-password", async (req, res) => {
 
     const normalizedEmail = normalizeEmail(email);
 
-    const user: any = await User.findOne({
-      $or: [
-        { email: normalizedEmail },
-        { officialEmail: normalizedEmail },
-        { personalEmail: normalizedEmail },
-      ],
-    });
+    // Same account login would pick; ambiguous → treated as unknown.
+    const { user } = await findUserByLoginEmail(normalizedEmail, { context: "forgot-password" });
 
     // Always return ok — never reveal whether the email exists
     if (!user) return res.json({ ok: true });
