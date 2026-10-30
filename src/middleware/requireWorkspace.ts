@@ -160,10 +160,15 @@ export function clearMembershipCache(mid?: string): void {
   else membershipCache.clear();
 }
 
+// The fields the session check needs, plus what services/activeMembership.ts
+// reads for the per-company roles and flags — one cached row serves both.
+const SESSION_MEMBERSHIP_SELECT =
+  "userId workspaceId status tokenVersion customerId kind roles memberRole flags isDefault";
+
 async function loadMembershipCached(mid: string): Promise<any | null> {
   const hit = membershipCache.get(mid);
   if (hit && Date.now() - hit.at < MEMBERSHIP_CACHE_TTL_MS) return hit.m;
-  const m = await WorkspaceMembership.findById(mid).select("userId workspaceId status tokenVersion").lean();
+  const m = await WorkspaceMembership.findById(mid).select(SESSION_MEMBERSHIP_SELECT).lean();
   if (membershipCache.size >= MEMBERSHIP_CACHE_MAX) membershipCache.clear();
   membershipCache.set(mid, { m: m ?? null, at: Date.now() });
   return m ?? null;
@@ -171,20 +176,29 @@ async function loadMembershipCached(mid: string): Promise<any | null> {
 
 const isOidStr = (v: unknown) => /^[a-fA-F0-9]{24}$/.test(String(v ?? "").trim());
 
-/** Is the membership named by these token claims still the live session for this user? */
-export async function verifySessionMembership(claims: any): Promise<boolean> {
+/**
+ * The membership named by these token claims, if it is still the live session
+ * for this user (same user, same workspace, ACTIVE, same tokenVersion) — else
+ * null. Read through the same ≤60s cache as requireWorkspace.
+ */
+export async function loadSessionMembership(claims: any): Promise<any | null> {
   const mid = String(claims?.mid ?? "").trim();
   const wsid = String(claims?.wsid ?? "").trim();
   const sub = String(claims?.sub ?? claims?._id ?? claims?.id ?? "").trim();
-  if (!isOidStr(mid) || !isOidStr(wsid) || !sub) return false;
+  if (!isOidStr(mid) || !isOidStr(wsid) || !sub) return null;
   const m = await loadMembershipCached(mid);
-  return (
+  const live =
     !!m &&
     String(m.userId) === sub &&
     String(m.workspaceId) === wsid &&
     m.status === "ACTIVE" &&
-    Number(m.tokenVersion ?? 0) === Number(claims.mver)
-  );
+    Number(m.tokenVersion ?? 0) === Number(claims.mver);
+  return live ? m : null;
+}
+
+/** Is the membership named by these token claims still the live session for this user? */
+export async function verifySessionMembership(claims: any): Promise<boolean> {
+  return !!(await loadSessionMembership(claims));
 }
 
 export const MEMBERSHIP_REVOKED_BODY = {

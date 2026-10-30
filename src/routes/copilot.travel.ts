@@ -19,7 +19,7 @@ import { reduceToDelta } from "../utils/plutoDeltaReducer.js";
 import { isHandoffReady } from "../utils/plutoHandoffEvaluator.js";
 
 import { buildHandoffPayload } from "../utils/plutoHandoffBuilder.js";
-import { sendHandoffPayload } from "../utils/plutoHandoffSink.js";
+import { sendHandoffPayload, legacyCustomerIdOf } from "../utils/plutoHandoffSink.js";
 
 import { emitPlutoDebug } from "../utils/plutoDebugSink.js";
 
@@ -2435,10 +2435,15 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
       ? { watchOptIn: true, whatsappNumber: whatsappNumber || null }
       : undefined;
 
-    // Resolve workspace
-    const workspace = user.customerId
-      ? await CustomerWorkspace.findById(user.customerId).lean() as any
+    // Resolve workspace — the session's (requireWorkspace). Not
+    // findById(user.customerId): for a customer that is a Customer._id, not a
+    // CustomerWorkspace._id, so it found nothing (audit §7.2).
+    const workspace = (req as any).workspaceObjectId
+      ? await CustomerWorkspace.findById((req as any).workspaceObjectId).lean() as any
       : null;
+    // SBTRequest.customerId is the legacy Customer._id (what the request inbox
+    // filters on), i.e. the workspace's customerId — never the workspace _id.
+    const legacyCustomerId = legacyCustomerIdOf(workspace);
 
     if (!workspace) {
       return res.status(400).json({
@@ -2457,10 +2462,11 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
       if (approver) assignedBookerId = approver._id;
     }
 
-    // Fallback: workspace leader
-    if (!assignedBookerId) {
+    // Fallback: workspace leader (User.customerId is a Customer._id). No
+    // customerId → no lookup: an undefined filter would match any company's leader.
+    if (!assignedBookerId && workspace.customerId) {
       const leader = await User.findOne({
-        customerId: workspace._id,
+        customerId: String(workspace.customerId),
         roles: { $in: ["WORKSPACE_LEADER"] },
         _id: { $ne: user._id },
       }).select("_id name email").lean() as any;
@@ -2522,7 +2528,7 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
 
     const request = await SBTRequest.create({
       workspaceId: (req as any).workspaceObjectId,
-      customerId: workspace._id,
+      customerId: legacyCustomerId,
       requesterId: user._id,
       assignedBookerId,
       type: reqType,

@@ -11,6 +11,12 @@ import { requireFeature } from "../middleware/requireFeature.js";
 import { buildEmailShell, eCard, eRow, eLabel, eBtn, escapeHtml } from "./approvals.email.js";
 import TravelForm from "../models/TravelForm.js";
 import { sellingFlightResults, stripHotelCost } from "../services/sbtQuote.js";
+import {
+  getActiveMembership,
+  holdsSeveralCompanies,
+  isActiveWorkspaceLeader,
+  findOtherWorkspaceLeader,
+} from "../services/activeMembership.js";
 
 const router = express.Router();
 
@@ -32,6 +38,12 @@ router.use(requireFeature("sbtEnabled"));
 
 function userId(req: any): string {
   return String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? "");
+}
+
+/** Extra filter for lists keyed only by the caller: this workspace, when the
+ *  caller belongs to several companies; nothing (unchanged) otherwise. */
+async function sessionWorkspaceScope(req: any): Promise<Record<string, unknown>> {
+  return (await holdsSeveralCompanies(req)) ? { workspaceId: req.workspaceObjectId } : {};
 }
 
 function describeOption(type: string, opt: any, params: any): string {
@@ -56,35 +68,28 @@ function travelDate(type: string, params: any): string {
 router.post("/", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findById(uid)
-      .select("sbtRole sbtAssignedBookerId customerId name email roles")
-      .lean() as any;
+    // The caller in the session's company (services/activeMembership.ts).
+    const am = await getActiveMembership(req);
+    const user = am?.user as any;
 
-    const userCustomerId = user?.customerId?.toString();
     const wsCustomerId = req.workspace?.customerId?.toString();
-    if (!user || userCustomerId !== wsCustomerId) {
+    if (!am || am.customerId !== wsCustomerId) {
       return res.status(403).json({ error: "Access denied", code: "WORKSPACE_MISMATCH" });
     }
 
-    const postRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
-    const isWLPost = postRoles.includes("WORKSPACELEADER");
+    const isWLPost = isActiveWorkspaceLeader(am);
 
-    if (!isWLPost && user.sbtRole !== "L1" && user.sbtRole !== "BOTH") {
+    if (!isWLPost && am.flags.sbtRole !== "L1" && am.flags.sbtRole !== "BOTH") {
       return res.status(403).json({ error: "SBT Requestor access required", code: "NOT_L1" });
     }
 
-    let assignedBookerId = user.sbtAssignedBookerId;
+    let assignedBookerId: any = am.flags.sbtAssignedBookerId;
 
-    // Auto-assign workspace leader as booker if none explicitly set
-    if (!assignedBookerId && user.customerId) {
-      const leader = await User.findOne({
-        customerId: user.customerId,
-        roles: { $in: ["WORKSPACE_LEADER"] },
-        _id: { $ne: uid }, // cannot be self
-      }).select("_id").lean() as any;
-
-      if (leader) {
-        assignedBookerId = leader._id;
+    // Auto-assign workspace leader as booker if none explicitly set (cannot be self)
+    if (!assignedBookerId && am.customerId) {
+      const leaderId = await findOtherWorkspaceLeader(am, uid);
+      if (leaderId) {
+        assignedBookerId = leaderId;
       }
     }
 
@@ -140,7 +145,7 @@ router.post("/", async (req: any, res: any) => {
     }
 
     const request = await SBTRequest.create({
-      customerId: user.customerId,
+      customerId: am.customerId,
       requesterId: uid,
       assignedBookerId,
       type,
@@ -224,22 +229,21 @@ router.post("/", async (req: any, res: any) => {
 router.get("/my", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findById(uid).select("sbtRole customerId roles").lean() as any;
+    const am = await getActiveMembership(req);
 
-    const myCustomerId = user?.customerId?.toString();
     const myWsCustomerId = req.workspace?.customerId?.toString();
-    if (!user || myCustomerId !== myWsCustomerId) {
+    if (!am || am.customerId !== myWsCustomerId) {
       return res.status(403).json({ error: "Access denied", code: "WORKSPACE_MISMATCH" });
     }
 
-    const myRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
-    const isWLMy = myRoles.includes("WORKSPACELEADER");
+    const isWLMy = isActiveWorkspaceLeader(am);
 
-    if (!isWLMy && (user.sbtRole !== "L1" && user.sbtRole !== "BOTH")) {
+    if (!isWLMy && (am.flags.sbtRole !== "L1" && am.flags.sbtRole !== "BOTH")) {
       return res.status(403).json({ error: "SBT Requestor access required", code: "NOT_L1" });
     }
 
-    const requests = await SBTRequest.find({ requesterId: uid })
+    // Someone in several companies sees only this company's requests.
+    const requests = await SBTRequest.find({ requesterId: uid, ...(await sessionWorkspaceScope(req)) })
       .populate("assignedBookerId", "name email")
       .sort({ requestedAt: -1 })
       .lean();
@@ -256,7 +260,7 @@ router.get("/my", async (req: any, res: any) => {
 router.delete("/:id/cancel", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const request = await SBTRequest.findOne({ _id: req.params.id, requesterId: uid });
+    const request = await SBTRequest.findOne({ _id: req.params.id, requesterId: uid, ...(await sessionWorkspaceScope(req)) });
 
     if (!request) return res.status(404).json({ error: "Request not found" });
     if (request.status !== "PENDING") {
@@ -284,18 +288,16 @@ router.delete("/:id/cancel", async (req: any, res: any) => {
 router.get("/inbox", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findById(uid).select("sbtRole roles customerId").lean() as any;
+    const am = await getActiveMembership(req);
 
-    const inboxUserCustomerId = user?.customerId?.toString();
     const inboxWsCustomerId = req.workspace?.customerId?.toString();
-    if (!user || inboxUserCustomerId !== inboxWsCustomerId) {
+    if (!am || am.customerId !== inboxWsCustomerId) {
       return res.status(403).json({ error: "Access denied", code: "WORKSPACE_MISMATCH" });
     }
 
-    const allRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
-    const isWL = allRoles.includes("WORKSPACELEADER");
+    const isWL = isActiveWorkspaceLeader(am);
 
-    if (user.sbtRole !== "L2" && user.sbtRole !== "BOTH" && !isWL) {
+    if (am.flags.sbtRole !== "L2" && am.flags.sbtRole !== "BOTH" && !isWL) {
       return res.status(403).json({ error: "SBT Booker access required", code: "NOT_L2" });
     }
 
@@ -309,8 +311,8 @@ router.get("/inbox", async (req: any, res: any) => {
 
     // Workspace Leader sees ALL company requests; L2/BOTH only see assigned
     const filter: any = isWL
-      ? { customerId: user.customerId, ...statusFilter }
-      : { assignedBookerId: uid, ...statusFilter };
+      ? { customerId: am.customerId, ...statusFilter }
+      : { assignedBookerId: uid, ...statusFilter, ...(await sessionWorkspaceScope(req)) };
 
     const requests = await SBTRequest.find(filter)
       .populate("requesterId", "name email")
@@ -325,9 +327,9 @@ router.get("/inbox", async (req: any, res: any) => {
     ] as string[];
 
     const inboxTidMap: Record<string, string> = {};
-    if (requesterEmails.length > 0 && user?.customerId) {
+    if (requesterEmails.length > 0 && am.customerId) {
       const memberDocs = await CustomerMember.find({
-        customerId: user.customerId,
+        customerId: am.customerId,
         email: { $in: requesterEmails },
       })
         .select("email travelerId")
@@ -365,9 +367,8 @@ router.get("/:id", async (req: any, res: any) => {
     const isBooker = String(request.assignedBookerId?._id || request.assignedBookerId) === uid;
 
     // Workspace Leader can view any request in their company
-    const detailUser = await User.findById(uid).select("roles customerId").lean() as any;
-    const detailRoles = (Array.isArray(detailUser?.roles) ? detailUser.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
-    const isWLDetail = detailRoles.includes("WORKSPACELEADER") && String(detailUser?.customerId) === String(request.customerId);
+    const am = await getActiveMembership(req);
+    const isWLDetail = isActiveWorkspaceLeader(am) && String(am?.customerId) === String(request.customerId);
 
     if (!isRequester && !isBooker && !isWLDetail) {
       return res.status(403).json({ error: "Access denied" });
@@ -400,24 +401,22 @@ router.post("/:id/book", (_req: any, res: any) => {
 router.post("/:id/reject", async (req: any, res: any) => {
   try {
     const uid = userId(req);
-    const user = await User.findById(uid).select("sbtRole roles customerId").lean() as any;
+    const am = await getActiveMembership(req);
 
-    const rejUserCustomerId = user?.customerId?.toString();
     const rejWsCustomerId = req.workspace?.customerId?.toString();
-    if (!user || rejUserCustomerId !== rejWsCustomerId) {
+    if (!am || am.customerId !== rejWsCustomerId) {
       return res.status(403).json({ error: "Access denied", code: "WORKSPACE_MISMATCH" });
     }
 
-    const rejRoles = (Array.isArray(user?.roles) ? user.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
-    const isWLReject = rejRoles.includes("WORKSPACELEADER");
+    const isWLReject = isActiveWorkspaceLeader(am);
 
-    if (!user || (user.sbtRole !== "L2" && user.sbtRole !== "BOTH" && !isWLReject)) {
+    if (am.flags.sbtRole !== "L2" && am.flags.sbtRole !== "BOTH" && !isWLReject) {
       return res.status(403).json({ error: "SBT Booker access required", code: "NOT_L2" });
     }
 
     const rejFilter: any = isWLReject
-      ? { _id: req.params.id, customerId: user.customerId, status: "PENDING" }
-      : { _id: req.params.id, assignedBookerId: uid, status: "PENDING" };
+      ? { _id: req.params.id, customerId: am.customerId, status: "PENDING" }
+      : { _id: req.params.id, assignedBookerId: uid, status: "PENDING", ...(await sessionWorkspaceScope(req)) };
 
     const request = await SBTRequest.findOne(rejFilter);
 

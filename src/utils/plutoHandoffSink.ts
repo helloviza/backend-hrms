@@ -12,6 +12,17 @@ import User from "../models/User.js";
 import { sendMail } from "./mailer.js";
 import { renderTripSummaryHtml } from "../services/conciergeHandoff.js";
 
+/**
+ * The legacy SBTRequest.customerId for a CustomerWorkspace: its customerId
+ * (a Customer._id — what the request inbox and the Workspace Leader checks
+ * compare), never the workspace's own _id (audit §7.2). Undefined when the
+ * workspace carries none, or one that is not an ObjectId (the field is one).
+ */
+export function legacyCustomerIdOf(workspace: any): string | undefined {
+  const cid = String(workspace?.customerId ?? "").trim();
+  return /^[a-fA-F0-9]{24}$/.test(cid) ? cid : undefined;
+}
+
 export interface HandoffDeliveryContext {
   workspaceObjectId: any;
   requesterId: any;
@@ -47,9 +58,11 @@ export async function sendHandoffPayload(
         .lean()) as any;
       if (approver) assignedBookerId = approver._id;
     }
-    if (!assignedBookerId) {
+    // User.customerId is a Customer._id. No customerId → no lookup: an
+    // undefined filter would match any company's leader.
+    if (!assignedBookerId && workspace.customerId) {
       const leader = (await User.findOne({
-        customerId: workspace._id,
+        customerId: String(workspace.customerId),
         roles: { $in: ["WORKSPACE_LEADER"] },
         _id: { $ne: ctx.requesterId },
       })
@@ -67,7 +80,7 @@ export async function sendHandoffPayload(
 
     const request = (await SBTRequest.create({
       workspaceId: ctx.workspaceObjectId,
-      customerId: workspace._id,
+      customerId: legacyCustomerIdOf(workspace),
       requesterId: ctx.requesterId,
       assignedBookerId,
       type: "flight",

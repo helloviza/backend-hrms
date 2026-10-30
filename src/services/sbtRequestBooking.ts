@@ -8,7 +8,7 @@
 //   markRequestBooked       PENDING → BOOKED, once, plus the itinerary and
 //                           trip-watch hooks the old direct route used to run
 import SBTRequest from "../models/SBTRequest.js";
-import User from "../models/User.js";
+import { getActiveMembership, isActiveWorkspaceLeader } from "./activeMembership.js";
 import { propagateItineraryBooked } from "./itineraryStatus.js";
 import { maybeCreateTripWatch } from "./tripWatchCreate.js";
 import { sbtLogger } from "../utils/logger.js";
@@ -22,7 +22,6 @@ export const REQUEST_NOT_BOOKABLE = {
 } as const;
 
 const isHexId = (v: unknown) => typeof v === "string" && /^[a-f0-9]{24}$/i.test(v);
-const norm = (r: unknown) => String(r || "").toUpperCase().replace(/[\s\-_]/g, "");
 
 /**
  * The PENDING request `requestId`, if the caller may book it: the request's
@@ -42,14 +41,14 @@ export async function bookableRequest(
     _id: requestId, workspaceId: req.workspaceObjectId, status: "PENDING", type: product,
   }).lean()) as AnyObj | null;
   if (!request) return null;
-  const user = (await User.findById(uid).select("sbtRole roles customerId").lean()) as AnyObj | null;
-  if (!user) return null;
+  // The caller in the session's company (services/activeMembership.ts).
+  const am = await getActiveMembership(req);
+  if (!am) return null;
   // The workspace filter above already scopes the request; the legacy customerId
   // must also agree when both sides carry it.
-  if (request.customerId && user.customerId && String(user.customerId) !== String(request.customerId)) return null;
-  const isWL = (Array.isArray(user.roles) ? user.roles : []).map(norm).includes("WORKSPACELEADER");
-  if (isWL) return request;
-  if (user.sbtRole !== "L2" && user.sbtRole !== "BOTH") return null;
+  if (request.customerId && am.customerId && String(am.customerId) !== String(request.customerId)) return null;
+  if (isActiveWorkspaceLeader(am)) return request;
+  if (am.flags.sbtRole !== "L2" && am.flags.sbtRole !== "BOTH") return null;
   return String(request.assignedBookerId ?? "") === uid ? request : null;
 }
 

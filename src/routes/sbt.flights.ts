@@ -7,6 +7,7 @@ import path from "path";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { getActiveMembership } from "../services/activeMembership.js";
 import { sbtLogger } from "../utils/logger.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTQuote from "../models/SBTQuote.js";
@@ -359,15 +360,16 @@ async function requireSBT(req: any, res: any, next: any) {
     const userId = req.user?.id || req.user?._id;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-    const user = await User.findById(userId).select("sbtEnabled customerId").lean();
+    // The caller in the session's company (services/activeMembership.ts).
+    const am = await getActiveMembership(req);
 
     const wsCustomerId = req.workspace?.customerId?.toString();
-    const userCustomerId = (user as any)?.customerId?.toString();
+    const userCustomerId = am?.customerId;
     if (wsCustomerId && userCustomerId && wsCustomerId !== userCustomerId) {
       return res.status(403).json({ error: "Access denied" });
     }
 
-    if (!user || !(user as any).sbtEnabled) {
+    if (!am || !am.flags.sbtEnabled) {
       return res.status(403).json({ error: "SBT access not enabled for this account" });
     }
     next();
@@ -381,17 +383,14 @@ async function requireFlightAccess(req: any, res: any, next: any) {
   try {
     if (isPrivilegedSBTUser(req)) return next();
 
-    const userId = req.user?.id || req.user?._id;
-    const user = await User.findById(userId)
-      .select("sbtBookingType customerId")
-      .lean();
+    const am = await getActiveMembership(req);
 
-    if (!user) return res.status(401).json({ error: "User not found" });
+    if (!am) return res.status(401).json({ error: "User not found" });
 
-    // Check user-level sbtBookingType
-    if ((user as any).sbtBookingType &&
-        (user as any).sbtBookingType !== "flight" &&
-        (user as any).sbtBookingType !== "both") {
+    // Check user-level sbtBookingType (in the session's company)
+    if (am.flags.sbtBookingType &&
+        am.flags.sbtBookingType !== "flight" &&
+        am.flags.sbtBookingType !== "both") {
       return res.status(403).json({
         error: "Flight booking not permitted for your account",
         code: "FLIGHT_ACCESS_DENIED",
@@ -399,8 +398,8 @@ async function requireFlightAccess(req: any, res: any, next: any) {
     }
 
     // Check workspace-level travelMode
-    if ((user as any).customerId) {
-      const workspace = await CustomerWorkspace.findOne({ customerId: (user as any).customerId })
+    if (am.customerId) {
+      const workspace = await CustomerWorkspace.findOne({ customerId: am.customerId })
         .select("travelMode")
         .lean();
 

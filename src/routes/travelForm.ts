@@ -2,6 +2,7 @@ import express from "express";
 import mongoose from "mongoose";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { getActiveMembership } from "../services/activeMembership.js";
 import User from "../models/User.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
@@ -33,13 +34,14 @@ async function requireSBT(req: any, res: any, next: any) {
     if (isPrivileged(req)) return next();
     const userId = req.user?.id || req.user?._id;
     if (!userId) return res.status(401).json({ error: "Unauthorized" });
-    const user = await User.findById(userId).select("sbtEnabled customerId").lean();
+    // The caller in the session's company (services/activeMembership.ts).
+    const am = await getActiveMembership(req);
     const wsCustomerId = req.workspace?.customerId?.toString();
-    const userCustomerId = (user as any)?.customerId?.toString();
+    const userCustomerId = am?.customerId;
     if (wsCustomerId && userCustomerId && wsCustomerId !== userCustomerId) {
       return res.status(403).json({ error: "Access denied" });
     }
-    if (!user || !(user as any).sbtEnabled) {
+    if (!am || !am.flags.sbtEnabled) {
       return res.status(403).json({ error: "SBT access not enabled for this account" });
     }
     next();
