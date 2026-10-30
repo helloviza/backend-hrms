@@ -75,7 +75,9 @@ import TravellerProfile from "../models/TravellerProfile.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
 import User from "../models/User.js";
-import { isCustomerUser } from "../middleware/requireWorkspace.js";
+import WorkspaceMembership from "../models/WorkspaceMembership.js";
+import { isCustomerUser, membershipSessionEnabled } from "../middleware/requireWorkspace.js";
+import { isOwnCompany } from "./activeMembership.js";
 import logger from "../utils/logger.js";
 import { logVisaActivity } from "../models/VisaActivityLog.js";
 import { computeVisaFeeBlock, VISA_GST_PERCENT } from "../utils/visaFee.js";
@@ -170,7 +172,10 @@ interface BillingContext {
  *      their own User.customerId (or its businessId alias) resolves to a
  *      real, still-existing Customer. This names one specific person and
  *      is unambiguous by construction — it never depends on how many other
- *      Customers happen to share the same workspace.
+ *      Customers happen to share the same workspace. When the user raised it
+ *      from a SECOND company (company switcher: their WorkspaceMembership of
+ *      the application's workspace is not their User document's company),
+ *      that membership's customerId stands in for User.customerId.
  *
  *   2. CustomerWorkspace.customerId, but ONLY when that workspace is
  *      genuinely 1:1 — exactly one Customer has workspaceId pointing at
@@ -194,7 +199,18 @@ async function resolveBillingCustomer(application: any, request: any): Promise<C
     : null;
 
   if (raisingUser && isCustomerUser(raisingUser)) {
-    const candidateId = (raisingUser as any).customerId || (raisingUser as any).businessId;
+    // Company switcher Phase 3c: raised from a SECOND company (the user's
+    // membership of the application's workspace is not the company their User
+    // document describes) — bill that company, never the User document's.
+    const second: any = membershipSessionEnabled() && application?.workspaceId
+      ? await WorkspaceMembership.findOne({ userId: (raisingUser as any)._id, workspaceId: application.workspaceId })
+          .select("customerId isDefault")
+          .lean()
+      : null;
+    const own = { customerId: (raisingUser as any).customerId || (raisingUser as any).businessId };
+    const candidateId = second && !isOwnCompany(second, own)
+      ? second.customerId
+      : (raisingUser as any).customerId || (raisingUser as any).businessId;
     if (candidateId && mongoose.isValidObjectId(candidateId)) {
       const customer = await Customer.findById(candidateId).select("_id").lean();
       if (customer) {

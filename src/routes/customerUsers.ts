@@ -24,6 +24,14 @@ import { parseCsv as parseCsvRaw } from "../utils/csv.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import { isHouseUser, isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
 import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
+import WorkspaceMembership from "../models/WorkspaceMembership.js";
+import { clearMembershipCache, MEMBERSHIP_REVOKED_BODY } from "../middleware/requireWorkspace.js";
+import {
+  isActiveWorkspaceLeader,
+  secondCompanyMembers,
+  secondCompanyMembership,
+  sessionCompany,
+} from "../services/activeMembership.js";
 
 const router = Router();
 
@@ -630,6 +638,12 @@ async function resolveCustomerId(req: any): Promise<string | null> {
     return c || null;
   }
 
+  // Company switcher Phase 3c: a session in a SECOND company manages that
+  // company; a revoked one manages none. Own company: unchanged below.
+  const sc = await sessionCompany(req);
+  if (sc.kind === "second") return sc.am.customerId || null;
+  if (sc.kind === "revoked") return null;
+
   const cidFromToken = normStr(actor.customerId) || normStr(actor.businessId);
   if (cidFromToken) return cidFromToken;
 
@@ -689,6 +703,42 @@ async function resolveCustomerId(req: any): Promise<string | null> {
   }
 
   return null;
+}
+
+/**
+ * Company switcher Phase 3c — the caller as a Workspace Leader for the
+ * WL-gated routes below. Own company (or a legacy token): the token's global
+ * roles and customerId, exactly as before. A SECOND company: that
+ * membership's roles and the session workspace's customerId. null = the
+ * second-company session was revoked (answer 401).
+ */
+async function leaderScope(
+  req: any,
+  actorRoles: string[],
+): Promise<{ isLeader: boolean; customerId: string; workspaceId: string | null } | null> {
+  const sc = await sessionCompany(req);
+  if (sc.kind === "revoked") return null;
+  if (sc.kind === "second") {
+    return {
+      isLeader: isActiveWorkspaceLeader(sc.am),
+      customerId: String(sc.am.customerId || ""),
+      workspaceId: sc.am.workspaceId ? String(sc.am.workspaceId) : null,
+    };
+  }
+  const actor = req.user || {};
+  return {
+    isLeader: actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r)),
+    customerId: String(actor.customerId || actor.businessId || ""),
+    workspaceId: null,
+  };
+}
+
+/** The CustomerWorkspace _id of a company (for its second-company members). */
+async function workspaceIdOf(scope: { customerId: string; workspaceId: string | null }): Promise<string | null> {
+  if (scope.workspaceId) return scope.workspaceId;
+  if (!scope.customerId) return null;
+  const ws: any = await CustomerWorkspace.findOne({ customerId: scope.customerId }).select("_id").lean();
+  return ws?._id ? String(ws._id) : null;
 }
 
 /* =========================================================
@@ -1509,6 +1559,12 @@ router.get("/", requireAuth, async (req: any, res) => {
           hrmsAccessRole: u.hrmsAccessRole || null,
         };
       }
+    }
+    // Company switcher Phase 3c: a member who joined this company as a second
+    // company shows that membership's SBT flags, not their User document's.
+    for (const { user: u, membership: m } of await secondCompanyMembers(ws?._id)) {
+      const e = normEmail(u.email);
+      if (userLookup[e]) userLookup[e] = { ...userLookup[e], sbtEnabled: m.flags?.sbtEnabled === true, sbtRole: m.flags?.sbtRole || null };
     }
     const rows = rawRows.map((r: any) => {
       const lu = userLookup[normEmail(r.email)];
@@ -2493,7 +2549,9 @@ router.get("/workspace/available-bookers", requireAuth, async (req: any, res: an
     const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role])
       .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
     const isAdmin = isPlatformStaff(req) && actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
-    const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
+    const scope = await leaderScope(req, actorRoles);
+    if (!scope) return res.status(401).json(MEMBERSHIP_REVOKED_BODY);
+    const isLeader = scope.isLeader;
 
     if (!isAdmin && !isLeader) {
       return res.status(403).json({ error: "Access denied" });
@@ -2501,7 +2559,7 @@ router.get("/workspace/available-bookers", requireAuth, async (req: any, res: an
 
     let customerId = "";
     if (isLeader && !isAdmin) {
-      customerId = String(actor.customerId || actor.businessId || "");
+      customerId = scope.customerId;
       if (!customerId) return res.status(403).json({ error: "No workspace linked to your account" });
     } else {
       customerId = String(req.query.customerId || "").trim();
@@ -2518,6 +2576,18 @@ router.get("/workspace/available-bookers", requireAuth, async (req: any, res: an
     })
       .select("name email sbtRole roles")
       .lean();
+
+    // Company switcher Phase 3c: people who joined this company as a second
+    // company qualify on that membership's sbtRole / roles.
+    const seen = new Set(users.map((u: any) => String(u._id)));
+    for (const { user: u, membership: m } of await secondCompanyMembers(
+      await workspaceIdOf({ customerId, workspaceId: isLeader && !isAdmin ? scope.workspaceId : null }),
+    )) {
+      if (seen.has(String(u._id))) continue;
+      const sbtRole = m.flags?.sbtRole ?? null;
+      const leader = (m.roles || []).includes("WORKSPACE_LEADER");
+      if (sbtRole === "L2" || sbtRole === "BOTH" || leader) (users as any[]).push({ _id: u._id, name: u.name, email: u.email, sbtRole, roles: m.roles || [] });
+    }
 
     const bookers = users.map((u: any) => {
       const uRoles = (Array.isArray(u.roles) ? u.roles : []).map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, ""));
@@ -2546,7 +2616,9 @@ router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => 
     const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role])
       .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
     const isAdmin = isPlatformStaff(req) && actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
-    const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
+    const scope = await leaderScope(req, actorRoles);
+    if (!scope) return res.status(401).json(MEMBERSHIP_REVOKED_BODY);
+    const isLeader = scope.isLeader;
 
     if (!isAdmin && !isLeader) {
       return res.status(403).json({ error: "Access denied" });
@@ -2555,7 +2627,7 @@ router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => 
     let customerId = "";
 
     if (isLeader && !isAdmin) {
-      customerId = String(actor.customerId || actor.businessId || "");
+      customerId = scope.customerId;
       if (!customerId) return res.status(403).json({ error: "No workspace linked to your account" });
     } else {
       customerId = String(req.query.customerId || "").trim();
@@ -2590,6 +2662,31 @@ router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => 
       };
     });
 
+    // Company switcher Phase 3c: people who joined this company as a second
+    // company, with that membership's role and flags (their User document
+    // describes another company).
+    const listed = new Set(rows.map((r: any) => String(r._id)));
+    for (const { user: u, membership: m } of await secondCompanyMembers(
+      ws?._id ? String(ws._id) : await workspaceIdOf({ customerId, workspaceId: null }),
+    )) {
+      if (listed.has(String(u._id))) continue;
+      const f = m.flags || {};
+      rows.push({
+        _id: u._id,
+        name: u.name || "",
+        email: u.email || "",
+        role: resolveMemberRole(memberRoleMap, u.email, m.roles, m.memberRole),
+        isActive: true,
+        sbtEnabled: f.sbtEnabled ?? false,
+        sbtRole: f.sbtRole || null,
+        sbtAssignedBookerId: f.sbtAssignedBookerId || null,
+        canRaiseRequest: f.canRaiseRequest ?? true,
+        canViewBilling: f.canViewBilling ?? false,
+        canManageUsers: f.canManageUsers ?? false,
+        isWorkspaceLeader: memberRoleMap.get(u.email) === "WORKSPACE_LEADER" || (m.roles || []).includes("WORKSPACE_LEADER"),
+      });
+    }
+
     res.json({
       workspace: {
         customerId,
@@ -2604,6 +2701,81 @@ router.get("/workspace/permissions", requireAuth, async (req: any, res: any) => 
     res.status(500).json({ error: "Failed to load permissions", detail: err?.message });
   }
 });
+
+/**
+ * Company switcher Phase 3c — PATCH /workspace/permissions/:userId for a
+ * target who joined the leader's company as a second company. The same rules
+ * as the User-document path below, applied to that membership's flags: the
+ * company's travel mode, the booker's company, sbtEnabled ⇄ canRaiseRequest.
+ */
+async function patchSecondCompanyPermission(
+  req: any,
+  res: any,
+  x: { actor: any; permission: string; value: any; targetMembership: any; customerId: string },
+) {
+  const { permission, value, targetMembership: tm } = x;
+  const ws: any = await CustomerWorkspace.findById(tm.workspaceId).select("travelMode").lean();
+  if (permission === "sbtEnabled" && value === true && ws?.travelMode === "APPROVAL_FLOW") {
+    return res.status(409).json({
+      error: "Cannot enable SBT. Company uses approval flow.",
+      code: "APPROVAL_FLOW_CONFLICT",
+    });
+  }
+
+  const $set: any = {};
+  if (permission === "sbtAssignedBookerId") {
+    if (value) {
+      if (String(value) === String(req.params.userId)) {
+        return res.status(400).json({ error: "Cannot assign user as their own booker" });
+      }
+      const booker: any = await User.findOne({ _id: value }).select("sbtRole customerId roles").lean();
+      if (!booker) return res.status(400).json({ error: "Assigned booker user not found" });
+      // The booker's role and company in THIS company: their User document
+      // when it is this company, else their membership of it.
+      const bm = String(booker.customerId || "") === x.customerId ? null : await secondCompanyMembership(booker, tm.workspaceId);
+      if (String(booker.customerId || "") !== x.customerId && !bm) {
+        return res.status(400).json({ error: "Assigned booker must belong to the same company" });
+      }
+      const bRole = bm ? bm.flags?.sbtRole : booker.sbtRole;
+      const bRoles = (bm ? bm.roles : booker.roles) || [];
+      const bIsWL = bRoles.map((r: any) => String(r || "").toUpperCase().replace(/[\s\-_]/g, "")).includes("WORKSPACELEADER");
+      if (bRole !== "L2" && bRole !== "BOTH" && !bIsWL) {
+        return res.status(400).json({ error: "Assigned booker must have SBT role L2 or BOTH, or be a Workspace Leader" });
+      }
+      $set["flags.sbtAssignedBookerId"] = value;
+    } else {
+      $set["flags.sbtAssignedBookerId"] = null;
+    }
+  } else if (permission === "sbtRole") {
+    $set["flags.sbtRole"] = value;
+    if (value === "L2" || value === null) $set["flags.sbtAssignedBookerId"] = null;
+  } else {
+    $set[`flags.${permission}`] = value;
+    if (permission === "sbtEnabled" && value === true) $set["flags.canRaiseRequest"] = false;
+    if (permission === "sbtEnabled" && value === false) $set["flags.canRaiseRequest"] = true;
+  }
+
+  const updated: any = await WorkspaceMembership.findByIdAndUpdate(tm._id, { $set }, { new: true }).select("flags").lean();
+  clearMembershipCache(String(tm._id));
+
+  console.info("Permission changed", {
+    changedBy: String(x.actor.sub || x.actor.id || x.actor._id || x.actor.email || ""),
+    targetUserId: req.params.userId,
+    membershipId: String(tm._id),
+    permission,
+    value,
+  });
+
+  const f = updated?.flags || {};
+  return res.json({
+    sbtEnabled: f.sbtEnabled ?? false,
+    sbtRole: f.sbtRole || null,
+    sbtAssignedBookerId: f.sbtAssignedBookerId || null,
+    canRaiseRequest: f.canRaiseRequest ?? true,
+    canViewBilling: f.canViewBilling ?? false,
+    canManageUsers: f.canManageUsers ?? false,
+  });
+}
 
 /* =========================================================
  * PATCH /workspace/permissions/:userId — toggle a single permission
@@ -2620,7 +2792,9 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
     const actorRoles = (Array.isArray(actor.roles) ? actor.roles : [actor.role])
       .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
     const isAdmin = isPlatformStaff(req) && actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
-    const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
+    const scope = await leaderScope(req, actorRoles);
+    if (!scope) return res.status(401).json(MEMBERSHIP_REVOKED_BODY);
+    const isLeader = scope.isLeader;
 
     if (!isAdmin && !isLeader) {
       return res.status(403).json({ error: "Access denied" });
@@ -2654,11 +2828,19 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
       .lean();
     if (!targetUser) return res.status(404).json({ error: "User not found" });
 
+    // Company switcher Phase 3c: a target who joined the leader's company as a
+    // SECOND company is managed there — on that membership, never on their
+    // User document (which holds another company's settings).
+    let targetMembership: any = null;
+
     // WORKSPACE_LEADER scoped checks
     if (isLeader && !isAdmin) {
-      const actorCustomerId = String(actor.customerId || actor.businessId || "");
+      const actorCustomerId = scope.customerId;
       const targetCustomerId = String(targetUser.customerId || "");
-      if (!actorCustomerId || actorCustomerId !== targetCustomerId) {
+      if (actorCustomerId && actorCustomerId !== targetCustomerId) {
+        targetMembership = await secondCompanyMembership(targetUser, await workspaceIdOf(scope));
+      }
+      if (!actorCustomerId || (actorCustomerId !== targetCustomerId && !targetMembership)) {
         return res.status(403).json({ error: "You can only manage users in your own company" });
       }
 
@@ -2677,6 +2859,10 @@ router.patch("/workspace/permissions/:userId", requireAuth, async (req: any, res
       if (targetRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r))) {
         return res.status(403).json({ error: "Cannot modify permissions for admin/HR users" });
       }
+    }
+
+    if (targetMembership) {
+      return patchSecondCompanyPermission(req, res, { actor, permission, value, targetMembership, customerId: scope.customerId });
     }
 
     // If enabling SBT, check travelMode conflict
@@ -2775,7 +2961,11 @@ router.post("/workspace/invite", requireAuth, async (req: any, res: any) => {
       .map((r: any) => String(r || "").trim().toUpperCase().replace(/[\s\-_]/g, ""));
 
     const isAdmin = isPlatformStaff(req) && callerRoles.some((r) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
-    const isLeader = callerRoles.some((r) => r === "WORKSPACELEADER");
+    // Company switcher Phase 3c: in a SECOND company, leadership and "own
+    // workspace" are that membership's; own company reads the User as before.
+    const sc = await sessionCompany(req);
+    if (sc.kind === "revoked") return res.status(401).json(MEMBERSHIP_REVOKED_BODY);
+    const isLeader = sc.kind === "second" ? isActiveWorkspaceLeader(sc.am) : callerRoles.some((r) => r === "WORKSPACELEADER");
 
     if (!isAdmin && !isLeader) {
       return res.status(403).json({ error: "Not authorized" });
@@ -2783,8 +2973,10 @@ router.post("/workspace/invite", requireAuth, async (req: any, res: any) => {
 
     // WORKSPACE_LEADER may only invite into their own workspace
     if (isLeader && !isAdmin) {
-      const callerDoc: any = await User.findById(req.user._id || req.user.id, "customerId").lean();
-      if (String(callerDoc?.customerId) !== String(customerId)) {
+      const ownCustomerId = sc.kind === "second"
+        ? sc.am.customerId
+        : (await User.findById(req.user._id || req.user.id, "customerId").lean() as any)?.customerId;
+      if (String(ownCustomerId) !== String(customerId)) {
         return res.status(403).json({ error: "Cannot manage other workspaces" });
       }
     }

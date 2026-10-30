@@ -3,7 +3,9 @@ import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requireAdmin } from "../middleware/rbac.js";
 import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
-import { requireWorkspace, isCustomerUser } from "../middleware/requireWorkspace.js";
+import { requireWorkspace, isCustomerUser, MEMBERSHIP_REVOKED_BODY } from "../middleware/requireWorkspace.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { secondCompanyMembers, sessionCompany } from "../services/activeMembership.js";
 import { requireRoles } from "../middleware/roles.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import Customer from "../models/Customer.js";
@@ -170,8 +172,15 @@ router.get("/account-team", requireAuth, async (req: any, res, next) => {
  */
 router.get("/workspace-members", requireAuth, async (req: any, res) => {
   try {
+    // Company switcher Phase 3c: a session in a SECOND company lists that
+    // company's members; own company reads the User document as before.
+    const sc = await sessionCompany(req);
+    if (sc.kind === "revoked") return res.status(401).json(MEMBERSHIP_REVOKED_BODY);
+
     const userId = String(req.user._id || req.user.id);
-    const user = await User.findById(userId, "customerId workspaceId").lean() as any;
+    const user = sc.kind === "second"
+      ? { customerId: sc.am.customerId }
+      : await User.findById(userId, "customerId workspaceId").lean() as any;
 
     if (!user?.customerId) {
       return res.json({ ok: true, members: [] });
@@ -198,6 +207,23 @@ router.get("/workspace-members", requireAuth, async (req: any, res) => {
       role: resolveMemberRole(roleMap, m.email, m.roles, m.role),
       bandNumber: m.bandNumber ?? null,
     }));
+
+    // Plus people who joined this company as a second company (their User
+    // document describes another one), with that membership's role and band.
+    const wsId = sc.kind === "second"
+      ? sc.am.workspaceId
+      : ((await CustomerWorkspace.findOne({ customerId: String(user.customerId) }).select("_id").lean()) as any)?._id;
+    const listed = new Set(mapped.map((m) => m.userId));
+    for (const { user: u, membership: m } of await secondCompanyMembers(wsId)) {
+      if (listed.has(String(u._id))) continue;
+      mapped.push({
+        userId: String(u._id),
+        name: u.name || `${u.firstName || ""} ${u.lastName || ""}`.trim() || u.email,
+        email: u.email,
+        role: resolveMemberRole(roleMap, u.email, m.roles, m.memberRole),
+        bandNumber: m.flags?.bandNumber ?? null,
+      });
+    }
 
     return res.json({ ok: true, members: mapped });
   } catch {

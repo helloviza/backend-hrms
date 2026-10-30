@@ -6,6 +6,7 @@
 // routes/invoices.ts; mount it after requireAuth + requireWorkspace.
 import type { Request, Response, NextFunction } from "express";
 import User from "../models/User.js";
+import { getActiveMembership, isActiveWorkspaceLeader } from "../services/activeMembership.js";
 
 /* Same shape as admin.billing.ts's requireAdminOrSBT (role detection +
  * workspace-ownership check + canViewBilling gate) — this is the invoice
@@ -27,8 +28,26 @@ export async function requireInvoiceAccess(req: Request, res: Response, next: Ne
     ...(Array.isArray(user?.roles) ? user.roles : []),
     ...(user?.role ? [user.role] : []),
   ].map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""));
-
   const adminRoles = ["ADMIN", "SUPERADMIN", "HR", "HRADMIN", "OPS"];
+
+  // Company switcher Phase 3c: in a SECOND company the admin roles, Workspace
+  // Leader and canViewBilling are that company's membership values, not the
+  // login's global roles or the User document (another company). Own
+  // company: below, unchanged.
+  const am = user?.mid ? await getActiveMembership(req) : null;
+  if (am?.source === "membership") {
+    const leader =
+      isActiveWorkspaceLeader(am) ||
+      String(am.memberRole || "").toUpperCase().replace(/[\s_-]/g, "") === "WORKSPACELEADER";
+    const memberRoles = am.roles.map((r) => String(r).toUpperCase().replace(/[\s_-]/g, ""));
+    if (memberRoles.some((r) => adminRoles.includes(r))) return next();
+    if (leader || am.flags.canViewBilling === true) return next();
+    return res.status(403).json({
+      error: "Billing access not enabled for your account.",
+      code: "BILLING_ACCESS_DENIED",
+    });
+  }
+
   if (roles.some((r) => adminRoles.includes(r))) return next();
 
   const isWL =

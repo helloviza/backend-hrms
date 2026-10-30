@@ -5,7 +5,9 @@ import { Onboarding } from "../models/Onboarding.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import { requireRoles } from "../middleware/roles.js";
-import { requireWorkspace } from "../middleware/requireWorkspace.js";
+import { clearMembershipCache, requireWorkspace } from "../middleware/requireWorkspace.js";
+import WorkspaceMembership from "../models/WorkspaceMembership.js";
+import { getActiveMembership, isActiveWorkspaceLeader, secondCompanyMembership } from "../services/activeMembership.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { isPlatformStaff, roleAssignmentRefusal } from "../middleware/requirePlatformAdmin.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
@@ -661,7 +663,13 @@ r.patch("/admin/users/:id/sbt", requireAuth, requireWorkspace, async (req: any, 
     // The "anyone" branch is Plumtrips staff only: a customer company's own
     // ADMIN / HR falls to the leader rules below (own company only).
     const isAdmin = isPlatformStaff(req) && actorRoles.some((r: string) => ["ADMIN", "SUPERADMIN", "HR"].includes(r));
-    const isLeader = actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
+    // Company switcher Phase 3c: in a SECOND company, leadership and the
+    // caller's company are that membership's; own company reads as before.
+    const am = actor.mid ? await getActiveMembership(req) : null;
+    const second = am?.source === "membership" ? am : null;
+    const isLeader = second
+      ? isActiveWorkspaceLeader(second)
+      : actorRoles.some((r: string) => ["WORKSPACELEADER", "WORKSPACE_LEADER"].includes(r));
 
     if (!isAdmin && !isLeader) {
       return res.status(403).json({ error: "Access denied" });
@@ -674,13 +682,20 @@ r.patch("/admin/users/:id/sbt", requireAuth, requireWorkspace, async (req: any, 
     const targetUser: any = await User.findById(req.params.id).lean();
     if (!targetUser) return res.status(404).json({ error: "User not found" });
 
+    // A target who joined the leader's company as a SECOND company is managed
+    // on that membership, never on their User document (another company's).
+    let targetMembership: any = null;
+
     // Step 2: authorization check for WORKSPACE_LEADER callers
     if (isLeader && !isAdmin) {
-      const actorCustomerId = String(actor.customerId || actor.businessId || "");
+      const actorCustomerId = second ? String(second.customerId || "") : String(actor.customerId || actor.businessId || "");
       const targetCustomerId = String(targetUser.customerId || "");
+      if (actorCustomerId && actorCustomerId !== targetCustomerId) {
+        targetMembership = await secondCompanyMembership(targetUser, req.workspaceObjectId);
+      }
 
       // Cannot modify users outside their own company
-      if (!actorCustomerId || actorCustomerId !== targetCustomerId) {
+      if (!actorCustomerId || (actorCustomerId !== targetCustomerId && !targetMembership)) {
         return res.status(403).json({ error: "You can only manage users in your own company" });
       }
 
@@ -697,6 +712,33 @@ r.patch("/admin/users/:id/sbt", requireAuth, requireWorkspace, async (req: any, 
       }
     }
     // Staff admins (ADMIN/SUPERADMIN/HR) can update anyone — no additional check needed
+
+    if (targetMembership) {
+      if (sbtEnabled) {
+        const ws: any = await CustomerWorkspace.findById(targetMembership.workspaceId).select("travelMode").lean();
+        if (ws?.travelMode === "APPROVAL_FLOW") {
+          return res.status(409).json({
+            error: "Cannot enable SBT for this user. Company travel mode is set to Approval Flow.",
+            code: "APPROVAL_FLOW_CONFLICT",
+          });
+        }
+      }
+      const $set: any = {};
+      if (sbtEnabled !== undefined) $set["flags.sbtEnabled"] = sbtEnabled;
+      if (sbtBookingType !== undefined) $set["flags.sbtBookingType"] = sbtBookingType;
+      const m: any = await WorkspaceMembership.findByIdAndUpdate(targetMembership._id, { $set }, { new: true }).select("flags").lean();
+      clearMembershipCache(String(targetMembership._id));
+      return res.json({
+        success: true,
+        user: {
+          _id: targetUser._id,
+          name: targetUser.name,
+          email: targetUser.email,
+          sbtEnabled: m?.flags?.sbtEnabled,
+          sbtBookingType: m?.flags?.sbtBookingType,
+        },
+      });
+    }
 
     // If enabling SBT, check workspace travelMode for conflicts
     if (sbtEnabled) {

@@ -14,6 +14,7 @@ import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { isHouseUser, isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
+import { sessionCompany } from "../services/activeMembership.js";
 
 const router = express.Router();
 
@@ -237,6 +238,26 @@ async function resolveWorkspaceScope(user: AnyObj, req: AnyObj): Promise<Resolve
       reason: "query:customerId(no-workspace)",
       debug: { staff: true, queryCustomerId: qCustomerId },
     };
+  }
+
+  // Company switcher Phase 3c: a session in a SECOND company is scoped to that
+  // company (not the token's / User's customerId or the latest CustomerMember);
+  // a revoked one gets no company. Own company: steps 1–5, unchanged.
+  const session = await sessionCompany(req);
+  if (session.kind === "second" && session.am.customerId) {
+    const cid = session.am.customerId;
+    return {
+      scopeType: "CUSTOMER",
+      scopeId: cid,
+      customerId: cid,
+      memberRole: session.am.memberRole || undefined,
+      workspaceMeta: (await loadWorkspaceMeta(cid)) || undefined,
+      reason: "session:membership",
+      debug: { workspaceId: String(session.am.workspaceId || "") },
+    };
+  }
+  if (session.kind !== "own") {
+    return { scopeType: "USER", scopeId: safeStr(pickFrom(user, ["sub", "id", "_id"])) || "unknown", reason: "session:membership-revoked" };
   }
 
   // 1) Token-based workspace references (customerId/businessId/workspaceId)

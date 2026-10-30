@@ -33,8 +33,9 @@
 import mongoose from "mongoose";
 import User from "../models/User.js";
 import WorkspaceMembership from "../models/WorkspaceMembership.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
-import { loadSessionMembership, membershipSessionEnabled } from "../middleware/requireWorkspace.js";
+import { loadSessionMembership, membershipSessionEnabled, resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 
 export type ActiveMembershipFlags = {
   sbtEnabled?: boolean;
@@ -92,7 +93,7 @@ function fromUser(req: any, u: any): ActiveMembership {
 }
 
 /** Is this membership the company the User document already describes? */
-function isOwnCompany(m: any, u: any): boolean {
+export function isOwnCompany(m: any, u: any): boolean {
   const userCustomerId = str(u.customerId);
   if (userCustomerId) return str(m.customerId) === userCustomerId;
   return m.isDefault === true;
@@ -107,12 +108,16 @@ async function resolve(req: any): Promise<ActiveMembership | null> {
   const m = await loadSessionMembership(req.user);
   if (!m || str(m.workspaceId) !== str(req.workspaceObjectId) || isOwnCompany(m, u)) return fromUser(req, u);
 
+  // The active workspace's customerId, never the User's (§7.2 design rule).
+  return fromMembership(u, m, req.workspaceObjectId ?? null, str(req.workspace?.customerId) || str(m.customerId) || undefined);
+}
+
+function fromMembership(u: any, m: any, workspaceId: any, customerId: string | undefined): ActiveMembership {
   const f = m.flags || {};
   return {
     source: "membership",
-    workspaceId: req.workspaceObjectId ?? null,
-    // The active workspace's customerId, never the User's (§7.2 design rule).
-    customerId: str(req.workspace?.customerId) || str(m.customerId) || undefined,
+    workspaceId,
+    customerId,
     roles: Array.isArray(m.roles) ? m.roles : [],
     memberRole: m.memberRole ?? null,
     flags: {
@@ -181,4 +186,124 @@ export async function findOtherWorkspaceLeader(am: ActiveMembership, excludeUser
     userId: { $ne: excludeUserId },
   }).select("userId").lean();
   return m?.userId ?? null;
+}
+
+/**
+ * Workspace Leader in the session's company: a second company reads its
+ * membership's roles; the User's own company keeps the token's roles, exactly
+ * as the routes read them before (Phase 3b, approvals routing).
+ */
+export async function actsAsWorkspaceLeader(req: any): Promise<boolean> {
+  // Only a membership session (mid) can be in a second company.
+  const am = req.user?.mid ? await getActiveMembership(req) : null;
+  if (am?.source === "membership") return isActiveWorkspaceLeader(am);
+  return (Array.isArray(req.user?.roles) ? req.user.roles : [])
+    .map((r: unknown) => str(r).toUpperCase().replace(/[\s\-_]/g, ""))
+    .includes("WORKSPACELEADER");
+}
+
+/**
+ * The session's company as the ids an ApprovalRequest.customerId may hold:
+ * the workspace's customerId and (older rows) the workspace _id. Empty when no
+ * workspace resolves — callers then match nothing. Memoised on the request.
+ */
+export async function sessionCompanyIds(req: any): Promise<string[]> {
+  if (!req._sessionCompanyIds) {
+    req._sessionCompanyIds = (async () => {
+      let ws: any = req.workspace?._id ? req.workspace : null;
+      if (!ws && req.workspaceObjectId) ws = await CustomerWorkspace.findById(req.workspaceObjectId).select("_id customerId").lean();
+      if (!ws) ws = await resolveWorkspaceForUser(req.user, "_id customerId");
+      return ws?._id ? [str(ws.customerId), str(ws._id)].filter(Boolean) : [];
+    })();
+  }
+  return req._sessionCompanyIds;
+}
+
+/* ── Phase 3c: routers that do not run requireWorkspace ─────────────
+ * Customer admin (customerUsers.ts), workspace config (workspace.ts),
+ * /customers/workspace-members and notifications resolve the company
+ * themselves from token claims and the User document. sessionCompany(req)
+ * tells them whether this session is in a SECOND company:
+ *
+ *   own      no mid, switch off, SuperAdmin, or the membership of the company
+ *            the User document describes — the route keeps today's code.
+ *   second   the token's mid is the live session for a second company; `am`
+ *            carries that company's workspaceId, customerId, roles and flags.
+ *   revoked  the mid names a second-company membership that is no longer the
+ *            live session (suspended, removed, token version bumped, workspace
+ *            inactive) — refuse rather than fall back to the User's company.
+ * Memoised on the request.
+ */
+export type SessionCompany =
+  | { kind: "own" }
+  | { kind: "second"; am: ActiveMembership }
+  | { kind: "revoked" };
+
+const OWN: SessionCompany = { kind: "own" };
+const REVOKED: SessionCompany = { kind: "revoked" };
+
+async function resolveSessionCompany(req: any): Promise<SessionCompany> {
+  const claims = req.user;
+  if (!claims?.mid || !membershipSessionEnabled() || isSuperAdmin(req)) return OWN;
+
+  // requireWorkspace already ran (and refused a dead membership).
+  if (req.workspaceObjectId) {
+    const am = await getActiveMembership(req);
+    return am?.source === "membership" ? { kind: "second", am } : OWN;
+  }
+
+  const u: any = await User.findById(callerId(req)).select(USER_SELECT).lean();
+  if (!u) return OWN;
+  const live = await loadSessionMembership(claims);
+  if (live) {
+    if (isOwnCompany(live, u)) return OWN;
+    const ws: any = await CustomerWorkspace.findById(live.workspaceId).select("_id customerId status").lean();
+    if (!ws || ws.status !== "ACTIVE") return REVOKED;
+    return { kind: "second", am: fromMembership(u, live, ws._id, str(ws.customerId) || str(live.customerId) || undefined) };
+  }
+  // Not live: refuse only when it named a second company. A one-company
+  // user's stale token is answered exactly as before on these routers.
+  const mid = str(claims.mid);
+  const raw: any = mongoose.isValidObjectId(mid)
+    ? await WorkspaceMembership.findById(mid).select("userId customerId isDefault").lean()
+    : null;
+  return raw && str(raw.userId) === str(u._id) && !isOwnCompany(raw, u) ? REVOKED : OWN;
+}
+
+export async function sessionCompany(req: any): Promise<SessionCompany> {
+  if (!req._sessionCompany) req._sessionCompany = resolveSessionCompany(req);
+  return req._sessionCompany;
+}
+
+/**
+ * `target` (a User row with _id and customerId) joined `workspaceId` as a
+ * SECOND company: their membership there, or null. null for the company the
+ * target's User document describes — callers keep comparing User.customerId
+ * for that, exactly as before. REMOVED memberships do not count.
+ */
+export async function secondCompanyMembership(target: any, workspaceId: unknown): Promise<any | null> {
+  if (!target?._id || !workspaceId || !mongoose.isValidObjectId(String(workspaceId)) || !membershipSessionEnabled()) return null;
+  const m: any = await WorkspaceMembership.findOne({
+    userId: target._id,
+    workspaceId: String(workspaceId),
+    status: { $ne: "REMOVED" },
+  }).lean();
+  return m && !isOwnCompany(m, target) ? m : null;
+}
+
+/**
+ * Users who joined this workspace as a SECOND company (ACTIVE memberships
+ * whose company is not the one their User document describes). Lists keyed
+ * by User.customerId add these so the second company sees them; a
+ * workspace with no such member gets [] and its lists are unchanged.
+ */
+export async function secondCompanyMembers(workspaceId: unknown): Promise<Array<{ user: any; membership: any }>> {
+  if (!workspaceId || !mongoose.isValidObjectId(String(workspaceId)) || !membershipSessionEnabled()) return [];
+  const ms: any[] = await WorkspaceMembership.find({ workspaceId: String(workspaceId), status: "ACTIVE", isDefault: { $ne: true } }).lean();
+  if (!ms.length) return [];
+  const users: any[] = await User.find({ _id: { $in: ms.map((m) => m.userId) } }).lean();
+  const byId = new Map(users.map((u) => [String(u._id), u]));
+  return ms
+    .map((m) => ({ user: byId.get(String(m.userId)), membership: m }))
+    .filter((x) => x.user && !isOwnCompany(x.membership, x.user));
 }

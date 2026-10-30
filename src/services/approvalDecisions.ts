@@ -59,7 +59,8 @@ export const REQUEST_ACTIONABLE_STAGES = ["REQUEST_RAISED", "REQUEST_ON_HOLD", n
 
 /* ───────────────────────── who may decide ───────────────────────── */
 
-async function assertActorMayDecide(deciders: string[], actor: DecisionActor, requesterEmail: string) {
+async function assertActorMayDecide(deciders: string[], actor: DecisionActor, ar: AnyObj) {
+  const requesterEmail = ar?.frontlinerEmail;
   const email = norm(actor.email);
   if (email && email === norm(requesterEmail) && !deciders.includes(email)) {
     throw new DecisionError(403, "SELF_APPROVAL_NOT_ALLOWED", "You cannot approve or decline your own request.");
@@ -67,7 +68,8 @@ async function assertActorMayDecide(deciders: string[], actor: DecisionActor, re
   if (!email || !deciders.includes(email)) {
     throw new DecisionError(403, "NOT_AN_APPROVER", "You are no longer an approver for this request.");
   }
-  if (await isUserInactive(email)) {
+  // Inactive in the request's company (a suspended second-company membership counts).
+  if (await isUserInactive(email, ar?.workspaceId?._id || ar?.workspaceId || ar?.meta?.customerWorkspaceId)) {
     throw new DecisionError(403, "NOT_AN_APPROVER", "Your account is not active.");
   }
 }
@@ -136,7 +138,7 @@ export async function applyRequestDecision(opts: {
     throw new DecisionError(409, "ALREADY_DECIDED", "This request has already been decided.", { decided: decidedBy(ar) });
   }
 
-  await assertActorMayDecide(await requestDeciders(ar), actor, ar.frontlinerEmail);
+  await assertActorMayDecide(await requestDeciders(ar), actor, ar);
 
   const email = norm(actor.email);
   const name = str(actor.name) || str(ar.managerName) || "Approver";
@@ -360,7 +362,7 @@ export async function applyProposalDecision(opts: {
   const ar: any = await ApprovalRequest.findOne({ _id: p.requestId }).lean().exec();
   if (!ar) throw new DecisionError(404, "NOT_FOUND", "Request not found for this proposal");
 
-  if (!onBehalf) await assertActorMayDecide(await proposalDeciders(ar), actor, ar.frontlinerEmail);
+  if (!onBehalf) await assertActorMayDecide(await proposalDeciders(ar), actor, ar);
 
   const email = norm(actor.email);
   const name = str(actor.name) || email;

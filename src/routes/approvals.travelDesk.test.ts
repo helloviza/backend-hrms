@@ -141,6 +141,10 @@ beforeAll(async () => {
       _id: new mongoose.Types.ObjectId(u.sub), workspaceId: HOUSE, email: u.email, name: u.name, roles: u.roles, status: "ACTIVE",
     })) as any[],
   );
+  // The customer-side callers too: approvals refuse an account they can't read.
+  await col("users").insertMany(
+    [REQUESTER, APPROVER_USER, LEADER].map((u) => ({ _id: new mongoose.Types.ObjectId(u.sub), workspaceId: WS, email: u.email, name: u.name, roles: u.roles, status: "ACTIVE" })) as any[],
+  );
   // The booking team = Access Console "Admin Queue" grant (WRITE). The plain
   // HOUSE employee has none.
   await col("userpermissions").insertMany(

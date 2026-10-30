@@ -18,7 +18,9 @@
 //     role WORKSPACE_LEADER — the list the Business Wallet alerts use), and
 //     Users of the workspace holding the WORKSPACE_LEADER role;
 //   • Users of the workspace with canViewBilling === true whose customerId,
-//     when set, is the workspace's customer (the rule's ownership check).
+//     when set, is the workspace's customer (the rule's ownership check);
+//   • users who joined the workspace as a second company (company switcher),
+//     by that membership's roles and canViewBilling.
 // The rule's staff bypass (ADMIN / SUPERADMIN / HR / HRADMIN / OPS) is NOT a
 // recipient: those are Plumtrips staff, not the client. INACTIVE users and
 // fully-deactivated members are dropped (approvalDeciders.inactiveEmails).
@@ -28,6 +30,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import LoyaltyAccount from "../models/LoyaltyAccount.js";
 import User from "../models/User.js";
 import { activeLeaderEmails, inactiveEmails } from "./approvalDeciders.js";
+import { secondCompanyMembers } from "./activeMembership.js";
 import { companyNameFor } from "./companyNames.js";
 import { enqueueEmail } from "./emailOutbox.js";
 import { renderLayout, card, factsGrid, para, buttonGroup, DESK_MAILBOX } from "./approvalEmails/layout.js";
@@ -66,7 +69,15 @@ export async function rewardsRecipients(ws: { _id: unknown; customerId?: unknown
       return u.canViewBilling === true && (!u.customerId || !customerId || String(u.customerId) === customerId);
     })
     .map((u) => normEmail(u.email));
-  const all = [...new Set([...leaders, ...fromUsers].map(normEmail).filter((e) => e.includes("@")))];
+  // Company switcher Phase 3c: a user who joined this workspace as a SECOND
+  // company passes the same rule on that membership's roles and flags (their
+  // User document describes another company, so the query above skips them).
+  const fromMemberships = (await secondCompanyMembers(ws._id))
+    .map(({ user, membership: m }) => ({ email: user.email, roles: [...(m.roles || []), m.memberRole].filter(Boolean), m }))
+    .filter((x) => !x.roles.some((r: unknown) => STAFF_ROLES.has(normRole(r))))
+    .filter((x) => x.roles.some((r: unknown) => normRole(r) === "WORKSPACELEADER") || x.m.flags?.canViewBilling === true)
+    .map((x) => normEmail(x.email));
+  const all = [...new Set([...leaders, ...fromUsers, ...fromMemberships].map(normEmail).filter((e) => e.includes("@")))];
   const skip = await inactiveEmails(all);
   return all.filter((e) => !skip.has(e));
 }

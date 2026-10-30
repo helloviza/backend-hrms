@@ -181,6 +181,14 @@ vi.mock("../models/User.js", () => ({
   },
 }));
 
+// No second-company memberships in this file: every raiser bills from the
+// company their User document describes (company switcher Phase 3c).
+vi.mock("../models/WorkspaceMembership.js", () => ({
+  default: {
+    findOne: () => ({ select: () => ({ lean: () => Promise.resolve(null) }) }),
+  },
+}));
+
 vi.mock("../models/Customer.js", () => ({
   default: {
     findById: (id: any) => ({ select: () => ({ lean: () => Promise.resolve(_customers.get(id)) }) }),

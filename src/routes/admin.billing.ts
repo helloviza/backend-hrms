@@ -10,6 +10,7 @@ import CustomerMember from "../models/CustomerMember.js";
 import { scopedFindById } from "../middleware/scopedFindById.js";
 import { toCustomerSafeFlight, toCustomerSafeHotel } from "../utils/customerSafeBooking.js";
 import { isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
+import { getActiveMembership, isActiveWorkspaceLeader } from "../services/activeMembership.js";
 
 const router = express.Router();
 router.use(requireAuth);
@@ -38,6 +39,27 @@ async function requireAdminOrSBT(req: Request, res: Response, next: NextFunction
   // Check sbtEnabled / WL for non-admin users
   const sub = String(user?.sub || user?._id || user?.id || "");
   if (!sub) return res.status(403).json({ error: "Access denied" });
+
+  // Company switcher Phase 3c: in a SECOND company the role, flags and the
+  // company billed are that company's membership — never the User document's
+  // (which describes another company). The User's own company is unchanged.
+  const am = user?.mid ? await getActiveMembership(req) : null;
+  if (am?.source === "membership") {
+    const leader =
+      isActiveWorkspaceLeader(am) ||
+      String(am.memberRole || "").toUpperCase().replace(/[\s_-]/g, "") === "WORKSPACELEADER";
+    if (am.customerId && (am.flags.sbtEnabled === true || leader)) {
+      if (!leader && am.flags.canViewBilling !== true) {
+        return res.status(403).json({
+          error: "Billing access not enabled for your account.",
+          code: "BILLING_ACCESS_DENIED",
+        });
+      }
+      (req as any).sbtCustomerId = String(am.customerId);
+      return next();
+    }
+    return res.status(403).json({ error: "Access denied" });
+  }
 
   const dbUser: any = await User.findById(sub)
     .select("customerId sbtEnabled canViewBilling roles")
