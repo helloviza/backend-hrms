@@ -2,7 +2,9 @@
 //
 // PHASE 1 of the company switcher (docs/audits/multi-workspace-login-audit.md
 // §8.5): keep a shadow WorkspaceMembership row in step with the User record.
-// Nothing reads the collection yet.
+// Phase 2 reads it for the session (routes/auth.ts sessionMembershipFor,
+// middleware/requireWorkspace.ts verifySessionMembership); login calls
+// syncMembershipFromUser when a user has no row yet.
 //
 //   resolveMembershipTarget(user) — which workspace the person's session
 //     resolves to TODAY, using the same order login does. Read only. Shared by

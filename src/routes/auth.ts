@@ -18,7 +18,13 @@ import Vendor from "../models/Vendor.js";
 
 import CustomerMember from "../models/CustomerMember.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
-import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
+import {
+  resolveWorkspaceForUser,
+  membershipSessionEnabled,
+  verifySessionMembership,
+  MEMBERSHIP_REVOKED_BODY,
+} from "../middleware/requireWorkspace.js";
+import WorkspaceMembership from "../models/WorkspaceMembership.js";
 import { ensureCustomerWorkspace } from "../services/customerWorkspace.service.js";
 import MasterData from "../models/MasterData.js";
 import { UserPermission } from "../models/UserPermission.js";
@@ -151,6 +157,8 @@ export function signAccessToken(params: {
   // Demo Platform claims (optional, backward-compatible — existing callers don't pass these)
   isDemoUser?: boolean;
   demoImpersonation?: boolean;
+  // Session membership (company switcher Phase 2) — see sessionMembershipFor.
+  membership?: SessionMembership | null;
 }) {
   const payload: any = {
     sub: String(params.userId),
@@ -168,13 +176,82 @@ export function signAccessToken(params: {
   if (params.isDemoUser) payload.isDemoUser = true;
   if (params.demoImpersonation) payload._demoImpersonation = true;
 
+  if (params.membership) Object.assign(payload, params.membership);
+
   return jwt.sign(payload, safeEnv("JWT_SECRET"), { expiresIn: ACCESS_EXPIRES_IN });
 }
 
-function signRefresh(user: any) {
-  return jwt.sign({ sub: String(user._id) }, safeEnv("JWT_REFRESH_SECRET"), {
+function signRefresh(user: any, membership?: SessionMembership | null) {
+  const payload: any = { sub: String(user._id) };
+  if (membership) Object.assign(payload, membership);
+  return jwt.sign(payload, safeEnv("JWT_REFRESH_SECRET"), {
     expiresIn: REFRESH_EXPIRES_IN,
   });
+}
+
+/* ───────────────────────────────────────────────
+ * Session membership (company switcher Phase 2)
+ * docs/audits/multi-workspace-login-audit.md §2.6, §8.2, §8.4
+ *
+ * Access and refresh tokens ALSO carry wsid / mid / mver of the user's
+ * default ACTIVE WorkspaceMembership. Roles, customerId/businessId and
+ * customerMemberRole are still derived exactly as before — the membership is
+ * only stamped when its workspace is the one today's resolver gives those
+ * very claims, so requireWorkspace's wsid path lands on the same workspace
+ * the legacy path would. Any doubt (no row, not ACTIVE, a different
+ * workspace, a DB error) mints a plain legacy token instead: never blocks.
+ * ─────────────────────────────────────────────── */
+type SessionMembership = { wsid: string; mid: string; mver: number };
+
+async function sessionMembershipFor(
+  user: any,
+  claims: { roles: string[]; workspaceId?: string; customerId?: string; businessId?: string },
+  // A membership the caller already verified (refresh of an mid token).
+  verified?: any,
+): Promise<SessionMembership | null> {
+  if (!membershipSessionEnabled()) return null;
+  const userId = String(user?._id || "");
+  try {
+    let m: any = verified ?? null;
+    if (!m) {
+      m = await WorkspaceMembership.findOne({ userId: user._id, isDefault: true }).lean();
+      // Never written by Phase 1 (or created since): write it now, then continue.
+      if (!m && !(await WorkspaceMembership.exists({ userId: user._id }))) {
+        await syncMembershipFromUser(user._id, { source: "auth.session" });
+        m = await WorkspaceMembership.findOne({ userId: user._id, isDefault: true }).lean();
+      }
+    }
+    if (!m || m.status !== "ACTIVE") {
+      authLogger.warn("Session minted without membership", { userId, reason: m ? `membership ${m.status}` : "no default membership" });
+      return null;
+    }
+
+    // The workspace requireWorkspace's legacy path resolves for these claims
+    // (requireAuth copies workspaceId into customerId/businessId when absent).
+    const fallbackId = claims.customerId || claims.businessId || claims.workspaceId;
+    const asRequest = {
+      sub: userId,
+      roles: normalizeRoles(claims.roles || []),
+      workspaceId: claims.workspaceId,
+      customerId: fallbackId,
+      businessId: fallbackId,
+    };
+    const legacy: any = await resolveWorkspaceForUser(asRequest, "_id");
+    if (!legacy || String(legacy._id) !== String(m.workspaceId)) {
+      authLogger.warn("Session minted without membership", {
+        userId,
+        reason: "membership workspace differs from the legacy resolution",
+        membershipWorkspaceId: String(m.workspaceId),
+        legacyWorkspaceId: legacy ? String(legacy._id) : null,
+      });
+      return null;
+    }
+
+    return { wsid: String(m.workspaceId), mid: String(m._id), mver: Number(m.tokenVersion ?? 0) };
+  } catch (err) {
+    authLogger.error("Session membership lookup failed", { userId, error: err instanceof Error ? err.message : String(err) });
+    return null;
+  }
 }
 
 // Demo Platform — refresh token that carries impersonation claims. Signed with
@@ -988,7 +1065,7 @@ r.post("/login", loginLimiter, async (req, res) => {
       }
     }
 
-    const accessToken = signAccessToken({
+    const claims = {
       userId: String(user._id),
       email: built.safe.email,
       roles: built.roles,
@@ -1001,9 +1078,12 @@ r.post("/login", loginLimiter, async (req, res) => {
       vendorId: built.staff ? undefined : built.vendorId || undefined,
       customerMemberRole: built.staff ? undefined : built.customerMemberRole || undefined,
       isDemoUser: user.isDemoUser === true,
-    });
+    };
+    const membership = await sessionMembershipFor(user, claims);
 
-    const refreshToken = signRefresh(user);
+    const accessToken = signAccessToken({ ...claims, membership });
+
+    const refreshToken = signRefresh(user, membership);
 
     clearStaleRefreshCookies(res);
     setRefreshCookie(res, refreshToken);
@@ -1111,6 +1191,41 @@ r.post("/refresh", async (req, res) => {
       });
     }
 
+    // A membership-bound refresh re-mints only while that membership is still
+    // ACTIVE, at the same tokenVersion, for the same workspace — read from the
+    // DB, never requireWorkspace's cache. A legacy refresh (no mid) is
+    // upgraded below to the default membership.
+    let verifiedMembership: any = null;
+    if (payload.mid && membershipSessionEnabled()) {
+      const m: any = isValidObjectId(payload.mid) ? await WorkspaceMembership.findById(String(payload.mid)).lean() : null;
+      const ok =
+        !!m &&
+        String(m.userId) === String(user._id) &&
+        String(m.workspaceId) === String(payload.wsid || "") &&
+        m.status === "ACTIVE" &&
+        Number(m.tokenVersion ?? 0) === Number(payload.mver);
+      if (!ok) {
+        clearRefreshCookie(res);
+        authLogger.warn("Refresh refused: membership no longer valid", {
+          userId: String(user._id),
+          mid: String(payload.mid),
+          status: m?.status ?? null,
+          ip: req.ip,
+        });
+        SessionLog.create({
+          userId: user._id,
+          email: normalizeEmail(user.email || ""),
+          event: "TOKEN_REFRESH",
+          ipAddress: req.ip || req.headers["x-forwarded-for"] as string,
+          userAgent: req.headers["user-agent"],
+          success: false,
+          failureReason: "membership_revoked",
+        }).catch(() => {});
+        return res.status(401).json(MEMBERSHIP_REVOKED_BODY);
+      }
+      verifiedMembership = m;
+    }
+
     let built = await buildAuthSafeUser(user);
 
     // ✅ STAFF: never auto-link workspace leader
@@ -1133,7 +1248,7 @@ r.post("/refresh", async (req, res) => {
       }
     }
 
-    const newAccessToken = signAccessToken({
+    const claims = {
       userId: String(user._id),
       email: built.safe.email,
       roles: built.roles,
@@ -1143,9 +1258,12 @@ r.post("/refresh", async (req, res) => {
       vendorId: built.staff ? undefined : built.vendorId || undefined,
       customerMemberRole: built.staff ? undefined : built.customerMemberRole || undefined,
       isDemoUser: user.isDemoUser === true,
-    });
+    };
+    const membership = await sessionMembershipFor(user, claims, verifiedMembership);
 
-    const newRefreshToken = signRefresh(user);
+    const newAccessToken = signAccessToken({ ...claims, membership });
+
+    const newRefreshToken = signRefresh(user, membership);
 
     setRefreshCookie(res, newRefreshToken);
     setAccessCookie(res, newAccessToken);
@@ -1193,20 +1311,27 @@ r.get("/me", async (req, res) => {
     let workspaceData = null;
     let setupProgressData = null;
 
+    // Membership session: the token's workspace, once the membership is re-checked.
+    const membershipSession = !!payload.wsid && membershipSessionEnabled();
+    if (membershipSession && !(await verifySessionMembership(payload))) {
+      return res.status(401).json(MEMBERSHIP_REVOKED_BODY);
+    }
+
     try {
-      // Shared resolver (middleware/requireWorkspace.ts) — same customer-first
+      // Legacy token: shared resolver (middleware/requireWorkspace.ts) — same customer-first
       // branching requireWorkspace uses for every other authenticated request.
       // Previously this did a bare findById(user.workspaceId), which returns
       // the WRONG workspace for any customer whose User.workspaceId is stale
       // (still pointing at HOUSE from the promote-customer flow) instead of
       // resolving via their customerId like everywhere else does.
-      const ws: any = await resolveWorkspaceForUser(
-        user,
-        // allowedDomains added so the frontend has a real (non-email, non-
-        // generic) fallback to display when companyName is empty — see
-        // resolveDisplayName in MyProfileCustomer.tsx.
-        "_id customerId slug companyName companyLogo companyLogoKey plan status source tenantType config onboardingStep trialEndsAt allowedDomains",
-      );
+      // allowedDomains is selected so the frontend has a real (non-email, non-
+      // generic) fallback to display when companyName is empty — see
+      // resolveDisplayName in MyProfileCustomer.tsx.
+      const select =
+        "_id customerId slug companyName companyLogo companyLogoKey plan status source tenantType config onboardingStep trialEndsAt allowedDomains";
+      const ws: any = membershipSession
+        ? await CustomerWorkspace.findById(String(payload.wsid)).select(select).lean()
+        : await resolveWorkspaceForUser(user, select);
 
       if (ws) {
         const logoKey = (ws as any).companyLogoKey as string | undefined;

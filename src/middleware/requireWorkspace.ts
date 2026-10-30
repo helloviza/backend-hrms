@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import { isSuperAdmin } from "./isSuperAdmin.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import User from "../models/User.js";
+import WorkspaceMembership from "../models/WorkspaceMembership.js";
 
 /* ── Extend Express Request with workspace fields ───────────────── */
 declare global {
@@ -133,6 +134,65 @@ export async function resolveWorkspaceForUser(
     : resolveWorkspaceById(String(raw), select);
 }
 
+/* ── Session membership (company switcher Phase 2) ───────────────
+ * A token minted from a WorkspaceMembership carries wsid (CustomerWorkspace
+ * _id), mid (membership _id) and mver (its tokenVersion). Such a session is
+ * bound to exactly that workspace for as long as the membership stays ACTIVE
+ * at the same tokenVersion. Tokens without wsid keep the legacy resolution.
+ * docs/audits/multi-workspace-login-audit.md §2.6, §8.2.
+ *
+ * MEMBERSHIP_SESSION_DISABLED=true is the rollback: nothing is stamped and
+ * wsid/mid are ignored everywhere, i.e. exactly the pre-Phase-2 behaviour.
+ */
+export function membershipSessionEnabled(): boolean {
+  return String(process.env.MEMBERSHIP_SESSION_DISABLED || "").trim().toLowerCase() !== "true";
+}
+
+// Per-request check is one _id lookup, cached in-process for ≤60s keyed by
+// mid — so a suspension or tokenVersion bump reaches open sessions within a
+// minute (refresh always reads the DB, never this cache).
+const MEMBERSHIP_CACHE_TTL_MS = 60_000;
+const MEMBERSHIP_CACHE_MAX = 10_000;
+const membershipCache = new Map<string, { m: any | null; at: number }>();
+
+export function clearMembershipCache(mid?: string): void {
+  if (mid) membershipCache.delete(String(mid));
+  else membershipCache.clear();
+}
+
+async function loadMembershipCached(mid: string): Promise<any | null> {
+  const hit = membershipCache.get(mid);
+  if (hit && Date.now() - hit.at < MEMBERSHIP_CACHE_TTL_MS) return hit.m;
+  const m = await WorkspaceMembership.findById(mid).select("userId workspaceId status tokenVersion").lean();
+  if (membershipCache.size >= MEMBERSHIP_CACHE_MAX) membershipCache.clear();
+  membershipCache.set(mid, { m: m ?? null, at: Date.now() });
+  return m ?? null;
+}
+
+const isOidStr = (v: unknown) => /^[a-fA-F0-9]{24}$/.test(String(v ?? "").trim());
+
+/** Is the membership named by these token claims still the live session for this user? */
+export async function verifySessionMembership(claims: any): Promise<boolean> {
+  const mid = String(claims?.mid ?? "").trim();
+  const wsid = String(claims?.wsid ?? "").trim();
+  const sub = String(claims?.sub ?? claims?._id ?? claims?.id ?? "").trim();
+  if (!isOidStr(mid) || !isOidStr(wsid) || !sub) return false;
+  const m = await loadMembershipCached(mid);
+  return (
+    !!m &&
+    String(m.userId) === sub &&
+    String(m.workspaceId) === wsid &&
+    m.status === "ACTIVE" &&
+    Number(m.tokenVersion ?? 0) === Number(claims.mver)
+  );
+}
+
+export const MEMBERSHIP_REVOKED_BODY = {
+  success: false,
+  error: "Your access to this workspace has changed. Please sign in again.",
+  code: "MEMBERSHIP_REVOKED",
+};
+
 /**
  * requireResolvedWorkspace — the fail-closed companion to requireWorkspace.
  *
@@ -175,8 +235,11 @@ export const requireResolvedWorkspace = (
  * Instead reads workspaceId from body / query / params / header.
  * If none provided, continues without workspace context.
  *
- * Priority (normal users): workspaceId > customerId > businessId
- * Returns 403 if none found or workspace not active (non-SUPERADMIN only).
+ * Normal users: a token with wsid resolves exactly that workspace after
+ * verifySessionMembership (401 MEMBERSHIP_REVOKED when it fails); a legacy
+ * token goes through resolveWorkspaceForUser (workspaceId > customerId >
+ * businessId). Returns 403 if none found or workspace not active
+ * (non-SUPERADMIN only).
  */
 export const requireWorkspace = async (
   req: Request,
@@ -225,9 +288,20 @@ export const requireWorkspace = async (
     return next();
   }
 
-  // ── Normal users — shared resolver, see resolveWorkspaceForUser above ──
+  // ── Normal users ──
   try {
-    const workspace = await resolveWorkspaceForUser(user, WS_SELECT);
+    let workspace: any;
+    if (user.wsid && membershipSessionEnabled()) {
+      // Membership session: exactly the token's workspace, membership re-checked.
+      if (!(await verifySessionMembership(user))) {
+        res.status(401).json(MEMBERSHIP_REVOKED_BODY);
+        return;
+      }
+      workspace = await CustomerWorkspace.findById(String(user.wsid)).select(WS_SELECT).lean();
+    } else {
+      // Legacy token — shared resolver, see resolveWorkspaceForUser above.
+      workspace = await resolveWorkspaceForUser(user, WS_SELECT);
+    }
 
     if (!workspace) {
       res.status(403).json({ success: false, error: "Workspace context required" });

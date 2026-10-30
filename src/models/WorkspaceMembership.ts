@@ -6,9 +6,13 @@
 //
 // PHASE 1 (shadow): written by scripts/backfill-workspace-memberships.ts and
 // by services/workspaceMembership.service.ts syncMembershipFromUser from the
-// user-creation / role-change / deactivation paths. NOTHING READS IT YET —
-// login, tokens, refresh, requireWorkspace and /auth/me are unchanged. Still
-// exactly one row per user (isDefault = true). Rollback = drop the collection.
+// user-creation / role-change / deactivation paths. Still exactly one row per
+// user (isDefault = true).
+//
+// PHASE 2 (session): login / refresh stamp the default ACTIVE row into the
+// tokens as wsid / mid / mver (routes/auth.ts sessionMembershipFor); refresh,
+// requireWorkspace and /auth/me re-check status + tokenVersion. Claims are
+// still derived as before. Rollback = MEMBERSHIP_SESSION_DISABLED=true.
 //
 // No workspaceScopePlugin: a membership lookup is by userId across
 // workspaces by design.
