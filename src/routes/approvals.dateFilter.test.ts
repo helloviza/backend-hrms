@@ -144,6 +144,10 @@ beforeEach(async () => {
   await col("customerworkspaces").insertOne({ _id: HOUSE, customerId: "PLUMTRIPS-HOUSE", name: "Plumtrips", status: "ACTIVE", config: { features: {} } } as any);
   await grant(OWN, "OWN");
   await grant(ALL, "ALL");
+  // Every caller has a User row: approvals refuse an account they can't read.
+  await col("users").insertMany([REQ, APPR, OWN, ALL, CUST].map((w) => ({
+    _id: new mongoose.Types.ObjectId(w.sub), email: w.email, name: w.name, roles: w.roles,
+  })) as any[]);
 });
 
 describe("parseDateRange", () => {

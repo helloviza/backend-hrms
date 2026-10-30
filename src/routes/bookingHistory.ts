@@ -6,8 +6,10 @@ import fs from "fs";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { requireAuth } from "../middleware/auth.js";
-import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
-import { sanitizeApprovalForViewer, adminQueueAccess, queueCaseScope, hasQueueView, resolveLeaderCustomerIds } from "./approvals.security.js";
+import { loadSessionMembership, membershipSessionEnabled, resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { sanitizeApprovalForViewer, adminQueueAccess, queueCaseScope, hasQueueView, leaderCustomerIdsForSession } from "./approvals.security.js";
+import { actsAsWorkspaceLeader } from "../services/activeMembership.js";
 import { actorNamesOnResponse, userNames, nameOrUnknown, collectActorRows, resolveActors, maskStaffActors } from "../services/actorNames.js";
 import { publicDocuments, requestDocumentsVisibleTo } from "../services/bookingDocuments.js";
 import { dateRangeOr400, withDateRange } from "../utils/dateRange.js";
@@ -70,10 +72,19 @@ async function isQueueViewer(req: any): Promise<boolean> {
   // rejection — these handlers have no try/catch, so a throw would hang).
   try {
     if (!req.workspaceId) {
-      const ws: any = await resolveWorkspaceForUser(req.user, "_id status");
+      // A membership session's workspace when its membership is still live
+      // (what requireWorkspace resolves; for a one-company user that is the
+      // same workspace the legacy resolver gives), else the legacy resolver.
+      let ws: any = null;
+      if (req.user?.wsid && membershipSessionEnabled()) {
+        const m = await loadSessionMembership(req.user);
+        if (m) ws = await CustomerWorkspace.findById(m.workspaceId).select("_id status customerId").lean();
+      }
+      if (!ws) ws = await resolveWorkspaceForUser(req.user, "_id status customerId");
       if (ws?._id && ws.status === "ACTIVE") {
         req.workspaceId = String(ws._id);
         req.workspaceObjectId = ws._id;
+        req.workspace = ws;
       }
     }
     return (await adminQueueAccess(req)).view;
@@ -498,8 +509,11 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
   // else their own. Rows are the customer-safe shape (customerHistoryRow).
   const email = userEmail(user);
   const sub = String(user?.sub || user?._id || user?.id || "");
-  const leaderOf = await resolveLeaderCustomerIds(email);
-  const leader = leaderOf.length > 0 || isWorkspaceLeaderRole(user);
+  // Leader scope is the session's company only for a caller in several
+  // companies (leaderCustomerIdsForSession); a second company's Leader role
+  // comes from its membership.
+  const leaderOf = await leaderCustomerIdsForSession(req, email);
+  const leader = leaderOf.length > 0 || (await actsAsWorkspaceLeader(req));
   let scope: any;
   if (leader) {
     const ors: any[] = [];
@@ -526,12 +540,6 @@ router.get("/history", requireAuth, async (req: Request, res: Response) => {
 
   return res.json({ ok: true, rows: out });
 });
-
-function isWorkspaceLeaderRole(user: any): boolean {
-  return (Array.isArray(user?.roles) ? user.roles : [])
-    .map((r: any) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
-    .includes("WORKSPACELEADER");
-}
 
 /** The caller's own requests (by user id, or the email they raised it with). */
 function ownScope(sub: string, email: string) {

@@ -274,7 +274,8 @@ vi.mock("../models/ApprovalRequest.js", () => ({
 vi.mock("../models/User.js", () => ({
   default: {
     findOne: () => chain(() => ({ email: "mgr@cust.com", name: "Manoj Manager" })),
-    findById: () => chain(() => null),
+    // Every caller is an account (approvals refuse one they can't read): no flags.
+    findById: (id: any) => chain(() => ({ _id: id, roles: [] })),
     // Deactivated-recipient check (approvalDeciders.inactiveEmails): nobody is inactive.
     find: () => chain(() => []),
   },

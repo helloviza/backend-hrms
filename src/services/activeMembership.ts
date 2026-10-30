@@ -33,8 +33,9 @@
 import mongoose from "mongoose";
 import User from "../models/User.js";
 import WorkspaceMembership from "../models/WorkspaceMembership.js";
+import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
-import { loadSessionMembership, membershipSessionEnabled } from "../middleware/requireWorkspace.js";
+import { loadSessionMembership, membershipSessionEnabled, resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 
 export type ActiveMembershipFlags = {
   sbtEnabled?: boolean;
@@ -92,7 +93,7 @@ function fromUser(req: any, u: any): ActiveMembership {
 }
 
 /** Is this membership the company the User document already describes? */
-function isOwnCompany(m: any, u: any): boolean {
+export function isOwnCompany(m: any, u: any): boolean {
   const userCustomerId = str(u.customerId);
   if (userCustomerId) return str(m.customerId) === userCustomerId;
   return m.isDefault === true;
@@ -181,4 +182,35 @@ export async function findOtherWorkspaceLeader(am: ActiveMembership, excludeUser
     userId: { $ne: excludeUserId },
   }).select("userId").lean();
   return m?.userId ?? null;
+}
+
+/**
+ * Workspace Leader in the session's company: a second company reads its
+ * membership's roles; the User's own company keeps the token's roles, exactly
+ * as the routes read them before (Phase 3b, approvals routing).
+ */
+export async function actsAsWorkspaceLeader(req: any): Promise<boolean> {
+  // Only a membership session (mid) can be in a second company.
+  const am = req.user?.mid ? await getActiveMembership(req) : null;
+  if (am?.source === "membership") return isActiveWorkspaceLeader(am);
+  return (Array.isArray(req.user?.roles) ? req.user.roles : [])
+    .map((r: unknown) => str(r).toUpperCase().replace(/[\s\-_]/g, ""))
+    .includes("WORKSPACELEADER");
+}
+
+/**
+ * The session's company as the ids an ApprovalRequest.customerId may hold:
+ * the workspace's customerId and (older rows) the workspace _id. Empty when no
+ * workspace resolves — callers then match nothing. Memoised on the request.
+ */
+export async function sessionCompanyIds(req: any): Promise<string[]> {
+  if (!req._sessionCompanyIds) {
+    req._sessionCompanyIds = (async () => {
+      let ws: any = req.workspace?._id ? req.workspace : null;
+      if (!ws && req.workspaceObjectId) ws = await CustomerWorkspace.findById(req.workspaceObjectId).select("_id customerId").lean();
+      if (!ws) ws = await resolveWorkspaceForUser(req.user, "_id customerId");
+      return ws?._id ? [str(ws.customerId), str(ws._id)].filter(Boolean) : [];
+    })();
+  }
+  return req._sessionCompanyIds;
 }

@@ -11,6 +11,12 @@ import { hasAccess } from "../models/UserPermission.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import { isSuperAdmin as isSuperAdminReq } from "../middleware/isSuperAdmin.js";
 import { isHouseUser } from "../middleware/requirePlatformAdmin.js";
+import {
+  actsAsWorkspaceLeader,
+  getActiveMembership,
+  holdsSeveralCompanies,
+  sessionCompanyIds,
+} from "../services/activeMembership.js";
 
 export type AnyObj = Record<string, any>;
 export type EmailAction = "approved" | "declined" | "on_hold" | "resend_email";
@@ -565,6 +571,20 @@ export async function resolveLeaderCustomerIds(email: string): Promise<string[]>
   return Array.from(new Set(ids));
 }
 
+/**
+ * resolveLeaderCustomerIds narrowed to the session's company (company
+ * switcher Phase 3b). A caller with one ACTIVE membership gets exactly what
+ * resolveLeaderCustomerIds returns, as before; a caller in several companies
+ * only the company they are signed in to — never the others where the same
+ * email is a Workspace Leader.
+ */
+export async function leaderCustomerIdsForSession(req: AnyObj, email: string): Promise<string[]> {
+  const ids = await resolveLeaderCustomerIds(email);
+  if (!ids.length || !(await holdsSeveralCompanies(req))) return ids;
+  const session = await sessionCompanyIds(req);
+  return ids.filter((id) => session.includes(id));
+}
+
 /* ────────────────────────────────────────────────────────────────
  * Ops queue access — the /admin/access "Admin Queue" grant (adminQueue)
  *
@@ -698,7 +718,7 @@ export async function requireApprovalsAdminRead(req: AnyObj, res: any, next: any
 
       if ((await adminQueueAccess(req)).view) return next();
 
-      const leaderCustomerIds = await resolveLeaderCustomerIds(user?.email);
+      const leaderCustomerIds = await leaderCustomerIdsForSession(req, user?.email);
       if (!leaderCustomerIds.length) {
         return res.status(403).json({
           error: "Your account doesn’t have permission to view this page.",
@@ -753,25 +773,29 @@ export async function requireApprovalsAdminWrite(req: AnyObj, res: any, next: an
 /* ────────────────────────────────────────────────────────────────
  * Who may raise a travel request (POST /requests and /search/*)
  *
- * WORKSPACE_LEADER always passes. Anyone else is refused when their
- * User row in this workspace has sbtEnabled (they book directly) or
- * canRaiseRequest === false. No row found → allowed, as before.
+ * WORKSPACE_LEADER always passes. Anyone else is refused when, in the
+ * session's company (getActiveMembership: the User document for their own
+ * company, the membership for a second one), they have sbtEnabled (they
+ * book directly) or canRaiseRequest === false. A caller whose account can't
+ * be read is refused — it used to be allowed when no User row matched the
+ * workspace, which let anyone in a second company through.
  * ──────────────────────────────────────────────────────────────── */
 
 export type RaiseRequestRefusal = { status: 403; body: { error: string; code: string } };
 
 export async function checkCanRaiseRequest(req: AnyObj): Promise<RaiseRequestRefusal | null> {
   const sub = String(req.user?.sub || req.user?._id || "");
-  const isWL = (req.user?.roles || [])
-    .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
-    .includes("WORKSPACELEADER");
+  if (sub && (await actsAsWorkspaceLeader(req))) return null;
 
-  if (!sub || isWL) return null;
-
-  const sbtCheck: any = await User.findOne({ _id: sub, workspaceId: req.workspaceObjectId })
-    .select("sbtEnabled canRaiseRequest")
-    .lean();
-  if (sbtCheck?.sbtEnabled === true) {
+  const am = sub ? await getActiveMembership(req) : null;
+  if (!am) {
+    return {
+      status: 403,
+      body: { error: "We couldn't find your account. Please sign in again.", code: "ACCOUNT_NOT_FOUND" },
+    };
+  }
+  const sbtCheck = am.flags;
+  if (sbtCheck.sbtEnabled === true) {
     return {
       status: 403,
       body: {
@@ -780,7 +804,7 @@ export async function checkCanRaiseRequest(req: AnyObj): Promise<RaiseRequestRef
       },
     };
   }
-  if (sbtCheck?.canRaiseRequest === false) {
+  if (sbtCheck.canRaiseRequest === false) {
     return {
       status: 403,
       body: {
