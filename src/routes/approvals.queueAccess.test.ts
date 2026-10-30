@@ -125,10 +125,6 @@ beforeEach(async () => {
   await col("users").insertMany(
     [AGENT, VIEWER, ADMIN_NO_GRANT, SECOND, PLAIN].map((u) => ({ _id: new mongoose.Types.ObjectId(u.sub), workspaceId: HOUSE, email: u.email, name: u.name, roles: u.roles, status: "ACTIVE", passwordHash: "x" })) as any[],
   );
-  // The customer-side callers too: approvals refuse an account they can't read.
-  await col("users").insertMany(
-    [TENANT_ADMIN, LEADER, REQUESTER, APPROVER_USER].map((u) => ({ _id: new mongoose.Types.ObjectId(u.sub), workspaceId: WS, email: u.email, name: u.name, roles: u.roles, status: "ACTIVE" })) as any[],
-  );
   await grant(AGENT, "WRITE");
   await grant(SECOND, "FULL");
   await grant(VIEWER, "READ");

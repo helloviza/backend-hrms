@@ -25,19 +25,8 @@ process.env.JWT_SECRET ||= "jwt-secret-for-tests";
 const sent: Array<{ to: string; subject: string }> = [];
 
 vi.mock("../middleware/auth.js", () => {
-  // Like a real login, the caller is a User row: the one with this email, else
-  // a new one (approvals refuse an account they can't read).
-  const requireAuth = async (req: any, _res: any, next: any) => {
+  const requireAuth = (req: any, _res: any, next: any) => {
     req.user = JSON.parse(String(req.headers["x-test-user"] || "{}"));
-    const { default: mg } = await import("mongoose");
-    const users = mg.connection.db!.collection("users");
-    const sub = String(req.user.sub || "");
-    const email = String(req.user.email || "").toLowerCase();
-    if (mg.isValidObjectId(sub) && email && !(await users.findOne({ _id: new mg.Types.ObjectId(sub) }))) {
-      const same: any = await users.findOne({ email });
-      if (same) req.user.sub = String(same._id);
-      else await users.insertOne({ _id: new mg.Types.ObjectId(sub), email, roles: req.user.roles || [] } as any);
-    }
     next();
   };
   return { requireAuth, default: requireAuth };

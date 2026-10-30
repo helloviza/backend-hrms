@@ -66,7 +66,6 @@ import { assignCase, TravelDeskError, flagNeedsReassignment } from "../services/
 import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
 import { markRequestDone, notifyRequesterProgress, latestProposalsFor, closedCaseRefusal } from "../services/approvalProgress.js";
 import { requestDocumentsVisibleTo, sendRequestDocument } from "../services/bookingDocuments.js";
-import { actsAsWorkspaceLeader, getActiveMembership } from "../services/activeMembership.js";
 import {
   prepareCartSelections,
   writeSelectionSnapshots,
@@ -295,7 +294,11 @@ function resolveSubmitRouting(opts: {
   return { approverEmail: normEmail(opts.approverEmail), autoApprove: false, routedToLeader: false };
 }
 
-const ACCOUNT_NOT_FOUND = { error: "We couldn't find your account. Please sign in again.", code: "ACCOUNT_NOT_FOUND" };
+function hasWorkspaceLeaderRole(user: AnyObj) {
+  return (user?.roles || [])
+    .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
+    .includes("WORKSPACELEADER");
+}
 
 
 /* ────────────────────────────────────────────────────────────────
@@ -516,7 +519,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       approverEmail: picked.approverEmail,
       leaderEmails,
       actorEmail: email,
-      actorIsLeader: leaderEmails.includes(email) || (await actsAsWorkspaceLeader(req)),
+      actorIsLeader: leaderEmails.includes(email) || hasWorkspaceLeaderRole(user),
     });
     const approverEmail = routing.approverEmail;
     const isSelfApproval = routing.autoApprove;
@@ -725,7 +728,7 @@ router.get("/request-context", requireAuth, requireWorkspace, requireTravelMode(
       approverEmail: picked.approverEmail,
       leaderEmails: picked.leaderEmails,
       actorEmail: email,
-      actorIsLeader: picked.leaderEmails.includes(email) || (await actsAsWorkspaceLeader(req)),
+      actorIsLeader: picked.leaderEmails.includes(email) || hasWorkspaceLeaderRole(user),
     });
     const companyName = normStr((picked.ws as any)?.name || (picked.ws as any)?.displayName || loginWs.name || "");
 
@@ -745,12 +748,9 @@ router.get("/request-context", requireAuth, requireWorkspace, requireTravelMode(
 
 router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
-    // SBT users must not access approval flow — sbtEnabled in the session's
-    // company; an account that can't be read is refused, not let through.
-    // Workspace Leaders (of the session's company) are exempt, as for raising.
-    const am = await getActiveMembership(req);
-    if (!am) return res.status(403).json(ACCOUNT_NOT_FOUND);
-    if (am.flags.sbtEnabled === true && !(await actsAsWorkspaceLeader(req))) {
+    // SBT users must not access approval flow
+    const sbtUser = await User.findOne({ _id: req.user?.sub || req.user?._id, workspaceId: req.workspaceObjectId }).select("sbtEnabled").lean();
+    if (sbtUser?.sbtEnabled === true) {
       return res.status(403).json({ error: "SBT users cannot access approval requests.", code: "SBT_USER_CANNOT_ACCESS_APPROVALS" });
     }
 
@@ -788,10 +788,9 @@ router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("A
 
 router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
-    // SBT users must not access approval flow (see /requests/mine)
-    const am = await getActiveMembership(req);
-    if (!am) return res.status(403).json(ACCOUNT_NOT_FOUND);
-    if (am.flags.sbtEnabled === true && !(await actsAsWorkspaceLeader(req))) {
+    // SBT users must not access approval flow
+    const sbtUser = await User.findOne({ _id: req.user?.sub || req.user?._id, workspaceId: req.workspaceObjectId }).select("sbtEnabled").lean();
+    if (sbtUser?.sbtEnabled === true) {
       return res.status(403).json({ error: "SBT users cannot access approval inbox.", code: "SBT_USER_CANNOT_ACCESS_APPROVALS" });
     }
 
@@ -800,9 +799,10 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
     const range = dateRangeOr400(req, res);
     if (range === false) return;
 
-    // WORKSPACE_LEADER sees all pending requests in their workspace (a
-    // Leader in this company — not a Leader of another company they belong to)
-    const isWLInbox = await actsAsWorkspaceLeader(req);
+    // WORKSPACE_LEADER sees all pending requests in their workspace
+    const isWLInbox = (req.user?.roles || [])
+      .map((r: string) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
+      .includes("WORKSPACELEADER");
 
     // Nobody sees their own request as something to approve.
     const notOwn = { frontlinerEmail: { $not: exactIRegex(email) } };

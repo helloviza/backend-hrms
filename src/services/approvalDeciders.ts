@@ -8,8 +8,6 @@ import mongoose from "mongoose";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import User from "../models/User.js";
-import WorkspaceMembership from "../models/WorkspaceMembership.js";
-import { isOwnCompany } from "./activeMembership.js";
 
 type AnyObj = Record<string, any>;
 
@@ -36,23 +34,10 @@ export async function activeLeaderEmails(ws: AnyObj | null, ar?: AnyObj): Promis
   return Array.from(new Set(rows.map((r) => norm(r.email)).filter(Boolean)));
 }
 
-/**
- * Inactive: a User marked INACTIVE. With `workspaceId` (the request's
- * company), also a membership of that company that is no longer ACTIVE —
- * when it is a second company. The User's own company is read from the User
- * document alone, as before (company switcher Phase 3b; the same own-company
- * rule as services/activeMembership.ts).
- */
-export async function isUserInactive(email: string, workspaceId?: unknown): Promise<boolean> {
+export async function isUserInactive(email: string): Promise<boolean> {
   if (!email) return true;
-  const u: any = await User.findOne({ email: exactRx(email) }).select("status customerId").lean().exec();
-  if (String(u?.status || "").toUpperCase() === "INACTIVE") return true;
-  if (!u?._id || !workspaceId || !mongoose.Types.ObjectId.isValid(str(workspaceId))) return false;
-  const m: any = await WorkspaceMembership.findOne({ userId: u._id, workspaceId: str(workspaceId) })
-    .select("status customerId isDefault")
-    .lean()
-    .exec();
-  return !!m && m.status !== "ACTIVE" && !isOwnCompany(m, u);
+  const u: any = await User.findOne({ email: exactRx(email) }).select("status").lean().exec();
+  return String(u?.status || "").toUpperCase() === "INACTIVE";
 }
 
 /**

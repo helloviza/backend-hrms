@@ -36,11 +36,10 @@ import {
   caseInQueueScope,
   isManagerOrLeaderOfRequest,
   isOwnerOfRequest,
-  leaderCustomerIdsForSession,
+  resolveLeaderCustomerIds,
 } from "../routes/approvals.security.js";
 import { requestDocuments, publicDocuments, CUSTOMER_DOC_TYPES as CUSTOMER_TYPES, type RequestDocument } from "./requestDocumentList.js";
 import { isPartnerLeadCase } from "./partnerLeadCase.js";
-import { actsAsWorkspaceLeader } from "./activeMembership.js";
 
 export { requestDocuments, publicDocuments, type RequestDocument };
 
@@ -52,6 +51,12 @@ async function s3Bytes(key: string): Promise<Buffer> {
   return getObjectBuffer(key);
 }
 const str = (v: any) => String(v ?? "").trim();
+
+function userWorkspaceLeader(user: AnyObj): boolean {
+  return (Array.isArray(user?.roles) ? user.roles : [])
+    .map((r: any) => String(r).toUpperCase().replace(/[\s_-]/g, ""))
+    .includes("WORKSPACELEADER");
+}
 
 /**
  * May the caller see (and download) this request's booking documents? Staff
@@ -69,9 +74,8 @@ export async function requestDocumentsVisibleTo(req: AnyObj, doc: AnyObj): Promi
   if (isOwnerOfRequest(doc, user) || isManagerOrLeaderOfRequest(doc, user)) return true;
 
   const sameWorkspace = !!doc.workspaceId && str(doc.workspaceId?._id || doc.workspaceId) === str(req.workspaceObjectId || req.workspaceId);
-  // A Leader in this company (a second company's membership roles).
-  if (sameWorkspace && (await actsAsWorkspaceLeader(req))) return true;
-  const leaderOf = await leaderCustomerIdsForSession(req, str(user.email));
+  if (sameWorkspace && userWorkspaceLeader(user)) return true;
+  const leaderOf = await resolveLeaderCustomerIds(str(user.email));
   return leaderOf.includes(str(doc.customerId));
 }
 

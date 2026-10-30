@@ -116,8 +116,6 @@ beforeAll(async () => {
     config: { travelFlow: "APPROVAL_FLOW", features: { approvalFlowEnabled: true } },
   } as any);
   await col("users").insertOne({ email: APPROVER, name: "Manoj Approver", roles: ["EMPLOYEE"] } as any);
-  // The requester has a User row: approvals refuse an account they can't read.
-  await col("users").insertOne({ _id: new mongoose.Types.ObjectId(REQUESTER.sub), email: REQUESTER.email, name: "Riya", roles: ["EMPLOYEE"], workspaceId: WS } as any);
 }, 120_000);
 
 afterAll(async () => {

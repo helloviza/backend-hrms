@@ -201,13 +201,12 @@ describe("the router gate for everyone else", () => {
   });
 
   it("a Flow 2 workspace (approvalFlowEnabled only) still passes", async () => {
-    const r = await as(request(app).get("/api/approvals/requests/mine"), REQ, WS_FLOW);
+    const r = await as(request(app).get("/api/approvals/requests/mine"), oid(), WS_FLOW);
     expect(r.status).toBe(200);
   });
 
   it("HOUSE and SUPERADMIN bypass the feature gate with no flags set", async () => {
-    // A caller with a User row (approvals refuse an account they can't read).
-    expect((await as(request(app).get("/api/approvals/requests/mine"), REQ, HOUSE)).status).toBe(200);
-    expect((await as(request(app).get("/api/approvals/requests/mine"), REQ, WS_NONE, ["SUPERADMIN"])).status).toBe(200);
+    expect((await as(request(app).get("/api/approvals/requests/mine"), oid(), HOUSE)).status).toBe(200);
+    expect((await as(request(app).get("/api/approvals/requests/mine"), oid(), WS_NONE, ["SUPERADMIN"])).status).toBe(200);
   });
 });

@@ -33,8 +33,7 @@ vi.mock("../middleware/auth.js", () => {
   };
   return { requireAuth, default: requireAuth };
 });
-vi.mock("../middleware/requireWorkspace.js", async (orig) => ({
-  ...(await orig<any>()),
+vi.mock("../middleware/requireWorkspace.js", () => ({
   requireWorkspace: async (req: any, res: any, next: any) => {
     const { default: mg } = await import("mongoose");
     const id = String(req.headers["x-test-ws"] || "");
@@ -160,10 +159,6 @@ beforeAll(async () => {
     { customerId: "D1", email: LEADER, role: "WORKSPACE_LEADER", isActive: true },
     { customerId: "F1", email: LEADER, role: "WORKSPACE_LEADER", isActive: true },
   ] as any[]);
-  // Every caller has a User row: approvals refuse an account they can't read.
-  await col("users").insertMany([REQUESTER, APPROVER_USER, LEADER_USER, STAFF].map((w) => ({
-    _id: new mongoose.Types.ObjectId(w.sub), email: w.email, roles: w.roles || ["EMPLOYEE"],
-  })) as any[]);
 }, 120_000);
 
 afterAll(async () => {

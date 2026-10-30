@@ -64,7 +64,7 @@ const isProd = process.env.NODE_ENV === "production";
 /* ───────────────────────────────────────────────
  * Helpers
  * ─────────────────────────────────────────────── */
-export function normalizeRoles(roles: string[] = []) {
+function normalizeRoles(roles: string[] = []) {
   return roles
     .map((rr) => String(rr).trim().toUpperCase())
     .filter(Boolean)
@@ -614,7 +614,7 @@ async function applyRealName(safe: any) {
   }
 }
 
-export async function buildAuthSafeUserCore(userDoc: any) {
+async function buildAuthSafeUserCore(userDoc: any) {
   const base = userDoc?.toJSON ? userDoc.toJSON() : userDoc;
 
   const email = normalizeEmail(base?.email || "");
