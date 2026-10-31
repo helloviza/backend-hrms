@@ -36,6 +36,21 @@ import { isUserActive } from "../utils/userActiveStatus.js";
 import { findUserByLoginEmail } from "../utils/loginEmailLookup.js";
 import { isLoginDisabled, loginEnabledFilter } from "../utils/loginDisabled.js";
 import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
+import { isOwnCompany } from "../services/activeMembership.js";
+import {
+  multiWorkspaceLoginEnabled,
+  switchableCompanies,
+  switchableCompany,
+  companyCard,
+  signPickToken,
+  verifyPickToken,
+  pickTokenMatchesUser,
+  switchIneligibleReason,
+  tokenIneligibleReason,
+  secondCompanyClaims,
+  overlaySecondCompany,
+  type SwitchableCompany,
+} from "../services/workspaceSwitch.service.js";
 
 const r = Router();
 
@@ -252,6 +267,122 @@ async function sessionMembershipFor(
     authLogger.error("Session membership lookup failed", { userId, error: err instanceof Error ? err.message : String(err) });
     return null;
   }
+}
+
+/* ───────────────────────────────────────────────
+ * Session claims (login, refresh, select / switch workspace)
+ * ─────────────────────────────────────────────── */
+
+/**
+ * Today's claims for the company the User document describes, exactly as
+ * login and refresh always built them (customer auto-link included).
+ */
+async function ownSessionClaims(user: any) {
+  let built = await buildAuthSafeUser(user);
+
+  // ✅ STAFF: never auto-link workspace leader
+  if (!built.staff) {
+    // Auto-link workspace + leader if customerId is ObjectId
+    if (built.customerId && isValidObjectId(built.customerId)) {
+      await ensureWorkspaceAndLeader({
+        customerId: built.customerId,
+        email: built.safe.email,
+        name: built.safe.firstName || built.safe.name,
+        userRoles: user.roles || [],
+      });
+
+      if (!user.customerId) {
+        user.customerId = built.customerId;
+        user.businessId = built.customerId;
+        await user.save();
+      }
+
+      // Rebuild so roles reflect member role immediately
+      built = await buildAuthSafeUser(user);
+    }
+  }
+
+  const claims = {
+    userId: String(user._id),
+    email: built.safe.email,
+    roles: built.roles,
+    // Staff users carry workspaceId in JWT (their workspaceId is reliable).
+    // Customer users must not — their workspaceId on the User doc may be stale
+    // or point to the wrong workspace. requireWorkspace resolves them via customerId.
+    workspaceId: built.staff ? (user.workspaceId?.toString() || undefined) : undefined,
+    customerId: built.staff ? undefined : built.customerId || undefined,
+    businessId: built.staff ? undefined : built.customerId || undefined,
+    vendorId: built.staff ? undefined : built.vendorId || undefined,
+    customerMemberRole: built.staff ? undefined : built.customerMemberRole || undefined,
+    isDemoUser: user.isDemoUser === true,
+  };
+  return { built, claims };
+}
+
+/**
+ * Company switcher Phase 4: claims, token membership and session user for a
+ * SECOND company (one the User document does not describe), minted from the
+ * membership. null when that workspace is gone or not ACTIVE.
+ */
+async function secondCompanySession(user: any, m: any) {
+  const ws: any = await CustomerWorkspace.findById(m.workspaceId).select("_id customerId status").lean();
+  if (!ws || ws.status !== "ACTIVE") return null;
+  const built = await buildAuthSafeUser(user);
+  const claims = { userId: String(user._id), email: built.safe.email, ...secondCompanyClaims(m, ws) };
+  const membership: SessionMembership = { wsid: String(ws._id), mid: String(m._id), mver: Number(m.tokenVersion ?? 0) };
+  return { claims, membership, safe: overlaySecondCompany(built.safe, m, ws) };
+}
+
+/**
+ * Mint and set the session for one chosen company (select-workspace /
+ * switch-workspace). The own company goes through login's own path, so its
+ * token is exactly what /login would have minted.
+ */
+async function issueCompanySession(req: any, res: any, user: any, target: SwitchableCompany, event: "LOGIN" | "WORKSPACE_SWITCH") {
+  let accessToken: string;
+  let refreshToken: string;
+  let safe: any;
+  let role: string | undefined;
+  let wsid: string;
+  if (isOwnCompany(target.membership, user)) {
+    const { built, claims } = await ownSessionClaims(user);
+    const membership = await sessionMembershipFor(user, claims);
+    accessToken = signAccessToken({ ...claims, membership });
+    refreshToken = signRefresh(user, membership);
+    safe = built.safe;
+    role = built.roles[0];
+    wsid = membership?.wsid || String(target.workspace._id);
+  } else {
+    const second = await secondCompanySession(user, target.membership);
+    if (!second) return null;
+    accessToken = signAccessToken({ ...second.claims, membership: second.membership });
+    refreshToken = signRefresh(user, second.membership);
+    safe = second.safe;
+    role = second.claims.roles[0];
+    wsid = second.membership.wsid;
+  }
+
+  clearStaleRefreshCookies(res);
+  setRefreshCookie(res, refreshToken);
+  setAccessCookie(res, accessToken);
+
+  authLogger.info(event === "LOGIN" ? "User login (company picked)" : "Workspace switch", {
+    userId: user._id,
+    workspaceId: wsid,
+    ip: req.ip,
+  });
+  SessionLog.create({
+    userId: user._id,
+    email: normalizeEmail(user.email || ""),
+    role,
+    event,
+    workspaceId: wsid,
+    ipAddress: req.ip || req.headers["x-forwarded-for"] as string,
+    userAgent: req.headers["user-agent"],
+    success: true,
+  }).catch(() => {});
+
+  return { accessToken, user: safe, workspaceId: wsid };
 }
 
 // Demo Platform — refresh token that carries impersonation claims. Signed with
@@ -614,6 +745,16 @@ async function applyRealName(safe: any) {
   }
 }
 
+/** Does this user hold more than one (non-removed) WorkspaceMembership? */
+async function holdsSeveralMemberships(userId: unknown): Promise<boolean> {
+  if (!isValidObjectId(userId)) return false;
+  try {
+    return (await WorkspaceMembership.countDocuments({ userId: String(userId), status: { $ne: "REMOVED" } })) > 1;
+  } catch {
+    return false;
+  }
+}
+
 export async function buildAuthSafeUserCore(userDoc: any) {
   const base = userDoc?.toJSON ? userDoc.toJSON() : userDoc;
 
@@ -629,13 +770,19 @@ export async function buildAuthSafeUserCore(userDoc: any) {
   let member: any = null;
   if (!staff && email) {
     const rx = new RegExp(`^${escapeRegExp(email)}$`, "i");
-    member = await CustomerMember.findOne({
-      email: rx,
-      $or: [{ isActive: { $exists: false } }, { isActive: true }],
-    })
-      .sort({ updatedAt: -1, createdAt: -1 })
-      .lean()
-      .exec();
+    const activeMember = { $or: [{ isActive: { $exists: false } }, { isActive: true }] };
+    // Company switcher Phase 4: a person of two companies has a member row in
+    // each. The User document's own company keeps ITS row's role — not the
+    // role of whichever company's row changed last. One-company users skip this.
+    if (base?.customerId && (await holdsSeveralMemberships(base._id))) {
+      member = await CustomerMember.findOne({ customerId: String(base.customerId), email: rx, ...activeMember }).lean().exec();
+    }
+    if (!member) {
+      member = await CustomerMember.findOne({ email: rx, ...activeMember })
+        .sort({ updatedAt: -1, createdAt: -1 })
+        .lean()
+        .exec();
+    }
   }
 
   const set = new Set<string>(baseRoles);
@@ -1040,45 +1187,20 @@ r.post("/login", loginLimiter, async (req, res) => {
       return res.status(400).json({ error: "Invalid credentials" });
     }
 
-    // 1) Build safe
-    let built = await buildAuthSafeUser(user);
-
-    // ✅ STAFF: never auto-link workspace leader
-    if (!built.staff) {
-      // 2) Auto-link workspace + leader if customerId is ObjectId
-      if (built.customerId && isValidObjectId(built.customerId)) {
-        await ensureWorkspaceAndLeader({
-          customerId: built.customerId,
-          email: built.safe.email,
-          name: built.safe.firstName || built.safe.name,
-          userRoles: user.roles || [],
-        });
-
-        if (!user.customerId) {
-          user.customerId = built.customerId;
-          user.businessId = built.customerId;
-          await user.save();
-        }
-
-        // 3) Rebuild so roles reflect member role immediately
-        built = await buildAuthSafeUser(user);
-      }
+    // Company switcher Phase 4 (MULTI_WORKSPACE_LOGIN): a person of two or
+    // more companies picks one first. No session yet, only a short-lived pick
+    // token for POST /auth/select-workspace. Everyone else: unchanged.
+    const companies = await switchableCompanies(user);
+    if (companies.length >= 2) {
+      authLogger.info("Login needs a company pick", { userId: user._id, companies: companies.length, ip: req.ip });
+      return res.json({
+        needsPick: true,
+        pickToken: signPickToken(user),
+        memberships: await Promise.all(companies.map((c) => companyCard(c))),
+      });
     }
 
-    const claims = {
-      userId: String(user._id),
-      email: built.safe.email,
-      roles: built.roles,
-      // Staff users carry workspaceId in JWT (their workspaceId is reliable).
-      // Customer users must not — their workspaceId on the User doc may be stale
-      // or point to the wrong workspace. requireWorkspace resolves them via customerId.
-      workspaceId: built.staff ? (user.workspaceId?.toString() || undefined) : undefined,
-      customerId: built.staff ? undefined : built.customerId || undefined,
-      businessId: built.staff ? undefined : built.customerId || undefined,
-      vendorId: built.staff ? undefined : built.vendorId || undefined,
-      customerMemberRole: built.staff ? undefined : built.customerMemberRole || undefined,
-      isDemoUser: user.isDemoUser === true,
-    };
+    const { built, claims } = await ownSessionClaims(user);
     const membership = await sessionMembershipFor(user, claims);
 
     const accessToken = signAccessToken({ ...claims, membership });
@@ -1226,39 +1348,43 @@ r.post("/refresh", async (req, res) => {
       verifiedMembership = m;
     }
 
-    let built = await buildAuthSafeUser(user);
-
-    // ✅ STAFF: never auto-link workspace leader
-    if (!built.staff) {
-      if (built.customerId && isValidObjectId(built.customerId)) {
-        await ensureWorkspaceAndLeader({
-          customerId: built.customerId,
-          email: built.safe.email,
-          name: built.safe.firstName || built.safe.name,
-          userRoles: user.roles || [],
+    // Company switcher Phase 4: a session in a SECOND company re-mints that
+    // company, never the User document's, or a switch would revert within 30
+    // minutes (audit 2.2). With MULTI_WORKSPACE_LOGIN off it falls through to
+    // the own company below (sessionMembershipFor drops the second mid).
+    if (
+      verifiedMembership &&
+      multiWorkspaceLoginEnabled() &&
+      !switchIneligibleReason(user) &&
+      !isOwnCompany(verifiedMembership, user)
+    ) {
+      const second = await secondCompanySession(user, verifiedMembership);
+      if (!second) {
+        clearRefreshCookie(res);
+        authLogger.warn("Refresh refused: second-company workspace no longer active", {
+          userId: String(user._id),
+          mid: String(verifiedMembership._id),
+          ip: req.ip,
         });
-
-        if (!user.customerId) {
-          user.customerId = built.customerId;
-          user.businessId = built.customerId;
-          await user.save();
-        }
-
-        built = await buildAuthSafeUser(user);
+        return res.status(401).json(MEMBERSHIP_REVOKED_BODY);
       }
+      const secondAccess = signAccessToken({ ...second.claims, membership: second.membership });
+      setRefreshCookie(res, signRefresh(user, second.membership));
+      setAccessCookie(res, secondAccess);
+      SessionLog.create({
+        userId: user._id,
+        email: second.claims.email,
+        role: second.claims.roles[0],
+        event: "TOKEN_REFRESH",
+        workspaceId: second.membership.wsid,
+        ipAddress: req.ip || req.headers["x-forwarded-for"] as string,
+        userAgent: req.headers["user-agent"],
+        success: true,
+      }).catch(() => {});
+      return res.json({ accessToken: secondAccess, user: second.safe });
     }
 
-    const claims = {
-      userId: String(user._id),
-      email: built.safe.email,
-      roles: built.roles,
-      workspaceId: built.staff ? (user.workspaceId?.toString() || undefined) : undefined,
-      customerId: built.staff ? undefined : built.customerId || undefined,
-      businessId: built.staff ? undefined : built.customerId || undefined,
-      vendorId: built.staff ? undefined : built.vendorId || undefined,
-      customerMemberRole: built.staff ? undefined : built.customerMemberRole || undefined,
-      isDemoUser: user.isDemoUser === true,
-    };
+    const { built, claims } = await ownSessionClaims(user);
     const membership = await sessionMembershipFor(user, claims, verifiedMembership);
 
     const newAccessToken = signAccessToken({ ...claims, membership });
@@ -1287,6 +1413,150 @@ r.post("/refresh", async (req, res) => {
 });
 
 /* ───────────────────────────────────────────────
+ * COMPANY SWITCHER (Phase 4) — docs/audits/multi-workspace-login-audit.md §8.2
+ * All three answer 404 FEATURE_DISABLED unless MULTI_WORKSPACE_LOGIN=true.
+ * ─────────────────────────────────────────────── */
+const FEATURE_DISABLED_BODY = { error: "Not found", code: "FEATURE_DISABLED" };
+
+function companyRefusal(res: any, status: number, code: string, error: string) {
+  return res.status(status).json({ error, code });
+}
+
+/**
+ * The caller of a session-bound switcher route: a verified access token whose
+ * membership (if any) is still live, and an active User. Answers the 401/403
+ * itself and returns null when the caller does not check out.
+ */
+async function switcherCaller(req: any, res: any): Promise<{ payload: any; user: any } | null> {
+  const token = extractAccessToken(req);
+  if (!token) {
+    res.status(401).json({ error: "Missing token" });
+    return null;
+  }
+  let payload: any;
+  try {
+    payload = verifyAccessTokenOrThrow(token);
+  } catch (err: any) {
+    send401ForJwtError(res, err);
+    return null;
+  }
+  if (payload.mid && membershipSessionEnabled() && !(await verifySessionMembership(payload))) {
+    res.status(401).json(MEMBERSHIP_REVOKED_BODY);
+    return null;
+  }
+  const user: any = isValidObjectId(payload.sub) ? await User.findById(String(payload.sub)) : null;
+  if (!user || isLoginDisabled(user)) {
+    res.status(401).json({ error: "User not found" });
+    return null;
+  }
+  if (!isUserActive(user)) {
+    res.status(403).json({
+      error: "This account has been deactivated. Please contact your administrator.",
+      code: "ACCOUNT_INACTIVE",
+    });
+    return null;
+  }
+  return { payload, user };
+}
+
+/* POST /auth/select-workspace {pickToken, workspaceId} — second step of a
+ * login that answered needsPick. Mints the session for that company.
+ * A bad / expired pick token is a 400 PICK_EXPIRED, not a 401: the caller
+ * holds no session yet, and the frontend client answers a 401 by refreshing
+ * with whatever refresh cookie the browser still has. */
+r.post("/select-workspace", async (req, res) => {
+  try {
+    if (!multiWorkspaceLoginEnabled()) return res.status(404).json(FEATURE_DISABLED_BODY);
+    const { pickToken, workspaceId } = (req.body || {}) as { pickToken?: unknown; workspaceId?: unknown };
+
+    const pick = verifyPickToken(pickToken);
+    if (!pick) return companyRefusal(res, 400, "PICK_EXPIRED", "Your sign-in has expired. Please sign in again.");
+
+    const user: any = isValidObjectId(pick.sub) ? await User.findById(pick.sub) : null;
+    if (!user || isLoginDisabled(user) || !pickTokenMatchesUser(pick, user)) {
+      return companyRefusal(res, 400, "PICK_EXPIRED", "Your sign-in has expired. Please sign in again.");
+    }
+    if (!isUserActive(user)) {
+      return res.status(403).json({
+        error: "This account has been deactivated. Please contact your administrator.",
+        code: "ACCOUNT_INACTIVE",
+      });
+    }
+
+    const target = await switchableCompany(user, workspaceId);
+    if (!target) return companyRefusal(res, 403, "NOT_A_MEMBER", "You don't have access to that company.");
+
+    const out = await issueCompanySession(req, res, user, target, "LOGIN");
+    if (!out) return companyRefusal(res, 403, "WORKSPACE_INACTIVE", "That company is not available right now.");
+
+    // The picker's "last used" hint for next time. Never isDefault.
+    WorkspaceMembership.updateOne({ _id: target.membership._id }, { $set: { lastSelectedAt: new Date() } }).catch(() => {});
+
+    res.json({ accessToken: out.accessToken, user: out.user, workspaceId: out.workspaceId });
+  } catch (err) {
+    authLogger.error("Select workspace failed", { error: err instanceof Error ? err.message : String(err) });
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* POST /auth/switch-workspace {workspaceId} — move a live session to another
+ * of the caller's companies: new access + refresh tokens for that membership. */
+r.post("/switch-workspace", async (req, res) => {
+  try {
+    if (!multiWorkspaceLoginEnabled()) return res.status(404).json(FEATURE_DISABLED_BODY);
+    const caller = await switcherCaller(req, res);
+    if (!caller) return;
+    const { payload, user } = caller;
+
+    // SuperAdmin already picks any workspace; demo sessions and HOUSE staff
+    // keep the one they have (audit 7.3).
+    const why = tokenIneligibleReason(payload) || switchIneligibleReason(user);
+    if (why) {
+      authLogger.warn("Workspace switch refused", { userId: String(user._id), reason: why, ip: req.ip });
+      return companyRefusal(res, 403, "SWITCH_NOT_ALLOWED", "This account cannot switch companies.");
+    }
+
+    const target = await switchableCompany(user, req.body?.workspaceId);
+    if (!target) {
+      authLogger.warn("Workspace switch refused", { userId: String(user._id), reason: "not a member", ip: req.ip });
+      return companyRefusal(res, 403, "NOT_A_MEMBER", "You don't have access to that company.");
+    }
+
+    const out = await issueCompanySession(req, res, user, target, "WORKSPACE_SWITCH");
+    if (!out) return companyRefusal(res, 403, "WORKSPACE_INACTIVE", "That company is not available right now.");
+
+    res.json({ accessToken: out.accessToken, user: out.user, workspaceId: out.workspaceId });
+  } catch (err) {
+    authLogger.error("Switch workspace failed", { error: err instanceof Error ? err.message : String(err) });
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* GET /auth/my-companies — the caller's switchable companies (ACTIVE
+ * memberships), with the current one marked. The frontend renders a switcher
+ * only when this lists two or more. */
+r.get("/my-companies", async (req, res) => {
+  try {
+    if (!multiWorkspaceLoginEnabled()) return res.json({ enabled: false, companies: [], currentWorkspaceId: null });
+    const caller = await switcherCaller(req, res);
+    if (!caller) return;
+    const { payload, user } = caller;
+    if (tokenIneligibleReason(payload)) return res.json({ enabled: true, companies: [], currentWorkspaceId: null });
+
+    const list = await switchableCompanies(user);
+    // A legacy token (no wsid) is in the User's own company.
+    const current =
+      (payload.wsid && String(payload.wsid)) ||
+      (list.find((c: SwitchableCompany) => isOwnCompany(c.membership, user))?.workspace._id?.toString() ?? null);
+    const companies = await Promise.all(list.map((c) => companyCard(c, current)));
+    res.json({ enabled: true, companies, currentWorkspaceId: current });
+  } catch (err) {
+    authLogger.error("My companies failed", { error: err instanceof Error ? err.message : String(err) });
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ───────────────────────────────────────────────
  * CURRENT USER
  * ─────────────────────────────────────────────── */
 r.get("/me", async (req, res) => {
@@ -1305,7 +1575,7 @@ r.get("/me", async (req, res) => {
     const user: any = await User.findById(payload.sub);
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    const { safe } = await buildAuthSafeUser(user);
+    let { safe } = await buildAuthSafeUser(user);
 
     // Resolve workspace (best-effort — never block /me on workspace lookup failure)
     let workspaceData = null;
@@ -1315,6 +1585,16 @@ r.get("/me", async (req, res) => {
     const membershipSession = !!payload.wsid && membershipSessionEnabled();
     if (membershipSession && !(await verifySessionMembership(payload))) {
       return res.status(401).json(MEMBERSHIP_REVOKED_BODY);
+    }
+
+    // Company switcher Phase 4: in a SECOND company the session user carries
+    // that company's identity, roles and flags, as the token does.
+    if (membershipSession && multiWorkspaceLoginEnabled() && !switchIneligibleReason(user)) {
+      const m: any = await WorkspaceMembership.findById(String(payload.mid)).lean();
+      if (m && !isOwnCompany(m, user)) {
+        const ws: any = await CustomerWorkspace.findById(m.workspaceId).select("_id customerId status").lean();
+        if (ws) safe = overlaySecondCompany(safe, m, ws);
+      }
     }
 
     try {

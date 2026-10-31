@@ -14,6 +14,11 @@
 // requireWorkspace and /auth/me re-check status + tokenVersion. Claims are
 // still derived as before. Rollback = MEMBERSHIP_SESSION_DISABLED=true.
 //
+// PHASE 4 (switcher, MULTI_WORKSPACE_LOGIN=true): a person may hold a second
+// CUSTOMER membership, added by routes/admin.workspaceMemberships.ts. The
+// isDefault row stays the company the User document describes; login asks
+// which company when 2+ are ACTIVE (services/workspaceSwitch.service.ts).
+//
 // No workspaceScopePlugin: a membership lookup is by userId across
 // workspaces by design.
 import mongoose, { Schema, type Model } from "mongoose";
@@ -59,6 +64,9 @@ export interface WorkspaceMembershipDoc {
   isDefault: boolean;
   /** Bump to revoke this membership's sessions (read from Phase 2). */
   tokenVersion: number;
+  /** Phase 4: when the login picker last chose this company (the picker's
+   *  "last used" hint). Not isDefault — that stays the User's own company. */
+  lastSelectedAt: Date | null;
   invitedBy: mongoose.Types.ObjectId | null;
   removedAt: Date | null;
   removedBy: mongoose.Types.ObjectId | null;
@@ -94,6 +102,7 @@ const WorkspaceMembershipSchema = new Schema<WorkspaceMembershipDoc>(
     status: { type: String, enum: MEMBERSHIP_STATUSES, default: "ACTIVE" },
     isDefault: { type: Boolean, default: false },
     tokenVersion: { type: Number, default: 0 },
+    lastSelectedAt: { type: Date, default: null },
     invitedBy: { type: Schema.Types.ObjectId, ref: "User", default: null },
     removedAt: { type: Date, default: null },
     removedBy: { type: Schema.Types.ObjectId, ref: "User", default: null },

@@ -4,7 +4,9 @@ export interface ISessionLog extends Document {
   userId?: mongoose.Types.ObjectId;
   email: string;
   role?: string;
-  event: "LOGIN" | "LOGOUT" | "TOKEN_REFRESH" | "LOGIN_FAILED" | "PASSWORD_CHANGE";
+  event: "LOGIN" | "LOGOUT" | "TOKEN_REFRESH" | "LOGIN_FAILED" | "PASSWORD_CHANGE" | "WORKSPACE_SWITCH";
+  /** The session's company (company switcher Phase 4: company-picked logins, switches). */
+  workspaceId?: mongoose.Types.ObjectId;
   ipAddress?: string;
   userAgent?: string;
   success: boolean;
@@ -21,8 +23,9 @@ const sessionLogSchema = new Schema<ISessionLog>(
     event: {
       type: String,
       required: true,
-      enum: ["LOGIN", "LOGOUT", "TOKEN_REFRESH", "LOGIN_FAILED", "PASSWORD_CHANGE"],
+      enum: ["LOGIN", "LOGOUT", "TOKEN_REFRESH", "LOGIN_FAILED", "PASSWORD_CHANGE", "WORKSPACE_SWITCH"],
     },
+    workspaceId: { type: Schema.Types.ObjectId, ref: "CustomerWorkspace" },
     ipAddress: { type: String, default: "" },
     userAgent: { type: String, default: "" },
     success: { type: Boolean, default: true },

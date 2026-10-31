@@ -3,6 +3,7 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 import User from "../models/User.js";
+import WorkspaceMembership from "../models/WorkspaceMembership.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
@@ -206,6 +207,16 @@ router.post("/admin-set", requireAuth, requireWorkspace, async (req: any, res, n
     // same reply as a user that is not there.
     if (!user || isLoginDisabled(user)) {
       return res.status(404).json({ error: "User not found in the target workspace" });
+    }
+
+    // Company switcher Phase 4 (audit §6): one password, several companies.
+    // No single company's admin may set it — the person resets it themselves.
+    const memberships = await WorkspaceMembership.countDocuments({ userId: user._id, status: { $ne: "REMOVED" } });
+    if (memberships > 1) {
+      return res.status(409).json({
+        error: "This person signs in to more than one company, so their password can't be set by an admin. Ask them to use “Forgot password” on the sign-in page.",
+        code: "MULTI_COMPANY_SELF_SERVICE_ONLY",
+      });
     }
 
     const hash = await bcrypt.hash(String(newPassword), 10);

@@ -15,8 +15,9 @@
 //
 // Still exactly one membership per user: when the resolved workspace changes
 // (e.g. promote-customer moves User.workspaceId) the existing row is moved in
-// place rather than a second row being added. Phase 4 (second memberships)
-// must replace that rule.
+// place rather than a second row being added. Phase 4: only the DEFAULT row
+// (the User's own company) is synced or moved here; second-company rows
+// (routes/admin.workspaceMemberships.ts) are left alone.
 //
 // The resolution below DUPLICATES routes/auth.ts on purpose (Phase 1 must not
 // touch login): isStaffActor (auth.ts:315-340) and the customerId order in
@@ -255,12 +256,22 @@ export async function writeMembership(
     isDefault: true,
   };
 
-  // 1. The row for this workspace already exists.
+  // 1. The row for this workspace already exists. It is the User's own
+  // company, so it is the default; any other row stops being it (Phase 4:
+  // still exactly one default per user).
   const same = await WorkspaceMembership.updateOne({ userId, workspaceId: target.workspaceId }, { $set: fields });
-  if (same.matchedCount) return "updated";
+  if (same.matchedCount) {
+    await WorkspaceMembership.updateMany(
+      { userId, workspaceId: { $ne: target.workspaceId }, isDefault: true },
+      { $set: { isDefault: false } },
+    );
+    return "updated";
+  }
 
-  // 2. One row exists for another workspace — move it (still one per user).
-  const moved = await WorkspaceMembership.updateOne({ userId }, { $set: { ...fields, workspaceId: target.workspaceId } });
+  // 2. The user's own-company row exists for another workspace — move it.
+  // Only the DEFAULT row moves: a second-company membership (Phase 4,
+  // isDefault false) is never relocated by a change to the User document.
+  const moved = await WorkspaceMembership.updateOne({ userId, isDefault: true }, { $set: { ...fields, workspaceId: target.workspaceId } });
   if (moved.matchedCount) return "moved";
 
   // 3. None yet.

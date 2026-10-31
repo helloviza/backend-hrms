@@ -1064,6 +1064,7 @@ import { requireInvoiceAccess } from "./middleware/requireInvoiceAccess.js";
 import notificationsRouter from "./routes/notifications.js";
 import { requireBillingStaff } from "./middleware/requireBillingStaff.js";
 import adminTravellersRouter from "./routes/admin.travellers.js";
+import adminWorkspaceMembershipsRouter from "./routes/admin.workspaceMemberships.js";
 import extractedDocumentsRouter from "./routes/admin.extractedDocuments.js";
 import carbonRouter from "./routes/admin.carbon.js";
 // Tasks / Reminders
@@ -1084,6 +1085,10 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   // see routes/admin.travellers.ts. Same interception reason for the
   // position as manual-bookings above.
   app.use("/api/admin/customers", requireAuth, requireWorkspace, requireHouse, adminTravellersRouter);
+  // Company switcher Phase 4: add an existing login to another customer
+  // company / suspend / remove it. HOUSE ADMIN + SuperAdmin; 404 unless
+  // MULTI_WORKSPACE_LOGIN=true (routes/admin.workspaceMemberships.ts).
+  app.use("/api/admin/workspace-memberships", requireAuth, requireWorkspace, requireHouse, adminWorkspaceMembershipsRouter);
   // Cross-tenant oversight over extracteddocuments. SuperAdmin-only; the router
   // carries its own requireAuth/requireWorkspace + superAdminOnly guard, and is
   // mounted before the broad /api/admin routers for the same interception
