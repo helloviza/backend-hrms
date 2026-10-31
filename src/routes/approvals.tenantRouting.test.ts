@@ -235,3 +235,13 @@ describe("POST /requests — staff have no raise-on-behalf path", () => {
     expect(sent).toEqual([]);
   });
 });
+
+describe("the request's company name comes from the workspace's companyName", () => {
+  it("a workspace with only companyName (the schema's field) names the request — not 'Workspace'", async () => {
+    await col("customerworkspaces").updateOne({ _id: WS_A }, { $set: { companyName: "Company A Pvt Ltd" }, $unset: { name: "" } });
+    const r = await as(request(app).post("/api/approvals/requests"), REQUESTER_A).send({ cartItems: [flightItem] });
+    expect(r.status).toBe(200);
+    expect((await reqDoc(r.body.request._id)).customerName).toBe("Company A Pvt Ltd");
+    expect(sent.find((m) => m.to === "approver@a.test")?.subject).toMatch(/^Approval Needed — Company A Pvt Ltd/);
+  });
+});

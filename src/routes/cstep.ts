@@ -169,6 +169,7 @@ import {
   type CstepExpenseCategory,
 } from "../models/cstep/expenseCategories.js";
 import { buildEventSpendRows, UNCATEGORISED, type EventSpendCase, type EventSpendRow } from "../utils/cstepEventSpend.js";
+import { personName } from "../services/actorNames.js";
 
 const router = Router();
 
@@ -6386,7 +6387,7 @@ router.get("/requests/:id/activity", async (req: any, res: any) => {
 
     const actorNameOf = (u: any): string | undefined => {
       if (!u || typeof u !== "object") return undefined;
-      return u.name || [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.email || undefined;
+      return personName(u) || u.email || undefined;
     };
 
     const activity = [
@@ -6482,7 +6483,7 @@ router.get("/requests/:id/pdf", async (req: any, res: any) => {
         const trail: CstepApprovalTrailEntry[] = (approvals as any[]).map((a) => ({
           action: a.action,
           actorName:
-            a.actor?.name || [a.actor?.firstName, a.actor?.lastName].filter(Boolean).join(" ").trim() || a.actor?.email || "—",
+            personName(a.actor) || a.actor?.email || "—",
           at: a.at,
           comment: a.comment,
         }));
@@ -6627,7 +6628,7 @@ async function ensureClaimDeclaration(req: any, doc: any): Promise<string | null
     .lean();
   const trail: CstepApprovalTrailEntry[] = (approvals as any[]).map((a) => ({
     action: a.action,
-    actorName: a.actor?.name || [a.actor?.firstName, a.actor?.lastName].filter(Boolean).join(" ").trim() || a.actor?.email || "—",
+    actorName: personName(a.actor) || a.actor?.email || "—",
     at: a.at,
     comment: a.comment,
   }));
@@ -6793,7 +6794,7 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
         const trail: CstepApprovalTrailEntry[] = (approvals as any[]).map((a) => ({
           action: a.action,
           actorName:
-            a.actor?.name || [a.actor?.firstName, a.actor?.lastName].filter(Boolean).join(" ").trim() || a.actor?.email || "—",
+            personName(a.actor) || a.actor?.email || "—",
           at: a.at,
           comment: a.comment,
         }));

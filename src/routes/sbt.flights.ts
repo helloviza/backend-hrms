@@ -96,6 +96,7 @@ import {
   getCheckoutHandler,
 } from "../services/sbtFulfil.js";
 import { stripSbtGstIfUnregistered } from "../utils/customerGst.js";
+import { personName } from "../services/actorNames.js";
 
 const router = express.Router();
 
@@ -2009,7 +2010,7 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
                   ${eRow('PNR', escapeHtml(doc.pnr || b.pnr || '—'))}
                   ${eRow('Route', escapeHtml(`${b.origin?.city || b.searchParams?.origin || '?'} → ${b.destination?.city || b.searchParams?.destination || '?'}`))}
                   ${eRow('Departure', escapeHtml(b.departureTime || b.searchParams?.departDate || '—'))}
-                  ${eRow('Passenger', escapeHtml(requester?.name || requester?.email || '—'))}
+                  ${eRow('Passenger', escapeHtml(personName(requester) || requester?.email || '—'))}
                   ${eRow('Booked by', escapeHtml(req.user?.email || '—'))}
                 </table>
               `)}

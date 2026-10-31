@@ -21,6 +21,7 @@ const { sendTemplateMessage, sendTextMessageResult, sendButtonMessage } = outbou
 import { toWaRecipient } from "../utils/waNumber.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { arriveMetric } from "../utils/plutoMetricsBuilder.js";
+import { personName } from "./actorNames.js";
 
 const EXPIRY_CAP_MS = 48 * 60 * 60 * 1000; // openedAt + 48h hard cap
 const CHECKIN_GRACE_MS = 24 * 60 * 60 * 1000; // hotel checkInDate + 1 day
@@ -104,10 +105,10 @@ export async function resolveArrivalContext(watch: any, info: any): Promise<Arri
   let bookerPhone: string | null = null;
   if (bookerUserId) {
     const u: any = await User.findById(bookerUserId)
-      .select("name firstName email phone personalContact")
+      .select("name firstName lastName email phone personalContact")
       .lean();
     if (u) {
-      bookerName = u.name || u.firstName || null;
+      bookerName = personName(u) || null;
       bookerEmail = u.email || null;
       bookerPhone = u.phone || u.personalContact || null;
     }

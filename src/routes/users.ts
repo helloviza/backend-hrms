@@ -28,6 +28,8 @@ import {
 import { stripTravelFields } from "../utils/stripTravelFields.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
 import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
+import { renameUser } from "../services/personNames.js";
+import { personName } from "../services/actorNames.js";
 
 const r = Router();
 
@@ -188,7 +190,7 @@ r.get(
         roles:            u.roles || [],
 
         // Name
-        name:             u.name || u.firstName || u.email?.split("@")[0] || "",
+        name:             personName(u) || u.email?.split("@")[0] || "",
         firstName:        u.firstName || "",
         middleName:       u.middleName || "",
         lastName:         u.lastName || "",
@@ -293,6 +295,29 @@ r.get(
     }
   },
 );
+
+/**
+ * PATCH /api/users/me/name  { firstName, lastName }
+ * Every signed-in user may set their own name (customers included — no
+ * "people" permission). Keeps name = first + last, copies it to their roster
+ * rows and records a UserNameAudit row (services/personNames.ts).
+ */
+r.patch("/me/name", requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const userId = (req as any).user?.sub;
+    if (!userId || !mongoose.isValidObjectId(userId)) return res.status(401).json({ error: "Unauthorized" });
+    const out = await renameUser({
+      userId,
+      input: { firstName: req.body?.firstName, lastName: req.body?.lastName },
+      actor: (req as any).user,
+      via: "self",
+    });
+    if (!out.ok) return res.status(out.status || 400).json({ error: out.error });
+    res.json({ ok: true, user: out.user });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /**
  * POST /api/users/profile/update

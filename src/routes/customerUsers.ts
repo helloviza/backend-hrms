@@ -4,6 +4,7 @@ import multer from "multer";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 import ExcelJS from "exceljs";
+import mongoose from "mongoose";
 
 import { requireAuth } from "../middleware/auth.js";
 import MasterData from "../models/MasterData.js";
@@ -25,6 +26,7 @@ import { activeUserFilter } from "../utils/userActiveStatus.js";
 import { isHouseUser, isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
 import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 import WorkspaceMembership from "../models/WorkspaceMembership.js";
+import { renameUser, splitPersonName } from "../services/personNames.js";
 import { clearMembershipCache, MEMBERSHIP_REVOKED_BODY } from "../middleware/requireWorkspace.js";
 import {
   isActiveWorkspaceLeader,
@@ -823,6 +825,8 @@ export async function ensureAuthUserForCustomer(params: {
 }) {
   const email = normEmail(params.email);
   const name = normStr(params.name || "");
+  // One typed "full name" → first / last (it used to land whole in firstName).
+  const person = splitPersonName(name);
   const roles = Array.from(new Set(["CUSTOMER", params.memberRole].map((x) => String(x).toUpperCase()).filter(Boolean)));
 
   const passwordPlain = params.passwordPlain && params.passwordPlain.length >= 6 ? params.passwordPlain : null;
@@ -877,12 +881,12 @@ export async function ensureAuthUserForCustomer(params: {
       email,
       officialEmail: email,
       personalEmail: email,
-      name: name || undefined,
+      name: person.name || undefined,
       // No placeholder: an unnamed account shows its claimed traveller
       // profile's name, else its email (services/actorNames.ts) — never
       // "Workspace User" on requests and activity.
-      firstName: name || undefined,
-      lastName: "",
+      firstName: person.firstName || undefined,
+      lastName: person.lastName,
       roles,
       passwordHash,
       customerId: params.customerId,
@@ -913,8 +917,13 @@ export async function ensureAuthUserForCustomer(params: {
   user.accountType = user.accountType || "CUSTOMER";
   user.userType = user.userType || "CUSTOMER";
 
-  if (name && !user.name) user.name = name;
-  if (name && !user.firstName) user.firstName = name;
+  // Only an unnamed login takes the typed name — never a `name` that
+  // disagrees with a first name already on the account.
+  if (person.name && !user.name && !user.firstName) user.name = person.name;
+  if (person.firstName && !user.firstName) {
+    user.firstName = person.firstName;
+    if (!user.lastName) user.lastName = person.lastName;
+  }
 
   if (passwordPlain) user.passwordHash = passwordHash;
 
@@ -2425,6 +2434,90 @@ router.patch("/:id", requireAuth, async (req: any, res) => {
     res.status(500).json({ error: "Failed to update user", detail: err?.message });
   }
 });
+
+/**
+ * PATCH /api/customer/users/:id/name            :id = the CustomerMember row
+ * PATCH /api/customer/users/user/:userId/name   by login (the client-portal Team tab)
+ * Body { firstName, lastName }. Renames that person's login (User first /
+ * last / name + their roster rows, audited — services/personNames.ts
+ * renameUser). Allowed: Plumtrips staff for any company; that company's
+ * active Workspace Leader for its own people (never a Plumtrips staff login).
+ */
+async function renameCompanyMember(req: any, res: any, findMember: (customerId: string) => Promise<any>) {
+  try {
+    const actor = req.user || {};
+    const actorEmail = normEmail(actor.email || "");
+    const staff = isStaffPrivileged(actor);
+
+    const customerId = await resolveCustomerId(req);
+    if (!customerId) {
+      return res.status(400).json({
+        error: staff ? "Please set Customer ID first (Business id) to load the workspace." : "Customer workspace not found for this login",
+      });
+    }
+
+    if (!staff) {
+      const me: any = await getActorMember(customerId, actorEmail);
+      if (!me || me.isActive === false || String(me.role || "").toUpperCase() !== "WORKSPACE_LEADER") {
+        return res.status(403).json({ error: "Only your Workspace Leader or Plumtrips can change other people's names" });
+      }
+    }
+
+    const m: any = await findMember(customerId);
+    if (!m) return res.status(404).json({ error: "Member not found" });
+
+    const email = normEmail(m.email);
+    const ws: any = await CustomerWorkspace.findOne({ customerId }).select("_id").lean();
+    const target: any = await User.findOne({ $or: [{ email }, { officialEmail: email }] })
+      .select("_id email customerId workspaceId roles accountType")
+      .lean();
+    if (!target) return res.status(409).json({ error: "This person has no login yet", code: "NO_LOGIN" });
+
+    // The login must belong to this company: its home company, its workspace,
+    // or an active membership here (a second company).
+    const belongs =
+      String(target.customerId || "") === String(customerId) ||
+      (!!ws && String(target.workspaceId || "") === String(ws._id)) ||
+      (!!ws &&
+        !!(await WorkspaceMembership.exists({ userId: target._id, workspaceId: ws._id, status: "ACTIVE" })));
+    if (!belongs) return res.status(403).json({ error: "This login belongs to another company" });
+    if (!staff && isStaffPrivileged(target)) {
+      return res.status(403).json({ error: "Plumtrips staff names can't be changed here" });
+    }
+
+    const out = await renameUser({
+      userId: target._id,
+      input: { firstName: req.body?.firstName, lastName: req.body?.lastName },
+      actor,
+      via: staff ? "staff" : "workspace_leader",
+      customerId,
+    });
+    if (!out.ok) return res.status(out.status || 400).json({ error: out.error });
+    res.json({ ok: true, user: out.user, member: { _id: String(m._id), name: out.user?.name } });
+  } catch (err: any) {
+    console.error("[customerUsers:rename] error", err);
+    res.status(500).json({ error: "Failed to update the name" });
+  }
+}
+
+router.patch("/:id/name", requireAuth, (req: any, res) =>
+  renameCompanyMember(req, res, async (customerId) => {
+    const id = normStr(req.params?.id);
+    if (!mongoose.isValidObjectId(id)) return null;
+    return CustomerMember.findOne({ _id: id, customerId }).lean().exec();
+  }),
+);
+
+router.patch("/user/:userId/name", requireAuth, (req: any, res) =>
+  renameCompanyMember(req, res, async (customerId) => {
+    const userId = normStr(req.params?.userId);
+    if (!mongoose.isValidObjectId(userId)) return null;
+    const u: any = await User.findById(userId).select("email officialEmail").lean();
+    if (!u) return null;
+    const emails = [normEmail(u.email), normEmail(u.officialEmail || "")].filter(Boolean);
+    return CustomerMember.findOne({ customerId, email: { $in: emails } }).lean().exec();
+  }),
+);
 
 /**
  * POST /api/customer/users/:id/reinvite

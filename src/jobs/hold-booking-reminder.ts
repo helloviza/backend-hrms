@@ -4,6 +4,7 @@ import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import User from "../models/User.js";
 import { sendMail } from "../utils/mailer.js";
 import logger from "../utils/logger.js";
+import { personName } from "../services/actorNames.js";
 
 type ReminderType = "24h" | "1h";
 
@@ -23,7 +24,7 @@ async function sendReminderEmail(booking: any, user: any, type: ReminderType) {
         <h2 style="font-family:'Cormorant Garamond',Georgia,serif;font-size:24px;font-weight:600;color:#1c1c1c;margin:0 0 16px;">
           Hotel Voucher Deadline — ${type === "24h" ? "24 Hours" : "1 Hour"} Remaining
         </h2>
-        <p style="margin:0 0 12px;">Dear ${user.name || user.firstName || "Guest"},</p>
+        <p style="margin:0 0 12px;">Dear ${personName(user) || "Guest"},</p>
         <p style="margin:0 0 20px;">
           Your held booking at <strong>${booking.hotelName}</strong> requires a voucher to be generated
           by <strong>${deadline} IST</strong>. After this deadline, the booking may be auto-cancelled by the supplier.

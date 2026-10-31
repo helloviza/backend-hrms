@@ -60,7 +60,7 @@ import {
   checkCanRaiseRequest,
 } from "./approvals.security.js";
 import approvalSearchRouter from "./approvals.search.js";
-import { actorNamesOnResponse, actorStamp, SYSTEM_ACTOR, isPlaceholderName, userNames } from "../services/actorNames.js";
+import { actorNamesOnResponse, actorStamp, SYSTEM_ACTOR, isPlaceholderName, personName, userNames } from "../services/actorNames.js";
 import travelDeskRouter from "./approvals.travelDesk.js";
 import { assignCase, TravelDeskError, flagNeedsReassignment } from "../services/travelDesk.js";
 import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
@@ -527,7 +527,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     let wsInternalId: string | null = null;
 
     if (ws) {
-      customerName = normStr((ws as any).name || (ws as any).displayName || "") || "Workspace";
+      customerName = normStr((ws as any).companyName || (ws as any).name || (ws as any).displayName || "") || "Workspace";
       customerEmailDomain = leaderEmails[0] ? getEmailDomain(leaderEmails[0]) : "";
       finalCustomerId = String((ws as any).customerId || cid);
       wsInternalId = String((ws as any)._id || "");
@@ -569,7 +569,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     const mgrUser: any = await User.findOne({ email: exactIRegex(approverEmail) }).lean().exec();
 
     const managerId = String(mgrUser?.sub || mgrUser?._id || "");
-    const managerName = normStr(mgrUser?.name || mgrUser?.firstName || "") || "Approver";
+    const managerName = personName(mgrUser) || "Approver";
 
     // Resolve workspace travel flow (requireTravelMode attaches req.workspace)
     const wsTravelFlow =

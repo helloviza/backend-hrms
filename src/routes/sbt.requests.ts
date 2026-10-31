@@ -11,6 +11,7 @@ import { requireFeature } from "../middleware/requireFeature.js";
 import { buildEmailShell, eCard, eRow, eLabel, eBtn, escapeHtml } from "./approvals.email.js";
 import TravelForm from "../models/TravelForm.js";
 import { sellingFlightResults, stripHotelCost } from "../services/sbtQuote.js";
+import { userNames } from "../services/actorNames.js";
 import {
   getActiveMembership,
   holdsSeveralCompanies,
@@ -181,11 +182,13 @@ router.post("/", async (req: any, res: any) => {
       const date = travelDate(type, searchParams);
       const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
 
+      // The requester's person name (first + last), not whatever `name` holds.
+      const fromName = (await userNames([String(user?._id || "")])).get(String(user?._id || "")) || user.email;
       const sbtEmailBody = `
         ${eCard(`
           ${eLabel("Request Details")}
           <table cellpadding="0" cellspacing="0">
-            ${eRow("From", escapeHtml(user.name || user.email))}
+            ${eRow("From", escapeHtml(fromName))}
             ${eRow("Type", escapeHtml(type === "flight" ? "Flight" : "Hotel"))}
             ${eRow("Route / Hotel", escapeHtml(desc))}
             ${date ? eRow("Travel Date", escapeHtml(date)) : ""}
@@ -199,7 +202,7 @@ router.post("/", async (req: any, res: any) => {
 
       await sendMail({
         to: booker.email,
-        subject: `New SBT Request from ${user.name || user.email} — ${desc}`,
+        subject: `New SBT Request from ${fromName} — ${desc}`,
         kind: "REQUESTS",
         html: buildEmailShell(sbtEmailBody, {
           title: "New Booking Request",

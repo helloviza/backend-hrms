@@ -102,15 +102,21 @@ This is an automated message from PlumTrips HRMS. Do not reply to this email.<br
   await sendOnboardingNotice({ emailType: "Employee welcome", recipient: email, workspaceId: params.workspaceId });
 }
 
+const escapeHtml = (v: string) =>
+  v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
 export async function sendClientWelcomeEmail(params: {
   to: string;
-  name: string;
+  /** The PERSON's first name; empty → "there". Never the company. */
+  firstName?: string;
+  /** The client (customer/vendor) company the login belongs to. */
+  companyName?: string;
   setPasswordUrl: string;
   loginUrl: string;
 }): Promise<void> {
-  const { to, name, setPasswordUrl, loginUrl } = params;
-  // name is the client (customer/vendor) company for every caller
-  const firstName = String(name || "").trim().split(/\s+/)[0] || "there";
+  const { to, setPasswordUrl, loginUrl } = params;
+  const firstName = escapeHtml(String(params.firstName || "").trim() || "there");
+  const company = String(params.companyName || "").trim();
 
   const html = `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width"/></head>
@@ -128,7 +134,7 @@ export async function sendClientWelcomeEmail(params: {
 <h1 style="margin:0 0 8px;font-size:24px;font-weight:700;color:#1e293b;">Welcome to Plumbox, ${firstName}!</h1>
 
 <p style="margin:0 0 20px;font-size:15px;color:#475569;line-height:1.6;">
-Your Plumbox account has been created. Your sign-in email is <strong>${to}</strong>.
+Your Plumbox account${company ? ` for <strong>${escapeHtml(company)}</strong>` : ""} has been created. Your sign-in email is <strong>${to}</strong>.
 </p>
 
 ${setPasswordBlock(setPasswordUrl)}
@@ -157,5 +163,5 @@ This is an automated message from Plumbox. Do not reply to this email.<br/>
       "Plumbox <onboarding@plumtrips.com>",
     kind: "WELCOME",
   });
-  await sendOnboardingNotice({ emailType: "Client welcome", recipient: to, company: name });
+  await sendOnboardingNotice({ emailType: "Client welcome", recipient: to, company: company || undefined });
 }

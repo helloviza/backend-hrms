@@ -1,6 +1,6 @@
 // apps/backend/src/routes/auth.ts
 import { Router } from "express";
-import { isPlaceholderName, resolveRealName } from "../services/actorNames.js";
+import { isPlaceholderName, personName, resolveRealName } from "../services/actorNames.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
@@ -287,7 +287,9 @@ async function ownSessionClaims(user: any) {
       await ensureWorkspaceAndLeader({
         customerId: built.customerId,
         email: built.safe.email,
-        name: built.safe.firstName || built.safe.name,
+        // The stored person name (first + last); never the session's
+        // email-local-part fallback. Empty → the roster name is left alone.
+        name: personName(user),
         userRoles: user.roles || [],
       });
 

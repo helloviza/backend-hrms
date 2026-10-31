@@ -29,6 +29,7 @@ import { generateTravelerId } from "../utils/travelerId.js";
 import { GST_STATE_CODES } from "../utils/gstDetection.js";
 import { isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
 import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
+import { promotePersonName, suggestLoginPersonName } from "../services/personNames.js";
 import {
   GST_STATUSES,
   normalizeGstStatus,
@@ -1664,6 +1665,49 @@ return res.json({
 );
 
 /**
+ * GET /api/master-data/:id/login-person
+ * The person the promote dialog pre-fills as the new login's name (customer:
+ * key contact with the login email → first key contact → signatory → invitee;
+ * vendor: contact person → invitee). "" when unknown — never the company.
+ * Same gate as the promote routes.
+ */
+router.get(
+  "/:id/login-person",
+  requireAuth,
+  requireWorkspace,
+  async (req: any, res, next) => {
+    try {
+      if (!isHrmsAdmin(req.user) || !isPlatformStaff(req)) {
+        return res.status(403).json({ error: "Only Plumtrips staff can promote" });
+      }
+      const workspaceId = await resolveWorkspaceId(req);
+      const query: any = { _id: req.params.id };
+      if (workspaceId) query.workspaceId = workspaceId;
+      const doc: any = await Onboarding.findOne(query).lean().exec();
+      if (!doc) return res.status(404).json({ error: "Onboarding record not found" });
+
+      const type = String(doc.type || "").toLowerCase();
+      const kind = type === "vendor" ? "vendor" : type === "business" || type === "customer" ? "customer" : null;
+      if (!kind) return res.status(400).json({ error: "Only Business/Customer or Vendor records have a login person" });
+
+      const form = doc.formPayload || doc.payload || doc.extras_json || {};
+      // The same default login email the promote routes use.
+      const email = String(
+        doc.email || doc.inviteeEmail || (kind === "customer" ? form.billingEmail : form.companyEmail) || form.contactEmail || "",
+      ).trim().toLowerCase();
+      const companyNames = [
+        doc.companyName, doc.businessName, doc.name,
+        form.legalName, form.companyName, form.businessName, form.customerName, form.vendorName,
+      ];
+      const s = suggestLoginPersonName({ kind, onboarding: doc, form, email, companyNames });
+      res.json({ ok: true, email, personName: s.name, source: s.source });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/**
  * Promote Vendor-type onboarding into real Vendor record.
  */
 router.post(
@@ -1815,9 +1859,19 @@ if (email) {
       'PLMX-' + Math.random().toString(36).slice(2, 10).toUpperCase()
     const passwordHash = await bcrypt.hash(tempPassword, 10)
 
+    // A PERSON, as for promote-customer: dialog value, else the form's
+    // contact person / invitee; never the company.
+    const person = promotePersonName(req.body, {
+      kind: 'vendor',
+      onboarding: onboardingDoc,
+      form,
+      email,
+      companyNames: [name, form.companyName, form.businessName, form.vendorName],
+    })
+
     vendorUser = await User.create({
       email:          email.toLowerCase(),
-      name:           form.companyName || name,
+      ...(person.name ? person : {}),
       passwordHash,
       roles:          ['VENDOR'],
       role:           'VENDOR',
@@ -1831,7 +1885,8 @@ if (email) {
     try {
       await sendClientWelcomeEmail({
         to:             email,
-        name:           (vendorUser as any).name,
+        firstName:      (vendorUser as any).firstName,
+        companyName:    form.companyName || name,
         setPasswordUrl: await issueSetPasswordLink((vendorUser as any)._id, ONBOARDING_LINK_TTL_MS),
         loginUrl:       'https://plumbox.plumtrips.com',
       })
@@ -2248,10 +2303,23 @@ if (email) {
     generatedTempPassword = tempPassword
     const passwordHash = await bcrypt.hash(tempPassword, 10)
 
+    // The login is a PERSON: the name typed in the promote dialog, else the
+    // onboarding's key contact / signatory / invitee. Never the company —
+    // unknown stays empty (services/personNames.ts).
+    const person = promotePersonName(req.body, {
+      kind: 'customer',
+      onboarding: onboardingDoc,
+      form,
+      email,
+      companyNames: [name, form.legalName, form.companyName, form.businessName, customer.legalName, customer.name],
+    })
+
     clientUser = await User.create({
       email:              email.toLowerCase(),
       officialEmail:      email.toLowerCase(),
-      name:               form.legalName || name,
+      ...(person.name ? person : {}),
+      customerId:         String(customer._id),
+      businessId:         String(customer._id),
       passwordHash,
       roles:              [customerRole],
       role:               customerRole,
@@ -2266,7 +2334,8 @@ if (email) {
       try {
         await sendClientWelcomeEmail({
           to:             email,
-          name:           (clientUser as any).name,
+          firstName:      (clientUser as any).firstName,
+          companyName:    customer.legalName || customer.name || name,
           setPasswordUrl: await issueSetPasswordLink((clientUser as any)._id, ONBOARDING_LINK_TTL_MS),
           loginUrl:       'https://plumbox.plumtrips.com',
         })

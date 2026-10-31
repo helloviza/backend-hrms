@@ -141,6 +141,7 @@ import {
   replyReaskedLocked,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
+import { personName } from "../services/actorNames.js";
 
 // CABIN_LABELS, dedupeRawTBOFlights, mapTBOFlight and searchFlightsForChat now
 // live in ../utils/plutoFlightSearch.ts (extracted for unit-testability). The
@@ -2562,9 +2563,10 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
         : (itinerary?.destinationCity || itinerary?.destinationIata || "Trip");
       const date = effectiveFlightData?.departure?.date || "";
       const frontendUrl = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
+      const fromName = personName(user) || user.email;
       const subject = itineraryId
-        ? `New Concierge Trip Request from ${user.name || user.email} — ${route}`
-        : `New Concierge Flight Request from ${user.name || user.email} — ${route}`;
+        ? `New Concierge Trip Request from ${fromName} — ${route}`
+        : `New Concierge Flight Request from ${fromName} — ${route}`;
 
       await sendMail({
         to: booker.email,
@@ -2572,7 +2574,7 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
         kind: "REQUESTS",
         html: `
           <h3>New ${itineraryId ? "Trip" : "Flight"} Request (via Concierge)</h3>
-          <p><strong>From:</strong> ${user.name || user.email}</p>
+          <p><strong>From:</strong> ${fromName}</p>
           ${effectiveFlightData ? `<p><strong>Flight:</strong> ${effectiveFlightData.airline?.name || ""} ${effectiveFlightData.flightNo || ""}</p>` : ""}
           <p><strong>Route:</strong> ${route}</p>
           ${date ? `<p><strong>Date:</strong> ${date}</p>` : ""}
