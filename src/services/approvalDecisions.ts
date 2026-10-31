@@ -22,7 +22,7 @@
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import Proposal from "../models/Proposal.js";
 import { autoAllocate } from "./travelDesk.js";
-import { actorStamp, TRAVEL_DESK_NAME } from "./actorNames.js";
+import { actorName, actorStamp, TRAVEL_DESK_NAME } from "./actorNames.js";
 import {
   workspaceOf,
   activeLeaderEmails,
@@ -141,7 +141,9 @@ export async function applyRequestDecision(opts: {
   await assertActorMayDecide(await requestDeciders(ar), actor, ar);
 
   const email = norm(actor.email);
-  const name = str(actor.name) || str(ar.managerName) || "Approver";
+  // The person who clicked — never the approver on file (a delegate or a
+  // Workspace Leader may decide).
+  const name = str(actor.name) || (await actorName(actor)) || email;
   const set: AnyObj =
     action === "approved"
       ? { status: "approved", stage: approvedStageFor(ar), adminState: "pending" }
@@ -240,7 +242,7 @@ export async function replyToClarification(opts: {
 
   const doc: any = await ApprovalRequest.findOne({ _id: (claimed as any)._id }).exec();
   const email = norm(opts.actor.email);
-  const name = str(opts.actor.name) || str(doc.frontlinerName) || email;
+  const name = str(opts.actor.name) || (await actorName(opts.actor)) || email;
   doc.clarifications = Array.isArray(doc.clarifications) ? doc.clarifications : [];
   const question = [...doc.clarifications].reverse().find((c: any) => c?.kind === "question");
   doc.clarifications.push({ kind: "reply", text: reply, at: new Date(), byEmail: email, byName: name, edited: !!opts.edited });
@@ -365,7 +367,7 @@ export async function applyProposalDecision(opts: {
   if (!onBehalf) await assertActorMayDecide(await proposalDeciders(ar), actor, ar);
 
   const email = norm(actor.email);
-  const name = str(actor.name) || email;
+  const name = str(actor.name) || (await actorName(actor)) || email;
 
   if (action === "request_changes") {
     const back: any = await Proposal.findOneAndUpdate(

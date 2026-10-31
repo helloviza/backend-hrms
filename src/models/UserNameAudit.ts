@@ -1,8 +1,9 @@
 // apps/backend/src/models/UserNameAudit.ts
 //
-// One row per change of a person's name — written ONLY by renameUser
-// (services/personNames.ts): who renamed whom, from what to what, and as
-// whom (themselves, Plumtrips staff, or their company's Workspace Leader).
+// One row per change of a person's name — written by renameUser
+// (services/personNames.ts) and scripts/fix-company-named-users.ts: who
+// renamed whom, from what to what, and as whom (themselves, Plumtrips staff,
+// their company's Workspace Leader, or a one-off script).
 // Append-only.
 import { Schema, model } from "mongoose";
 
@@ -23,7 +24,7 @@ const UserNameAuditSchema = new Schema(
     email: { type: String, trim: true, lowercase: true },
     from: { type: NameSchema },
     to: { type: NameSchema, required: true },
-    via: { type: String, enum: ["self", "staff", "workspace_leader"], required: true },
+    via: { type: String, enum: ["self", "staff", "workspace_leader", "script"], required: true },
     actorId: { type: String, trim: true },
     actorEmail: { type: String, trim: true, lowercase: true },
   },

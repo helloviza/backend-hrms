@@ -1,5 +1,6 @@
 // apps/backend/src/routes/approvals.security.ts
 import { requireAuth } from "../middleware/auth.js";
+import { hydrateActorName } from "../services/actorNames.js";
 import { plainActivity, CUSTOMER_HIDDEN_ACTIONS } from "../services/activityText.js";
 import { publicDocuments } from "../services/requestDocumentList.js";
 import User from "../models/User.js";
@@ -748,6 +749,8 @@ export async function requireApprovalsAdminWrite(req: AnyObj, res: any, next: an
       let user = (req as AnyObj).user;
       user = await hydrateUserFromDb(user);
       (req as AnyObj).user = user;
+      // The token carries no name: ops history rows name the person who clicked.
+      await hydrateActorName(req, res, () => undefined);
 
       if (!(await adminQueueAccess(req)).work) {
         return res.status(403).json({

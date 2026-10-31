@@ -27,6 +27,7 @@ import { isHouseUser, isPlatformStaff } from "../middleware/requirePlatformAdmin
 import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 import WorkspaceMembership from "../models/WorkspaceMembership.js";
 import { renameUser, splitPersonName } from "../services/personNames.js";
+import { actorName as actorNameOf } from "../services/actorNames.js";
 import { clearMembershipCache, MEMBERSHIP_REVOKED_BODY } from "../middleware/requireWorkspace.js";
 import {
   isActiveWorkspaceLeader,
@@ -516,7 +517,6 @@ async function ensureWorkspace(customerId: string) {
 async function ensureOwnerIsLeaderSafe(customerId: string, ws: any, actor: any, businessView: any | null) {
   const cid = normStr(customerId);
   const actorEmail = normEmail(actor?.email || "");
-  const actorName = normStr(actor?.name || "");
 
   // Staff: never auto-create leader; just return existing leader if present
   if (isStaffPrivileged(actor)) {
@@ -551,6 +551,7 @@ async function ensureOwnerIsLeaderSafe(customerId: string, ws: any, actor: any, 
   if (!allowByWs && !allowByBiz) return "";
 
   // Promote or create as leader (safe because we passed allow checks above)
+  const actorName = await actorNameOf(actor);
   const now = new Date();
   const ownerCompanyName = businessView?.legalName || businessView?.companyName || businessView?.name || "PLUM";
   const ownerTravelerId = await generateTravelerId(cid, ownerCompanyName);

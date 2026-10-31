@@ -186,6 +186,40 @@ export async function userNames(keys: any[]): Promise<Map<string, string>> {
 }
 
 /**
+ * The acting user's name. The access JWT carries no name, so `req.user.name`
+ * is "" for every signed-in request: read it from their User record (by id,
+ * else email) instead. "" when nobody can be named — callers pick their own
+ * fallback, never someone else's name.
+ */
+export async function actorName(user: any): Promise<string> {
+  const own = personName(user);
+  if (own) return own;
+  const id = str(user?.sub || user?._id || user?.id);
+  const key = HEX24.test(id) ? id : lower(user?.email);
+  // Display-only: never wait on a disconnected database (queries buffer).
+  if (!key || mongoose.connection.readyState !== 1) return "";
+  const name = (await userNames([key])).get(key) || "";
+  return name.includes("@") ? "" : name;
+}
+
+/**
+ * Middleware: fills `req.user.name` (see actorName) on writes, so every
+ * history row, actorStamp and email a write produces names the person who
+ * clicked. Mount after the router's auth.
+ */
+export async function hydrateActorName(req: any, _res: any, next: any) {
+  try {
+    if (req.user && !["GET", "HEAD", "OPTIONS"].includes(req.method) && !personName(req.user)) {
+      const name = await actorName(req.user);
+      if (name) req.user.name = name;
+    }
+  } catch (err: any) {
+    console.error("[actor-names] actor name lookup failed", err?.message || err);
+  }
+  next();
+}
+
+/**
  * Free-text notes that older code wrote with a user id where a name was
  * missing ("Assigned to 69dc05e1…", "L1 → 69a7f38d…"). Returns a function that
  * rewrites such text: every id that is a user becomes their profile name; an

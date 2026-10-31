@@ -38,6 +38,7 @@ import {
 } from "../utils/userActiveStatus.js";
 import { collectPendingWork, summarizePendingWork } from "../services/pendingWork.service.js";
 import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
+import { actorName } from "../services/actorNames.js";
 
 const router = Router();
 
@@ -1424,7 +1425,7 @@ router.post("/", requireAuth, requireWorkspace, async (req: any, res, next) => {
           const inviteUrl = `https://plumbox.plumtrips.com/join?token=${token}`;
           await sendEmployeeInvite(officialEmail, {
             companyName: (workspace as any)?.companyName || "your company",
-            inviterName: req.user.name || req.user.email || "HR",
+            inviterName: (await actorName(req.user)) || req.user.email || "HR",
             inviteUrl,
             expiresAt,
           });

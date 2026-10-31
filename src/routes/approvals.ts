@@ -3,7 +3,7 @@ import { Router } from "express";
 import mongoose from "mongoose";
 import fs from "fs";
 import path from "path";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAuth as verifyToken } from "../middleware/auth.js";
 import { requireWorkspace, resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
 import { requireTravelMode } from "../middleware/travelModeGuard.js";
 import { requireAnyFeature } from "../middleware/requireFeature.js";
@@ -60,7 +60,7 @@ import {
   checkCanRaiseRequest,
 } from "./approvals.security.js";
 import approvalSearchRouter from "./approvals.search.js";
-import { actorNamesOnResponse, actorStamp, SYSTEM_ACTOR, isPlaceholderName, personName, userNames } from "../services/actorNames.js";
+import { actorNamesOnResponse, actorStamp, hydrateActorName, SYSTEM_ACTOR, isPlaceholderName, personName, userNames } from "../services/actorNames.js";
 import travelDeskRouter from "./approvals.travelDesk.js";
 import { assignCase, TravelDeskError, flagNeedsReassignment } from "../services/travelDesk.js";
 import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
@@ -154,6 +154,11 @@ function forViewer(doc: any, req: AnyObj) {
 
 /** Ops rows carry their Book Now bookings (`_bookings`: the queue buttons); nobody else gets them. */
 const staffBookings = <T extends AnyObj>(req: AnyObj, rows: T[]) => (hasQueueView(req) ? withRequestBookings(rows) : Promise.resolve(rows));
+
+// The access token carries no name: every auth on this router (router-level
+// and per-route — each one re-reads the token) fills req.user.name, so writes
+// name the person who clicked.
+const requireAuth = (req: any, res: any, next: any) => verifyToken(req, res, () => hydrateActorName(req, res, next));
 
 const router = Router();
 router.use(requireAuth);

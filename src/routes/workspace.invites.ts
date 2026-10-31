@@ -8,6 +8,7 @@ import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
 import { sendEmployeeInvite } from "../services/email.service.js";
+import { actorName } from "../services/actorNames.js";
 
 const router = Router();
 
@@ -217,7 +218,7 @@ router.post(
       const result = await processInvites(rows, {
         workspaceObjectId: req.workspaceObjectId,
         invitedById: user._id ?? user.id ?? user.sub,
-        inviterName: normStr(user.name) || normEmail(user.email),
+        inviterName: (await actorName(user)) || normEmail(user.email),
         companyName: workspace.companyName || "your company",
         inviterIsSuperAdmin: isSuperAdmin(req),
       });
@@ -273,7 +274,7 @@ router.post(
       const result = await processInvites(rows, {
         workspaceObjectId: req.workspaceObjectId,
         invitedById: user._id ?? user.id ?? user.sub,
-        inviterName: normStr(user.name) || normEmail(user.email),
+        inviterName: (await actorName(user)) || normEmail(user.email),
         companyName: workspace.companyName || "your company",
         inviterIsSuperAdmin: isSuperAdmin(req),
       });

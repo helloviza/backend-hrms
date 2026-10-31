@@ -42,7 +42,7 @@ import { buildFlightAutofill } from "../services/flightAutofill.js";
 import { buildHotelAutofill } from "../services/hotelAutofill.js";
 import { bookingTripType, bookingLegRoute, bookingLegDetail } from "../utils/bookingLegs.js";
 import type { VoucherType } from "../types/index.js";
-import { userNames, nameOrUnknown, personName } from "../services/actorNames.js";
+import { userNames, nameOrUnknown, personName, hydrateActorName } from "../services/actorNames.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import { syncRequestFromManualBooking } from "../services/bookingDocuments.js";
 import { bookingsByRequest, requestBookingSummaries, requestBookingSummary } from "../services/requestBookings.js";
@@ -85,6 +85,8 @@ const HOUSE_CUSTOMER_ID = "6a4e0d2ea90c293c9e129f48";
  * accepted, so it always returned zero rows. */
 
 router.use(requireAuth);
+// The access token carries no name: writes name the person who clicked.
+router.use(hydrateActorName);
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 

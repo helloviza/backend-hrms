@@ -32,7 +32,7 @@ import {
   requestInQueueScope,
 } from "./approvals.security.js";
 import { markRequestDone, notifyRequesterProgress, notifyProposalReady, closedCaseRefusal } from "../services/approvalProgress.js";
-import { actorNamesOnResponse } from "../services/actorNames.js";
+import { actorNamesOnResponse, hydrateActorName } from "../services/actorNames.js";
 
 type AnyObj = Record<string, any>;
 type ProposalStatus = "DRAFT" | "SUBMITTED" | "APPROVED" | "DECLINED" | "CHANGES_REQUESTED" | "EXPIRED";
@@ -581,7 +581,8 @@ const requireAnyAuth: RequestHandler = (req: Request, res: Response, next: NextF
     return next();
   }
 
-  return requireAuth(req as any, res as any, next as any);
+  // The token carries no name: fill it so writes name the person who clicked.
+  return requireAuth(req as any, res as any, () => hydrateActorName(req, res, next));
 };
 
 /**
@@ -1557,7 +1558,7 @@ router.post("/:id/record-decision", requireAnyAuth, requireWorkspace, requireSta
         workspaceId: staffWorkspaceScope(req),
         actor: {
           email: normEmail(aReq.user?.email),
-          name: normStr(aReq.user?.name || aReq.user?.firstName || "") || normEmail(aReq.user?.email),
+          name: normStr(aReq.user?.name || aReq.user?.firstName || ""),
           sub: String(aReq.user?.sub || ""),
           via: "app",
         },
