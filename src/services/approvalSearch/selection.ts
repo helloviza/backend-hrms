@@ -55,6 +55,8 @@ export type FlightSelection = {
   optionRef: string;
   returnOptionRef?: string;
   tripKind: FlightTripKind;
+  /** Same flight(s), different fare: every fare family of one itinerary shares it (flightGroupKey). */
+  groupKey: string;
   legs: FlightLegSelection[];
   searchedAt: string;
 };
@@ -96,6 +98,9 @@ export type HotelSearchResult = {
   stars: number | null;
   address: string;
   city: string;
+  /** From the hotel catalogue (F9); null when unknown. A position, not a price. */
+  latitude: number | null;
+  longitude: number | null;
   checkIn: string;
   checkOut: string;
   rooms: HotelRoomOption[];
@@ -109,6 +114,16 @@ const num = (v: unknown): number => {
   return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
 };
 const bool = (v: unknown): boolean | null => (typeof v === "boolean" ? v : null);
+/** A coordinate within ±limit; "" / 0 (the catalogue's "unknown") → null. */
+const coord = (v: unknown, limit: number): number | null => {
+  const n = v === "" || v == null ? NaN : Number(v);
+  return Number.isFinite(n) && n !== 0 && Math.abs(n) <= limit ? n : null;
+};
+/** Both coordinates or neither: half a position is no position. */
+const position = (lat: unknown, lng: unknown) => {
+  const [latitude, longitude] = [coord(lat, 90), coord(lng, 180)];
+  return latitude === null || longitude === null ? { latitude: null, longitude: null } : { latitude, longitude };
+};
 
 // TBO Air CabinClass codes.
 const CABIN: Record<number, string> = {
@@ -181,6 +196,24 @@ function leg(rawSegments: any[], raw: any, direction: "out" | "back"): FlightLeg
   };
 }
 
+/**
+ * The itinerary, never the fare: airline code, flight number and departure of
+ * EVERY segment of EVERY leg, so an international return with a different
+ * return flight, or a connection differing only in a middle segment, is a
+ * different group. Segments joined by "+", legs by "|".
+ */
+function groupKeyOf(legs: FlightSegmentSelection[][]): string {
+  return legs
+    .map((segs) => segs.map((s) => `${s.airlineCode.toUpperCase()}-${s.flightNumber}@${s.departAt}`).join("+"))
+    .join("|");
+}
+
+/** The groupKey of one raw TBO flight Result (all of its Segments legs). */
+export function flightGroupKey(raw: any): string {
+  const legs = Array.isArray(raw?.Segments) ? raw.Segments : [];
+  return groupKeyOf(legs.map((l: any) => (Array.isArray(l) ? l : []).map(segment)));
+}
+
 /* ── projections ─────────────────────────────────────────────────────────── */
 
 /**
@@ -190,11 +223,13 @@ function leg(rawSegments: any[], raw: any, direction: "out" | "back"): FlightLeg
  */
 export function toInboundOption(args: { raw: any; optionRef: string; searchedAt: Date }): FlightSelection {
   const segs = Array.isArray(args.raw?.Segments) ? args.raw.Segments : [];
+  const legs = [leg(segs[0], args.raw, "back")];
   return {
     kind: "flight",
     optionRef: args.optionRef,
     tripKind: "RT_DOM",
-    legs: [leg(segs[0], args.raw, "back")],
+    groupKey: groupKeyOf(legs.map((l) => l.segments)),
+    legs,
     searchedAt: args.searchedAt.toISOString(),
   };
 }
@@ -230,6 +265,7 @@ export function toFlightSelection(args: {
     optionRef: args.optionRef,
     ...(args.returnOptionRef ? { returnOptionRef: args.returnOptionRef } : {}),
     tripKind,
+    groupKey: groupKeyOf(legs.map((l) => l.segments)),
     legs,
     searchedAt: args.searchedAt.toISOString(),
   };
@@ -297,6 +333,7 @@ export function toHotelSearchResult(args: {
     stars: parseStars(args.hotel?.HotelRating ?? args.hotel?.StarRating),
     address: text(args.hotel?.Address),
     city: text(args.hotel?.CityName),
+    ...position(args.hotel?.Latitude, args.hotel?.Longitude),
     checkIn: text(args.checkIn),
     checkOut: text(args.checkOut),
     rooms: rooms

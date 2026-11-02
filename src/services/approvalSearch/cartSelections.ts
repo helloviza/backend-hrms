@@ -76,6 +76,8 @@ export async function prepareCartSelections(args: {
     const item: any = { ...src };
     const meta: any = item.meta && typeof item.meta === "object" && !Array.isArray(item.meta) ? { ...item.meta } : {};
     delete meta.selection;
+    // A search option's price display is shown, never stored: the request keeps no client price.
+    delete meta.display;
 
     const optionRef = refOf(meta.optionRef);
     const returnOptionRef = refOf(meta.returnOptionRef);

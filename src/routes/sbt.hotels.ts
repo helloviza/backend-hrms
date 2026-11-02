@@ -33,7 +33,6 @@ import { withTBOSessionRetry } from "../services/tbo.session.helper.js";
 import { getCompanySettings } from "../utils/companySettings.js";
 import {
   hotelAuthHeader,
-  hotelStaticAuthHeader,
   fetchCityList,
   getCachedCountryList,
   validatePaxRooms,
@@ -42,6 +41,7 @@ import {
   PRIORITY_COUNTRY_CODES,
 } from "../services/tbo.hotel.shared.js";
 import { searchHotels, isHotelSearchError } from "../services/tbo.hotel.search.service.js";
+import { fetchHotelImages, fetchHotelDetails } from "../services/tbo.hotel.details.service.js";
 import { searchHotelCatalog } from "../services/hotelCatalogSearch.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 import ManualDateChangeRequest from "../models/ManualDateChangeRequest.js";
@@ -674,14 +674,8 @@ function getPrimaryLeadContact(rooms: any[]): { phone: string; email: string } {
   return { phone: "", email: "" };
 }
 
-const hotelDetailsCache = new Map<string, { data: any; ts: number }>();
-const DETAILS_CACHE_TTL = 60 * 60 * 1000; // 1 hour
-
-// Per-hotel-code image cache (keyed by single hotel code, NOT the batch string).
-// Only successful non-empty image URLs are cached — empties/timeouts are never
-// stored, so a transient failure can't pin a hotel to "no image" for hours.
-const hotelImageCache = new Map<string, { url: string; ts: number }>();
-const IMAGE_CACHE_TTL = 12 * 60 * 60 * 1000; // 12 hours
+// HotelDetails fetch + its caches (details per hotelCodes string, first image
+// per hotel code) live in services/tbo.hotel.details.service.ts.
 
 // Hotel city/code helpers, name index, pax validation, and the startup IIFE
 // that pre-loads the index now live in services/tbo.hotel.shared.ts. The TBO
@@ -3485,74 +3479,7 @@ router.get("/images", requireAuth, async (req: any, res: any) => {
     // Split, dedupe, limit to 20 codes
     const codes = [...new Set(hotelCodes.split(",").map((c: string) => c.trim()).filter(Boolean))].slice(0, 20);
 
-    // Serve fresh per-code cache hits immediately; only fetch the misses.
-    const imageMap: Record<string, string> = {};
-    const now = Date.now();
-    const missCodes: string[] = [];
-    for (const code of codes) {
-      const hit = hotelImageCache.get(code);
-      if (hit && now - hit.ts < IMAGE_CACHE_TTL) {
-        imageMap[code] = hit.url;
-      } else {
-        missCodes.push(code);
-      }
-    }
-
-    if (missCodes.length) {
-      const tboPayload = {
-        Hotelcodes: missCodes.join(","),
-        Language: "en",
-        IsRoomDetailRequired: false,
-      };
-
-      // Fetch HotelDetails with ONE retry on timeout/throw, so a single
-      // transient failure doesn't blank a whole batch of hotels.
-      const fetchOnce = async (): Promise<any[] | null> => {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 12000);
-        try {
-          const t0 = Date.now();
-          const tboRes = await fetch(TBO_URLS.HOTEL_DETAILS, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: hotelStaticAuthHeader(),
-            },
-            body: JSON.stringify(tboPayload),
-            signal: controller.signal,
-          });
-          const data: any = await tboRes.json();
-          logTBOCall({
-            method: "HotelImages",
-            traceId: `hotel-images-${missCodes[0]}`,
-            request: tboPayload,
-            response: { hotelCount: data?.HotelDetails?.length ?? 0 },
-            durationMs: Date.now() - t0,
-          });
-          return data?.HotelDetails || data?.Hotels || [];
-        } catch {
-          return null;
-        } finally {
-          clearTimeout(timeout);
-        }
-      };
-
-      let hotels = await fetchOnce();
-      if (hotels === null) hotels = await fetchOnce(); // single retry
-
-      // Build map from the response and cache only successful non-empty results.
-      for (const h of hotels || []) {
-        const code = h.HotelCode || h.TBOHotelCode || "";
-        const imgs = h.Images || [];
-        const imageUrls = imgs.map((img: any) =>
-          typeof img === "string" ? img : (img.Url || img.url || "")
-        ).filter(Boolean);
-        if (code && imageUrls.length > 0) {
-          imageMap[code] = imageUrls[0];
-          hotelImageCache.set(code, { url: imageUrls[0], ts: Date.now() });
-        }
-      }
-    }
+    const imageMap = await fetchHotelImages(codes);
 
     res.json({ ok: true, images: imageMap });
   } catch (err: unknown) {
@@ -3577,49 +3504,7 @@ router.get("/details", requireAuth, async (req: any, res: any) => {
     const hotelCodes = (req.query.hotelCodes as string) || "";
     if (!hotelCodes) return res.status(400).json({ error: "hotelCodes required" });
 
-    // Check cache first (keyed by hotelCodes string)
-    const cached = hotelDetailsCache.get(hotelCodes);
-    if (cached && Date.now() - cached.ts < DETAILS_CACHE_TTL) {
-      return res.json(cached.data);
-    }
-
-    const tboPayload = { Hotelcodes: hotelCodes, Language: "en", IsRoomDetailRequired: true };
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-
-    let data: any;
-    try {
-      const t0 = Date.now();
-      const tboRes = await fetch(
-        TBO_URLS.HOTEL_DETAILS,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: hotelStaticAuthHeader(),
-          },
-          body: JSON.stringify(tboPayload),
-          signal: controller.signal,
-        }
-      );
-      data = await tboRes.json();
-      logTBOCall({ method: "HotelDetails", traceId: `hotel-details-${hotelCodes.split(",")[0]}`, request: tboPayload, response: data, durationMs: Date.now() - t0 });
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    // Normalize Images arrays to string URLs
-    const hotelList: any[] = data?.HotelDetails || data?.Hotels || [];
-    for (const h of hotelList) {
-      if (Array.isArray(h.Images)) {
-        h.Images = h.Images.map((img: any) =>
-          typeof img === "string" ? img : (img.Url || img.url || "")
-        ).filter(Boolean);
-      }
-    }
-
-    hotelDetailsCache.set(hotelCodes, { data, ts: Date.now() });
-    res.json(data);
+    res.json(await fetchHotelDetails(hotelCodes));
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Hotel details failed";
     sbtLogger.error("Hotel details failed", { error: msg });

@@ -13,11 +13,16 @@
 //   5. per-user and per-workspace limits (Imran D8)
 //
 // Responses are price-free by construction (services/approvalSearch/selection.ts
-// is the contract). Raw TBO results go only to ApprovalSearchSession.
+// is the contract), except a separate `display` selling price per fare / room
+// when the workspace has approvalFlightPricesEnabled / approvalHotelPricesEnabled.
+// Raw TBO results go only to ApprovalSearchSession.
 //
 // /flights and /hotels call TBO through services/approvalSearch/search.ts.
 // /hotel-cities is the hotel city / hotel name typeahead: the local catalogue
 // only (services/hotelCatalogSearch.ts), never a TBO call.
+// /hotel-content is static hotel content (images, facilities, description)
+// for hotels the caller's own search returned (services/approvalSearch/hotelContent.ts);
+// it needs no hotelBookingEnabled — approval-only workspaces have it off.
 
 import { Router, type Request, type Response, type NextFunction } from "express";
 import rateLimit from "express-rate-limit";
@@ -30,6 +35,7 @@ import {
   type SearchReply,
 } from "../services/approvalSearch/search.js";
 import { searchHotelCatalog } from "../services/hotelCatalogSearch.js";
+import { hotelContentForApproval } from "../services/approvalSearch/hotelContent.js";
 import { parseStars } from "../services/approvalSearch/selection.js";
 import { normalizeSearch } from "../jobs/static-data-refresh.js";
 
@@ -41,6 +47,8 @@ export const SEARCH_LIMITS = {
   hotel: { perUser: 10, perUserWindowMs: 10 * MIN, perWorkspace: 100, perWorkspaceWindowMs: 60 * MIN },
   // Typeahead: one call per pause in typing, a database read only.
   hotelCity: { perUser: 120, perUserWindowMs: 10 * MIN, perWorkspace: 2000, perWorkspaceWindowMs: 60 * MIN },
+  // Card content: up to 5 batches of 20 per hotel search, server-cached per hotel.
+  hotelContent: { perUser: 60, perUserWindowMs: 10 * MIN, perWorkspace: 1000, perWorkspaceWindowMs: 60 * MIN },
 } as const;
 
 const userKey = (req: Request) => `user:${String((req as any).user?.sub || (req as any).user?._id || "")}`;
@@ -85,10 +93,20 @@ export function blockDemoSearch(req: Request, res: Response, next: NextFunction)
   next();
 }
 
-const caller = (req: Request) => ({
-  userId: String((req as any).user?.sub || (req as any).user?._id || ""),
-  workspaceId: (req as any).workspaceObjectId,
-});
+// Price display is the WORKSPACE's setting, read straight off req.workspace
+// (lean: a missing key is OFF) — never requireFeature, whose SUPERADMIN and
+// HOUSE bypass would turn prices on for those sessions.
+const caller = (req: Request) => {
+  const features = (req as any).workspace?.config?.features;
+  return {
+    userId: String((req as any).user?.sub || (req as any).user?._id || ""),
+    workspaceId: (req as any).workspaceObjectId,
+    prices: {
+      flight: features?.approvalFlightPricesEnabled === true,
+      hotel: features?.approvalHotelPricesEnabled === true,
+    },
+  };
+};
 
 const run = (search: (input: any, c: ReturnType<typeof caller>) => Promise<SearchReply>) =>
   async (req: Request, res: Response, next: NextFunction) => {
@@ -100,6 +118,17 @@ const run = (search: (input: any, c: ReturnType<typeof caller>) => Promise<Searc
       next(err);
     }
   };
+
+/** GET /hotel-content?hotelCodes=a,b,c */
+async function hotelContent(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { status, body } = await hotelContentForApproval(req.query || {}, caller(req));
+    res.setHeader("Cache-Control", "no-store");
+    res.status(status).json(body);
+  } catch (err) {
+    next(err);
+  }
+}
 
 /** Typeahead result: a city or a specific hotel. No prices exist in the catalogue. */
 export type HotelPlaceOption = {
@@ -166,6 +195,7 @@ export function buildApprovalSearchRouter(): Router {
   router.post("/flights", ...limitsFor("flight"), run(searchFlightsForApproval));
   router.post("/hotels", ...limitsFor("hotel"), run(searchHotelsForApproval));
   router.get("/hotel-cities", ...limitsFor("hotelCity"), hotelCityTypeahead);
+  router.get("/hotel-content", ...limitsFor("hotelContent"), hotelContent);
 
   return router;
 }

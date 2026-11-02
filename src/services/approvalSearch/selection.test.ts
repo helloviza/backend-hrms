@@ -15,7 +15,7 @@ import { describe, it, expect } from "vitest";
 
 process.env.JWT_SECRET ||= "jwt-secret-for-tests";
 
-const { toFlightSelection, toHotelSelection, toInboundOption, toHotelSearchResult, cabinLabel, parseStars, cancelByDate } =
+const { toFlightSelection, toHotelSelection, toInboundOption, toHotelSearchResult, cabinLabel, parseStars, cancelByDate, flightGroupKey } =
   await import("./selection.js");
 const { isPriceKey, sanitizeApprovalForViewer } = await import("../../routes/approvals.security.js");
 
@@ -129,7 +129,7 @@ const strings = (v: any): string[] =>
 const CURRENCY_FIGURE = /(₹|&#8377;|\bINR\b|\bRs\.?)\s*\d|\d[\d,]*\s*(₹|\bINR\b)/i;
 
 const EXPECTED_FLIGHT_KEYS = [
-  "$.kind", "$.optionRef", "$.returnOptionRef", "$.tripKind", "$.legs", "$.searchedAt",
+  "$.kind", "$.optionRef", "$.returnOptionRef", "$.tripKind", "$.groupKey", "$.legs", "$.searchedAt",
   "$.legs[].direction", "$.legs[].segments", "$.legs[].stopCount", "$.legs[].journeyMin", "$.legs[].refundable", "$.legs[].isLCC",
   "$.legs[].productLabel", "$.legs[].seatsLeft",
   "$.legs[].segments[].airlineCode", "$.legs[].segments[].airlineName", "$.legs[].segments[].flightNumber",
@@ -143,7 +143,7 @@ const EXPECTED_HOTEL_KEYS = [
   "$.roomName", "$.mealPlan", "$.refundable", "$.cancelBy", "$.inclusions", "$.searchedAt",
 ].sort();
 const EXPECTED_HOTEL_RESULT_KEYS = [
-  "$.hotelCode", "$.name", "$.stars", "$.address", "$.city", "$.checkIn", "$.checkOut", "$.rooms",
+  "$.hotelCode", "$.name", "$.stars", "$.address", "$.city", "$.latitude", "$.longitude", "$.checkIn", "$.checkOut", "$.rooms",
   "$.rooms[].optionRef", "$.rooms[].roomName", "$.rooms[].mealPlan", "$.rooms[].refundable", "$.rooms[].cancelBy", "$.rooms[].inclusions",
 ].sort();
 const uniq = (a: string[]) => [...new Set(a)].sort();
@@ -190,6 +190,16 @@ describe("approval search selection — price-free contract", () => {
     expect(inboundOpt()).toMatchObject({ tripKind: "RT_DOM", legs: [{ direction: "back" }] });
   });
 
+  it("hotel result carries the catalogue position (F9); unknown → null", () => {
+    expect(hotelResult()).toMatchObject({ latitude: 19.04, longitude: 72.82 });
+    const r = (lat: unknown, lng: unknown) =>
+      toHotelSearchResult({ hotel: { ...hotel, Latitude: lat, Longitude: lng }, refFor: (j) => `h.0.${j}`, checkIn: "", checkOut: "" });
+    expect(r("19.0760", "72.8777")).toMatchObject({ latitude: 19.076, longitude: 72.8777 });
+    for (const [lat, lng] of [["", ""], [0, 0], [undefined, null], ["abc", "1"], [91, 181]]) {
+      expect(r(lat, lng)).toMatchObject({ latitude: null, longitude: null });
+    }
+  });
+
   it("hotel result rooms are in name order, not TBO's price order", () => {
     expect(hotelResult().rooms.map((r) => r.roomName)).toEqual(["Deluxe Room", "Luxury Room, 1 King Bed"]);
     expect(hotelResult().rooms.map((r) => r.optionRef)).toEqual(["h.0.1", "h.0.0"]);
@@ -224,6 +234,48 @@ describe("approval search selection — price-free contract", () => {
       airlineCode: "6E", flightNumber: "512", cabin: "Economy",
       from: { code: "BLR", city: "BLR City", terminal: "1" }, departAt: "2026-10-12T07:00:00",
       baggage: { checkIn: "15 Kg", cabin: "7 Kg" },
+    });
+  });
+
+  describe("groupKey: same itinerary, any fare", () => {
+    const fare = (raw: any, type: string, i: number) => ({
+      ...raw, ResultIndex: `${raw.ResultIndex}-${i}`, IsRefundable: i % 2 === 0, FareClassification: { Type: type },
+      Fare: { ...raw.Fare, PublishedFare: 5000 + i * 900 },
+    });
+    const key = (raw: any) => toFlightSelection({ out: raw, optionRef: "x", searchedAt: AT }).groupKey;
+
+    it("one flight's three fare families share one key", () => {
+      const keys = ["Saver", "Flexi Plus", "Upfront"].map((t, i) => key(fare(oneWay, t, i)));
+      expect(new Set(keys).size).toBe(1);
+      expect(keys[0]).toBe("6E-512@2026-10-12T07:00:00+6E-2134@2026-10-12T11:00:00");
+      expect(flightGroupKey(fare(oneWay, "Upfront", 2))).toBe(keys[0]);
+    });
+
+    it("international return: same outbound, different return flight → different keys", () => {
+      const otherBack = {
+        ...intlReturn, ResultIndex: "OB8",
+        Segments: [intlReturn.Segments[0], [seg("EK", "Emirates", "502", "DXB", "BOM", "2026-11-08T09:30:00", "2026-11-08T14:10:00", 180)]],
+      };
+      expect(key(intlReturn)).not.toBe(key(otherBack));
+      expect(key(intlReturn)).toBe("EK-507@2026-11-01T04:30:00|EK-500@2026-11-08T21:40:00");
+    });
+
+    it("a connection differing only in the middle segment → different keys", () => {
+      const viaHyd = (no: string, dep: string) => ({
+        ...oneWay,
+        Segments: [[
+          seg("6E", "IndiGo", "512", "BLR", "HYD", "2026-10-12T07:00:00", "2026-10-12T08:10:00", 70),
+          seg("6E", "IndiGo", no, "HYD", "DEL", dep, "2026-10-12T12:00:00", 120, 60),
+          seg("6E", "IndiGo", "2134", "DEL", "BOM", "2026-10-12T14:00:00", "2026-10-12T16:10:00", 130, 120),
+        ]],
+      });
+      expect(key(viaHyd("777", "2026-10-12T09:10:00"))).not.toBe(key(viaHyd("779", "2026-10-12T09:10:00")));
+      expect(key(viaHyd("777", "2026-10-12T09:10:00"))).not.toBe(key(viaHyd("777", "2026-10-13T09:10:00")));
+    });
+
+    it("an inbound option keys on its own leg; the combined domestic pick on both legs", () => {
+      expect(inboundOpt().groupKey).toBe("AI-640@2026-10-15T18:00:00");
+      expect(flightRTDom().groupKey).toBe(`${key(oneWay)}|AI-640@2026-10-15T18:00:00`);
     });
   });
 

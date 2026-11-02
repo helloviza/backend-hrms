@@ -52,6 +52,13 @@ export interface WorkspaceFeatures {
   // the leads it sent through its partner links. SCHEMA DEFAULT false; not in
   // any plan preset — set only from the Workspace Manager features toggle.
   partnerCasesEnabled?: boolean;
+  // Approval live search: show the selling price (margin applied, never our
+  // net) per flight fare / hotel room. SCHEMA DEFAULT false, no backfill;
+  // read with === true (req.workspace is lean, so a missing key is OFF). Not
+  // in any plan preset — set only from the Workspace Manager features toggle,
+  // which audits each change (WorkspaceFeatureAudit).
+  approvalFlightPricesEnabled?: boolean;
+  approvalHotelPricesEnabled?: boolean;
 }
 
 export type WorkspacePlan = "trial" | "starter" | "growth" | "enterprise";
@@ -354,6 +361,9 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         plumconnectEnabled: { type: Boolean, default: false },
         // Plumtrips Rewards client view — visibility only, see the interface.
         loyaltyRewardsEnabled: { type: Boolean, default: false },
+        // Approval live-search prices — see the interface.
+        approvalFlightPricesEnabled: { type: Boolean, default: false },
+        approvalHotelPricesEnabled: { type: Boolean, default: false },
         revenueShareEnabled: { type: Boolean, default: false },
         partnerCasesEnabled: { type: Boolean, default: false },
       },

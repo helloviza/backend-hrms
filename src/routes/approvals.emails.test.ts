@@ -235,7 +235,8 @@ beforeEach(async () => {
 describe("the email map", () => {
   it("docs/approval-emails.md is generated from the map and up to date", () => {
     if (!fs.existsSync(DOC_PATH)) return; // the GitHub subtree has no docs/
-    expect(fs.readFileSync(DOC_PATH, "utf8")).toBe(renderApprovalEmailsDoc());
+    // CRLF → LF: a Windows (autocrlf) checkout of the doc is the same doc.
+    expect(fs.readFileSync(DOC_PATH, "utf8").replace(/\r\n/g, "\n")).toBe(renderApprovalEmailsDoc());
   });
 
   it("every event renders; customer events reply to ops@, staff events are not customer-facing", () => {

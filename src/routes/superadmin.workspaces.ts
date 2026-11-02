@@ -9,6 +9,8 @@ import User from "../models/User.js";
 import WorkspaceInvite from "../models/WorkspaceInvite.js";
 import { UserPermission } from "../models/UserPermission.js";
 import TenantSetupProgress from "../models/TenantSetupProgress.js";
+import WorkspaceFeatureAudit from "../models/WorkspaceFeatureAudit.js";
+import { userNames, nameOrUnknown, SYSTEM_NAME } from "../services/actorNames.js";
 import { sendMail } from "../utils/mailer.js";
 import {
   buildWelcomeEmailHtml,
@@ -51,6 +53,64 @@ function generateTempPassword(length = 12): string {
   return crypto.randomBytes(Math.ceil(length * 0.75)).toString("base64").slice(0, length);
 }
 
+/**
+ * The feature names PUT /features accepts: every `config.features.<name>`
+ * path on the CustomerWorkspace schema, read off the schema itself so a new
+ * flag is toggleable the moment it is declared there.
+ */
+export const WORKSPACE_FEATURE_NAMES: ReadonlySet<string> = new Set(
+  Object.keys(CustomerWorkspace.schema.paths)
+    .filter((p) => p.startsWith("config.features."))
+    .map((p) => p.slice("config.features.".length))
+    .filter((name) => name && !name.includes(".")),
+);
+
+/**
+ * A workspace's features as stored, one boolean per schema flag: a key missing
+ * from the document is false — the way every backend gate reads the lean
+ * workspace — never the schema default (approvalFlowEnabled defaults to true).
+ */
+function storedFeatures(features: any): Record<string, boolean> {
+  return Object.fromEntries([...WORKSPACE_FEATURE_NAMES].map((name) => [name, features?.[name] === true]));
+}
+
+// Flags whose last change Workspace Manager shows under the switch.
+const PRICE_FLAGS = ["approvalFlightPricesEnabled", "approvalHotelPricesEnabled"] as const;
+
+type FeatureChange = { by: string; at: Date };
+
+/**
+ * workspace id → { flag → last change } for the price flags, in two queries.
+ * `by` is the actor's profile name ("Unknown user" if they can't be named,
+ * never an id), or "System" for a row with no actor.
+ */
+async function priceFlagChanges(workspaceIds: any[]): Promise<Map<string, Record<string, FeatureChange>>> {
+  const out = new Map<string, Record<string, FeatureChange>>();
+  if (!workspaceIds.length) return out;
+  const latest = await WorkspaceFeatureAudit.aggregate([
+    { $match: { workspaceId: { $in: workspaceIds }, feature: { $in: [...PRICE_FLAGS] } } },
+    { $sort: { createdAt: -1 } },
+    {
+      $group: {
+        _id: { workspaceId: "$workspaceId", feature: "$feature" },
+        actorId: { $first: "$actorId" },
+        actorEmail: { $first: "$actorEmail" },
+        at: { $first: "$createdAt" },
+      },
+    },
+  ]);
+  const names = await userNames(latest.flatMap((r: any) => [r.actorId, r.actorEmail]).filter(Boolean));
+  for (const r of latest as any[]) {
+    const hasActor = !!(r.actorId || r.actorEmail);
+    const by = hasActor
+      ? nameOrUnknown(names.get(String(r.actorId || "")), names.get(String(r.actorEmail || "").toLowerCase()), r.actorEmail)
+      : SYSTEM_NAME;
+    const key = String(r._id.workspaceId);
+    out.set(key, { ...(out.get(key) || {}), [r._id.feature]: { by, at: r.at } });
+  }
+  return out;
+}
+
 /* ── GET /workspaces ─────────────────────────────────────────────── */
 
 router.get("/workspaces", async (req: any, res) => {
@@ -81,6 +141,7 @@ router.get("/workspaces", async (req: any, res) => {
       { $group: { _id: "$workspaceId", count: { $sum: 1 } } },
     ]);
     const userCountMap = new Map(userCounts.map((u: any) => [String(u._id), u.count as number]));
+    const changesByWs = await priceFlagChanges(wsIds);
 
     // Batch: admin user per workspace — keyed by customerId, not workspaceId.
     // User.workspaceId can be stale/inconsistent; customerId is always correct.
@@ -119,7 +180,8 @@ router.get("/workspaces", async (req: any, res) => {
           || `Workspace ${ws.createdAt ? new Date(ws.createdAt).toLocaleDateString("en-IN", { month: "short", year: "numeric" }) : ""}`.trim(),
         adminName,
         adminEmail: admin?.email || "—",
-        features: ws.config?.features || {},
+        features: storedFeatures(ws.config?.features),
+        featureChanges: changesByWs.get(String(ws._id)) || {},
         userCount: userCountMap.get(String(ws._id)) || 0,
       };
     });
@@ -386,9 +448,10 @@ router.get("/workspaces/:workspaceId", async (req, res) => {
     const workspace = await CustomerWorkspace.findById(req.params.workspaceId).lean();
     if (!workspace) return res.status(404).json({ error: "Workspace not found" });
 
-    const [userCount, inviteCount] = await Promise.all([
+    const [userCount, inviteCount, changesByWs] = await Promise.all([
       User.countDocuments({ workspaceId: workspace._id }),
       WorkspaceInvite.countDocuments({ workspaceId: workspace._id }),
+      priceFlagChanges([workspace._id]),
     ]);
 
     const admin = await User.findOne({
@@ -414,7 +477,8 @@ router.get("/workspaces/:workspaceId", async (req, res) => {
         || `Workspace ${(workspace as any).createdAt ? new Date((workspace as any).createdAt).toLocaleDateString("en-IN", { month: "short", year: "numeric" }) : ""}`.trim(),
       adminName,
       adminEmail: (admin as any)?.email || "—",
-      features: (workspace as any).config?.features || {},
+      features: storedFeatures((workspace as any).config?.features),
+      featureChanges: changesByWs.get(String(workspace._id)) || {},
     };
     res.json({ workspace: wsFlat, userCount, inviteCount });
   } catch (err: any) {
@@ -459,6 +523,18 @@ router.put("/workspaces/:workspaceId/features", async (req: any, res) => {
     if (!feature || typeof enabled !== "boolean") {
       return res.status(400).json({ error: "feature (string) and enabled (boolean) are required" });
     }
+    // Only a declared config.features flag: an unknown name would add a stray
+    // key, a dotted one would write a nested path.
+    if (typeof feature !== "string" || !WORKSPACE_FEATURE_NAMES.has(feature)) {
+      return res.status(400).json({ error: "Unknown feature" });
+    }
+
+    const before: any = await CustomerWorkspace.findById(req.params.workspaceId).select("config.features").lean();
+    if (!before) return res.status(404).json({ error: "Workspace not found" });
+    const stored = (name: string) => {
+      const v = before.config?.features?.[name];
+      return typeof v === "boolean" ? v : null;
+    };
 
     const $set: Record<string, any> = { [`config.features.${feature}`]: enabled };
 
@@ -476,12 +552,45 @@ router.put("/workspaces/:workspaceId/features", async (req: any, res) => {
       $set["config.travelFlow"] = "SBT";
     }
 
-    const workspace = await CustomerWorkspace.findByIdAndUpdate(
+    // Lean: a hydrated document fills missing keys with schema defaults.
+    const workspace: any = await CustomerWorkspace.findByIdAndUpdate(
       req.params.workspaceId,
       { $set },
       { new: true },
-    );
+    ).lean();
     if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+
+    // One audit row for the flag clicked, plus one per linked flag the write
+    // actually changed (stored value differs), marked linkedTo the clicked one.
+    // The toggle is saved by now: a failed audit write is logged, never a 500.
+    const actorId = String(req.user?._id || req.user?.sub || "");
+    const actor = {
+      actorId: mongoose.isValidObjectId(actorId) ? actorId : undefined,
+      actorEmail: req.user?.email || undefined,
+    };
+    const auditRows = Object.entries($set)
+      .filter(([path]) => path.startsWith("config.features."))
+      .map(([path, to]) => ({ name: path.slice("config.features.".length), to: to as boolean }))
+      .filter(({ name, to }) => name === feature || stored(name) !== to)
+      .map(({ name, to }) => ({
+        workspaceId: workspace._id,
+        feature: name,
+        from: stored(name),
+        to,
+        ...(name === feature ? {} : { linkedTo: feature }),
+        ...actor,
+      }));
+    try {
+      await WorkspaceFeatureAudit.insertMany(auditRows);
+    } catch (auditErr: any) {
+      logger.error("Workspace feature audit write failed (toggle saved)", {
+        workspaceId: req.params.workspaceId,
+        feature,
+        enabled,
+        rows: auditRows.map((r) => ({ feature: r.feature, from: r.from, to: r.to })),
+        err: auditErr?.message,
+      });
+    }
 
     logger.info("SUPERADMIN toggled workspace feature", {
       workspaceId: req.params.workspaceId,
@@ -557,11 +666,19 @@ router.put("/workspaces/:workspaceId/features", async (req: any, res) => {
       };
     }
 
+    let featureChanges: Record<string, FeatureChange> = {};
+    try {
+      featureChanges = (await priceFlagChanges([workspace._id])).get(String(workspace._id)) || {};
+    } catch (err: any) {
+      logger.error("Price flag last-change lookup failed (toggle saved)", { workspaceId: req.params.workspaceId, err: err?.message });
+    }
+
     res.json({
       success: true,
       workspace: {
         _id: workspace._id,
-        config: { features: workspace.config.features },
+        config: { features: storedFeatures(workspace.config?.features) },
+        featureChanges,
       },
       userPropagation,
     });
