@@ -177,14 +177,29 @@ const router = Router();
 // Same memoryStorage-then-S3 pattern as manualBookings.ts's attachmentUpload
 // — reused verbatim, not reinvented.
 const REPORT_ATTACHMENT_ALLOWED_MIME = ["application/pdf", "image/png", "image/jpeg", "image/webp"];
+// Keep in step with CSTEP_UPLOAD_MAX_MB in apps/frontend/src/lib/cstepApi.ts.
+const REPORT_ATTACHMENT_MAX_MB = 20;
 const reportAttachmentUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 },
+  limits: { fileSize: REPORT_ATTACHMENT_MAX_MB * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (REPORT_ATTACHMENT_ALLOWED_MIME.includes(file.mimetype)) return cb(null, true);
     cb(new Error("Only PDF, PNG, JPEG, or WEBP files are allowed."));
   },
 });
+
+// Wrap multer so file errors return clean JSON (mirrors expenses.ts's
+// receiptUploadMw) — unwrapped, an oversized file reached the global error
+// handler as a bare 500 "File too large".
+function reportAttachmentMw(req: any, res: any, next: any) {
+  reportAttachmentUpload.single("file")(req, res, (err: any) => {
+    if (!err) return next();
+    if (err.code === "LIMIT_FILE_SIZE") {
+      return res.status(413).json({ error: `File too large. Maximum size is ${REPORT_ATTACHMENT_MAX_MB} MB.` });
+    }
+    return res.status(400).json({ error: err?.message || "Upload failed" });
+  });
+}
 
 // Best-effort mapping from a report leg's travelMode to CstepAttachment's
 // required documentType — Step 4 has no separate document-type picker in
@@ -5598,7 +5613,7 @@ router.delete("/requests/:id/report/legs/:legId", async (req: any, res: any) => 
  * ───────────────────────────────────────────────────────────────────── */
 router.post(
   "/requests/:id/report/legs/:legId/attachment",
-  reportAttachmentUpload.single("file"),
+  reportAttachmentMw,
   async (req: any, res: any) => {
     try {
       const doc = await loadRequest(req, req.params.id);
@@ -5754,7 +5769,7 @@ async function loadTravelProofLeg(req: any, res: any): Promise<{ doc: any; leg: 
  * optional proof (travelProofAttachmentIds). One file per call, appended.
  * DELETE …/travel-proof/:attachmentId takes one off again.
  * ───────────────────────────────────────────────────────────────────── */
-router.post("/requests/:id/report/legs/:legId/travel-proof", reportAttachmentUpload.single("file"), async (req: any, res: any) => {
+router.post("/requests/:id/report/legs/:legId/travel-proof", reportAttachmentMw, async (req: any, res: any) => {
   try {
     const loaded = await loadTravelProofLeg(req, res);
     if (!loaded) return;
@@ -5844,7 +5859,7 @@ async function loadBookingDocumentLine(req: any, res: any): Promise<{ doc: any; 
  * and its settlement line read them from here, live. Logged as
  * ARRANGE_SERVICE. DELETE …/attachment/:attachmentId takes one off.
  * ───────────────────────────────────────────────────────────────────── */
-router.post("/requests/:id/arrangements/:lineId/attachment", reportAttachmentUpload.single("file"), async (req: any, res: any) => {
+router.post("/requests/:id/arrangements/:lineId/attachment", reportAttachmentMw, async (req: any, res: any) => {
   try {
     const loaded = await loadBookingDocumentLine(req, res);
     if (!loaded) return;
@@ -5937,7 +5952,7 @@ const STAGING_DOCUMENT_TYPES = new Set<string>([
   "OTHER",
 ]);
 
-router.post("/attachments/staging", reportAttachmentUpload.single("file"), async (req: any, res: any) => {
+router.post("/attachments/staging", reportAttachmentMw, async (req: any, res: any) => {
   try {
     const uid = ownerId(req);
     if (!req.workspaceObjectId || !uid) {
