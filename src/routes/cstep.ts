@@ -1483,13 +1483,121 @@ function seededLegDirections(arrangements: any[]): Array<CstepReportDirection> {
   );
 }
 
-/** Arrangements in creation order — the order seededLegDirections reads. */
-function seedReportLegs(arrangements: any[]) {
+/** Module B — the route a seeded leg starts with, read from the request.
+ * An arrangement carries no route or date of its own; the request's
+ * itinerary does. Stations (domestic) read as one chain — stations[0].from
+ * → each station's .to, as placeLine shows them; countries (international)
+ * carry no origin, so their onward hops start from the previous country
+ * and the first onward leg's From, like the return leg's To, stays blank.
+ *
+ * The trip is its onward hops plus one return hop: back from the last
+ * station's .to to stations[0].from (for a single station, its reverse) on
+ * returnDate. A station list that already ends back home (last .to ==
+ * stations[0].from) carries its own return hop.
+ *
+ * Only FLIGHT / TRAIN / BUS legs get a route; a hotel / cab / visa / other
+ * leg is left blank. The legs map onto the hops only where they line up:
+ *   - as many directional legs as hops → in order, one to one;
+ *   - otherwise the ONWARD legs map in order only when there are exactly as
+ *     many as onward hops, and a lone RETURN leg takes the return hop.
+ * Anything else stays blank for the traveller to fill (PATCH still edits
+ * every field). Dates: the first onward hop departs on departureDate, the
+ * return on returnDate, a country hop on that country's fromDate; arrival
+ * (toDate) is never guessed. */
+export type CstepSeedLegRoute = { fromLocation?: string; toLocation?: string; fromDate?: string; toDate?: string };
+
+type SeedRouteRequest = {
+  type?: string;
+  stations?: Array<{ from?: string; to?: string }>;
+  countries?: Array<{ country?: string; fromDate?: string; toDate?: string }>;
+  departureDate?: string;
+  returnDate?: string;
+};
+
+const cleanStr = (v: unknown): string | undefined => {
+  const t = typeof v === "string" ? v.trim() : "";
+  return t || undefined;
+};
+const samePlace = (a?: string, b?: string) => !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
+
+function requestTripHops(request: SeedRouteRequest | null | undefined): { onward: CstepSeedLegRoute[]; ret: CstepSeedLegRoute | null } {
+  if (!request) return { onward: [], ret: null };
+  const departureDate = cleanStr(request.departureDate);
+  const returnDate = cleanStr(request.returnDate);
+
+  const stations = (request.stations || [])
+    .map((s) => ({ from: cleanStr(s?.from), to: cleanStr(s?.to) }))
+    .filter((s) => s.from || s.to);
+  if (stations.length > 0 && request.type !== "INTERNATIONAL") {
+    const home = stations[0].from;
+    const last = stations[stations.length - 1];
+    const endsHome = stations.length > 1 && samePlace(last.to, home);
+    const onwardStations = endsHome ? stations.slice(0, -1) : stations;
+    const onward = onwardStations.map((s, i) => ({ fromLocation: s.from, toLocation: s.to, fromDate: i === 0 ? departureDate : undefined }));
+    const ret = endsHome
+      ? { fromLocation: last.from, toLocation: last.to, fromDate: returnDate }
+      : { fromLocation: last.to, toLocation: home ?? last.from, fromDate: returnDate };
+    return { onward, ret };
+  }
+
+  const countries = (request.countries || [])
+    .map((c) => ({ country: cleanStr(c?.country), fromDate: cleanStr(c?.fromDate), toDate: cleanStr(c?.toDate) }))
+    .filter((c) => c.country);
+  if (countries.length > 0) {
+    const onward = countries.map((c, i) => ({
+      fromLocation: i > 0 ? countries[i - 1].country : undefined,
+      toLocation: c.country,
+      fromDate: c.fromDate ?? (i === 0 ? departureDate : undefined),
+    }));
+    const last = countries[countries.length - 1];
+    return { onward, ret: { fromLocation: last.country, toLocation: undefined, fromDate: returnDate ?? last.toDate } };
+  }
+  return { onward: [], ret: null };
+}
+
+/** One route per seeded row (same order) — {} where nothing lines up. */
+export function seedLegRoutes(
+  rows: Array<{ direction: CstepReportDirection; travelMode: string }>,
+  request: SeedRouteRequest | null | undefined,
+): CstepSeedLegRoute[] {
+  const out: CstepSeedLegRoute[] = rows.map(() => ({}));
+  const { onward, ret } = requestTripHops(request);
+  if (!onward.length && !ret) return out;
+  const directional = rows
+    .map((r, i) => ({ r, i }))
+    .filter(({ r }) => DIRECTIONAL_SERVICE_TYPES.has(r.travelMode as CstepServiceType));
+  const trip = ret ? [...onward, ret] : onward;
+  if (directional.length === trip.length) {
+    directional.forEach(({ i }, k) => (out[i] = { ...trip[k] }));
+    return out;
+  }
+  const onwardLegs = directional.filter(({ r }) => r.direction === "ONWARD");
+  const returnLegs = directional.filter(({ r }) => r.direction === "RETURN");
+  if (onwardLegs.length === onward.length) onwardLegs.forEach(({ i }, k) => (out[i] = { ...onward[k] }));
+  if (ret && returnLegs.length === 1) out[returnLegs[0].i] = { ...ret };
+  return out;
+}
+
+/** Fill only the route fields the row doesn't already carry. */
+function withSeedRoute<T extends Partial<CstepSeedLegRoute>>(row: T, route: CstepSeedLegRoute): T {
+  const out: any = { ...row };
+  for (const k of ["fromLocation", "toLocation", "fromDate", "toDate"] as const) {
+    if (!cleanStr(out[k]) && route[k]) out[k] = route[k];
+  }
+  return out;
+}
+
+/** Arrangements in creation order — the order seededLegDirections reads.
+ * Module B: given the request, each FLIGHT / TRAIN / BUS row also starts
+ * with its From / To / date (seedLegRoutes). */
+function seedReportLegs(arrangements: any[], request?: SeedRouteRequest | null) {
   const real = [...arrangements]
     .filter(arrangementIsReal)
     .sort((x, y) => new Date(x.createdAt).getTime() - new Date(y.createdAt).getTime() || String(x._id).localeCompare(String(y._id)));
   const directions = seededLegDirections(real);
-  return buildSeedReportLegs(real).map((row, i) => ({ ...row, direction: directions[i] }));
+  const rows = buildSeedReportLegs(real).map((row, i) => ({ ...row, direction: directions[i] }));
+  const routes = seedLegRoutes(rows, request);
+  return rows.map((row, i) => withSeedRoute(row, routes[i]));
 }
 
 function buildSeedReportLegs(arrangements: any[]): Array<{
@@ -1501,6 +1609,10 @@ function buildSeedReportLegs(arrangements: any[]): Array<{
   remarks?: string;
   source: "SEEDED";
   arrangementId: any;
+  fromLocation?: string;
+  toLocation?: string;
+  fromDate?: string;
+  toDate?: string;
 }> {
   return arrangements.filter(arrangementIsReal).map((a) => ({
     direction: "ONWARD" as const,
@@ -5204,7 +5316,7 @@ router.post("/requests/:id/report/start", async (req: any, res: any) => {
         workspaceId: req.workspaceObjectId,
         requestId: doc._id,
       }).lean();
-      const seedRows = seedReportLegs(arrangements);
+      const seedRows = seedReportLegs(arrangements, doc);
       if (seedRows.length > 0) {
         await CstepReportLeg.insertMany(
           seedRows.map((row) => ({
@@ -5370,11 +5482,19 @@ router.post("/requests/:id/report/legs", async (req: any, res: any) => {
       if (seededOfMode >= bookedOfMode || linkedAlready) {
         return res.status(409).json({ error: "This booked service is already on the travel report" });
       }
+      // Module B — the route the report/start seed gives this booking, when
+      // it comes back in that same direction (another direction is the
+      // traveller's own call: the route stays blank for them to fill).
       const [seed] = buildSeedReportLegs([a]);
+      const seededRow = seedReportLegs(arrangements, doc).find((r) => String(r.arrangementId) === String(a._id));
+      const route: CstepSeedLegRoute =
+        seededRow && seededRow.direction === direction
+          ? { fromLocation: seededRow.fromLocation, toLocation: seededRow.toLocation, fromDate: seededRow.fromDate, toDate: seededRow.toDate }
+          : {};
       const restored = await CstepReportLeg.create({
         workspaceId: req.workspaceObjectId,
         requestId: doc._id,
-        ...seed,
+        ...withSeedRoute(seed, route),
         direction,
         createdBy: new mongoose.Types.ObjectId(uid),
       });

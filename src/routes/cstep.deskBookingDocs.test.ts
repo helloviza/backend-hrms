@@ -350,7 +350,7 @@ describe("a booked flight with no boarding pass", () => {
 
     const items = rendered[rendered.length - 1].items;
     expect(items).toEqual([
-      expect.objectContaining({ kind: "BOARDING_PASS", lineId: legs.flightLeg, amount: FLIGHT_FARE, currency: "INR", particulars: "Boarding pass not available — Onward Flight — 6E-511 BLR-DEL" }),
+      expect.objectContaining({ kind: "BOARDING_PASS", lineId: legs.flightLeg, amount: FLIGHT_FARE, currency: "INR", particulars: "Boarding pass not available — Onward Flight: Bengaluru → Delhi — 6E-511 BLR-DEL", date: "2026-11-02" }), // Module B: the seeded leg now carries its route + departure date
     ]);
     const g = ok(await get(ACT.traveller, `/requests/${b.id}`)).body;
     expect(g.hasDeclarationForm).toBe(true);
