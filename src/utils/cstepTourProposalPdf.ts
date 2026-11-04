@@ -6,7 +6,7 @@
 // details, trip details, status, TIN if issued); the bottom half reproduces
 // CSTEP's paper form's sign-off area — Researcher/PI signature + date
 // lines, a Funds availability line, and a "For Office (Accounts/Admin)
-// purposes only" expense table + Admin/Accounts signature lines.
+// purposes only" expense table + Travel Desk/Accounts signature lines.
 //
 // The system is the source of truth: the Researcher and PI/Director
 // signature lines print a text-based DIGITAL signature (name + "Digitally
@@ -14,10 +14,11 @@
 // happened — SUBMIT for the Researcher, APPROVE for the PI/Director — read
 // from the CstepApproval `trail` already passed into this renderer. A
 // stage that hasn't happened yet stays a genuinely blank line for wet
-// signing. The Funds availability line and the Office expense table +
-// Admin/Accounts lines stay blank always (no finance-stage action type
-// exists yet, and the Office settlement table is post-trip, Steps 5-6, not
-// built). The full CstepApproval audit trail is NOT printed as a table
+// signing. The Funds availability line stays blank always. The Office
+// expense table fills from the Step 5 settlement, and the Travel Desk /
+// Accounts lines sign digitally from their own stages — latest SETTLE for
+// the Travel Desk, latest FINANCE_SETTLE for Accounts (tourOfficeSignatures).
+// The full CstepApproval audit trail is NOT printed as a table
 // here — only these inline signature blocks; the trail itself stays on the
 // on-screen detail view only. Does NOT attempt Annexure-IX claim/expense/
 // settlement tables — those belong to the post-trip claim phases and don't
@@ -176,6 +177,16 @@ function firstEntryOfAction(trail: CstepApprovalTrailEntry[], action: string): C
   return matches.reduce((earliest, e) => (new Date(e.at).getTime() < new Date(earliest.at).getTime() ? e : earliest));
 }
 
+/** Latest entry of the given action — the office sign-off signs with its
+ * CURRENT signer: a case Finance returned to the Desk and the Desk settled
+ * again shows the re-settler, not the original. (Same helper as
+ * cstepClaimPdf.ts.) */
+function latestEntryOfAction(trail: CstepApprovalTrailEntry[], action: string): CstepApprovalTrailEntry | undefined {
+  const matches = trail.filter((e) => e.action === action);
+  if (matches.length === 0) return undefined;
+  return matches.reduce((latest, e) => (new Date(e.at).getTime() > new Date(latest.at).getTime() ? e : latest));
+}
+
 function signatureFromEntry(entry: CstepApprovalTrailEntry | undefined): CstepSignature | null {
   if (!entry) return null;
   return { name: entry.actorName || "—", date: fmtSignatureDate(entry.at) };
@@ -268,9 +279,9 @@ function drawHeaderBlock(
 // Reproduces the bottom of CSTEP's paper form. The Researcher/PI signature
 // lines print a digital signature (name + date) when that stage has
 // genuinely happened (read from the trail — see drawSignOffSection); the
-// Funds availability line and the Office expense table + Admin/Accounts
-// lines always stay blank for hand-filling (see their own doc comments for
-// why). The full approval-trail TABLE is never printed here either way —
+// Funds availability line always stays blank for hand-filling; the
+// Travel Desk / Accounts lines sign once their stage has happened (see
+// tourOfficeSignatures). The full approval-trail TABLE is never printed here either way —
 // only individual signature lines, derived from the trail, not the trail
 // itself.
 
@@ -282,9 +293,8 @@ function drawHeaderBlock(
  * position is identical in both cases — only whether the ink is real or
  * digital changes. `withDateLine`: also prints a "Date: ____" line (or the
  * digital-signature date line) between the ruled line and the caption
- * (used for the Researcher/PI block; the Admin/Accounts pair below the
- * office table folds "and date" into its own caption instead, so it never
- * has a signature to wire — see module note). */
+ * (used for the Researcher/PI block; the Travel Desk/Accounts pair below
+ * the office table folds "and date" into its own caption instead). */
 function drawSignatureLinePair(
   doc: PdfDoc,
   fn: string,
@@ -314,9 +324,8 @@ function drawSignatureLinePair(
 
   // The date/digital-signature row shows whenever the caller asked for a
   // Date line (withDateLine) OR at least one side actually has a digital
-  // signature to print — so a fully-blank pair (the Admin/Accounts pair,
-  // which never receives signed info today) renders byte-for-byte as
-  // before, with no extra row, while a signed side always gets its
+  // signature to print — so a fully-blank pair (the Travel Desk/Accounts
+  // pair before settlement) renders with no extra row, while a signed side always gets its
   // "Digitally signed..." line even under a withDateLine=false caption
   // (defensive — kept consistent with cstepEventRequestPdf.ts's own copy
   // of this helper, which does exercise that combination).
@@ -409,16 +418,37 @@ function drawOfficeExpenseTable(doc: PdfDoc, fn: string, fb: string, y: number, 
   return y;
 }
 
+export const TRAVEL_DESK_SIGNATURE_CAPTION = "Travel Desk signature and date upon verification";
+export const ACCOUNTS_SIGNATURE_CAPTION = "Accounts signature and date upon verification";
+
+/** The office sign-off pair, each read from its OWN trail entry:
+ *   - Travel Desk (left) — the latest SETTLE: whoever finalized the
+ *     settlement (POST /settlement/finalize, the Desk or an Admin override).
+ *   - Accounts (right) — the latest FINANCE_SETTLE: whoever marked the
+ *     reimbursement paid (POST /finance/settle or the bulk import). Blank
+ *     until payment has happened — and on a case closed at the Desk with
+ *     nothing owed, which never reaches Finance.
+ * Latest, not first, for both: a case returned (RETURN_TO_OFFICIAL) and
+ * settled again signs with its current signer. */
+export function tourOfficeSignatures(trail: CstepApprovalTrailEntry[]): {
+  travelDesk: CstepSignature | null;
+  accounts: CstepSignature | null;
+} {
+  return {
+    travelDesk: signatureFromEntry(latestEntryOfAction(trail, "SETTLE")),
+    accounts: signatureFromEntry(latestEntryOfAction(trail, "FINANCE_SETTLE")),
+  };
+}
+
 /** The sign-off section: Researcher/PI signatures (digital where the
  * corresponding stage has actually happened — SUBMIT for the Researcher,
  * APPROVE for the PI/Director — blank otherwise), the Funds availability
  * line (always blank, see its own doc comment), and the Office expense
  * table (filled once a Step 5 CstepSettlement exists — see
- * drawOfficeExpenseTable) + Admin/Accounts signatures (digital once the
- * settlement has actually been finalized — SETTLE in the trail — blank
- * otherwise; the same Official signs both Admin and Accounts, there being
- * no separate accounts-stage action). Paginates if it would run off the
- * page. */
+ * drawOfficeExpenseTable) + Travel Desk / Accounts signatures (see
+ * tourOfficeSignatures — two different trail entries, each digital once its
+ * own stage has happened, blank otherwise). Paginates if it would run off
+ * the page. */
 function drawSignOffSection(
   doc: PdfDoc,
   fn: string,
@@ -455,17 +485,17 @@ function drawSignOffSection(
   y = drawOfficeExpenseTable(doc, fn, fb, y, settlement);
   y += 16;
 
-  const settleSignature = signatureFromEntry(firstEntryOfAction(trail, "SETTLE"));
+  const office = tourOfficeSignatures(trail);
   y = drawSignatureLinePair(
     doc,
     fn,
     fb,
     y,
-    "Admin signature and date upon verification",
-    "Accounts signature and date upon verification",
+    TRAVEL_DESK_SIGNATURE_CAPTION,
+    ACCOUNTS_SIGNATURE_CAPTION,
     false,
-    settleSignature,
-    settleSignature,
+    office.travelDesk,
+    office.accounts,
   );
 
   return y;
