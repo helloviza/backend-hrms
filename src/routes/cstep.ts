@@ -114,7 +114,7 @@ import {
   type CstepClaimDeclarationEntry,
   type CstepClaimSettlementPdfData,
 } from "../utils/cstepClaimPdf.js";
-import { uploadCstepPacketPdf, type CstepPacketReportLeg } from "../utils/cstepPacketPdf.js";
+import { uploadCstepPacketPdf, type CstepPacketDeskExpense, type CstepPacketReportLeg } from "../utils/cstepPacketPdf.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { getLiveRate } from "../utils/exchangeRate.js";
@@ -595,6 +595,35 @@ async function loadRequest(req: any, id: string) {
  */
 async function markPacketStale(workspaceId: any, requestId: any, session?: any) {
   await CstepTravelRequest.updateOne({ _id: requestId, workspaceId }, { $set: { packetStale: true } }, { timestamps: false, session });
+}
+
+/** Module C — the packet's "Expenses added by the Travel Desk": every
+ * deskAdded settlement line, with its document(s) — a reimbursable line's
+ * own attachment, a company-paid line's arrangement booking documents. */
+async function packetDeskExpenses(workspaceId: any, requestId: any, settlementId: any): Promise<CstepPacketDeskExpense[]> {
+  const lines: any[] = await CstepSettlementLine.find({ workspaceId, settlementId, deskAdded: true }).sort({ createdAt: 1, _id: 1 }).lean();
+  if (!lines.length) return [];
+  const arrangements: any[] = await CstepArrangement.find({
+    workspaceId,
+    requestId,
+    _id: { $in: lines.filter((l) => l.source === "ARRANGEMENT").map((l) => l.sourceId) },
+  })
+    .select("attachmentIds vendorName")
+    .lean();
+  const arrangementById = new Map(arrangements.map((a) => [String(a._id), a]));
+  const docIdsOf = (l: any) =>
+    l.source === "ARRANGEMENT" ? arrangementById.get(String(l.sourceId))?.attachmentIds || [] : l.attachmentId ? [l.attachmentId] : [];
+  const ids = lines.flatMap(docIdsOf);
+  const attachments: any[] = ids.length ? await CstepAttachment.find({ workspaceId, _id: { $in: ids } }).lean() : [];
+  const byId = new Map(attachments.map((a) => [String(a._id), a]));
+  return lines.map((l) => ({
+    categoryLabel: CSTEP_EXPENSE_CATEGORY_LABEL[l.category as CstepExpenseCategory] || l.mode,
+    description: l.description || undefined,
+    amountInr: Number(l.amountInr) || 0,
+    companyPaid: l.classification === "OFFICIAL",
+    vendorName: l.source === "ARRANGEMENT" ? arrangementById.get(String(l.sourceId))?.vendorName || undefined : undefined,
+    documents: docIdsOf(l).map((id: any) => byId.get(String(id))).filter(Boolean),
+  }));
 }
 
 /**
@@ -1882,7 +1911,10 @@ async function buildSeedSettlementLines(
     amountInr: number;
     classification: CstepSettlementLineClassification;
     classificationOverridden: false;
-    verified: false;
+    verified: boolean;
+    verifiedBy?: any;
+    verifiedAt?: Date;
+    deskAdded?: boolean;
     attachmentId?: any;
     noBill?: boolean;
   }>
@@ -1935,7 +1967,10 @@ async function buildSeedSettlementLines(
     amountInr: number;
     classification: CstepSettlementLineClassification;
     classificationOverridden: false;
-    verified: false;
+    verified: boolean;
+    verifiedBy?: any;
+    verifiedAt?: Date;
+    deskAdded?: boolean;
     attachmentId?: any;
     noBill?: boolean;
   }> = [];
@@ -1951,6 +1986,28 @@ async function buildSeedSettlementLines(
 
   for (const a of arrangements as any[]) {
     if (!arrangementIsReal(a)) continue; // F6 — never seeded a leg either, so nothing to pair
+    if (a.deskExpenseCategory) {
+      // Module C — a company-paid expense the Travel Desk added while
+      // verifying (re-seeded after a report send-back): no report leg pairs
+      // with it, and it comes back as the Desk added it — its category,
+      // verified by the Desk that added it.
+      lines.push({
+        source: "ARRANGEMENT",
+        sourceId: a._id,
+        description: a.details || undefined,
+        mode: a.arrangedType,
+        category: a.deskExpenseCategory,
+        amountInr: a.amountInr || 0,
+        classification: "OFFICIAL",
+        classificationOverridden: false,
+        verified: true,
+        verifiedBy: a.createdBy,
+        verifiedAt: a.createdAt,
+        deskAdded: true,
+        noBill: false,
+      });
+      continue;
+    }
     if (linkedLegByArrangement.has(String(a._id))) {
       // P1 — the linked booked leg: its document is the Desk's, read live.
       lines.push({
@@ -4719,7 +4776,12 @@ router.get("/requests/:id/vendor-options", async (req: any, res: any) => {
     const reopened =
       CHANGEABLE_STATUSES.has(doc.status) &&
       !!(await CstepChangeRequest.exists({ workspaceId: req.workspaceObjectId, travelRequestId: doc._id, status: "OPEN" }));
-    if (doc.status !== "ARRANGING" && !reopened) {
+    // Module C — and while the Desk verifies a submitted report, for a
+    // company-paid expense it adds there (POST /settlement/lines).
+    const verifying =
+      doc.status === "REPORT_SUBMITTED" &&
+      !!(await CstepSettlement.exists({ workspaceId: req.workspaceObjectId, requestId: doc._id, status: "VERIFYING" }));
+    if (doc.status !== "ARRANGING" && !reopened && !verifying) {
       return res.status(409).json({ error: "Vendors are chosen while the request is being arranged" });
     }
     const [vendors, types] = await Promise.all([
@@ -5467,9 +5529,15 @@ router.post("/requests/:id/report/legs", async (req: any, res: any) => {
       if (!a || !arrangementIsReal(a)) {
         return res.status(404).json({ error: "Booked service not found on this request" });
       }
+      // Module C — a company-paid expense the Travel Desk added at
+      // settlement is not a travel-report leg (it survives a send-back on its
+      // own, re-seeded onto the next settlement).
+      if (a.deskExpenseCategory) {
+        return res.status(409).json({ error: "This expense was added by the Travel Desk at settlement — it can't be added to the travel report" });
+      }
       // One seeded leg per booked service of that mode — refuse a second
       // add-back (a double click) rather than stack an extra booked leg.
-      const bookedOfMode = arrangements.filter((x) => arrangementIsReal(x) && x.arrangedType === a.arrangedType).length;
+      const bookedOfMode = arrangements.filter((x) => arrangementIsReal(x) && !x.deskExpenseCategory && x.arrangedType === a.arrangedType).length;
       const seededOfMode = await CstepReportLeg.countDocuments({
         workspaceId: req.workspaceObjectId,
         requestId: doc._id,
@@ -6973,7 +7041,8 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
         // A leg marked "No bill available" gets its self-declaration in the
         // packet, after the supporting documents (claimDeclarationItems).
         const declaration = claimDeclarationItems(doc, legs as any[]);
-        const { key } = await uploadCstepPacketPdf(doc.toObject(), travellerInfo, trail, packetLegs, settlementPdfData, declaration);
+        const deskExpenses = settlement ? await packetDeskExpenses(req.workspaceObjectId, doc._id, settlement._id) : [];
+        const { key } = await uploadCstepPacketPdf(doc.toObject(), travellerInfo, trail, packetLegs, settlementPdfData, declaration, deskExpenses);
         const packetGeneratedAt = new Date();
         await CstepTravelRequest.updateOne(scope, { $set: { packetS3Key: key, packetGeneratedAt, packetTravellerSig: travellerSig } }, { timestamps: false });
         doc.packetS3Key = key;
@@ -7068,6 +7137,13 @@ router.post("/requests/:id/settlement/start", async (req: any, res: any) => {
         startedBy: new mongoose.Types.ObjectId(uid),
         startedAt: new Date(),
       });
+
+      // Module C — the reimbursable Desk expenses a report send-back kept:
+      // onto this settlement, as they were (amount, document, verified).
+      await CstepSettlementLine.updateMany(
+        { workspaceId: req.workspaceObjectId, requestId: doc._id, source: "DESK_EXPENSE", settlementId: { $ne: settlement._id } },
+        { $set: { settlementId: settlement._id } },
+      );
 
       const seedRows = await buildSeedSettlementLines(req.workspaceObjectId, doc._id);
       if (seedRows.length > 0) {
@@ -7397,6 +7473,207 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
   }
 });
 
+/* ─────────────────────────────────────────────────────────────────────
+ * Module C — POST /requests/:id/settlement/lines: the Travel Desk adds an
+ * expense the report didn't carry, while it is verifying the settlement
+ * (request REPORT_SUBMITTED, settlement VERIFYING — before finalize; a
+ * post-finalize add goes through the reopen path, not here). No Manager
+ * re-approval: the line is appended directly, already verified by the Desk
+ * that added it. Gate: callerCanArrangeForTraveller (this traveller's
+ * Travel Desk, or a CSTEP Admin as an override). Tour / Event only — a
+ * claim's settlement belongs to the CSTEP Admin.
+ *
+ * Body (JSON, or multipart with an optional `file`):
+ *   category      one of CSTEP_EXPENSE_LINE_HEADS
+ *   amount        > 0, in `currency` (default INR; a foreign currency needs
+ *                 exchangeRate — the same rules as an arrangement's amount)
+ *   description   required
+ *   payment       "REIMBURSABLE" — the traveller paid it: a PERSONAL
+ *                   DESK_EXPENSE line (generated sourceId) → amountClaimed
+ *                   and the reimbursement Tally, by its category.
+ *                 "COMPANY_PAID" — a CstepArrangement row (source ADDED,
+ *                   ARRANGED, the type from the category, the amount, the
+ *                   REQUIRED vendorId) with its OFFICIAL ARRANGEMENT line →
+ *                   totalCostOfTour, and the vendor Tally once it is paid.
+ * Both kinds survive a report send-back (/report/return): the company-paid
+ * arrangement as before, a reimbursable line kept off the deleted
+ * settlement and moved onto the next one at /settlement/start.
+ * Then the totals are recomputed, both PDFs flagged stale, and
+ * ADD_SETTLEMENT_LINE logged.
+ * ───────────────────────────────────────────────────────────────────── */
+const DESK_EXPENSE_PAYMENTS = ["REIMBURSABLE", "COMPANY_PAID"] as const;
+type DeskExpensePayment = (typeof DESK_EXPENSE_PAYMENTS)[number];
+
+/** A category's service type — the settlement line's mode (its bucket) and a
+ * company-paid row's arrangedType. Own vehicle and food have none: Other. */
+function serviceTypeOfCategory(category: CstepExpenseCategory): CstepServiceType {
+  return (CSTEP_SERVICE_TYPES as readonly string[]).includes(category) ? (category as CstepServiceType) : "OTHER";
+}
+
+router.post("/requests/:id/settlement/lines", reportAttachmentMw, async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (isClaimFormType(doc.formType)) {
+      return res.status(409).json({ error: "A claim's settlement lines come from the claim itself" });
+    }
+    if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
+    }
+    if (doc.status !== "REPORT_SUBMITTED") {
+      return res.status(409).json({ error: "An expense can be added only while the Travel Desk is verifying a submitted travel report" });
+    }
+    const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id });
+    if (!settlement) return res.status(409).json({ error: "Open the settlement before adding an expense" });
+    if (settlement.status !== "VERIFYING") {
+      return res.status(409).json({ error: "This settlement has already been finalized" });
+    }
+
+    const body = req.body || {};
+    const category = String(body.category || "").trim().toUpperCase();
+    if (!isExpenseLineHead(category)) {
+      return res.status(400).json({ error: "category must be one of the expense heads" });
+    }
+    const payment = String(body.payment || "").trim().toUpperCase() as DeskExpensePayment;
+    if (!DESK_EXPENSE_PAYMENTS.includes(payment)) {
+      return res.status(400).json({ error: "payment must be COMPANY_PAID or REIMBURSABLE" });
+    }
+    const description = String(body.description || "").trim();
+    if (!description) return res.status(400).json({ error: "description is required" });
+    if (description.length > 300) return res.status(400).json({ error: "description is too long (300 characters max)" });
+
+    const amountResult = computeArrangementAmountFields({
+      currency: body.currency,
+      amount: body.amount,
+      exchangeRate: body.exchangeRate,
+      rateSource: body.rateSource || undefined,
+      rateDate: body.rateDate || undefined,
+    });
+    if (!amountResult.ok) return res.status(400).json({ error: amountResult.error });
+    const amountFields = amountResult.fields;
+    if (!(Number(amountFields.amount) > 0)) return res.status(400).json({ error: "amount must be more than 0" });
+    if (!(Number(amountFields.amountInr) > 0)) {
+      return res.status(400).json({ error: `exchangeRate is required for an amount in ${amountFields.currency}` });
+    }
+    const amountInr = Math.round(Number(amountFields.amountInr) * 100) / 100;
+
+    let vendorFields: { vendorId?: any; vendorCode?: string; vendorName?: string } = {};
+    if (payment === "COMPANY_PAID") {
+      // The vendor is what a company-paid line is paid through (and reaches
+      // the vendor Tally by), and it can't be set on the arrangement later.
+      if (!String(body.vendorId || "").trim()) {
+        return res.status(400).json({ error: "Choose the vendor for a company-paid expense" });
+      }
+      const vendorResult = await resolveArrangementVendor(req, body);
+      if ("error" in vendorResult) return res.status(vendorResult.status).json({ error: vendorResult.error });
+      if (vendorResult.touched && vendorResult.fields.vendorId) vendorFields = vendorResult.fields;
+    } else if (body.vendorId) {
+      return res.status(400).json({ error: "A vendor applies to a company-paid expense only" });
+    }
+
+    const mode = serviceTypeOfCategory(category);
+    const uid = new mongoose.Types.ObjectId(ownerId(req));
+    const now = new Date();
+    const file = req.file;
+    const attachment =
+      file && file.buffer
+        ? await storeRequestAttachment(
+            req,
+            doc,
+            file,
+            REPORT_DOCUMENT_TYPE_BY_MODE[mode] || "OTHER",
+            `cstep/settlement/${req.workspaceObjectId}/${doc._id}`,
+          )
+        : null;
+
+    const lineBase = {
+      workspaceId: req.workspaceObjectId,
+      settlementId: settlement._id,
+      requestId: doc._id,
+      description,
+      mode,
+      category,
+      amountInr,
+      claimedAmountInr: amountInr,
+      classificationOverridden: false,
+      // The Desk adding it is the Desk verifying it.
+      verified: true,
+      verifiedBy: uid,
+      verifiedAt: now,
+      deskAdded: true,
+      createdBy: uid,
+    };
+
+    let arrangement: any = null;
+    let line: any;
+    if (payment === "COMPANY_PAID") {
+      arrangement = await CstepArrangement.create({
+        workspaceId: req.workspaceObjectId,
+        requestId: doc._id,
+        source: "ADDED",
+        arrangedType: mode,
+        details: description,
+        status: "ARRANGED",
+        arrangedBy: uid,
+        arrangedAt: now,
+        createdBy: uid,
+        addedByRole: await arrangerRole(req, doc.travelerProfileId),
+        deskExpenseCategory: category,
+        ...amountFields,
+        ...vendorFields,
+        ...(attachment ? { attachmentIds: [attachment._id] } : {}),
+      });
+      try {
+        line = await CstepSettlementLine.create({ ...lineBase, source: "ARRANGEMENT", sourceId: arrangement._id, classification: "OFFICIAL" });
+      } catch (err) {
+        await CstepArrangement.deleteOne({ _id: arrangement._id, workspaceId: req.workspaceObjectId });
+        throw err;
+      }
+    } else {
+      line = await CstepSettlementLine.create({
+        ...lineBase,
+        source: "DESK_EXPENSE",
+        sourceId: new mongoose.Types.ObjectId(),
+        classification: "PERSONAL",
+        ...(attachment ? { attachmentId: attachment._id } : {}),
+      });
+    }
+
+    const allLines = await CstepSettlementLine.find({ workspaceId: req.workspaceObjectId, settlementId: settlement._id }).lean();
+    applySettlementTotals(settlement, allLines as any[], doc);
+    await settlement.save();
+    await markRenderedStale(req.workspaceObjectId, doc._id);
+
+    const foreign = amountFields.currency !== "INR" ? ` (${amountFields.amount} ${amountFields.currency} @ ${amountFields.exchangeRate})` : "";
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "OFFICIAL",
+      actor: uid,
+      action: "ADD_SETTLEMENT_LINE",
+      ...adminOverrideMark(req),
+      comment:
+        `Added expense — ${CSTEP_EXPENSE_CATEGORY_LABEL[category]}: ${inrText(amountInr)}${foreign}, ` +
+        `${payment === "COMPANY_PAID" ? "company-paid" : "reimbursable"}` +
+        (arrangement?.vendorId ? ` | Vendor: ${arrangement.vendorCode} ${arrangement.vendorName}` : "") +
+        ` — ${description}` +
+        (attachment ? ` | Document: ${attachment.originalName}` : ""),
+      at: now.toISOString(),
+    });
+
+    res.status(201).json({
+      ok: true,
+      line: line.toObject(),
+      settlement: settlement.toObject(),
+      ...(arrangement ? { arrangement: arrangement.toObject() } : {}),
+    });
+  } catch (err: any) {
+    console.error("[CSTEP requests settlement line POST]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to add the expense" });
+  }
+});
+
 /**
  * PATCH /requests/:id/settlement/perdiem — Official/Admin sets/overrides the
  * per-diem rate, days and/or a meal / provided-benefit deduction. Every
@@ -7582,7 +7859,11 @@ router.post("/requests/:id/report/return", async (req: any, res: any) => {
       return res.status(409).json({ error: "This settlement has already been finalized" });
     }
     if (settlement) {
-      await CstepSettlementLine.deleteMany({ workspaceId: req.workspaceObjectId, settlementId: settlement._id });
+      // Module C — a reimbursable expense the Travel Desk added has no record
+      // behind it to re-seed from, so it is kept (still pointing at the
+      // settlement it was on) and moved onto the next settlement at
+      // /settlement/start. Everything else is re-seeded from its source.
+      await CstepSettlementLine.deleteMany({ workspaceId: req.workspaceObjectId, settlementId: settlement._id, source: { $ne: "DESK_EXPENSE" } });
       await CstepSettlement.deleteMany({ workspaceId: req.workspaceObjectId, _id: settlement._id });
     }
 

@@ -84,7 +84,11 @@ export type CstepApprovalAction =
   // hard-copy prompt (traveller at report submit, Desk at finalize, Finance
   // at reimburse) and every correction. Record-only — hardCopyChange carries
   // from → to; it never gates the action it rides on.
-  | "HARD_COPY";
+  | "HARD_COPY"
+  // Module C — the Travel Desk adds an expense to the settlement while
+  // verifying (company-paid or reimbursable). The comment carries the
+  // category, the amount and which kind it is.
+  | "ADD_SETTLEMENT_LINE";
 
 export interface ICstepApproval extends Document {
   workspaceId: mongoose.Types.ObjectId;
@@ -159,6 +163,7 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "CHANGE_REQUEST",
       "CHANGE_RESOLVE",
       "HARD_COPY",
+      "ADD_SETTLEMENT_LINE",
     ],
     required: true,
   },

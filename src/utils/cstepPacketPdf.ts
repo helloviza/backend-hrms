@@ -21,6 +21,9 @@
 //      a bill — "Boarding pass not available" is declared like no-bill —
 //   2b. its self-declaration — the SAME Declaration form GET
 //      /requests/:id/declaration-pdf serves — follows the documents.
+//   2c. (Module C) each expense the Travel Desk added while verifying —
+//      listed on the itinerary page under its own table, with its document
+//      behind a caption page (or a note that none was attached).
 //   3. The approval form — the SAME generator GET /requests/:id/pdf already
 //      uses, dispatched on formType exactly the same way, appended last
 //      with its digital signatures intact.
@@ -97,6 +100,23 @@ export type CstepPacketReportLeg = {
   travelProofs?: ICstepAttachment[];
 };
 
+/** Module C — an expense the Travel Desk added to the settlement while
+ * verifying (POST /requests/:id/settlement/lines): what it was, the INR
+ * amount, who paid, and its document(s) — a reimbursable line's own
+ * attachment, a company-paid one's arrangement booking documents. */
+export type CstepPacketDeskExpense = {
+  categoryLabel: string;
+  description?: string;
+  amountInr: number;
+  companyPaid: boolean;
+  vendorName?: string;
+  documents: ICstepAttachment[];
+};
+
+function deskExpenseCaption(e: CstepPacketDeskExpense): string {
+  return `Travel Desk expense — ${e.categoryLabel}${e.description ? `: ${e.description}` : ""}`;
+}
+
 function fmtDate(d?: string): string {
   if (!d) return "";
   const iso = d.match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -141,7 +161,11 @@ function drawCell(
     .text(text, x + 4, y + 4, { width: w - 8, height: h - 8, align: opts.align || "left", lineBreak: true });
 }
 
-function generateItineraryPdf(request: ICstepTravelRequest, orderedLegs: CstepPacketReportLeg[]): Promise<Buffer> {
+function generateItineraryPdf(
+  request: ICstepTravelRequest,
+  orderedLegs: CstepPacketReportLeg[],
+  deskExpenses: CstepPacketDeskExpense[] = [],
+): Promise<Buffer> {
   const noto = fs.existsSync(FONT_PATH) && fs.existsSync(FONT_BOLD_PATH);
   const fn = noto ? "NotoSans" : "Helvetica";
   const fb = noto ? "NotoSans-Bold" : "Helvetica-Bold";
@@ -268,6 +292,57 @@ function generateItineraryPdf(request: ICstepTravelRequest, orderedLegs: CstepPa
 
   if (orderedLegs.length === 0) {
     doc.font(fn).fontSize(9).fillColor("#888888").text("No travel report has been filed for this request yet.", M, y, { width: CW });
+    y += 20;
+  }
+
+  // Module C — expenses the Travel Desk added while verifying.
+  if (deskExpenses.length > 0) {
+    const DCOLS = [
+      { label: "EXPENSE", w: Math.round(CW * 0.46) },
+      { label: "CATEGORY", w: Math.round(CW * 0.16) },
+      { label: "AMOUNT (INR)", w: Math.round(CW * 0.16) },
+      { label: "PAID BY", w: 0 },
+    ];
+    DCOLS[3].w = CW - DCOLS[0].w - DCOLS[1].w - DCOLS[2].w;
+    if (y + 60 > PG_H - M) {
+      doc.addPage();
+      y = M;
+    }
+    doc.font(fb).fontSize(10).fillColor("#111111").text("Expenses added by the Travel Desk", M, y, { width: CW });
+    y += 16;
+    let x = M;
+    for (const col of DCOLS) {
+      drawCell(doc, fn, fb, x, y, col.w, HEADER_H, col.label, { header: true, align: "center", size: 7.5 });
+      x += col.w;
+    }
+    y += HEADER_H;
+    for (const e of deskExpenses) {
+      const cells: Array<{ text: string; size: number; align: "left" | "center" | "right" }> = [
+        { text: e.description || "—", size: 8, align: "left" },
+        { text: e.categoryLabel, size: 8, align: "center" },
+        { text: fmtAmount(e.amountInr), size: 8, align: "right" },
+        {
+          text: (e.companyPaid ? `Company-paid${e.vendorName ? ` · ${e.vendorName}` : ""}` : "Reimbursable") + (e.documents.length ? "" : " · no document"),
+          size: 7,
+          align: "center",
+        },
+      ];
+      const rowH = Math.max(
+        ROW_H,
+        ...cells.map((c, i) => Math.ceil(doc.font(fn).fontSize(c.size).heightOfString(c.text, { width: DCOLS[i].w - 8 })) + 10),
+      );
+      if (y + rowH > PG_H - M) {
+        doc.addPage();
+        y = M;
+      }
+      x = M;
+      cells.forEach((c, i) => {
+        drawCell(doc, fn, fb, x, y, DCOLS[i].w, rowH, c.text, { size: c.size, align: c.align });
+        x += DCOLS[i].w;
+      });
+      y += rowH;
+    }
+    y += 14;
   }
 
   doc.end();
@@ -494,6 +569,7 @@ export async function generateCstepPacketPdf(
   legs: CstepPacketReportLeg[],
   settlement?: CstepSettlementPdfData,
   declaration: CstepClaimDeclarationEntry[] = [],
+  deskExpenses: CstepPacketDeskExpense[] = [],
 ): Promise<Buffer> {
   const orderedLegs = [
     ...legs.filter((l) => l.leg.direction === "ONWARD"),
@@ -504,7 +580,7 @@ export async function generateCstepPacketPdf(
   const { font, boldFont } = await embedPacketFonts(pdf);
 
   // 1. Itinerary
-  const itineraryBytes = await generateItineraryPdf(request, orderedLegs);
+  const itineraryBytes = await generateItineraryPdf(request, orderedLegs, deskExpenses);
   const itineraryDoc = await PdfLibDocument.load(itineraryBytes);
   const itineraryPages = await pdf.copyPages(itineraryDoc, itineraryDoc.getPageIndices());
   itineraryPages.forEach((p) => pdf.addPage(p));
@@ -521,6 +597,18 @@ export async function generateCstepPacketPdf(
     const declarationDoc = await PdfLibDocument.load(await generateCstepClaimDeclarationPdf(request, traveller, declaration, trail));
     const declarationPages = await pdf.copyPages(declarationDoc, declarationDoc.getPageIndices());
     declarationPages.forEach((p) => pdf.addPage(p));
+  }
+
+  // 2c. Module C — the Travel Desk's added expenses and their documents.
+  for (const e of deskExpenses) {
+    if (e.documents.length === 0) {
+      appendCaptionPage(pdf, font, boldFont, deskExpenseCaption(e), e.companyPaid ? "Company-paid" : "Reimbursable");
+      appendPlaceholderMessage(pdf, font, boldFont, "The Travel Desk did not attach a document to this expense.");
+    }
+    for (const d of e.documents) {
+      appendCaptionPage(pdf, font, boldFont, deskExpenseCaption(e), d.originalName);
+      await embedDocument(pdf, font, boldFont, d);
+    }
   }
 
   // 3. Approval form — same generator + formType dispatch as
@@ -553,8 +641,9 @@ export async function uploadCstepPacketPdf(
   legs: CstepPacketReportLeg[],
   settlement?: CstepSettlementPdfData,
   declaration: CstepClaimDeclarationEntry[] = [],
+  deskExpenses: CstepPacketDeskExpense[] = [],
 ): Promise<{ key: string }> {
-  const buf = await generateCstepPacketPdf(request, traveller, trail, legs, settlement, declaration);
+  const buf = await generateCstepPacketPdf(request, traveller, trail, legs, settlement, declaration, deskExpenses);
   const key = `cstep-packets/${request.workspaceId}/${request._id}/packet-${Date.now()}.pdf`;
   await s3.send(
     new PutObjectCommand({

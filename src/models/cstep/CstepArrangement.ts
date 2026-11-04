@@ -1,6 +1,7 @@
 // apps/backend/src/models/cstep/CstepArrangement.ts
 import mongoose, { Schema, type Document, type Model } from "mongoose";
 import { workspaceScopePlugin } from "../../plugins/workspaceScope.plugin.js";
+import { CSTEP_EXPENSE_CATEGORIES, type CstepExpenseCategory } from "./expenseCategories.js";
 
 /**
  * CstepArrangement
@@ -145,6 +146,11 @@ export interface ICstepArrangement extends Document {
 
   createdBy: mongoose.Types.ObjectId; // ref User — who created this row (seeding, or the Official who added it)
   addedByRole?: CstepArrangerRole; // source: "ADDED" only — see CSTEP_ARRANGER_ROLES
+  /** Module C — set only on a company-paid expense the Travel Desk added
+   * while verifying the settlement (POST /settlement/lines): the category it
+   * picked. A settlement re-seeded after a report send-back reads it, so the
+   * line comes back as the Desk added it (deskAdded, verified, category). */
+  deskExpenseCategory?: CstepExpenseCategory;
   arrangedBy?: mongoose.Types.ObjectId; // ref User — who last marked it ARRANGED
   arrangedAt?: Date;
 
@@ -189,6 +195,7 @@ const CstepArrangementSchema = new Schema<ICstepArrangement>(
 
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     addedByRole: { type: String, enum: CSTEP_ARRANGER_ROLES },
+    deskExpenseCategory: { type: String, enum: CSTEP_EXPENSE_CATEGORIES },
     arrangedBy: { type: Schema.Types.ObjectId, ref: "User" },
     arrangedAt: { type: Date },
   },

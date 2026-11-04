@@ -32,7 +32,12 @@ import { CSTEP_EXPENSE_CATEGORIES, type CstepExpenseCategory } from "./expenseCa
 // CLAIM_LINE (claims addition): seeded at a claim's approval from the claim's
 // own lines — sourceId is the travelLines/foodLines subdocument _id, or the
 // request's own _id for its single "Other expenses" line.
-export type CstepSettlementLineSource = "ARRANGEMENT" | "REPORT_LEG" | "CLAIM_LINE";
+// DESK_EXPENSE (Module C): a reimbursable expense the Travel Desk added
+// while verifying (POST /requests/:id/settlement/lines). There is no record
+// behind it, so sourceId is generated for it. A company-paid Desk expense is
+// an ARRANGEMENT line instead, over the CstepArrangement row the add creates.
+export const CSTEP_SETTLEMENT_LINE_SOURCES = ["ARRANGEMENT", "REPORT_LEG", "CLAIM_LINE", "DESK_EXPENSE"] as const;
+export type CstepSettlementLineSource = (typeof CSTEP_SETTLEMENT_LINE_SOURCES)[number];
 export type CstepSettlementLineClassification = "OFFICIAL" | "PERSONAL";
 
 export interface ICstepSettlementLine extends Document {
@@ -79,6 +84,11 @@ export interface ICstepSettlementLine extends Document {
   category?: CstepExpenseCategory;
   itemDate?: string;
 
+  /** Module C — added by the Travel Desk during verification (either kind:
+   * a DESK_EXPENSE line, or the ARRANGEMENT line over the arrangement the
+   * add created), not seeded at /settlement/start. */
+  deskAdded?: boolean;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -89,7 +99,7 @@ const CstepSettlementLineSchema = new Schema<ICstepSettlementLine>(
     settlementId: { type: Schema.Types.ObjectId, ref: "CstepSettlement", required: true, index: true },
     requestId: { type: Schema.Types.ObjectId, ref: "CstepTravelRequest", required: true, index: true },
 
-    source: { type: String, enum: ["ARRANGEMENT", "REPORT_LEG", "CLAIM_LINE"], required: true },
+    source: { type: String, enum: CSTEP_SETTLEMENT_LINE_SOURCES, required: true },
     sourceId: { type: Schema.Types.ObjectId, required: true },
 
     description: { type: String, trim: true },
@@ -117,6 +127,8 @@ const CstepSettlementLineSchema = new Schema<ICstepSettlementLine>(
 
     category: { type: String, enum: CSTEP_EXPENSE_CATEGORIES },
     itemDate: { type: String },
+
+    deskAdded: { type: Boolean },
   },
   { timestamps: true },
 );
