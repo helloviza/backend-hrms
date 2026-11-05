@@ -308,3 +308,33 @@ describe("report/start and + Add back fill the route from the request", () => {
     expect(raw).not.toHaveProperty("fromDate");
   });
 });
+
+// Full-circle QC 2026-11-05 — a rebooking's charge (Module D) added before
+// the report starts was seeded as its own FLIGHT leg: it asked for a
+// boarding pass, took the RETURN direction as the last FLIGHT, and pushed the
+// real return flight to ONWARD, so no leg got its From/To.
+describe("report/start never seeds a rebooking charge as a leg (Module D)", () => {
+  it("the charge gets no leg; the real flights keep their directions and routes", async () => {
+    const vendorId = oid();
+    await col("cstepvendors").insertOne({ _id: vendorId, workspaceId: WS, vendorCode: "CSTEPVEN0901", name: "Skyline Travels", isActive: true } as any);
+    const id = await arrangedRequest(
+      {
+        type: "DOMESTIC", purpose: "QC rebook charge seed", departureDate: "2026-12-01", returnDate: "2026-12-04",
+        stations: [{ from: "Bengaluru", to: "Delhi", durationOfStay: "3 days" }], modesRequested: ["AIR"],
+      },
+      [{ arrangedType: "FLIGHT", amount: 7600, details: "6E-512 DEL→BLR" }],
+    );
+    const [onward] = (ok(await call("get", ACT.traveller, `/requests/${id}`)).body.arrangements as any[]).filter((a) => a.amount === 5000);
+    const cr = ok(await call("post", ACT.traveller, `/requests/${id}/change-requests`, { arrangementId: String(onward._id), kind: "REBOOK", details: "Evening flight", reason: "Meeting moved" })).body;
+    const changeRequestId = String((cr.changeRequest || cr.change || cr)._id);
+    const charge = ok(await call("post", ACT.official, `/requests/${id}/arrangements`, { changeRequestId, amount: 1500, currency: "INR", vendorId: String(vendorId) })).body.line;
+
+    const legs = ok(await call("post", ACT.traveller, `/requests/${id}/report/start`)).body.legs as any[];
+    expect(legs).toHaveLength(2);
+    expect(legs.some((l) => String(l.arrangementId) === String(charge._id))).toBe(false);
+    const flight = (d: string) => legs.find((l) => l.travelMode === "FLIGHT" && l.direction === d);
+    expect(route(flight("ONWARD"))).toEqual({ fromLocation: "Bengaluru", toLocation: "Delhi", fromDate: "2026-12-01", toDate: undefined });
+    expect(flight("RETURN").remarks).toBe("6E-512 DEL→BLR");
+    expect(route(flight("RETURN"))).toEqual({ fromLocation: "Delhi", toLocation: "Bengaluru", fromDate: "2026-12-04", toDate: undefined });
+  });
+});

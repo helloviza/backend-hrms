@@ -282,7 +282,9 @@ function generateItineraryPdf(
       const paidBy = (leg.paidBy === "CSTEP" ? "Booked by CSTEP" : "Self Paid") + docNote;
 
       const cells: Array<{ text: string; size: number; align: "left" | "center" | "right" }> = [
-        { text: route + (leg.remarks ? `\n${leg.remarks}` : ""), size: 8, align: "left" },
+        // Typed booking details / remarks may carry "→" (no NotoSans glyph —
+        // it printed as a box: full-circle QC 2026-11-05).
+        { text: pdfSafeText(route + (leg.remarks ? `\n${leg.remarks}` : "")), size: 8, align: "left" },
         { text: dateRange, size: 8, align: "center" },
         { text: MODE_LABELS[leg.travelMode] || leg.travelMode, size: 8, align: "center" },
         { text: fare, size: 8, align: "right" },
@@ -388,11 +390,11 @@ function generateItineraryPdf(
     y += HEADER_H;
     for (const e of deskExpenses) {
       const cells: Array<{ text: string; size: number; align: "left" | "center" | "right" }> = [
-        { text: e.description || "—", size: 8, align: "left" },
+        { text: pdfSafeText(e.description || "—"), size: 8, align: "left" },
         { text: e.categoryLabel, size: 8, align: "center" },
         { text: fmtAmount(e.amountInr), size: 8, align: "right" },
         {
-          text: (e.companyPaid ? `Company-paid${e.vendorName ? ` · ${e.vendorName}` : ""}` : "Reimbursable") + (e.documents.length ? "" : " · no document"),
+          text: pdfSafeText((e.companyPaid ? `Company-paid${e.vendorName ? ` · ${e.vendorName}` : ""}` : "Reimbursable") + (e.documents.length ? "" : " · no document")),
           size: 7,
           align: "center",
         },

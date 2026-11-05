@@ -414,7 +414,17 @@ describe("the packet renderer", () => {
     const reqDoc: any = { _id: R.paid, workspaceId: WS, formType: "TOUR_PROPOSAL", type: "DOMESTIC", status: "REPORT_SUBMITTED", purpose: "QC", stations: [], countries: [] };
     const spy = vi.spyOn(PDFDocument.prototype as any, "text");
     try {
-      await real.generateCstepPacketPdf(reqDoc, { name: "Asha Rao" }, [], [], undefined, [], [], [
+      // Full-circle QC 2026-11-05: a booked leg whose typed details carry "→"
+      // (and a Desk expense typed the same way) printed a box in the itinerary.
+      const legs: any[] = [
+        {
+          leg: { direction: "ONWARD", travelMode: "FLIGHT", fromLocation: "Bengaluru", toLocation: "Delhi", fare: 9000, currency: "INR", paidBy: "CSTEP", remarks: "6E-511 BLR→DEL 02 Nov" },
+          attachment: null,
+          bookingDocuments: [],
+        },
+      ];
+      const desk: any[] = [{ categoryLabel: "Hotel", description: "Late checkout DEL→BLR transfer", amountInr: 1200, companyPaid: true, vendorName: "Lakeview Inn", documents: [] }];
+      await real.generateCstepPacketPdf(reqDoc, { name: "Asha Rao" }, [], legs, undefined, [], desk, [
         { service: "Hotel — 2 nights, Lakeview Inn", amountInr: 8000, creditNoteRef: "CN-LV-1", creditInr: 3000 },
         { service: "Train — Vande Bharat DEL→AGC", amountInr: 4000, creditNoteRef: "CN-SK-7", creditInr: 1500 },
       ]);
@@ -424,6 +434,8 @@ describe("the packet renderer", () => {
       expect(texts).toContain("Train — Vande Bharat DEL to AGC — cancelled");
       expect(texts).toContain("CN-LV-1");
       expect(texts).toContain("-3,000.00");
+      expect(texts).toContain("Bengaluru to Delhi\n6E-511 BLR to DEL 02 Nov");
+      expect(texts).toContain("Late checkout DEL to BLR transfer");
       // Browser QC: "−" (U+2212) and "→" have no NotoSans glyph and printed
       // as nothing — every character drawn must be one the font carries.
       const font = fontkit.create(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "fonts", "NotoSans-Regular.ttf")));

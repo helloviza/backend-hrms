@@ -1627,7 +1627,11 @@ function withSeedRoute<T extends Partial<CstepSeedLegRoute>>(row: T, route: Cste
  * with its From / To / date (seedLegRoutes). */
 function seedReportLegs(arrangements: any[], request?: SeedRouteRequest | null) {
   const real = [...arrangements]
-    .filter(arrangementIsReal)
+    // Module D — a rebooking's additional charge is never a travel-report
+    // leg (settlement seeds it as its own line, "+ Add back" refuses it).
+    // Seeded as a leg it asked for a boarding pass, and as the last FLIGHT it
+    // took the RETURN direction and broke the From/To prefill (full-circle QC).
+    .filter((a) => arrangementIsReal(a) && !a.changeRequestId)
     .sort((x, y) => new Date(x.createdAt).getTime() - new Date(y.createdAt).getTime() || String(x._id).localeCompare(String(y._id)));
   const directions = seededLegDirections(real);
   const rows = buildSeedReportLegs(real).map((row, i) => ({ ...row, direction: directions[i] }));
