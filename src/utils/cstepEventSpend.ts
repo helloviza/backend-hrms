@@ -31,7 +31,7 @@ export interface EventSpendCase {
   eventCode?: string; // the request's snapshot — the label when the master row is gone
   eventName?: string;
   /** Real arrangements only (arrangementIsReal). Read only when there is no settlement. */
-  arrangements: Array<{ arrangedType?: string; amount?: number; currency?: string; amountInr?: number }>;
+  arrangements: Array<{ arrangedType?: string; amount?: number; currency?: string; amountInr?: number; creditInr?: number }>;
   settlement?: { status: string; totalCostOfTour?: number; perDiem?: { amountInr?: number } };
   settlementLines: Array<{ classification?: string; amountInr?: number; category?: string | null }>;
 }
@@ -96,7 +96,8 @@ function addTo(row: EventSpendRow, c: EventSpendCase) {
   } else {
     total = 0;
     for (const a of c.arrangements) {
-      const inr = Number(a.amountInr || 0);
+      // Module D — a cancelled booking counts net of its credit note.
+      const inr = Number(a.amountInr || 0) - Number(a.creditInr || 0);
       if (inr > 0) {
         total += inr;
         row.cstepPaidInr += inr;

@@ -151,6 +151,21 @@ export interface ICstepArrangement extends Document {
    * picked. A settlement re-seeded after a report send-back reads it, so the
    * line comes back as the Desk added it (deskAdded, verified, category). */
   deskExpenseCategory?: CstepExpenseCategory;
+  /** Module D — a rebooking's additional charge: this ADDED line was
+   * recorded against an OPEN REBOOK change request on another line (ref
+   * CstepChangeRequest), which keeps its original fare. Not a travel-report
+   * leg (never offered to "+ Add back"). */
+  changeRequestId?: mongoose.Types.ObjectId;
+  /** Module D — the booking was cancelled with a vendor credit note
+   * (CstepCreditNote). A snapshot for the reports: the note's id, its INR
+   * credit, its number, and whether the booking was already paid then. */
+  cancelled?: boolean;
+  cancelledAt?: Date;
+  cancelledBy?: mongoose.Types.ObjectId; // ref User
+  creditNoteId?: mongoose.Types.ObjectId; // ref CstepCreditNote
+  creditInr?: number;
+  creditNoteRef?: string;
+  creditAgainstPaid?: boolean;
   arrangedBy?: mongoose.Types.ObjectId; // ref User — who last marked it ARRANGED
   arrangedAt?: Date;
 
@@ -196,6 +211,14 @@ const CstepArrangementSchema = new Schema<ICstepArrangement>(
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     addedByRole: { type: String, enum: CSTEP_ARRANGER_ROLES },
     deskExpenseCategory: { type: String, enum: CSTEP_EXPENSE_CATEGORIES },
+    changeRequestId: { type: Schema.Types.ObjectId, ref: "CstepChangeRequest" },
+    cancelled: { type: Boolean },
+    cancelledAt: { type: Date },
+    cancelledBy: { type: Schema.Types.ObjectId, ref: "User" },
+    creditNoteId: { type: Schema.Types.ObjectId, ref: "CstepCreditNote" },
+    creditInr: { type: Number },
+    creditNoteRef: { type: String, trim: true },
+    creditAgainstPaid: { type: Boolean },
     arrangedBy: { type: Schema.Types.ObjectId, ref: "User" },
     arrangedAt: { type: Date },
   },

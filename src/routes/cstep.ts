@@ -49,6 +49,7 @@ import {
   CstepVendorType,
   CstepSequenceChange,
   CstepChangeRequest,
+  CstepCreditNote,
 } from "../models/cstep/index.js";
 import {
   CSTEP_CHANGE_KINDS,
@@ -114,7 +115,12 @@ import {
   type CstepClaimDeclarationEntry,
   type CstepClaimSettlementPdfData,
 } from "../utils/cstepClaimPdf.js";
-import { uploadCstepPacketPdf, type CstepPacketDeskExpense, type CstepPacketReportLeg } from "../utils/cstepPacketPdf.js";
+import {
+  uploadCstepPacketPdf,
+  type CstepPacketCancelledBooking,
+  type CstepPacketDeskExpense,
+  type CstepPacketReportLeg,
+} from "../utils/cstepPacketPdf.js";
 import { presignGetObject } from "../utils/s3Presign.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { getLiveRate } from "../utils/exchangeRate.js";
@@ -1859,15 +1865,18 @@ export async function findDefaultPerDiemRate(
  * amountClaimed = PERSONAL (reimbursable) lines + per diem owed to the
  * traveller. */
 function recomputeSettlementTotals(
-  lines: Array<{ mode: CstepServiceType; amountInr?: number; classification: CstepSettlementLineClassification }>,
+  lines: Array<{ mode: CstepServiceType; amountInr?: number; classification: CstepSettlementLineClassification; source?: CstepSettlementLineSource }>,
   perDiemAmountInr: number,
 ): { buckets: { airRailBus: number; perDiem: number; boardingLodging: number; cab: number; other: number }; totalCostOfTour: number; amountClaimed: number } {
   const buckets = { airRailBus: 0, perDiem: Math.round(perDiemAmountInr * 100) / 100, boardingLodging: 0, cab: 0, other: 0 };
   let personalTotal = 0;
   for (const line of lines) {
     const bucket = SETTLEMENT_BUCKET_BY_MODE[line.mode] || "other";
-    buckets[bucket] += line.amountInr || 0;
-    if (line.classification === "PERSONAL") personalTotal += line.amountInr || 0;
+    // Module D — a credit note nets its cancelled booking out of the trip
+    // cost (in that booking's bucket); every other line adds (never below 0).
+    const amount = line.source === "CREDIT_NOTE" ? -Math.abs(line.amountInr || 0) : Math.max(0, line.amountInr || 0);
+    buckets[bucket] += amount;
+    if (line.classification === "PERSONAL" && line.source !== "CREDIT_NOTE") personalTotal += amount;
   }
   buckets.airRailBus = Math.round(buckets.airRailBus * 100) / 100;
   buckets.boardingLodging = Math.round(buckets.boardingLodging * 100) / 100;
@@ -1919,10 +1928,12 @@ async function buildSeedSettlementLines(
     noBill?: boolean;
   }>
 > {
-  const [arrangements, legs] = await Promise.all([
+  const [arrangements, legs, creditNotes] = await Promise.all([
     CstepArrangement.find({ workspaceId, requestId }).sort({ createdAt: 1, _id: 1 }).lean(),
     CstepReportLeg.find({ workspaceId, requestId }).sort({ createdAt: 1, _id: 1 }).lean(),
+    CstepCreditNote.find({ workspaceId, requestId }).lean(),
   ]);
+  const creditNoteByArrangement = new Map((creditNotes as any[]).map((n) => [String(n.arrangementId), n]));
 
   // Carry the traveller's uploaded document onto ARRANGEMENT-sourced lines.
   // The receipt/boarding pass for a CSTEP-paid service is uploaded on the
@@ -1975,6 +1986,9 @@ async function buildSeedSettlementLines(
     noBill?: boolean;
   }> = [];
 
+  // Module D — credit-note lines, written after every booking's own line.
+  const pendingCreditLines: typeof lines = [];
+
   // #7 — CSTEP-paid ADDED legs that are a restored booking. Each one is
   // claimed at most once, by an arrangement that has no SEEDED leg to pair.
   const addedCstepLegs = (legs as any[]).filter((l) => l.source === "ADDED" && l.paidBy === "CSTEP" && !isLinkedBookedLeg(l));
@@ -1986,6 +2000,26 @@ async function buildSeedSettlementLines(
 
   for (const a of arrangements as any[]) {
     if (!arrangementIsReal(a)) continue; // F6 — never seeded a leg either, so nothing to pair
+    // Module D — a cancelled booking's credit note follows its own line.
+    const note = creditNoteByArrangement.get(String(a._id));
+    if (note) pendingCreditLines.push(creditNoteLine(a, note));
+    if (a.changeRequestId) {
+      // Module D — a rebooking's additional charge: its own line, no report
+      // leg pairs with it (the original booking keeps its leg and its fare).
+      lines.push({
+        source: "ARRANGEMENT",
+        sourceId: a._id,
+        description: a.details || undefined,
+        mode: a.arrangedType,
+        category: categoryOfServiceType(a.arrangedType),
+        amountInr: a.amountInr || 0,
+        classification: "OFFICIAL",
+        classificationOverridden: false,
+        verified: false,
+        noBill: false,
+      });
+      continue;
+    }
     if (a.deskExpenseCategory) {
       // Module C — a company-paid expense the Travel Desk added while
       // verifying (re-seeded after a report send-back): no report leg pairs
@@ -2079,7 +2113,28 @@ async function buildSeedSettlementLines(
     }
   }
 
+  lines.push(...pendingCreditLines);
   return lines;
+}
+
+/** Module D — the negative settlement line for a cancelled booking's credit
+ * note (sourceId = the CstepCreditNote): the booking's mode/bucket, OFFICIAL,
+ * verified by the Desk that recorded it. */
+function creditNoteLine(a: any, note: any) {
+  return {
+    source: "CREDIT_NOTE" as const,
+    sourceId: note._id,
+    description: `Credit note ${note.ref} — cancelled ${SERVICE_LABEL[a.arrangedType] || a.arrangedType}${a.details ? `: ${a.details}` : ""}`,
+    mode: a.arrangedType as CstepServiceType,
+    category: categoryOfServiceType(a.arrangedType),
+    amountInr: -Math.abs(Math.round(Number(note.amountInr || 0) * 100) / 100),
+    classification: "OFFICIAL" as const,
+    classificationOverridden: false as const,
+    verified: true,
+    verifiedBy: note.recordedBy,
+    verifiedAt: note.recordedAt,
+    noBill: false,
+  };
 }
 
 /**
@@ -2290,6 +2345,9 @@ router.get("/requests/:id", async (req: any, res: any) => {
     // P1 — the Travel Desk attaches booking documents to its lines from
     // arranging until the settlement is finalized (late vouchers).
     const canAttachBookingDocs = !isClaim && deskAuthority && BOOKING_DOCUMENT_STATUSES.has(doc.status);
+    // Module D — cancel a booking with a credit note: the same window, and
+    // never once the settlement is finalized.
+    const canCancelBookings = canAttachBookingDocs && (await cancellationWindowOpen(req, doc));
     // Step 5 — same authority as canArrange (callerCanArrangeForTraveller):
     // the Official who arranges services also settles accounts. Covers both
     // "may open the settlement card" and "may act on it while VERIFYING" —
@@ -2447,6 +2505,7 @@ router.get("/requests/:id", async (req: any, res: any) => {
       travelDeskOverride,
       canArrange,
       canAttachBookingDocs,
+      canCancelBookings,
       canSettle,
       canFinance,
       canFinanceDecide,
@@ -4593,6 +4652,27 @@ router.patch("/requests/:id/arrangements/:lineId", async (req: any, res: any) =>
     const before = { arrangedType: line.arrangedType, details: line.details, status: line.status };
     const body = req.body || {};
 
+    const touchesMoney = ["currency", "amount", "exchangeRate", "rateDate", "rateSource"].some((k) => k in body);
+    // Module D — a cancelled booking (credit note recorded) stays as it was.
+    if (line.cancelled && (touchesMoney || "vendorId" in body || "arrangedType" in body)) {
+      return res.status(409).json({ error: "This booking is cancelled with a credit note — its amount and vendor stay as booked" });
+    }
+    // Module D — a rebooking never overwrites the original fare: its extra
+    // charge is its own line (POST /arrangements with the changeRequestId).
+    if (
+      reopenedForChange &&
+      touchesMoney &&
+      (await CstepChangeRequest.exists({
+        workspaceId: req.workspaceObjectId,
+        travelRequestId: doc._id,
+        arrangementId: line._id,
+        status: "OPEN",
+        kind: "REBOOK",
+      }))
+    ) {
+      return res.status(409).json({ error: "Record the rebooking's charge as its own line — the original fare stays as booked" });
+    }
+
     const vendorResult = await resolveArrangementVendor(req, body, line);
     if ("error" in vendorResult) return res.status(vendorResult.status).json({ error: vendorResult.error });
     // A paid line is locked to the vendor and amount it was paid on — the
@@ -4694,29 +4774,63 @@ router.patch("/requests/:id/arrangements/:lineId", async (req: any, res: any) =>
  * service line (not on the traveller's original form — Forex, Stationery,
  * etc.). Logs ADD_SERVICE. Only while the request is ARRANGING.
  * ───────────────────────────────────────────────────────────────────── */
-router.post("/requests/:id/arrangements", async (req: any, res: any) => {
+router.post("/requests/:id/arrangements", reportAttachmentMw, async (req: any, res: any) => {
   try {
     const doc = await loadRequest(req, req.params.id);
     if (!doc) return res.status(404).json({ error: "Travel request not found" });
     if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
       return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
     }
-    if (doc.status !== "ARRANGING") {
+    // Module D — past ARRANGING, a line can still be added as a rebooking's
+    // additional charge, against an OPEN REBOOK change request: its own
+    // line, so the original booking keeps its fare.
+    const body = req.body || {};
+    let rebook: any = null;
+    if (body.changeRequestId !== undefined && body.changeRequestId !== null && body.changeRequestId !== "") {
+      if (!mongoose.isValidObjectId(String(body.changeRequestId))) return res.status(400).json({ error: "Invalid change request id" });
+      rebook = await CstepChangeRequest.findOne({ _id: body.changeRequestId, workspaceId: req.workspaceObjectId, travelRequestId: doc._id }).lean();
+      if (!rebook) return res.status(404).json({ error: "Change request not found on this request" });
+      if (rebook.kind !== "REBOOK" || rebook.status !== "OPEN" || !(await lineOpenForChange(req, doc, rebook.arrangementId))) {
+        return res.status(409).json({ error: "A rebooking charge is added against an open rebook request" });
+      }
+    } else if (doc.status !== "ARRANGING") {
       return res.status(409).json({ error: "Only a request currently being arranged can have services added" });
     }
+    const original: any = rebook
+      ? await CstepArrangement.findOne({ _id: rebook.arrangementId, workspaceId: req.workspaceObjectId, requestId: doc._id }).lean()
+      : null;
+    if (rebook && !original) return res.status(404).json({ error: "The booking being rebooked is not on this request" });
 
-    const arrangedType = req.body?.arrangedType;
+    const arrangedType = rebook ? body.arrangedType || original.arrangedType : body.arrangedType;
     if (!CSTEP_SERVICE_TYPES.includes(arrangedType)) {
       return res.status(400).json({ error: "arrangedType is required and must be a recognized service type" });
     }
-    const details = String(req.body?.details || "").trim();
+    const typedDetails = String(body.details || "").trim();
+    const details = rebook
+      ? `Rebooking charge — ${SERVICE_LABEL[original.arrangedType] || original.arrangedType}${original.details ? ` ${original.details}` : ""}${typedDetails ? `: ${typedDetails}` : ""}`
+      : typedDetails;
     const uid = ownerId(req);
 
-    const amountResult = computeArrangementAmountFields(req.body || {});
+    const amountResult = computeArrangementAmountFields(body);
     if (!amountResult.ok) return res.status(400).json({ error: amountResult.error });
-    const vendorResult = await resolveArrangementVendor(req, req.body || {});
+    if (rebook) {
+      // It reaches the vendor Tally, so it needs a real INR amount and the
+      // vendor it is paid to.
+      if (!(Number(amountResult.fields.amount) > 0)) return res.status(400).json({ error: "amount must be more than 0" });
+      if (!(Number(amountResult.fields.amountInr) > 0)) {
+        return res.status(400).json({ error: `exchangeRate is required for an amount in ${amountResult.fields.currency}` });
+      }
+      if (!String(body.vendorId || "").trim()) return res.status(400).json({ error: "Choose the vendor for the rebooking charge" });
+    }
+    const vendorResult = await resolveArrangementVendor(req, body);
     if ("error" in vendorResult) return res.status(vendorResult.status).json({ error: vendorResult.error });
     const vendorFields = vendorResult.touched && vendorResult.fields.vendorId ? vendorResult.fields : {};
+
+    const file = req.file;
+    const attachment =
+      file && file.buffer
+        ? await storeRequestAttachment(req, doc, file, REPORT_DOCUMENT_TYPE_BY_MODE[arrangedType as CstepServiceType] || "OTHER", `cstep/arrangements/${req.workspaceObjectId}/${doc._id}`)
+        : null;
 
     const line = await CstepArrangement.create({
       workspaceId: req.workspaceObjectId,
@@ -4724,12 +4838,15 @@ router.post("/requests/:id/arrangements", async (req: any, res: any) => {
       source: "ADDED",
       arrangedType,
       details: details || undefined,
-      status: "PENDING",
+      status: rebook ? "ARRANGED" : "PENDING",
+      ...(rebook ? { arrangedBy: new mongoose.Types.ObjectId(uid), arrangedAt: new Date(), changeRequestId: rebook._id } : {}),
       createdBy: new mongoose.Types.ObjectId(uid),
       addedByRole: await arrangerRole(req, doc.travelerProfileId),
       ...(amountResult.touched ? amountResult.fields : {}),
       ...vendorFields,
+      ...(attachment ? { attachmentIds: [attachment._id] } : {}),
     });
+    if (rebook) await markPacketStale(req.workspaceObjectId, doc._id);
 
     const amountLabel =
       amountResult.touched && amountResult.fields.amount !== undefined
@@ -4746,6 +4863,7 @@ router.post("/requests/:id/arrangements", async (req: any, res: any) => {
       action: "ADD_SERVICE",
       ...adminOverrideMark(req),
       comment:
+        (rebook ? "Rebooking charge: " : "") +
         `Added ${arrangedType}${details ? ` — ${details}` : ""}` +
         amountLabel +
         (line.vendorId ? ` | Vendor: ${line.vendorCode} ${line.vendorName}` : ""),
@@ -4873,6 +4991,17 @@ router.patch("/requests/:id/arrangements/:lineId/payment", async (req: any, res:
         return res.status(400).json({ error: "The payment date can't be in the future" });
       }
       paidAt = parsed;
+    }
+
+    // Module D — a credit note against an unpaid booking: it is paid net,
+    // and a full credit leaves nothing owed. Once a credit note was recorded
+    // against a paid booking, the payment stays recorded (the note's own
+    // Tally voucher nets it).
+    if (next === "PAID" && line.cancelled && !line.creditAgainstPaid && money2(line.amountInr) - money2(line.creditInr) <= 0) {
+      return res.status(409).json({ error: "This booking is cancelled with a full credit note — nothing is owed to the vendor" });
+    }
+    if (next === "UNPAID" && line.creditNoteId && line.creditAgainstPaid) {
+      return res.status(409).json({ error: "A credit note was recorded against this payment — it can't be marked unpaid" });
     }
 
     const before = line.paymentStatus || "UNPAID";
@@ -5535,9 +5664,15 @@ router.post("/requests/:id/report/legs", async (req: any, res: any) => {
       if (a.deskExpenseCategory) {
         return res.status(409).json({ error: "This expense was added by the Travel Desk at settlement — it can't be added to the travel report" });
       }
+      // Module D — nor a rebooking's charge, nor a cancelled booking.
+      if (a.changeRequestId || a.cancelled) {
+        return res.status(409).json({ error: a.cancelled ? "This booking was cancelled — it can't be added to the travel report" : "A rebooking charge isn't a travel-report leg" });
+      }
       // One seeded leg per booked service of that mode — refuse a second
       // add-back (a double click) rather than stack an extra booked leg.
-      const bookedOfMode = arrangements.filter((x) => arrangementIsReal(x) && !x.deskExpenseCategory && x.arrangedType === a.arrangedType).length;
+      const bookedOfMode = arrangements.filter(
+        (x) => arrangementIsReal(x) && !x.deskExpenseCategory && !x.changeRequestId && !x.cancelled && x.arrangedType === a.arrangedType,
+      ).length;
       const seededOfMode = await CstepReportLeg.countDocuments({
         workspaceId: req.workspaceObjectId,
         requestId: doc._id,
@@ -6009,6 +6144,146 @@ router.delete("/requests/:id/report/legs/:legId/travel-proof/:attachmentId", asy
  * a hotel folio arrives after the stay). Finalize moves the request out of
  * REPORT_SUBMITTED, so the window closes there. */
 const BOOKING_DOCUMENT_STATUSES = new Set(["ARRANGING", "ARRANGED", "REPORT_PENDING", "REPORT_UNDER_APPROVAL", "REPORT_SUBMITTED"]);
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Module D — POST /requests/:id/arrangements/:lineId/cancel: the Travel Desk
+ * (or a CSTEP Admin, as an override) marks a booking cancelled and records
+ * the vendor's credit note. From ARRANGING until the settlement is finalized
+ * (a credit note after finalize is out of scope). Tour / Event only.
+ *
+ * Body: { ref, amount, currency (default INR), exchangeRate (a foreign
+ * credit), rateSource?, rateDate? }. 0 < credit (INR) ≤ the booking's INR
+ * amount — the vendor may keep a cancellation fee.
+ *
+ * Writes a CstepCreditNote (againstPaid = the booking was already paid), the
+ * booking's cancelled snapshot, and — if the settlement is open — its
+ * negative CREDIT_NOTE line, then recomputes and flags both PDFs stale. Logs
+ * CANCEL_BOOKING with the ref and amount.
+ * ───────────────────────────────────────────────────────────────────── */
+const money2 = (v: any) => Math.round(Number(v || 0) * 100) / 100;
+
+/** The cancellation window: from ARRANGING up to a finalized settlement. */
+async function cancellationWindowOpen(req: any, doc: any): Promise<boolean> {
+  if (isClaimFormType(doc.formType) || !BOOKING_DOCUMENT_STATUSES.has(doc.status)) return false;
+  const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id }).select("status").lean();
+  return !settlement || settlement.status === "VERIFYING";
+}
+
+router.post("/requests/:id/arrangements/:lineId/cancel", async (req: any, res: any) => {
+  try {
+    const doc = await loadRequest(req, req.params.id);
+    if (!doc) return res.status(404).json({ error: "Travel request not found" });
+    if (isClaimFormType(doc.formType)) return res.status(409).json({ error: "A claim has no bookings to cancel" });
+    if (!(await callerCanArrangeForTraveller(req, doc.travelerProfileId))) {
+      return res.status(403).json({ error: "Only this traveller's Travel Desk or a CSTEP Admin can perform this action" });
+    }
+    if (!(await cancellationWindowOpen(req, doc))) {
+      return res.status(409).json({ error: "A booking can be cancelled from arranging until the settlement is finalized" });
+    }
+    if (!mongoose.isValidObjectId(String(req.params.lineId))) return res.status(400).json({ error: "Invalid arrangement line id" });
+    const line: any = await CstepArrangement.findOne({ _id: req.params.lineId, workspaceId: req.workspaceObjectId, requestId: doc._id });
+    if (!line) return res.status(404).json({ error: "Arrangement line not found" });
+    if (line.cancelled || line.creditNoteId) return res.status(409).json({ error: "This booking is already cancelled" });
+    if (!(money2(line.amountInr) > 0)) {
+      return res.status(409).json({ error: "This booking has no INR amount — set its amount before recording a credit note" });
+    }
+
+    const body = req.body || {};
+    const ref = String(body.ref || "").trim();
+    if (!ref) return res.status(400).json({ error: "ref (the credit note number) is required" });
+    if (ref.length > 100) return res.status(400).json({ error: "ref is too long (100 characters max)" });
+    const amountResult = computeArrangementAmountFields({
+      currency: body.currency,
+      amount: body.amount,
+      exchangeRate: body.exchangeRate,
+      rateSource: body.rateSource || undefined,
+      rateDate: body.rateDate || undefined,
+    });
+    if (!amountResult.ok) return res.status(400).json({ error: amountResult.error });
+    const f = amountResult.fields;
+    if (!(Number(f.amount) > 0)) return res.status(400).json({ error: "The credit amount must be more than 0" });
+    if (!(Number(f.amountInr) > 0)) return res.status(400).json({ error: `exchangeRate is required for a credit in ${f.currency}` });
+    const creditInr = money2(f.amountInr);
+    if (creditInr > money2(line.amountInr)) {
+      return res.status(400).json({
+        error: `The credit (${inrText(creditInr)}) can't be more than the booking (${inrText(line.amountInr)})`,
+        bookingAmountInr: line.amountInr,
+      });
+    }
+
+    const uid = new mongoose.Types.ObjectId(ownerId(req));
+    const now = new Date();
+    const note: any = await CstepCreditNote.create({
+      workspaceId: req.workspaceObjectId,
+      requestId: doc._id,
+      arrangementId: line._id,
+      ref,
+      currency: f.currency || "INR",
+      amount: f.amount,
+      exchangeRate: f.exchangeRate,
+      rateDate: f.rateDate,
+      rateSource: f.rateSource,
+      amountInr: creditInr,
+      againstPaid: line.paymentStatus === "PAID",
+      recordedBy: uid,
+      recordedAt: now,
+    });
+    line.cancelled = true;
+    line.cancelledAt = now;
+    line.cancelledBy = uid;
+    line.creditNoteId = note._id;
+    line.creditInr = creditInr;
+    line.creditNoteRef = ref;
+    line.creditAgainstPaid = note.againstPaid;
+    await line.save();
+
+    // The open settlement gets the credit line now; otherwise
+    // /settlement/start seeds it (buildSeedSettlementLines).
+    const settlement: any = await CstepSettlement.findOne({ workspaceId: req.workspaceObjectId, requestId: doc._id });
+    let creditLine: any = null;
+    if (settlement) {
+      creditLine = await CstepSettlementLine.create({
+        ...creditNoteLine(line, note),
+        claimedAmountInr: -creditInr,
+        workspaceId: req.workspaceObjectId,
+        settlementId: settlement._id,
+        requestId: doc._id,
+        createdBy: uid,
+      });
+      const allLines = await CstepSettlementLine.find({ workspaceId: req.workspaceObjectId, settlementId: settlement._id }).lean();
+      applySettlementTotals(settlement, allLines as any[], doc);
+      await settlement.save();
+    }
+    await markRenderedStale(req.workspaceObjectId, doc._id);
+
+    const service = `${SERVICE_LABEL[line.arrangedType] || line.arrangedType}${line.details ? ` — ${line.details}` : ""}`;
+    const foreign = f.currency !== "INR" ? ` (${f.amount} ${f.currency} @ ${f.exchangeRate})` : "";
+    await CstepApproval.create({
+      workspaceId: req.workspaceObjectId,
+      entityType: "REQUEST",
+      entityId: doc._id,
+      stage: "OFFICIAL",
+      actor: uid,
+      action: "CANCEL_BOOKING",
+      ...adminOverrideMark(req),
+      comment:
+        `Cancelled ${service} (${inrText(line.amountInr)}) — credit note ${ref}: −${inrText(creditInr)}${foreign}` +
+        (note.againstPaid ? " · against the paid booking" : "") +
+        (creditInr < money2(line.amountInr) ? ` · vendor keeps ${inrText(money2(line.amountInr) - creditInr)}` : " · full credit"),
+      at: now.toISOString(),
+    });
+
+    res.status(201).json({
+      ok: true,
+      line: line.toObject(),
+      creditNote: note.toObject(),
+      ...(creditLine ? { settlementLine: creditLine.toObject(), settlement: settlement.toObject() } : {}),
+    });
+  } catch (err: any) {
+    console.error("[CSTEP requests arrangement cancel]", err?.message);
+    res.status(500).json({ error: err?.message || "Failed to cancel the booking" });
+  }
+});
 
 /** P1 — loads an arrangement line for the Desk's booking-document routes.
  * Sends the refusal itself and returns null when it refuses. */
@@ -7042,7 +7317,28 @@ router.get("/requests/:id/packet", async (req: any, res: any) => {
         // packet, after the supporting documents (claimDeclarationItems).
         const declaration = claimDeclarationItems(doc, legs as any[]);
         const deskExpenses = settlement ? await packetDeskExpenses(req.workspaceObjectId, doc._id, settlement._id) : [];
-        const { key } = await uploadCstepPacketPdf(doc.toObject(), travellerInfo, trail, packetLegs, settlementPdfData, declaration, deskExpenses);
+        // Module D — the bookings cancelled with a credit note.
+        const cancelledBookings: CstepPacketCancelledBooking[] = (
+          (await CstepArrangement.find({ workspaceId: req.workspaceObjectId, requestId: doc._id, cancelled: true })
+            .sort({ createdAt: 1, _id: 1 })
+            .select("arrangedType details amountInr creditInr creditNoteRef")
+            .lean()) as any[]
+        ).map((a) => ({
+          service: `${SERVICE_LABEL[a.arrangedType] || a.arrangedType}${a.details ? ` — ${a.details}` : ""}`,
+          amountInr: Number(a.amountInr) || 0,
+          creditNoteRef: a.creditNoteRef || "",
+          creditInr: Number(a.creditInr) || 0,
+        }));
+        const { key } = await uploadCstepPacketPdf(
+          doc.toObject(),
+          travellerInfo,
+          trail,
+          packetLegs,
+          settlementPdfData,
+          declaration,
+          deskExpenses,
+          cancelledBookings,
+        );
         const packetGeneratedAt = new Date();
         await CstepTravelRequest.updateOne(scope, { $set: { packetS3Key: key, packetGeneratedAt, packetTravellerSig: travellerSig } }, { timestamps: false });
         doc.packetS3Key = key;
@@ -7375,6 +7671,11 @@ router.patch("/requests/:id/settlement/lines/:lineId", async (req: any, res: any
 
     const before = { amountInr: line.amountInr, classification: line.classification, verified: line.verified };
     const body = req.body || {};
+
+    // Module D — a credit note's amount and side come from the note itself.
+    if (line.source === "CREDIT_NOTE" && ("amountInr" in body || "classification" in body)) {
+      return res.status(409).json({ error: "A credit note line is as the vendor's credit note says — only its verification can change" });
+    }
 
     let amountChange: LineReduction | null = null;
     if ("amountInr" in body) {

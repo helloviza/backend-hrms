@@ -20,7 +20,9 @@
 //                    one sheet.
 //
 // Vendor payments: each paid line is one journal voucher, two rows sharing
-// its number:
+// its number (Module D: a booking cancelled with a credit note while still
+// unpaid is paid — and exported — net: its amount less the credit; a full
+// credit exports nothing):
 //   Dr — the expense ledger mapped from the vendor's type (else the default
 //        ledger), the line's INR amount, an auto narration, and the cost
 //        centres: Project, the traveller's Department and name, and the
@@ -28,6 +30,13 @@
 //   Cr — the vendor's own ledger (its Vendor Master name), the same amount
 //        and bill-wise New ref with the vendor invoice no. (blank if none).
 //        No instrument columns: the payment itself is not in this journal.
+//
+// Vendor credit notes (Module D): a credit note recorded against a booking
+// that was already PAID is its own voucher, dated when it was recorded and
+// numbered from the same TALLY series — the paid voucher stays as it was:
+//   Dr — the vendor's ledger, the credit, bill-wise Agst Ref the vendor
+//        invoice no. (else the credit note's own ref);
+//   Cr — the same expense ledger as the booking, with its cost centres.
 //
 // Reimbursements (Finance-a Stage 2): each case Finance paid in the range
 // (its settlement's paidOn) is one journal voucher. Only what the traveller
@@ -60,6 +69,7 @@
 import { Router } from "express";
 import mongoose from "mongoose";
 import CstepArrangement, { arrangementAmountGap } from "../models/cstep/CstepArrangement.js";
+import CstepCreditNote from "../models/cstep/CstepCreditNote.js";
 import CstepSettlement from "../models/cstep/CstepSettlement.js";
 import CstepSettlementLine from "../models/cstep/CstepSettlementLine.js";
 import CstepTallySettings, {
@@ -429,29 +439,54 @@ async function costCentres(workspaceId: any, settings: TallySettings, requests: 
 
 /* ── vendor payments ──────────────────────────────────────────────────── */
 
+/** Module D — what a paid booking is exported at: its INR amount, less a
+ * credit note recorded while it was still unpaid (one recorded against the
+ * paid booking is its own voucher instead). */
+export function vendorPayableInr(l: { amountInr?: number | null; cancelled?: boolean; creditInr?: number | null; creditAgainstPaid?: boolean }): number {
+  const amount = money(l.amountInr);
+  if (!l.cancelled || l.creditAgainstPaid) return amount;
+  return Math.max(0, money(amount - money(l.creditInr)));
+}
+
 async function vendorVouchers(workspaceId: any, scope: Scope, start: Date, end: Date, settings: TallySettings): Promise<Built> {
-  const allLines: any[] = await CstepArrangement.find({
-    workspaceId,
-    paymentStatus: "PAID",
-    vendorId: { $exists: true, $ne: null },
-    paidAt: { $gte: start, $lt: end },
-  })
-    .sort({ paidAt: 1, _id: 1 })
-    .lean();
+  const [allLines, allNotes]: [any[], any[]] = await Promise.all([
+    CstepArrangement.find({
+      workspaceId,
+      paymentStatus: "PAID",
+      vendorId: { $exists: true, $ne: null },
+      paidAt: { $gte: start, $lt: end },
+    })
+      .sort({ paidAt: 1, _id: 1 })
+      .lean(),
+    // Module D — credit notes against a paid booking, recorded in the range.
+    CstepCreditNote.find({ workspaceId, againstPaid: true, recordedAt: { $gte: start, $lt: end } })
+      .sort({ recordedAt: 1, _id: 1 })
+      .lean(),
+  ]);
+  const noteBookings: any[] = allNotes.length
+    ? await CstepArrangement.find({ workspaceId, _id: { $in: allNotes.map((n) => n.arrangementId) }, vendorId: { $exists: true, $ne: null } }).lean()
+    : [];
+  const bookingById = new Map(noteBookings.map((b) => [String(b._id), b]));
 
   const requests: any[] = await CstepTravelRequest.find({
     workspaceId,
-    _id: { $in: [...new Set(allLines.map((l) => String(l.requestId)))] },
+    _id: { $in: [...new Set([...allLines, ...noteBookings].map((l) => String(l.requestId)))] },
     formType: { $in: ARRANGED_FORM_TYPES },
   })
     .select("_id claimReference travelerProfileId project projectCode projectTallyCC formType type stations countries eventLocation")
     .lean();
   const requestById = new Map(requests.filter((r) => inScope(scope, r.travelerProfileId)).map((r) => [String(r._id), r]));
-  const lines = allLines.filter((l) => requestById.has(String(l.requestId)));
-  if (!lines.length) return { found: 0, vouchers: [] };
+  // A booking fully credited before it was paid owes nothing: no voucher.
+  const lines = allLines.filter((l) => requestById.has(String(l.requestId)) && !(l.cancelled && !l.creditAgainstPaid && vendorPayableInr(l) <= 0));
+  const notes = allNotes
+    .map((n) => ({ note: n, booking: bookingById.get(String(n.arrangementId)) }))
+    .filter((x) => x.booking && requestById.has(String(x.booking.requestId)));
+  const found = lines.length + notes.length;
+  if (!found) return { found: 0, vouchers: [] };
+  const bookings = [...lines, ...notes.map((x) => x.booking)];
 
   const [vendors, types, cc] = await Promise.all([
-    CstepVendor.find({ workspaceId, _id: { $in: [...new Set(lines.map((l) => String(l.vendorId)))] } })
+    CstepVendor.find({ workspaceId, _id: { $in: [...new Set(bookings.map((l) => String(l.vendorId)))] } })
       .select("_id name vendorTypeId")
       .lean(),
     CstepVendorType.find({ workspaceId }).select("_id name").lean(),
@@ -464,9 +499,9 @@ async function vendorVouchers(workspaceId: any, scope: Scope, start: Date, end: 
 
   // An expense ledger for every line, and an amount on every line.
   if (!settings.defaultLedger) {
-    const unmapped = [...new Set(lines.filter((l) => !ledgerByType.get(typeIdOf(l))).map((l) => typeName.get(typeIdOf(l)) || "(no type)"))];
+    const unmapped = [...new Set(bookings.filter((l) => !ledgerByType.get(typeIdOf(l))).map((l) => typeName.get(typeIdOf(l)) || "(no type)"))];
     if (unmapped.length) {
-      return refuse(lines.length, {
+      return refuse(found, {
         error: `No expense ledger for vendor type ${unmapped.join(", ")} — map it, or set a default ledger, in the Tally settings`,
         unmappedTypes: unmapped,
       });
@@ -475,42 +510,74 @@ async function vendorVouchers(workspaceId: any, scope: Scope, start: Date, end: 
   const noAmount = lines.filter((l) => arrangementAmountGap(l));
   if (noAmount.length) {
     const references = [...new Set(noAmount.map((l) => requestById.get(String(l.requestId))?.claimReference || "(no reference)"))];
-    return refuse(lines.length, {
+    return refuse(found, {
       error: `${noAmount.length} paid vendor line${noAmount.length === 1 ? " has" : "s have"} no amount, on ${references.join(", ")} — Finance or a CSTEP Admin sets it on the request, then export again`,
       missingAmountReferences: references,
     });
   }
 
-  return {
-    found: lines.length,
-    vouchers: lines.map((l) => ({
-      model: CstepArrangement,
-      doc: l,
-      paidAt: new Date(l.paidAt),
-      rows: (voucherNo: string) => {
-        const r = requestById.get(String(l.requestId));
-        const vendor = vendorById.get(String(l.vendorId));
-        const typeId = typeIdOf(l);
-        const amount = money(l.amountInr);
-        const columns = cc.drColumns(r);
-        const [projects, projectCc] = columns;
-        const service = l.arrangedType === "OTHER" ? typeName.get(typeId) || "Other" : SERVICE_LABEL[l.arrangedType] || l.arrangedType;
-        const narration = ["Being", service, "for", cc.nameOf(r), r?.claimReference || ""].filter(Boolean).join(" ");
-        const head = [settings.companyName, settings.voucherType, voucherNo, excelDate(istDate(new Date(l.paidAt)))];
-        return [
-          [
-            ...head, ledgerByType.get(typeId) || settings.defaultLedger, "Dr", ...columns,
-            amount, narration, "", "", null, null, "", "", null, "", "",
-          ],
-          [
-            ...head, vendor?.name || l.vendorName || "", "Cr", projects, projectCc,
-            "", "", "", "", "", "",
-            amount, "", "New ref", l.vendorInvoiceNo || "", null, amount, "Cr", "", null, "", "",
-          ],
-        ];
-      },
-    })),
-  };
+  const serviceOf = (l: any) => (l.arrangedType === "OTHER" ? typeName.get(typeIdOf(l)) || "Other" : SERVICE_LABEL[l.arrangedType] || l.arrangedType);
+
+  const paidVouchers: PendingVoucher[] = lines.map((l) => ({
+    model: CstepArrangement,
+    doc: l,
+    paidAt: new Date(l.paidAt),
+    rows: (voucherNo: string) => {
+      const r = requestById.get(String(l.requestId));
+      const vendor = vendorById.get(String(l.vendorId));
+      const typeId = typeIdOf(l);
+      const amount = vendorPayableInr(l);
+      const columns = cc.drColumns(r);
+      const [projects, projectCc] = columns;
+      const service = serviceOf(l);
+      const net = l.cancelled && !l.creditAgainstPaid ? ` net of credit note ${l.creditNoteRef || ""}`.trimEnd() : "";
+      const narration = ["Being", service, "for", cc.nameOf(r), r?.claimReference || ""].filter(Boolean).join(" ") + net;
+      const head = [settings.companyName, settings.voucherType, voucherNo, excelDate(istDate(new Date(l.paidAt)))];
+      return [
+        [
+          ...head, ledgerByType.get(typeId) || settings.defaultLedger, "Dr", ...columns,
+          amount, narration, "", "", null, null, "", "", null, "", "",
+        ],
+        [
+          ...head, vendor?.name || l.vendorName || "", "Cr", projects, projectCc,
+          "", "", "", "", "", "",
+          amount, "", "New ref", l.vendorInvoiceNo || "", null, amount, "Cr", "", null, "", "",
+        ],
+      ];
+    },
+  }));
+
+  // Module D — the credit note's own voucher: Dr the vendor, Cr the expense.
+  const noteVouchers: PendingVoucher[] = notes.map(({ note, booking: l }) => ({
+    model: CstepCreditNote,
+    doc: note,
+    paidAt: new Date(note.recordedAt),
+    rows: (voucherNo: string) => {
+      const r = requestById.get(String(l.requestId));
+      const vendor = vendorById.get(String(l.vendorId));
+      const typeId = typeIdOf(l);
+      const amount = money(note.amountInr);
+      const columns = cc.drColumns(r);
+      const [projects, projectCc] = columns;
+      const narration = ["Being credit note", note.ref, "for cancelled", serviceOf(l), "for", cc.nameOf(r), r?.claimReference || ""]
+        .filter(Boolean)
+        .join(" ");
+      const head = [settings.companyName, settings.voucherType, voucherNo, excelDate(istDate(new Date(note.recordedAt)))];
+      return [
+        [
+          ...head, vendor?.name || l.vendorName || "", "Dr", projects, projectCc,
+          "", "", "", "", "", "",
+          amount, narration, "Agst Ref", l.vendorInvoiceNo || note.ref, null, amount, "Dr", "", null, "", "",
+        ],
+        [
+          ...head, ledgerByType.get(typeId) || settings.defaultLedger, "Cr", ...columns,
+          amount, "", "", "", null, null, "", "", null, "", "",
+        ],
+      ];
+    },
+  }));
+
+  return { found, vouchers: [...paidVouchers, ...noteVouchers] };
 }
 
 /* ── reimbursements ───────────────────────────────────────────────────── */

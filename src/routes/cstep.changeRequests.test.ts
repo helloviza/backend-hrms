@@ -280,9 +280,16 @@ describe("CSTEP change requests — raise, list, resolve", () => {
   });
 
   it("the open change reopens ITS line for the Official, past ARRANGING — and no other line", async () => {
-    const r = await patch(ACT.official, `/requests/${id}/arrangements/${lines.FLIGHT}`, { details: "6E-201 3 Nov 07:10", amount: 5200, currency: "INR" });
+    // Module D — a rebook never overwrites the original fare: the new
+    // details go on the line, an amount change is refused (the rebooking's
+    // charge is its own line, POST /arrangements with the changeRequestId).
+    const before = (await col("csteparrangements").findOne({ _id: new mongoose.Types.ObjectId(lines.FLIGHT) })) as any;
+    const refused = await patch(ACT.official, `/requests/${id}/arrangements/${lines.FLIGHT}`, { amount: 5200, currency: "INR" });
+    expect(refused.status).toBe(409);
+    expect(refused.body.error).toMatch(/rebooking's charge as its own line/);
+    const r = await patch(ACT.official, `/requests/${id}/arrangements/${lines.FLIGHT}`, { details: "6E-201 3 Nov 07:10" });
     expect(r.status).toBe(200);
-    expect(r.body.line).toMatchObject({ details: "6E-201 3 Nov 07:10", amountInr: 5200 });
+    expect(r.body.line).toMatchObject({ details: "6E-201 3 Nov 07:10", amountInr: before.amountInr });
     const entry = (await col("cstepapprovals").find({ entityId: new mongoose.Types.ObjectId(id), action: "ARRANGE_SERVICE" }).sort({ _id: -1 }).limit(1).toArray())[0];
     expect(entry.comment).toMatch(/^Change request — /);
     expect((await patch(ACT.official, `/requests/${id}/arrangements/${lines.CAB}`, { details: "x" })).status).toBe(409);

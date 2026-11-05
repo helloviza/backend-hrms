@@ -36,7 +36,11 @@ import { CSTEP_EXPENSE_CATEGORIES, type CstepExpenseCategory } from "./expenseCa
 // while verifying (POST /requests/:id/settlement/lines). There is no record
 // behind it, so sourceId is generated for it. A company-paid Desk expense is
 // an ARRANGEMENT line instead, over the CstepArrangement row the add creates.
-export const CSTEP_SETTLEMENT_LINE_SOURCES = ["ARRANGEMENT", "REPORT_LEG", "CLAIM_LINE", "DESK_EXPENSE"] as const;
+// CREDIT_NOTE (Module D): a cancelled booking's vendor credit note
+// (CstepCreditNote, its sourceId) as a NEGATIVE line — the only source whose
+// amountInr may be below 0 (and it may not be above 0), so totalCostOfTour
+// nets the credit off the booking's own ARRANGEMENT line.
+export const CSTEP_SETTLEMENT_LINE_SOURCES = ["ARRANGEMENT", "REPORT_LEG", "CLAIM_LINE", "DESK_EXPENSE", "CREDIT_NOTE"] as const;
 export type CstepSettlementLineSource = (typeof CSTEP_SETTLEMENT_LINE_SOURCES)[number];
 export type CstepSettlementLineClassification = "OFFICIAL" | "PERSONAL";
 
@@ -104,7 +108,18 @@ const CstepSettlementLineSchema = new Schema<ICstepSettlementLine>(
 
     description: { type: String, trim: true },
     mode: { type: String, enum: CSTEP_SERVICE_TYPES, required: true },
-    amountInr: { type: Number, default: 0 },
+    amountInr: {
+      type: Number,
+      default: 0,
+      validate: {
+        // Only a credit note is negative; every other line is ≥ 0.
+        validator(this: any, v: number) {
+          if (v === undefined || v === null) return true;
+          return this?.source === "CREDIT_NOTE" ? v <= 0 : v >= 0;
+        },
+        message: "amountInr must be ≥ 0 (≤ 0 for a credit note)",
+      },
+    },
     claimedAmountInr: { type: Number },
 
     classification: { type: String, enum: ["OFFICIAL", "PERSONAL"], required: true },

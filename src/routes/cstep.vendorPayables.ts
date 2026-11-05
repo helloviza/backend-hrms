@@ -112,10 +112,24 @@ async function requirePaymentScope(req: any, res: any): Promise<Scope | null> {
   return { all: false, travellerIds: mine.map((t: any) => t._id) };
 }
 
+/** Module D — an unpaid booking cancelled with a full credit note: nothing
+ * is owed, so it is neither "unpaid" in the totals nor a row on the payment
+ * working sheet (the import skips it and the Tally export never sends it). */
+export const fullyCredited = (r: { paymentStatus: string; cancelled: boolean; netInr: number | null }) =>
+  r.paymentStatus !== "PAID" && r.cancelled && r.netInr === 0;
+
 export const inScope = (scope: Scope, travelerProfileId: any) =>
   scope.all || scope.travellerIds.some((id) => String(id) === String(travelerProfileId));
 
 /* ── payables ─────────────────────────────────────────────────────────── */
+
+/** Module D — what a booking owes its vendor: the amount, less a credit
+ * note recorded while it was still unpaid. */
+export function payableNetInr(l: { amountInr?: number | null; cancelled?: boolean; creditInr?: number | null; creditAgainstPaid?: boolean }): number {
+  const amount = Math.round(Number(l.amountInr || 0) * 100) / 100;
+  if (!l.cancelled || l.creditAgainstPaid) return amount;
+  return Math.max(0, Math.round((amount - Number(l.creditInr || 0)) * 100) / 100);
+}
 
 export interface PayableRow {
   lineId: string;
@@ -131,6 +145,13 @@ export interface PayableRow {
   service: string;
   details: string;
   amountInr: number | null;
+  /** Module D — cancelled with a vendor credit note: its ref and INR credit,
+   * and what is owed (netInr: the amount less a credit recorded while
+   * unpaid; a credit against a paid booking is its own Tally voucher). */
+  cancelled: boolean;
+  creditNoteRef: string;
+  creditInr: number | null;
+  netInr: number | null;
   paymentStatus: "UNPAID" | "PAID";
   paidOn: string; // "YYYY-MM-DD" (IST) or ""
   paymentRef: string;
@@ -198,6 +219,10 @@ async function loadPayables(
       service: SERVICE_LABEL[l.arrangedType] || l.arrangedType,
       details: l.details || "",
       amountInr: typeof l.amountInr === "number" ? l.amountInr : null,
+      cancelled: !!l.cancelled,
+      creditNoteRef: l.creditNoteRef || "",
+      creditInr: typeof l.creditInr === "number" ? l.creditInr : null,
+      netInr: typeof l.amountInr === "number" ? payableNetInr(l) : null,
       paymentStatus: paid ? "PAID" : "UNPAID",
       paidOn: paid && l.paidAt ? istDate(new Date(l.paidAt)) : "",
       paymentRef: paid ? l.paymentRef || "" : "",
@@ -235,7 +260,7 @@ router.get("/", async (req: any, res: any) => {
     const parsed = readFilters(req.query);
     if ("error" in parsed) return res.status(400).json({ error: parsed.error });
     const rows = await loadPayables(req, scope, parsed.filters);
-    const unpaid = rows.filter((r) => r.paymentStatus === "UNPAID");
+    const unpaid = rows.filter((r) => r.paymentStatus === "UNPAID" && !fullyCredited(r));
     res.json({
       ok: true,
       scope: scope.all ? "ALL" : "MINE",
@@ -243,7 +268,7 @@ router.get("/", async (req: any, res: any) => {
       totals: {
         lines: rows.length,
         unpaidLines: unpaid.length,
-        unpaidInr: Math.round(unpaid.reduce((s, r) => s + (r.amountInr || 0), 0) * 100) / 100,
+        unpaidInr: Math.round(unpaid.reduce((s, r) => s + (r.netInr ?? r.amountInr ?? 0), 0) * 100) / 100,
       },
     });
   } catch (err: any) {
@@ -281,7 +306,9 @@ router.get("/export", async (req: any, res: any) => {
     if (!scope) return;
     const parsed = readFilters(req.query);
     if ("error" in parsed) return res.status(400).json({ error: parsed.error });
-    const rows = await loadPayables(req, scope, parsed.filters);
+    // Module D — a fully credited booking is not a row to pay; a partly
+    // credited unpaid one is owed (and imported) at its net.
+    const rows = (await loadPayables(req, scope, parsed.filters)).filter((r) => !fullyCredited(r));
     const format = String(req.query.format || "xlsx").toLowerCase() === "csv" ? "csv" : "xlsx";
     await sendSheet(res, {
       format,
@@ -295,7 +322,7 @@ router.get("/export", async (req: any, res: any) => {
         r.reference,
         r.traveller,
         r.details ? `${r.service} — ${r.details}` : r.service,
-        r.amountInr,
+        r.netInr ?? r.amountInr,
         r.paymentStatus === "PAID" ? "Paid" : "Unpaid",
         r.paidOn,
         r.paymentRef,
@@ -472,8 +499,9 @@ async function processPaymentRows(
       .sort({ createdAt: 1, _id: 1 })
       .lean();
     if (!lines.length) return out("NO_UNPAID_LINES", `No arrangement line on ${reference} is booked with ${vendorCode}`);
-    const unpaid = lines.filter((l) => l.paymentStatus !== "PAID");
-    if (!unpaid.length) return out("ALREADY_PAID", `All ${lines.length} line(s) for ${vendorCode} on ${reference} are already paid`);
+    // Module D — a booking fully credited while unpaid owes nothing.
+    const unpaid = lines.filter((l) => l.paymentStatus !== "PAID" && !(l.cancelled && !l.creditAgainstPaid && payableNetInr(l) <= 0));
+    if (!unpaid.length) return out("ALREADY_PAID", `All ${lines.length} line(s) for ${vendorCode} on ${reference} are already paid (or fully credited)`);
     // Every line the row would pay needs its amount first (as a manual
     // mark-paid does) — the whole row is refused, naming the lines, rather
     // than paying some of them.

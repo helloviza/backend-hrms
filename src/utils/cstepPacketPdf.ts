@@ -21,6 +21,9 @@
 //      a bill — "Boarding pass not available" is declared like no-bill —
 //   2b. its self-declaration — the SAME Declaration form GET
 //      /requests/:id/declaration-pdf serves — follows the documents.
+//   1b. (Module D) each booking cancelled with a vendor credit note, under
+//      its own table on the itinerary page ("Flight ₹X — cancelled · credit
+//      note REF −₹Y") — the trip totals on the approval form are net of it.
 //   2c. (Module C) each expense the Travel Desk added while verifying —
 //      listed on the itinerary page under its own table, with its document
 //      behind a caption page (or a note that none was attached).
@@ -113,6 +116,26 @@ export type CstepPacketDeskExpense = {
   documents: ICstepAttachment[];
 };
 
+/** Module D — a booking cancelled with a vendor credit note. */
+export type CstepPacketCancelledBooking = {
+  service: string; // "Flight — LH-755 BLR→FRA"
+  amountInr: number;
+  creditNoteRef: string;
+  creditInr: number;
+};
+
+/** NotoSans has no "→" (U+2192) or "−" (U+2212) glyph — both printed as
+ * nothing / a box (browser QC, Module D). A route arrow reads "to" and a
+ * credit is an ASCII hyphen-minus. */
+export function pdfSafeText(s: string): string {
+  return s.replace(/\s*\u2192\s*/g, " to ").replace(/\u2212/g, "-");
+}
+
+/** "Flight — LH-755 BLR to FRA ₹41,000 — cancelled · credit note CN-1 -₹30,000" */
+export function cancelledBookingText(b: CstepPacketCancelledBooking): string {
+  return pdfSafeText(`${b.service} ₹${fmtAmount(b.amountInr)} — cancelled · credit note ${b.creditNoteRef} -₹${fmtAmount(b.creditInr)}`);
+}
+
 function deskExpenseCaption(e: CstepPacketDeskExpense): string {
   return `Travel Desk expense — ${e.categoryLabel}${e.description ? `: ${e.description}` : ""}`;
 }
@@ -165,6 +188,7 @@ function generateItineraryPdf(
   request: ICstepTravelRequest,
   orderedLegs: CstepPacketReportLeg[],
   deskExpenses: CstepPacketDeskExpense[] = [],
+  cancelledBookings: CstepPacketCancelledBooking[] = [],
 ): Promise<Buffer> {
   const noto = fs.existsSync(FONT_PATH) && fs.existsSync(FONT_BOLD_PATH);
   const fn = noto ? "NotoSans" : "Helvetica";
@@ -293,6 +317,52 @@ function generateItineraryPdf(
   if (orderedLegs.length === 0) {
     doc.font(fn).fontSize(9).fillColor("#888888").text("No travel report has been filed for this request yet.", M, y, { width: CW });
     y += 20;
+  }
+
+  // Module D — bookings cancelled with a vendor credit note.
+  if (cancelledBookings.length > 0) {
+    const KCOLS = [
+      { label: "CANCELLED BOOKING", w: Math.round(CW * 0.46) },
+      { label: "BOOKED (INR)", w: Math.round(CW * 0.16) },
+      { label: "CREDIT NOTE", w: Math.round(CW * 0.2) },
+      { label: "CREDIT (INR)", w: 0 },
+    ];
+    KCOLS[3].w = CW - KCOLS[0].w - KCOLS[1].w - KCOLS[2].w;
+    if (y + 60 > PG_H - M) {
+      doc.addPage();
+      y = M;
+    }
+    doc.font(fb).fontSize(10).fillColor("#111111").text("Cancelled bookings & credit notes", M, y, { width: CW });
+    y += 16;
+    let x = M;
+    for (const col of KCOLS) {
+      drawCell(doc, fn, fb, x, y, col.w, HEADER_H, col.label, { header: true, align: "center", size: 7.5 });
+      x += col.w;
+    }
+    y += HEADER_H;
+    for (const b of cancelledBookings) {
+      const cells: Array<{ text: string; size: number; align: "left" | "center" | "right" }> = [
+        { text: pdfSafeText(`${b.service} — cancelled`), size: 8, align: "left" },
+        { text: fmtAmount(b.amountInr), size: 8, align: "right" },
+        { text: pdfSafeText(b.creditNoteRef), size: 8, align: "center" },
+        { text: `-${fmtAmount(b.creditInr)}`, size: 8, align: "right" },
+      ];
+      const rowH = Math.max(
+        ROW_H,
+        ...cells.map((c, i) => Math.ceil(doc.font(fn).fontSize(c.size).heightOfString(c.text, { width: KCOLS[i].w - 8 })) + 10),
+      );
+      if (y + rowH > PG_H - M) {
+        doc.addPage();
+        y = M;
+      }
+      x = M;
+      cells.forEach((c, i) => {
+        drawCell(doc, fn, fb, x, y, KCOLS[i].w, rowH, c.text, { size: c.size, align: c.align });
+        x += KCOLS[i].w;
+      });
+      y += rowH;
+    }
+    y += 14;
   }
 
   // Module C — expenses the Travel Desk added while verifying.
@@ -570,6 +640,7 @@ export async function generateCstepPacketPdf(
   settlement?: CstepSettlementPdfData,
   declaration: CstepClaimDeclarationEntry[] = [],
   deskExpenses: CstepPacketDeskExpense[] = [],
+  cancelledBookings: CstepPacketCancelledBooking[] = [],
 ): Promise<Buffer> {
   const orderedLegs = [
     ...legs.filter((l) => l.leg.direction === "ONWARD"),
@@ -580,7 +651,7 @@ export async function generateCstepPacketPdf(
   const { font, boldFont } = await embedPacketFonts(pdf);
 
   // 1. Itinerary
-  const itineraryBytes = await generateItineraryPdf(request, orderedLegs, deskExpenses);
+  const itineraryBytes = await generateItineraryPdf(request, orderedLegs, deskExpenses, cancelledBookings);
   const itineraryDoc = await PdfLibDocument.load(itineraryBytes);
   const itineraryPages = await pdf.copyPages(itineraryDoc, itineraryDoc.getPageIndices());
   itineraryPages.forEach((p) => pdf.addPage(p));
@@ -642,8 +713,9 @@ export async function uploadCstepPacketPdf(
   settlement?: CstepSettlementPdfData,
   declaration: CstepClaimDeclarationEntry[] = [],
   deskExpenses: CstepPacketDeskExpense[] = [],
+  cancelledBookings: CstepPacketCancelledBooking[] = [],
 ): Promise<{ key: string }> {
-  const buf = await generateCstepPacketPdf(request, traveller, trail, legs, settlement, declaration, deskExpenses);
+  const buf = await generateCstepPacketPdf(request, traveller, trail, legs, settlement, declaration, deskExpenses, cancelledBookings);
   const key = `cstep-packets/${request.workspaceId}/${request._id}/packet-${Date.now()}.pdf`;
   await s3.send(
     new PutObjectCommand({

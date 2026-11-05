@@ -88,7 +88,10 @@ export type CstepApprovalAction =
   // Module C — the Travel Desk adds an expense to the settlement while
   // verifying (company-paid or reimbursable). The comment carries the
   // category, the amount and which kind it is.
-  | "ADD_SETTLEMENT_LINE";
+  | "ADD_SETTLEMENT_LINE"
+  // Module D — the Travel Desk / an Admin cancels a booking and records the
+  // vendor's credit note (the comment carries its ref and amount).
+  | "CANCEL_BOOKING";
 
 export interface ICstepApproval extends Document {
   workspaceId: mongoose.Types.ObjectId;
@@ -164,6 +167,7 @@ const CstepApprovalSchema = new Schema<ICstepApproval>({
       "CHANGE_RESOLVE",
       "HARD_COPY",
       "ADD_SETTLEMENT_LINE",
+      "CANCEL_BOOKING",
     ],
     required: true,
   },
