@@ -1,6 +1,7 @@
 import mongoose, { Schema, model, type Document } from "mongoose";
 import Counter from "./Counter.js";
 import CompanySettings from "./CompanySettings.js";
+import { todayIST } from "../utils/dateIST.js";
 
 export interface IInvoiceLineItem {
   bookingRef: string;
@@ -221,9 +222,9 @@ InvoiceSchema.pre("save", async function (next) {
   try {
     if (!this.isNew || this.invoiceNo) return next();
 
-    const now = new Date();
-    const month = now.getMonth() + 1;
-    const year = now.getFullYear();
+    // The IST calendar, not the server's (UTC on App Runner): 00:00-05:30 IST
+    // on the 1st must number into the month and FY the invoice is dated in.
+    const [year, month] = todayIST().split("-").map(Number);
     const fyStartYear = month >= 4 ? year : year - 1;
 
     // Resolve which GST profile issued this invoice, purely to decide which

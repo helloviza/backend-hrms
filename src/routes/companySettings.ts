@@ -8,6 +8,7 @@ import { requirePermission } from "../middleware/requirePermission.js";
 import CompanySettings, { getCompanySettings, validateGstProfiles, validateD2CSellerGstin } from "../models/CompanySettings.js";
 import Counter from "../models/Counter.js";
 import { invalidateCompanySettingsCache } from "../utils/companySettings.js";
+import { todayIST } from "../utils/dateIST.js";
 import { s3 } from "../config/aws.js";
 import { env } from "../config/env.js";
 
@@ -81,8 +82,10 @@ router.put("/", requirePermission("companySettings", "WRITE"), async (req: any, 
 
     // Wire invoiceStartNumber to the atomic Counter so it takes effect on next invoice
     if (typeof body.invoiceStartNumber === "number" && body.invoiceStartNumber > 0) {
-      const now = new Date();
-      const fyStartYear = now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1;
+      // The IST calendar, not the server's (UTC on App Runner): the same period
+      // the Invoice pre-save hook will number from.
+      const [year, month] = todayIST().split("-").map(Number);
+      const fyStartYear = month >= 4 ? year : year - 1;
       const fyKey = `invoice:FY${fyStartYear}`;
       // targetFloor = startNumber - 1: next $inc produces exactly startNumber
       // $max ensures we never move the counter backward (no duplicate risk)
@@ -101,9 +104,9 @@ router.put("/", requirePermission("companySettings", "WRITE"), async (req: any, 
     // here.
     if (Array.isArray(body.gstProfiles)) {
       const cadence = settings.invoiceSeriesCadence === "monthly" ? "monthly" : "annual";
-      const now2 = new Date();
-      const fyStartYear2 = now2.getMonth() >= 3 ? now2.getFullYear() : now2.getFullYear() - 1;
-      const monthPeriod2 = `${now2.getFullYear()}${String(now2.getMonth() + 1).padStart(2, "0")}`;
+      const [year2, month2] = todayIST().split("-").map(Number);
+      const fyStartYear2 = month2 >= 4 ? year2 : year2 - 1;
+      const monthPeriod2 = `${year2}${String(month2).padStart(2, "0")}`;
 
       for (const p of body.gstProfiles as any[]) {
         if (p.isDefault) continue;
