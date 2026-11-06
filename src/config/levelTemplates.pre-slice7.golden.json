@@ -187,6 +187,14 @@
     "loyalty": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L2": {
@@ -375,6 +383,14 @@
       "scope": "NONE"
     },
     "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -567,6 +583,14 @@
     "loyalty": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L4": {
@@ -755,6 +779,14 @@
       "scope": "NONE"
     },
     "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -947,6 +979,14 @@
     "loyalty": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L6": {
@@ -1135,6 +1175,14 @@
       "scope": "NONE"
     },
     "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1327,6 +1375,14 @@
     "loyalty": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L8": {
@@ -1515,6 +1571,14 @@
       "scope": "NONE"
     },
     "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1707,6 +1771,14 @@
     "loyalty": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_SBT": {
@@ -1897,6 +1969,14 @@
     "loyalty": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_APPROVAL": {
@@ -2085,6 +2165,14 @@
       "scope": "NONE"
     },
     "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -2281,6 +2369,14 @@
     "loyalty": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L0": {
@@ -2473,6 +2569,14 @@
       "scope": "NONE"
     },
     "loyalty": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceDelete": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "invoiceReissue": {
       "access": "NONE",
       "scope": "NONE"
     }

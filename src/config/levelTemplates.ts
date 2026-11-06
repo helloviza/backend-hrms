@@ -104,6 +104,11 @@ type ModulesTemplate = {
   // Loyalty Points admin (2026-10-20) — per-user only, NONE everywhere below
   // (routes/admin.loyalty.ts: READ = view, FULL = edit / link / adjust).
   loyalty:           ModulePermission
+  // Invoice "Delete invoice" / "Cancel for reissue" + "Release reservation"
+  // (2026-11-05, routes/invoices.ts, services/invoiceReissue.ts) — per-user
+  // only, NONE everywhere below; each also needs invoices WRITE.
+  invoiceDelete:     ModulePermission
+  invoiceReissue:    ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -159,6 +164,8 @@ const L1: ModulesTemplate = {
   travellerIdentityPII: NONE,
   trainingReports: NONE,
   loyalty:         NONE,
+  invoiceDelete:   NONE,
+  invoiceReissue:  NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -249,6 +256,8 @@ const L6: ModulesTemplate = {
   travellerIdentityPII: NONE,
   trainingReports: NONE,
   loyalty:         NONE,
+  invoiceDelete:   NONE,
+  invoiceReissue:  NONE,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -269,6 +278,8 @@ const L7: ModulesTemplate = {
   travellerIdentityPII: NONE,
   trainingReports: NONE,
   loyalty:         NONE,
+  invoiceDelete:   NONE,
+  invoiceReissue:  NONE,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -324,6 +335,8 @@ const L8: ModulesTemplate = {
   travellerIdentityPII: NONE,
   trainingReports: NONE,
   loyalty:         NONE,
+  invoiceDelete:   NONE,
+  invoiceReissue:  NONE,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -379,6 +392,8 @@ const VENDOR: ModulesTemplate = {
   travellerIdentityPII: NONE,
   trainingReports: NONE,
   loyalty:         NONE,
+  invoiceDelete:   NONE,
+  invoiceReissue:  NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -434,6 +449,8 @@ const CUSTOMER_SBT: ModulesTemplate = {
   travellerIdentityPII: NONE,
   trainingReports: NONE,
   loyalty:         NONE,
+  invoiceDelete:   NONE,
+  invoiceReissue:  NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -489,6 +506,8 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   travellerIdentityPII: NONE,
   trainingReports: NONE,
   loyalty:         NONE,
+  invoiceDelete:   NONE,
+  invoiceReissue:  NONE,
 }
 
 // ── TENANT_ADMIN template ─────────────────────────────────────────────────────
@@ -591,6 +610,8 @@ const TENANT_ADMIN: ModulesTemplate = {
   travellerIdentityPII: NONE,
   trainingReports: NONE,
   loyalty:         NONE,
+  invoiceDelete:   NONE,
+  invoiceReissue:  NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

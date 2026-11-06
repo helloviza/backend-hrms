@@ -7,6 +7,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } 
 import mongoose from "mongoose";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import Invoice from "./Invoice.js";
+import { seriesOfInvoice, periodOfDate } from "../services/invoiceReissue.js";
 
 const KA = "29ABCDE1234F1Z5"; // default profile, bare annual series
 const MH = "27ABCDE1234F1Z5"; // prefixed profile
@@ -66,4 +67,11 @@ describe("invoice number period follows the IST calendar", () => {
     expect(await numberAt("2027-03-31T18:29:00Z", MH)).toBe("INV-MH20260001");
   });
 
+  it("the number and an invoice dated that IST day are in the same period, so reissue can reuse it", async () => {
+    await settings("monthly");
+    const no = await numberAt("2026-11-30T20:30:00Z", MH);
+    const companySettings = await col("companysettings").findOne({});
+    const series = seriesOfInvoice({ invoiceNo: no, issuerDetails: { gstin: MH } }, companySettings);
+    expect(series?.period).toBe(periodOfDate(new Date("2026-12-01T00:00:00+05:30"), "monthly"));
+  });
 });

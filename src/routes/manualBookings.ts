@@ -22,7 +22,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import CustomerMember from "../models/CustomerMember.js";
 import Invoice from "../models/Invoice.js";
 import User from "../models/User.js";
-import { buildSearchFilter, applyInvoiceFilter, applyPartnerFilter, partnerFilterOptions } from "./manualBookings.filters.js";
+import { buildSearchFilter, applyInvoiceFilter, applyPartnerFilter, applyReservedNumberFilter, partnerFilterOptions } from "./manualBookings.filters.js";
 import { canAccessBooking, isHouseCallerContext } from "../utils/bookingAccess.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
@@ -996,6 +996,8 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     if (req.query.invoiceNo) await applyInvoiceFilter(filter, req.query.invoiceNo);
     // Partner (More filters): that partner's partner-lead bookings only.
     if (req.query.partner) await applyPartnerFilter(filter, req.query.partner);
+    // Reserved invoice number (the /admin/invoices "reserved" chip links here).
+    if (req.query.reservedNumber === "1") await applyReservedNumberFilter(filter);
 
     const [docs, total, statsAgg] = await Promise.all([
       ManualBooking.find(filter)

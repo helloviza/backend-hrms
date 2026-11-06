@@ -231,6 +231,14 @@ export interface UserPermissionDoc extends Document {
      * template — per-user, on the trainingReports precedent.
      */
     loyalty: ModulePermission
+    /**
+     * invoiceDelete / invoiceReissue — "Delete invoice" and "Cancel for
+     * reissue" + "Release reservation" on /admin/invoices
+     * (services/invoiceReissue.ts). Any access above NONE grants the action;
+     * each also requires invoices WRITE. Granted to NO level template.
+     */
+    invoiceDelete: ModulePermission
+    invoiceReissue: ModulePermission
   }
 
   grantedBy: string
@@ -316,6 +324,8 @@ const modulesSchema = new Schema(
     travellerIdentityPII: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     trainingReports: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     loyalty: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    invoiceDelete: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    invoiceReissue: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
   },
   { _id: false }
 )

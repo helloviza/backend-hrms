@@ -1367,6 +1367,11 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       const { ensurePlutoIndexes } = await import("./bootstrap/ensurePlutoIndexes.js");
       await ensurePlutoIndexes().catch((e: unknown) => logger.warn("[PLUTO INDEXES] ensure failed", { e }));
 
+      // Same for the invoice reissue collections, plus a check that logs an
+      // error if the reserved-number partial unique index is missing.
+      const { ensureInvoiceReissueIndexes } = await import("./bootstrap/ensureInvoiceReissueIndexes.js");
+      await ensureInvoiceReissueIndexes().catch((e: unknown) => logger.error("[INVOICE INDEXES] ensure failed", { e }));
+
       // WA_HOST=true designates the dedicated WhatsApp host — the always-on
       // Fargate service that owns the single whatsapp-web.js client
       // (clientId "plumtrips-eod"). That host runs ONLY the EOD + Sales Pulse

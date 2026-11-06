@@ -218,7 +218,8 @@ import { snapshotPartnerShareSafe, clearPartnerShareSafe } from "../services/par
 import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { isHouseCallerContext } from "../utils/bookingAccess.js";
-import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
+import { parseISTStart, parseISTEnd, istDateString } from "../utils/dateIST.js";
+import User from "../models/User.js";
 import { buildInvoiceQueryFilter } from "./invoices.filters.js";
 import { partnerBookingIds } from "../services/partnerLeadBooking.js";
 import { normalizeGstStatus } from "../utils/customerGst.js";
@@ -226,6 +227,15 @@ import { cancelLinksAfterSubjectCancelled } from "../services/paymentRequests.js
 import {
   billingOwnUserId, bookingCreatorClause, ownInvoiceClause, invoiceOwnedBy, bookingRefsNotCreatedBy,
 } from "../utils/billingOwnScope.js";
+import {
+  archiveInvoice, archivePreview, releaseReservation, reservationsForBookings, reuseRefusal, ReissueError,
+  retryArchiveSideEffects,
+} from "../services/invoiceReissue.js";
+import ArchivedInvoice from "../models/ArchivedInvoice.js";
+import InvoiceNumberReservation from "../models/InvoiceNumberReservation.js";
+import { UserPermission } from "../models/UserPermission.js";
+import { storeInvoicePdf, presignArchivedInvoicePdf } from "../utils/invoicePdfStore.js";
+import { reservedIndexAvailable, RESERVED_INDEX_UNAVAILABLE_MESSAGE } from "../bootstrap/ensureInvoiceReissueIndexes.js";
 
 
 /** Today's IST calendar date as YYYY-MM-DD, for the "settled today" stat.
@@ -760,11 +770,16 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     const notTheirs = await bookingsNotTheirs(req, bookingIds);
     if (notTheirs.length) return res.status(403).json(notYourBookingsBody(notTheirs));
 
+    // Reserved invoice numbers: the operator must decide (decision D5).
+    const reservation = await reservationDecisionGate(req, res, bookingIds);
+    if (reservation === false) return;
+
     // Resolve invoiceDate — no restrictions, default to today if omitted
     const resolvedInvoiceDate = invoiceDate ? new Date(invoiceDate) : new Date();
     resolvedInvoiceDate.setHours(0, 0, 0, 0);
 
     const created = await createInvoiceFromBookings(bookingIds, {
+      reservation: reservation ?? undefined,
       format: "COMBINED",
       lineItemStyle,
       billingPeriod,
@@ -785,7 +800,8 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     });
     for (const inv of created) loyaltyTouch({ invoiceId: (inv as any)._id });
 
-    res.status(201).json({ ok: true, invoice: created[0] });
+    const reissued = reservation?.action === "REUSE" ? await renderReissuedPdf(created[0]) : null;
+    res.status(201).json({ ok: true, invoice: created[0], ...(reissued ? { reissued } : {}) });
   } catch (err: any) {
     if (err instanceof InvoiceGenerationError) {
       return res.status(err.httpStatus).json(err.body);
@@ -844,6 +860,9 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       });
     }
 
+    const reservation = await reservationDecisionGate(req, res, bookingIds);
+    if (reservation === false) return;
+
     const resolvedInvoiceDate = invoiceDate ? new Date(invoiceDate) : new Date();
     resolvedInvoiceDate.setHours(0, 0, 0, 0);
 
@@ -862,6 +881,7 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
     // SEPARATE → one invoice per booking. The service skips ineligible bookings
     // (already invoiced / cancelled) and returns the created invoices.
     const created = await createInvoiceFromBookings(bookingIds, {
+      reservation: reservation ?? undefined,
       format: "SEPARATE",
       billingPeriod,
       invoiceDate: resolvedInvoiceDate,
@@ -915,7 +935,12 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       });
     }
 
-    res.status(201).json({ ok: true, generated, failed });
+    let reissued = null;
+    if (reservation?.action === "REUSE") {
+      const inv = created.find((i: any) => (i.bookingIds || []).map(String).includes(String(reservation.bookingId)));
+      if (inv) reissued = await renderReissuedPdf(inv);
+    }
+    res.status(201).json({ ok: true, generated, failed, ...(reissued ? { reissued } : {}) });
   } catch (err: any) {
     if (err instanceof InvoiceGenerationError) {
       return res.status(err.httpStatus).json(err.body);
@@ -1427,6 +1452,370 @@ router.get("/insight", requirePermission("invoices", "READ"), async (req: any, r
   }
 });
 
+/* ── Cancel for reissue / Delete invoice / reserved numbers ──────────
+ * services/invoiceReissue.ts; audit + decisions in
+ * docs/audits/invoice-reissue-audit.md.
+ *
+ * Grants (decision D9): `invoices` WRITE plus a per-person key —
+ * invoiceReissue (cancel for reissue, release a reservation) or
+ * invoiceDelete. NONE in every level template. A platform SuperAdmin passes
+ * through isSuperAdmin; a tenant admin's synthesised full access in
+ * /permissions/my-access is never consulted here, and every write on this
+ * router is Plumtrips staff only anyway (requirePlatformStaff above).
+ */
+
+/** True when the caller holds `key` at any level above NONE. */
+async function holdsGrant(req: any, key: string): Promise<boolean> {
+  if (isSuperAdmin(req)) return true;
+  const userId = String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? "");
+  if (!userId) return false;
+  const perm: any = await UserPermission.findOne({ userId }).lean();
+  const access = perm?.modules?.[key]?.access;
+  return !!access && access !== "NONE";
+}
+
+function requireGrant(key: "invoiceReissue" | "invoiceDelete") {
+  return async (req: any, res: any, next: any) => {
+    try {
+      if (await holdsGrant(req, key)) return next();
+      return res.status(403).json({ success: false, message: "Module access not granted", module: key, required: "READ" });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  };
+}
+
+function sendReissueError(res: any, err: any, tag: string) {
+  if (err instanceof ReissueError) {
+    return res.status(err.httpStatus).json({ error: err.message, code: err.code, ...(err.extra ?? {}) });
+  }
+  console.error(`[Invoices ${tag}]`, err?.message);
+  return res.status(500).json({ error: err?.message || "Failed" });
+}
+
+function reservationSummary(r: any) {
+  return {
+    _id: String(r._id),
+    number: r.number,
+    status: r.status,
+    issuerGstin: r.issuerGstin,
+    seriesPrefix: r.seriesPrefix,
+    cadence: r.cadence,
+    period: r.period,
+    counterKey: r.counterKey,
+    workspaceId: String(r.workspaceId),
+    bookingIds: (r.bookingIds ?? []).map(String),
+    archivedInvoiceId: String(r.archivedInvoiceId),
+    archivedInvoiceDate: r.archivedInvoiceDate ?? null,
+    createdAt: r.createdAt,
+    createdBy: r.createdBy ? String(r.createdBy) : null,
+    consumedAt: r.consumedAt ?? null,
+    consumedBy: r.consumedBy ? String(r.consumedBy) : null,
+    consumedInvoiceId: r.consumedInvoiceId ? String(r.consumedInvoiceId) : null,
+    releasedAt: r.releasedAt ?? null,
+    releasedBy: r.releasedBy ? String(r.releasedBy) : null,
+    releaseReason: r.releaseReason ?? null,
+  };
+}
+
+type ReservationDecision = NonNullable<Parameters<typeof createInvoiceFromBookings>[1]["reservation"]>;
+
+/**
+ * Generate-side gate (decision D5): when the bookings hold a RESERVED number
+ * the request must carry the operator's decision for THAT reservation —
+ * REUSE, KEEP or RELEASE (with reason). Never silent. Returns the decision,
+ * null when no reservation is involved, or false after answering.
+ */
+async function reservationDecisionGate(req: any, res: any, bookingIds: string[]): Promise<ReservationDecision | null | false> {
+  const held = await reservationsForBookings(bookingIds, invoiceTenantClause(req));
+  const raw = req.body?.reservation;
+  const decision: ReservationDecision | null = raw && typeof raw === "object"
+    ? {
+        action: raw.action,
+        reservationId: String(raw.reservationId ?? ""),
+        bookingId: raw.bookingId ? String(raw.bookingId) : undefined,
+        releaseReason: raw.releaseReason ? String(raw.releaseReason) : undefined,
+      }
+    : null;
+  if (decision && !["REUSE", "KEEP", "RELEASE"].includes(decision.action)) {
+    res.status(400).json({ error: "reservation.action must be REUSE, KEEP or RELEASE", code: "RESERVATION_ACTION_INVALID" });
+    return false;
+  }
+  if (!held.length) {
+    if (decision) {
+      res.status(409).json({ error: "These bookings no longer hold a reserved number. Generate again.", code: "RESERVATION_ALREADY_USED" });
+      return false;
+    }
+    return null;
+  }
+  if (held.length > 1) {
+    res.status(409).json({
+      error: `The selected bookings hold different reserved numbers (${held.map((r: any) => r.number).join(", ")}). Generate each group separately.`,
+      code: "RESERVATION_CONFLICT",
+      reservations: held.map(reservationSummary),
+    });
+    return false;
+  }
+  const r = held[0];
+  if (!decision || decision.reservationId !== String(r._id)) {
+    res.status(409).json({
+      error: `These bookings hold the reserved number ${r.number}. Choose: reuse it, keep it reserved, or release it.`,
+      code: "RESERVATION_DECISION_REQUIRED",
+      reservation: reservationSummary(r),
+    });
+    return false;
+  }
+  if (decision.action === "REUSE" && !(await reservedIndexAvailable())) {
+    res.status(503).json({ error: RESERVED_INDEX_UNAVAILABLE_MESSAGE, code: "RESERVATION_INDEX_MISSING" });
+    return false;
+  }
+  if (decision.action === "RELEASE" && !(await holdsGrant(req, "invoiceReissue"))) {
+    res.status(403).json({ success: false, message: "Module access not granted", module: "invoiceReissue", required: "READ" });
+    return false;
+  }
+  return decision;
+}
+
+/** After a reissue commits: render the PDF fresh under the reused number
+ *  (the archived PDF was already copied away). Never throws — the invoice
+ *  exists either way and the PDF can be regenerated from the list. */
+async function renderReissuedPdf(inv: any): Promise<{ invoiceNo: string; pdfUrl?: string; pdfError?: string }> {
+  const invoiceNo = String(inv?.invoiceNo ?? "");
+  try {
+    const raw: any = await Invoice.collection.findOne({ _id: new mongoose.Types.ObjectId(String(inv._id)) });
+    if (!raw) return { invoiceNo, pdfError: "Invoice not found after create" };
+    const enrichedClient = await enrichClientDetails(raw);
+    const pdf = await generateInvoicePdf({ ...raw, clientDetails: enrichedClient } as any, undefined, { paid: raw.status === "PAID" });
+    const pdfUrl = await storeInvoicePdf(invoiceNo, pdf);
+    await Invoice.collection.updateOne({ _id: raw._id }, { $set: { pdfUrl } });
+    return { invoiceNo, pdfUrl };
+  } catch (err: any) {
+    console.error("[Invoices reissue pdf]", err?.message);
+    return { invoiceNo, pdfError: err?.message || "PDF generation failed" };
+  }
+}
+
+const actorOf = (req: any) => ({ id: String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? ""), email: req.user?.email });
+
+const idList = (raw: unknown) =>
+  String(raw ?? "").split(",").map((s) => s.trim()).filter((s) => mongoose.Types.ObjectId.isValid(s));
+
+// GET /api/admin/invoices/reservations?bookingIds=a,b
+// RESERVED numbers only — the booking-list badges and the /admin/invoices
+// count chip.
+router.get("/reservations", requirePermission("invoices", "READ"), async (req: any, res: any) => {
+  try {
+    const gate = invoiceTenantClause(req);
+    const filter: Record<string, any> = { status: "RESERVED" };
+    const ids = idList(req.query.bookingIds);
+    if (ids.length) filter.bookingIds = { $in: ids.map((id) => new mongoose.Types.ObjectId(id)) };
+    if (gate) filter.$and = [gate];
+    const rows = await InvoiceNumberReservation.find(filter).sort({ createdAt: -1 }).limit(500).lean();
+    res.json({ ok: true, reservations: rows.map(reservationSummary), count: rows.length });
+  } catch (err: any) {
+    sendReissueError(res, err, "reservations");
+  }
+});
+
+// GET /api/admin/invoices/reservations/check?bookingIds=a,b&sellerGstin=&invoiceDate=YYYY-MM-DD
+// The generate popup: which reserved number these bookings hold, and whether
+// it may be reused under the seller GSTIN + invoice date chosen (decision D1).
+// The generate call re-checks all of it server-side.
+router.get("/reservations/check", requirePermission("invoices", "READ"), async (req: any, res: any) => {
+  try {
+    const ids = idList(req.query.bookingIds);
+    if (!ids.length) return res.json({ ok: true, reservations: [] });
+    if (await bookingsOutsideTenantScope(req, ids)) return res.status(404).json({ error: "One or more booking IDs not found" });
+
+    const held = await reservationsForBookings(ids, invoiceTenantClause(req));
+    if (!held.length) return res.json({ ok: true, reservations: [] });
+
+    const first: any = await ManualBooking.findById(ids[0]).select("workspaceId").lean();
+    const customer: any = first ? await Customer.findById(first.workspaceId).select("defaultSellerGstin").lean() : null;
+    const companySettings = await getCompanySettings();
+    let issuerGstin = "";
+    let issuerError: string | null = null;
+    try {
+      issuerGstin = resolveSellerGstProfile({
+        overrideGstin: String(req.query.sellerGstin || "") || undefined,
+        customerDefaultGstin: customer?.defaultSellerGstin,
+        companySettings,
+      }).gstin;
+    } catch (err: any) {
+      issuerError = err?.message || "Seller GSTIN could not be resolved";
+    }
+    const dateStr = String(req.query.invoiceDate || "");
+    const invoiceDate = /^\d{4}-\d{2}-\d{2}$/.test(dateStr) ? new Date(`${dateStr}T00:00:00Z`) : null;
+    const indexAvailable = await reservedIndexAvailable();
+
+    const reservations = held.map((r: any) => {
+      const heldIds = new Set((r.bookingIds ?? []).map(String));
+      const coversAll = ids.every((id) => heldIds.has(id));
+      const refusal = !indexAvailable
+        ? { code: "RESERVATION_INDEX_MISSING", message: RESERVED_INDEX_UNAVAILABLE_MESSAGE }
+        : issuerError
+        ? { code: "SELLER_GSTIN_NOT_FOUND", message: issuerError }
+        : invoiceDate ? reuseRefusal(r, issuerGstin, invoiceDate, companySettings) : null;
+      return {
+        ...reservationSummary(r),
+        coversAll,
+        reuseOffered: !refusal,
+        why: refusal?.message ?? null,
+        whyCode: refusal?.code ?? null,
+        suggestedInvoiceDate: r.archivedInvoiceDate ? istDateString(new Date(r.archivedInvoiceDate)) : null,
+      };
+    });
+    res.json({ ok: true, issuerGstin, reservations });
+  } catch (err: any) {
+    sendReissueError(res, err, "reservations/check");
+  }
+});
+
+// POST /api/admin/invoices/reservations/:id/release  { reason }
+router.post("/reservations/:id/release", requireGrant("invoiceReissue"), requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  try {
+    const released = await releaseReservation({
+      reservationId: req.params.id,
+      reason: req.body?.reason,
+      actor: actorOf(req),
+      tenantGate: invoiceTenantClause(req),
+    });
+    res.json({ ok: true, reservation: reservationSummary(released) });
+  } catch (err: any) {
+    sendReissueError(res, err, "reservation release");
+  }
+});
+
+// GET /api/admin/invoices/reissue-history — platform SuperAdmin only.
+router.get("/reissue-history", async (req: any, res: any) => {
+  try {
+    if (!isSuperAdmin(req)) return res.status(403).json({ error: "Super Admin only" });
+    const limit = Math.min(500, parseInt(req.query.limit) || 200);
+    const [archived, reservations] = await Promise.all([
+      ArchivedInvoice.find({}, { snapshot: 0 }).sort({ archivedAt: -1 }).limit(limit).lean(),
+      InvoiceNumberReservation.find({}).sort({ createdAt: -1 }).limit(limit).lean(),
+    ]);
+    const userIds = new Set<string>();
+    for (const a of archived as any[]) if (a.archivedBy) userIds.add(String(a.archivedBy));
+    for (const r of reservations as any[]) for (const k of ["createdBy", "consumedBy", "releasedBy"]) if (r[k]) userIds.add(String(r[k]));
+    const reissuedIds = (archived as any[]).map((a) => a.reissuedAsInvoiceId).filter(Boolean);
+    const bookingIds = new Set<string>();
+    for (const a of archived as any[]) for (const b of a.bookingIds ?? []) bookingIds.add(String(b));
+    const [users, reissuedInvoices, bookings] = await Promise.all([
+      User.find({ _id: { $in: [...userIds].map((id) => new mongoose.Types.ObjectId(id)) } }, { email: 1, name: 1 }).lean(),
+      Invoice.find({ _id: { $in: reissuedIds } }, { invoiceNo: 1, status: 1 }).lean(),
+      ManualBooking.find({ _id: { $in: [...bookingIds].map((id) => new mongoose.Types.ObjectId(id)) } }, { bookingRef: 1 }).lean(),
+    ]);
+    const who = new Map((users as any[]).map((u) => [String(u._id), u.email || u.name || String(u._id)]));
+    const inv = new Map((reissuedInvoices as any[]).map((i) => [String(i._id), i]));
+    const ref = new Map((bookings as any[]).map((b) => [String(b._id), b.bookingRef]));
+    res.json({
+      ok: true,
+      archived: (archived as any[]).map((a) => ({
+        _id: String(a._id),
+        invoiceId: String(a.invoiceId),
+        invoiceNo: a.invoiceNo,
+        mode: a.mode,
+        status: a.status,
+        reason: a.reason,
+        invoiceDate: a.invoiceDate ?? null,
+        grandTotal: a.grandTotal ?? 0,
+        clientName: a.clientName,
+        issuerGstin: a.issuerGstin,
+        bookingRefs: (a.bookingIds ?? []).map((b: any) => ref.get(String(b)) ?? String(b)),
+        archivedAt: a.archivedAt,
+        archivedBy: a.archivedByEmail || who.get(String(a.archivedBy)) || String(a.archivedBy),
+        hasPdf: !!a.pdfArchiveKey,
+        reservationId: a.reservationId ? String(a.reservationId) : null,
+        reissuedAsInvoiceId: a.reissuedAsInvoiceId ? String(a.reissuedAsInvoiceId) : null,
+        reissuedAsInvoiceNo: a.reissuedAsInvoiceId ? inv.get(String(a.reissuedAsInvoiceId))?.invoiceNo ?? null : null,
+        reissuedAt: a.reissuedAt ?? null,
+        sideEffectFailures: (a.sideEffectFailures ?? []).map((f: any) => ({ step: f.step, label: f.label, error: f.error, at: f.at })),
+      })),
+      reservations: (reservations as any[]).map((r) => ({
+        ...reservationSummary(r),
+        createdByLabel: r.createdBy ? who.get(String(r.createdBy)) ?? null : null,
+        consumedByLabel: r.consumedBy ? who.get(String(r.consumedBy)) ?? null : null,
+        releasedByLabel: r.releasedBy ? who.get(String(r.releasedBy)) ?? null : null,
+      })),
+    });
+  } catch (err: any) {
+    sendReissueError(res, err, "reissue-history");
+  }
+});
+
+// POST /api/admin/invoices/archived/:id/retry-side-effects — re-runs the
+// post-archive steps that failed (platform SuperAdmin only).
+router.post("/archived/:id/retry-side-effects", async (req: any, res: any) => {
+  try {
+    if (!isSuperAdmin(req)) return res.status(403).json({ error: "Super Admin only" });
+    const failures = await retryArchiveSideEffects(req.params.id, actorOf(req));
+    res.json({ ok: true, sideEffectFailures: failures });
+  } catch (err: any) {
+    sendReissueError(res, err, "retry-side-effects");
+  }
+});
+
+// GET /api/admin/invoices/archived/:id/pdf — the PDF copied away at archive
+// time (platform SuperAdmin only, like the history tab).
+router.get("/archived/:id/pdf", async (req: any, res: any) => {
+  try {
+    if (!isSuperAdmin(req)) return res.status(403).json({ error: "Super Admin only" });
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "Not found" });
+    const a: any = await ArchivedInvoice.findById(req.params.id, { pdfArchiveKey: 1, invoiceNo: 1 }).lean();
+    if (!a?.pdfArchiveKey) return res.status(404).json({ error: "No archived PDF for this invoice" });
+    res.json({ ok: true, pdfUrl: await presignArchivedInvoicePdf(a.pdfArchiveKey, a.invoiceNo) });
+  } catch (err: any) {
+    sendReissueError(res, err, "archived pdf");
+  }
+});
+
+// GET /api/admin/invoices/:id/archive-preview?mode=REISSUE|DELETE
+// The confirm modal: summary, blockers, warnings.
+router.get(
+  "/:id/archive-preview",
+  // GETs skip the router-level platform-staff gate; this one is staff-only like the actions it previews.
+  requirePlatformStaff,
+  (req: any, res: any, next: any) => requireGrant(req.query.mode === "DELETE" ? "invoiceDelete" : "invoiceReissue")(req, res, next),
+  requirePermission("invoices", "WRITE"),
+  async (req: any, res: any) => {
+    try {
+      const mode = req.query.mode === "DELETE" ? "DELETE" : "REISSUE";
+      const invoice = mongoose.Types.ObjectId.isValid(req.params.id)
+        ? await Invoice.collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) })
+        : null;
+      if (!invoice || !(await invoiceInCallerScope(req, invoice))) return res.status(404).json({ error: "Invoice not found" });
+      res.json({ ok: true, ...(await archivePreview(invoice, mode)), reservationIndexAvailable: await reservedIndexAvailable() });
+    } catch (err: any) {
+      sendReissueError(res, err, "archive-preview");
+    }
+  },
+);
+
+function archiveRoute(mode: "REISSUE" | "DELETE") {
+  return async (req: any, res: any) => {
+    try {
+      const result = await archiveInvoice({
+        invoiceId: req.params.id,
+        mode,
+        reason: req.body?.reason,
+        confirmText: req.body?.confirmText,
+        actor: actorOf(req),
+        inScope: (inv) => invoiceInCallerScope(req, inv),
+      });
+      res.json({ ok: true, ...result });
+    } catch (err: any) {
+      sendReissueError(res, err, mode === "REISSUE" ? "cancel-for-reissue" : "delete");
+    }
+  };
+}
+
+// POST /api/admin/invoices/:id/cancel-for-reissue  { reason, confirmText }
+router.post("/:id/cancel-for-reissue", requireGrant("invoiceReissue"), requirePermission("invoices", "WRITE"), archiveRoute("REISSUE"));
+
+// POST /api/admin/invoices/:id/delete  { reason, confirmText }
+router.post("/:id/delete", requireGrant("invoiceDelete"), requirePermission("invoices", "WRITE"), archiveRoute("DELETE"));
+
 /* ── Cancel Invoice ───────────────────────────────────────────────── */
 
 // POST /api/admin/invoices/:id/cancel
@@ -1604,8 +1993,9 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
       // ── Simple fields ───────────────────────────────────────────────
       if (dueDate !== undefined) {
         const newDate = dueDate ? new Date(dueDate) : undefined;
-        const oldStr = invoice.dueDate ? new Date(invoice.dueDate).toISOString().slice(0, 10) : "";
-        const newStr = newDate ? newDate.toISOString().slice(0, 10) : "";
+        // Compare IST days, the day the Edit Invoice drawer shows.
+        const oldStr = invoice.dueDate ? istDateString(new Date(invoice.dueDate)) : "";
+        const newStr = newDate ? istDateString(newDate) : "";
         if (oldStr !== newStr) {
           oldValues.dueDate = invoice.dueDate ?? null;
           newValues.dueDate = newDate ?? null;

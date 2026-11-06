@@ -23,6 +23,7 @@
 
 import mongoose from "mongoose";
 import Invoice from "../models/Invoice.js";
+import InvoiceNumberReservation from "../models/InvoiceNumberReservation.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import PartnerLink from "../models/PartnerLink.js";
@@ -165,6 +166,13 @@ export async function partnerFilterOptions(): Promise<Array<{ workspaceId: strin
   return rows
     .map((w) => ({ workspaceId: String(w._id), name: String(w.companyName || "").trim() || "Partner" }))
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** "Holds a reserved invoice number" (services/invoiceReissue.ts): only bookings
+ *  in a RESERVED reservation. The list's own tenant gates still apply on top. */
+export async function applyReservedNumberFilter(filter: Record<string, any>) {
+  const ids = await InvoiceNumberReservation.distinct("bookingIds", { status: "RESERVED" });
+  filter.$and = [...(filter.$and ?? []), { _id: { $in: ids } }];
 }
 
 export async function applyInvoiceFilter(filter: Record<string, any>, invoiceNo: string) {

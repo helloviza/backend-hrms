@@ -32,6 +32,8 @@ import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sell
 import { triggerTaskAutomation } from "./taskAutomation.js";
 import { snapshotPartnerShareSafe } from "./partnerRevenue.js";
 import { partnerBookingIds } from "./partnerLeadBooking.js";
+import InvoiceNumberReservation from "../models/InvoiceNumberReservation.js";
+import { consumeReservation, releaseReservation, reuseRefusal, ReissueError } from "./invoiceReissue.js";
 
 /* ── Error type so route wrappers can reproduce the exact HTTP responses ── */
 
@@ -207,6 +209,25 @@ export interface CreateInvoiceOpts {
     pincode?: string;
     contactPerson?: string;
     email?: string;
+  };
+  /**
+   * RESERVED invoice number (services/invoiceReissue.ts) — the operator's
+   * decision for a reservation the bookings hold (decision D5):
+   *   REUSE   — the invoice is created with the reserved number (the Counter
+   *             is not touched) and the reservation is CONSUMED in the same
+   *             transaction. For format 'SEPARATE', `bookingId` names the one
+   *             booking whose invoice takes it (decision D4).
+   *   RELEASE — the reservation is released with `releaseReason`, then the
+   *             invoice(s) take fresh numbers.
+   *   KEEP    — fresh numbers; the reservation stays RESERVED.
+   * The routes refuse a generate whose bookings hold a reservation without
+   * one of these. Absent = no reservation involved (every other caller).
+   */
+  reservation?: {
+    action: "REUSE" | "KEEP" | "RELEASE";
+    reservationId: string;
+    bookingId?: string;
+    releaseReason?: string;
   };
   createdBy: string;
   isDemoUser?: boolean;
@@ -408,6 +429,7 @@ async function createOneInvoice(
   opts: CreateInvoiceOpts,
   useCombinedLineItems: boolean,
   resolvedInvoiceDate: Date,
+  reuse?: { reservationId: mongoose.Types.ObjectId; number: string; archivedInvoiceId: mongoose.Types.ObjectId },
 ): Promise<any> {
   const lineItems: any[] = useCombinedLineItems
     ? buildCombinedLineItems(bookingsForInvoice as any[])
@@ -469,8 +491,35 @@ async function createOneInvoice(
         });
       }
 
+      // Reserved number: consumed in THIS transaction, so the invoice and the
+      // reservation commit or roll back together. A concurrent generate that
+      // consumed it first makes this one a write conflict → withTransaction
+      // retries → the reservation is no longer RESERVED → 409.
+      if (reuse && !(await consumeReservation(reuse.reservationId, invoiceId, opts.createdBy, session))) {
+        throw new InvoiceGenerationError(409, {
+          error: `${reuse.number} has already been reused or released. Generate again to take a fresh number.`,
+          code: "RESERVATION_ALREADY_USED",
+          number: reuse.number,
+        });
+      }
+
       [invoice] = await Invoice.create([{
         _id: invoiceId,
+        // Preset → Invoice.ts's pre-save hook skips the Counter entirely.
+        ...(reuse ? {
+          invoiceNo: reuse.number,
+          editHistory: [{
+            editedAt: new Date(),
+            editedBy: opts.createdBy,
+            fieldsChanged: ["invoiceNo"],
+            oldValues: {},
+            newValues: {
+              invoiceNo: reuse.number,
+              reusedFromArchivedInvoiceId: reuse.archivedInvoiceId,
+              reservationId: reuse.reservationId,
+            },
+          }],
+        } : {}),
         workspaceId: ctx.invoiceWorkspaceId,
         billingPeriod: opts.billingPeriod,
         bookingIds: bookingsForInvoice.map((b: any) => b._id),
@@ -530,6 +579,81 @@ async function createOneInvoice(
   }).catch(() => {});
 
   return completeInvoice;
+}
+
+/** Validates opts.reservation against the bookings and the resolved issuer,
+ *  and carries out RELEASE. Returns what createOneInvoice needs for REUSE,
+ *  or null. Every check here is repeated server-side whatever the popup
+ *  showed (decision D1: issuer GSTIN + the number's own period). */
+async function resolveReservationDecision(
+  bookings: any[],
+  ctx: InvoiceContext,
+  opts: CreateInvoiceOpts,
+  invoiceDate: Date,
+  companySettings: any,
+): Promise<{ reservationId: mongoose.Types.ObjectId; number: string; archivedInvoiceId: mongoose.Types.ObjectId; bookingId?: string } | null> {
+  const decision = opts.reservation;
+  if (!decision || decision.action === "KEEP") return null;
+  if (!mongoose.Types.ObjectId.isValid(String(decision.reservationId))) {
+    throw new InvoiceGenerationError(400, { error: "reservationId is invalid", code: "RESERVATION_NOT_FOUND" });
+  }
+  const reservation: any = await InvoiceNumberReservation.findById(decision.reservationId).lean();
+  const held = new Set<string>((reservation?.bookingIds ?? []).map(String));
+  if (!reservation || !bookings.some((b) => held.has(String(b._id)))) {
+    throw new InvoiceGenerationError(404, { error: "Reservation not found for these bookings", code: "RESERVATION_NOT_FOUND" });
+  }
+  if (reservation.status !== "RESERVED") {
+    throw new InvoiceGenerationError(409, {
+      error: `${reservation.number} is no longer reserved (${reservation.status}). Generate again to take a fresh number.`,
+      code: "RESERVATION_ALREADY_USED",
+      number: reservation.number,
+    });
+  }
+
+  if (decision.action === "RELEASE") {
+    await releaseReservation({
+      reservationId: String(reservation._id),
+      reason: decision.releaseReason,
+      actor: { id: String(opts.createdBy) },
+      tenantGate: null,
+    }).catch((err: any) => {
+      if (err instanceof ReissueError) throw new InvoiceGenerationError(err.httpStatus, { error: err.message, code: err.code });
+      throw err;
+    });
+    return null;
+  }
+
+  // REUSE
+  let bookingId: string | undefined;
+  if (opts.format === "COMBINED") {
+    const outside = bookings.filter((b) => !held.has(String(b._id)));
+    if (outside.length) {
+      throw new InvoiceGenerationError(400, {
+        error: `${reservation.number} is reserved for other bookings; ${outside.map((b) => b.bookingRef).join(", ")} ${outside.length === 1 ? "is" : "are"} not among them. Invoice those separately to reuse the number.`,
+        code: "RESERVATION_BOOKINGS_MISMATCH",
+      });
+    }
+  } else {
+    bookingId = String(decision.bookingId ?? "");
+    const chosen = bookings.find((b) => String(b._id) === bookingId);
+    if (!chosen || !held.has(bookingId)) {
+      throw new InvoiceGenerationError(400, {
+        error: `Pick which booking's invoice takes ${reservation.number}; it must be one of the bookings the number is reserved for.`,
+        code: "RESERVATION_BOOKING_REQUIRED",
+      });
+    }
+    if (chosen.invoiceId || chosen.status === "INVOICED" || chosen.status === "CANCELLED") {
+      throw new InvoiceGenerationError(400, {
+        error: `${chosen.bookingRef} cannot be invoiced (${chosen.invoiceId ? "already invoiced" : chosen.status}), so it cannot take ${reservation.number}.`,
+        code: "RESERVATION_BOOKING_INELIGIBLE",
+      });
+    }
+  }
+
+  const refusal = reuseRefusal(reservation, ctx.issuerDetails?.gstin ?? "", invoiceDate, companySettings);
+  if (refusal) throw new InvoiceGenerationError(400, { error: refusal.message, code: refusal.code });
+
+  return { reservationId: reservation._id, number: reservation.number, archivedInvoiceId: reservation.archivedInvoiceId, bookingId };
 }
 
 /**
@@ -611,23 +735,32 @@ export async function createInvoiceFromBookings(
         refs: alreadyInvoiced.map((b: any) => b.bookingRef),
       });
     }
+    const reuse = await resolveReservationDecision(bookings as any[], ctx, opts, resolvedInvoiceDate, companySettings);
     const useCombinedLineItems = opts.lineItemStyle === "COMBINED";
-    const invoice = await createOneInvoice(bookings as any[], ctx, opts, useCombinedLineItems, resolvedInvoiceDate);
+    const invoice = await createOneInvoice(bookings as any[], ctx, opts, useCombinedLineItems, resolvedInvoiceDate, reuse?.number ? reuse : undefined);
     return [invoice];
   }
 
   // SEPARATE — one invoice per eligible booking, sequential to keep invoice
   // numbers in booking order. Ineligible/failed bookings are skipped; the
-  // caller derives the failure list from the returned set.
+  // caller derives the failure list from the returned set. The booking that
+  // takes a reserved number goes first and its failure is NOT swallowed: a
+  // lost reuse must reach the operator, never silently become "skipped".
+  const reuse = await resolveReservationDecision(bookings as any[], ctx, opts, resolvedInvoiceDate, companySettings);
   const created: any[] = [];
-  for (const booking of bookings as any[]) {
+  const ordered = reuse?.bookingId
+    ? [...(bookings as any[])].sort((a, b) => Number(String(b._id) === reuse.bookingId) - Number(String(a._id) === reuse.bookingId))
+    : (bookings as any[]);
+  for (const booking of ordered) {
     if (booking.invoiceId || booking.status === "INVOICED" || booking.status === "CANCELLED" || partnerNotConfirmed(booking)) {
       continue;
     }
+    const takesReserved = !!reuse?.bookingId && String(booking._id) === reuse.bookingId;
     try {
-      const invoice = await createOneInvoice([booking], ctx, opts, false, resolvedInvoiceDate);
+      const invoice = await createOneInvoice([booking], ctx, opts, false, resolvedInvoiceDate, takesReserved ? reuse ?? undefined : undefined);
       created.push(invoice);
     } catch (err: any) {
+      if (takesReserved) throw err;
       console.error(`[createInvoiceFromBookings] booking ${booking.bookingRef}:`, err?.message);
       // Skip — surfaced to the caller as a non-generated booking.
     }
