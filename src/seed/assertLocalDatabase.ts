@@ -13,6 +13,29 @@
 
 const LOCAL_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "0.0.0.0", "[::1]"]);
 
+/** Hosts in a mongodb:// URI that are not local; null when it can't be parsed. */
+function remoteHosts(uri: string): string[] | null {
+  try {
+    const afterScheme = uri.replace(/^mongodb:\/\//, "");
+    const afterCreds = afterScheme.includes("@") ? afterScheme.slice(afterScheme.indexOf("@") + 1) : afterScheme;
+    const hosts = afterCreds
+      .split("/")[0]
+      .split(",")
+      .map((h) => h.split(":")[0].trim().toLowerCase());
+    return hosts.filter((h) => !LOCAL_HOSTS.has(h));
+  } catch {
+    return null;
+  }
+}
+
+/** True only for a plain mongodb:// URI whose every host is local. Atlas
+ *  (mongodb+srv://), any remote host, or an unparseable string → false. */
+export function isLocalMongoUri(uri: string): boolean {
+  if (!uri || !uri.startsWith("mongodb://")) return false;
+  const remote = remoteHosts(uri);
+  return remote !== null && remote.length === 0;
+}
+
 export function assertLocalDatabase(uri: string): void {
   if (!uri) {
     throw new Error(
@@ -30,22 +53,10 @@ export function assertLocalDatabase(uri: string): void {
     );
   }
 
-  let hosts: string[];
-  try {
-    // Strip the scheme and any credentials, then take the host list.
-    const afterScheme = uri.replace(/^mongodb:\/\//, "");
-    const afterCreds = afterScheme.includes("@")
-      ? afterScheme.slice(afterScheme.indexOf("@") + 1)
-      : afterScheme;
-    hosts = afterCreds
-      .split("/")[0]
-      .split(",")
-      .map((h) => h.split(":")[0].trim().toLowerCase());
-  } catch {
+  const remote = remoteHosts(uri);
+  if (remote === null) {
     throw new Error(`REFUSING TO SEED: could not parse MONGO_URI to verify it is local.`);
   }
-
-  const remote = hosts.filter((h) => !LOCAL_HOSTS.has(h));
   if (remote.length) {
     throw new Error(
       `REFUSING TO SEED: MONGO_URI points at a non-local host (${remote.join(", ")}).\n` +

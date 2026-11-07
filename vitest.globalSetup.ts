@@ -47,8 +47,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { guardTestDatabase, guardTestStorage } from "./vitest.dbGuard.js";
 
 export default function setup(): void {
+  // Before anything else: never run against a real database or the
+  // production S3 bucket (vitest.dbGuard.ts). Throwing here stops the whole
+  // run once, with one message, instead of failing every file.
+  guardTestDatabase();
+  guardTestStorage();
+
   // Gate 1 — Windows is the only platform with a separate system drive to
   // get off.
   if (process.platform !== "win32") return;
