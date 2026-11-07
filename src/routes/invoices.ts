@@ -212,13 +212,13 @@ import { detectGSTType, calculateGSTAmounts, type GSTType } from "../utils/gstDe
 import { env } from "../config/env.js";
 import { resolveCustomerState, buildAddressStr } from "../utils/invoiceClient.js";
 import {
-  createInvoiceFromBookings, InvoiceGenerationError, claimBookingsForInvoice,
+  buildInvoiceContext, createInvoiceFromBookings, InvoiceGenerationError, claimBookingsForInvoice, resolveInvoiceWorkspace,
 } from "../services/invoiceGeneration.service.js";
 import { snapshotPartnerShareSafe, clearPartnerShareSafe } from "../services/partnerRevenue.js";
 import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { isHouseCallerContext } from "../utils/bookingAccess.js";
-import { parseISTStart, parseISTEnd, istDateString } from "../utils/dateIST.js";
+import { parseISTStart, parseISTEnd, istDateString, billingPeriodIST } from "../utils/dateIST.js";
 import User from "../models/User.js";
 import { buildInvoiceQueryFilter } from "./invoices.filters.js";
 import { partnerBookingIds } from "../services/partnerLeadBooking.js";
@@ -534,35 +534,50 @@ export async function enrichClientDetails(invoice: any): Promise<any> {
 /* ── GST Preview ─────────────────────────────────────────────────── */
 
 // GET /api/admin/invoices/gst-preview?customerId=X
+/**
+ * The client a preview may read: Generate's own lookup (findById on the booking's
+ * Customer._id), behind the same tenant rule as every invoice read. A malformed
+ * id, a missing client and another tenant's client all answer the same way, so a
+ * tenant cannot learn that an id exists.
+ */
+async function previewCustomer(req: any, customerId: string): Promise<any | null> {
+  if (!mongoose.Types.ObjectId.isValid(customerId)) return null;
+  const customer: any = await Customer.findById(customerId).lean();
+  if (!customer) return null;
+  const gate = invoiceTenantClause(req);
+  if (!gate) return customer;
+  const allowed = (gate.$or ?? []).map((c: any) => String(c.workspaceId));
+  return allowed.includes(String(customer._id)) || allowed.includes(String(customer.workspaceId ?? ""))
+    ? customer
+    : null;
+}
+
+// GET /api/admin/invoices/gst-preview?customerId=&sellerGstin=&customerStateOverride=&gstBypass=true
+//
+// Runs Generate's own resolution (buildInvoiceContext) on the same inputs, so the
+// popup's banner shows what Generate will do. Nothing is written.
 router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ"), async (req: any, res: any) => {
   try {
-    const { customerId, sellerGstin, customerStateOverride } = req.query as {
+    const { customerId, sellerGstin, customerStateOverride, gstBypass } = req.query as {
       customerId?: string;
       sellerGstin?: string;
       customerStateOverride?: string;
+      gstBypass?: string;
     };
     if (!customerId) return res.status(400).json({ error: "customerId is required" });
 
     const [customer, companySettings] = await Promise.all([
-      // Workspace-scoped by design (tenant isolation — see
-      // infra/audit/admin-bookings-invoices-audit.md). NOT broadened here:
-      // HOUSE-scoped manual-booking customers can legitimately miss this
-      // filter for some staff callers, and that's handled below by degrading
-      // gracefully rather than changing the filter.
-      Customer.findOne({ _id: customerId, workspaceId: req.workspaceObjectId }).lean(),
+      previewCustomer(req, String(customerId)),
       getCompanySettings(),
     ]);
 
-    // Seller-side resolution + activeGstProfiles derive ONLY from
-    // CompanySettings, never from the customer — so they're computed (and
-    // returned) unconditionally, whether or not the customer lookup above
-    // found anything. Only the customer-dependent fields (place of supply,
-    // GST-type detection) degrade to null on a miss.
+    // The seller is reported even when the client's tax can't be worked out, so
+    // the popup can show the registration Generate will use.
     let sellerProfile;
     try {
       sellerProfile = resolveSellerGstProfile({
         overrideGstin: sellerGstin || undefined,
-        customerDefaultGstin: undefined, // step 4: per-customer default GSTIN
+        customerDefaultGstin: customer?.defaultSellerGstin,
         companySettings,
       });
     } catch (err: any) {
@@ -576,44 +591,63 @@ router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ
       .filter((p) => p.active)
       .map((p) => ({ gstin: p.gstin, state: p.state, stateCode: p.stateCode, legalName: p.legalName, isDefault: p.isDefault }));
 
-    const supplierState = sellerProfile.state;
+    const unresolved = {
+      ok: true,
+      supplierState: sellerProfile.state,
+      supplierGstin: sellerProfile.gstin,
+      supplierStateCode: sellerProfile.stateCode,
+      activeGstProfiles,
+      placeOfSupply: null,
+      detectedGstType: null,
+      customerStateCode: null,
+      canCalculate: false,
+    };
 
     if (!customer) {
       return res.json({
-        ok: true,
+        ...unresolved,
         customerFound: false,
-        supplierState,
-        supplierGstin: sellerProfile.gstin,
-        supplierStateCode: sellerProfile.stateCode,
-        activeGstProfiles,
         customerState: null,
-        placeOfSupply: null,
-        detectedGstType: null,
-        customerStateCode: null,
-        canCalculate: false,
         reason: "Customer not found in this workspace scope",
       });
     }
 
-    const { state: customerStateAuto, country: customerCountry } = resolveCustomerState(customer);
-    const customerState = (customerStateOverride && customerStateOverride.trim()) || customerStateAuto;
-
-    const detection = detectGSTType({ supplierState, customerState, customerCountry });
-
-    res.json({
-      ok: true,
-      customerFound: true,
-      supplierState,
-      supplierGstin: sellerProfile.gstin,
-      customerState: detection.customerState,
-      placeOfSupply: detection.placeOfSupply,
-      detectedGstType: detection.gstType,
-      supplierStateCode: detection.supplierStateCode,
-      customerStateCode: detection.customerStateCode,
-      canCalculate: detection.canCalculate,
-      reason: detection.reason ?? null,
-      activeGstProfiles,
-    });
+    const { invoiceWorkspaceId, workspace } = await resolveInvoiceWorkspace(customer._id);
+    try {
+      const ctx = buildInvoiceContext(customer, workspace, companySettings, invoiceWorkspaceId, {
+        // Required by the options type; the context does not read them.
+        format: "COMBINED",
+        createdBy: "",
+        sellerGstin: sellerGstin || undefined,
+        customerStateOverride: customerStateOverride || undefined,
+        gstBypass: gstBypass === "true",
+      });
+      return res.json({
+        ok: true,
+        customerFound: true,
+        supplierState: ctx.detection.supplierState,
+        supplierGstin: ctx.issuerDetails.gstin,
+        customerState: ctx.detection.customerState,
+        placeOfSupply: ctx.detection.placeOfSupply,
+        detectedGstType: ctx.resolvedGstType,
+        supplierStateCode: ctx.detection.supplierStateCode,
+        customerStateCode: ctx.detection.customerStateCode,
+        canCalculate: true,
+        reason: null,
+        activeGstProfiles,
+      });
+    } catch (err: any) {
+      if (err instanceof InvoiceGenerationError && err.body?.error === "GST_DETECTION_FAILED") {
+        return res.json({
+          ...unresolved,
+          customerFound: true,
+          customerState: customerStateOverride || resolveCustomerState(customer).state || null,
+          reason: err.body.message ?? null,
+          missingField: err.body.missingField ?? null,
+        });
+      }
+      throw err;
+    }
   } catch (err: any) {
     console.error("[Invoices gst-preview]", err.message);
     res.status(500).json({ error: err.message });
@@ -774,15 +808,16 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     const reservation = await reservationDecisionGate(req, res, bookingIds);
     if (reservation === false) return;
 
-    // Resolve invoiceDate — no restrictions, default to today if omitted
-    const resolvedInvoiceDate = invoiceDate ? new Date(invoiceDate) : new Date();
+    // Resolve invoiceDate — no restrictions, default to the IST day if omitted
+    const resolvedInvoiceDate = new Date(invoiceDate || todayIST());
     resolvedInvoiceDate.setHours(0, 0, 0, 0);
 
     const created = await createInvoiceFromBookings(bookingIds, {
       reservation: reservation ?? undefined,
       format: "COMBINED",
       lineItemStyle,
-      billingPeriod,
+      // What the popup shows; blank falls back to the invoice date's month.
+      billingPeriod: String(billingPeriod ?? "").trim() || billingPeriodIST(resolvedInvoiceDate),
       invoiceDate: resolvedInvoiceDate,
       dueDate: dueDate ? new Date(dueDate) : undefined,
       notes,
@@ -863,7 +898,7 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
     const reservation = await reservationDecisionGate(req, res, bookingIds);
     if (reservation === false) return;
 
-    const resolvedInvoiceDate = invoiceDate ? new Date(invoiceDate) : new Date();
+    const resolvedInvoiceDate = new Date(invoiceDate || todayIST());
     resolvedInvoiceDate.setHours(0, 0, 0, 0);
 
     const resolvedDueDate = dueDate
@@ -871,10 +906,7 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       : new Date(resolvedInvoiceDate.getTime() + 7 * 24 * 60 * 60 * 1000);
 
     // Auto-compute billing period from invoice date (e.g. "April 2026")
-    const billingPeriod = resolvedInvoiceDate.toLocaleDateString("en-IN", {
-      month: "long",
-      year: "numeric",
-    });
+    const billingPeriod = billingPeriodIST(resolvedInvoiceDate);
 
     const isDemoUser = req.user?.isDemoUser === true;
 
@@ -1997,6 +2029,14 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
         const oldStr = invoice.dueDate ? istDateString(new Date(invoice.dueDate)) : "";
         const newStr = newDate ? istDateString(newDate) : "";
         if (oldStr !== newStr) {
+          // Only a change is checked, so an old bad due date doesn't block other edits.
+          // A legacy draft with no stored invoice date hydrates to "now": nothing to compare.
+          if (newDate && !invoice.$isDefault("invoiceDate") && newStr < istDateString(new Date(invoice.invoiceDate))) {
+            const shown = new Date(invoice.invoiceDate).toLocaleDateString("en-IN", {
+              day: "2-digit", month: "short", year: "numeric", timeZone: "Asia/Kolkata",
+            });
+            throw new HttpError(400, `Due date can't be before the invoice date (${shown}).`);
+          }
           oldValues.dueDate = invoice.dueDate ?? null;
           newValues.dueDate = newDate ?? null;
           fieldsChanged.push("dueDate");

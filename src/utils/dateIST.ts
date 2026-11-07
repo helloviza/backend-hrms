@@ -31,6 +31,11 @@ export function istDateString(at: Date | number = Date.now()): string {
   return new Date(ms + IST_OFFSET_MS).toISOString().slice(0, 10);
 }
 
+/** The IST month of the instant `at` as a billing period label, e.g. "December 2026". */
+export function billingPeriodIST(at: Date | number = Date.now()): string {
+  return new Date(at).toLocaleDateString("en-IN", { month: "long", year: "numeric", timeZone: "Asia/Kolkata" });
+}
+
 /** Today's IST calendar day as "YYYY-MM-DD". */
 export function todayIST(now: Date | number = Date.now()): string {
   return istDateString(now);

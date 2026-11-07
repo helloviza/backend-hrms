@@ -254,7 +254,7 @@ interface InvoiceContext {
 /** Build the per-batch client/issuer/GST context once (all bookings in a call
  *  share one workspace, so this is resolved a single time). Mirrors the old
  *  /generate block including the workspace-address fallback. */
-function buildInvoiceContext(
+export function buildInvoiceContext(
   customer: any,
   workspace: any,
   companySettings: any,
