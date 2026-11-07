@@ -17,6 +17,8 @@ import { validateObjectId } from "../middleware/validateObjectId.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMemberRoles.js";
 import { GST_STATUSES, normalizeGstStatus, validateRegisteredGstin } from "../utils/customerGst.js";
+import { applyLegacyGstFields, sendGstRegistrationError } from "../services/gstRegistrations.js";
+import { canManageGstRegistrations } from "../services/gstRegistrationAccess.js";
 
 const router = Router();
 
@@ -393,6 +395,13 @@ router.patch(
       // front — before any write — rather than silently letting Mongoose's
       // strict-mode cast drop the offending keys and returning {ok:true}
       // regardless (see docs/audits/business-form-persistence-audit.md).
+      if (req.body && ("gstRegistrations" in req.body || "gstRegistrationsRev" in req.body)) {
+        return res.status(400).json({
+          error: "GST registrations are edited through /api/customers/:id/gst-registrations.",
+          code: "USE_GST_REGISTRATIONS",
+        });
+      }
+
       const unrecognized = findUnrecognizedCustomerFields(req.body || {});
       if (unrecognized.length > 0) {
         return res.status(400).json({
@@ -450,6 +459,22 @@ router.patch(
         }
       }
 
+      // GST registrations (R2): the company GSTIN and its state are owned by
+      // services/gstRegistrations.ts. A GSTIN sent here becomes the default
+      // registration through the service; nothing below $sets it raw.
+      let gstForForm: string | undefined;
+      try {
+        gstForForm = await applyLegacyGstFields(
+          id,
+          req.body,
+          { actorId: String(req.user?._id || req.user?.id || ""), source: "PATCH /customers/:id" },
+          { canManageGst: await canManageGstRegistrations(req) },
+        );
+      } catch (e) {
+        if (sendGstRegistrationError(res, e)) return;
+        throw e;
+      }
+
       const updated = await Customer.findOneAndUpdate(
         { _id: id },
         { $set: { ...req.body, updatedAt: new Date() } },
@@ -459,6 +484,7 @@ router.patch(
       if (!updated) {
         return res.status(404).json({ error: "Customer not found" });
       }
+      if (gstForForm !== undefined) req.body.gstNumber = gstForForm; // onboarding form copy below
 
       // Sync to Onboarding formPayload if onboardingId exists
       if ((updated as any).onboardingId) {

@@ -103,6 +103,7 @@ import businessServicesRouter from "./routes/businessServices.js";
 // ✅ Vendor / Customer master + self endpoints
 import vendorsRouter from "./routes/vendors.js";
 import customersRouter from "./routes/customers.js";
+import gstRegistrationsRouter from "./routes/gstRegistrations.js";
 import directCustomersRouter from "./routes/directCustomers.js";
 import adminBusinessMsaRouter from "./routes/admin.businessMsa.js";
 import vendorCustomerSelfRouter from "./routes/vendorCustomerSelf.js";
@@ -739,6 +740,8 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/vendor-services", vendorServicesRouter);
   app.use("/api/business-services", businessServicesRouter);
   app.use("/api/vendors", vendorsRouter);
+  // GST registrations first: /api/customers/:id/gst-registrations[/...] (R2).
+  app.use("/api/customers", gstRegistrationsRouter);
   app.use("/api/customers", customersRouter);
   app.use("/api/admin/direct-customers", directCustomersRouter);
   app.use("/api/admin/businesses", adminBusinessMsaRouter);

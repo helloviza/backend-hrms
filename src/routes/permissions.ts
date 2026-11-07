@@ -164,7 +164,7 @@ router.get('/my-access', requireAuth, async (req: any, res: any) => {
       // Invoice delete / reissue are per-person grants that a tenant admin
       // never holds by default (decision D9, docs/audits/invoice-reissue-audit.md);
       // the backend gate never reads this synthesised map, so the UI must not either.
-      for (const k of ['invoiceDelete', 'invoiceReissue']) {
+      for (const k of ['invoiceDelete', 'invoiceReissue', 'gstRegistrations']) {
         if (allModules[k]) allModules[k] = { access: 'NONE', scope: 'NONE' }
       }
       return res.json({

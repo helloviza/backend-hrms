@@ -12,6 +12,14 @@ import Employee from "../models/Employee.js";
 import DocumentModel from "../models/Document.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { ensureCustomerWorkspace } from "../services/customerWorkspace.service.js";
+import {
+  applyLegacyGstFields,
+  assertCompanyChangeAllowed,
+  ensureRegistrationFromOnboarding,
+  preflightOnboardingGstin,
+  sendGstRegistrationError,
+} from "../services/gstRegistrations.js";
+import { canManageGstRegistrations } from "../services/gstRegistrationAccess.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
@@ -1003,6 +1011,7 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
     const linkedCustomer: any = isBusinessRecord
       ? await Customer.findOne({ onboardingId: onboardingDoc._id }).exec()
       : null;
+    let gstAdapted: Record<string, any> | null = null;
     if (isBusinessRecord) {
       if (
         body.gstStatus !== undefined &&
@@ -1055,6 +1064,26 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
           }
         }
         body.defaultSellerGstin = sellerGstin;
+      }
+
+      // GST registrations (R2): a promoted company's GSTIN/state go through
+      // services/gstRegistrations.ts, never the raw sync below. Runs on a copy
+      // of the GST keys; whatever it leaves in that copy is what the sync may
+      // still write (only the state of a company with no registrations).
+      if (linkedCustomer) {
+        gstAdapted = {};
+        for (const k of ["gstNumber", "gstin", "gstRegisteredState", "gstStatus", "panNumber", "pan"]) {
+          if (body[k] !== undefined) gstAdapted[k] = body[k];
+        }
+        try {
+          await applyLegacyGstFields(linkedCustomer._id, gstAdapted, {
+            actorId: String((req as any).user?._id || (req as any).user?.id || ""),
+            source: "PATCH /master-data/:id",
+          }, { canManageGst: await canManageGstRegistrations(req) });
+        } catch (e) {
+          if (sendGstRegistrationError(res, e)) return;
+          throw e;
+        }
       }
 
       // The legal name now reaches the Customer (invoices print it); refuse a
@@ -1276,17 +1305,16 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
         // Master edit. A non-empty value is written; an empty one never wipes
         // what the Customer already holds (the edit form shows the onboarding
         // copy, which can be blank while the Customer has the real value).
-        const gstSent = body.gstNumber ?? body.gstin;
-        if (typeof gstSent === "string" && gstSent.trim()) {
-          (customer as any).gstNumber = gstSent.trim().toUpperCase();
-        }
+        // GSTIN: applied above through the registration service (R2).
         if (typeof body.legalName === "string" && body.legalName.trim()) {
           (customer as any).legalName = body.legalName.trim();
         }
         if (body.gstStatus !== undefined) {
           (customer as any).gstStatus = normalizeGstStatus(body.gstStatus);
         }
-        if (body.gstRegisteredState) {
+        // Only a company with no GST registrations still takes a typed state
+        // (the adapter above removed it otherwise).
+        if (gstAdapted?.gstRegisteredState) {
           (customer as any).gstRegisteredState = String(body.gstRegisteredState).trim();
           (customer as any).gstRegisteredStateCode = GST_STATE_CODES[String(body.gstRegisteredState).trim()] || "";
         }
@@ -2093,6 +2121,33 @@ router.post(
       }
       let existingCustomer: any = customerMatch.existing;
 
+      // GST registrations (R2): the form's GSTIN becomes the company's default
+      // registration after the Customer exists. Checked HERE, before any write,
+      // so an invalid GSTIN (format, check digit, PAN, state code, on another
+      // company, or not among a re-promoted company's registrations) refuses the
+      // promote instead of leaving a half-promoted customer.
+      const promoteForm = {
+        ...form,
+        gstNumber: form.gstNumber || onboardingDoc.gstNumber || onboardingDoc.gstin || "",
+        panNumber: form.panNumber || onboardingDoc.pan || "",
+        gstStatus: gstStatusFromForm(form),
+      };
+      try {
+        if (existingCustomer) {
+          await assertCompanyChangeAllowed(existingCustomer._id, {
+            gstStatus: form.gstStatus ? promoteForm.gstStatus : undefined,
+            panNumber: promoteForm.panNumber || undefined,
+          });
+        }
+        const gstPre = await preflightOnboardingGstin(existingCustomer?._id || null, promoteForm);
+        if (gstPre && !gstPre.ok) {
+          return res.status(422).json({ error: gstPre.error, code: gstPre.code, ...(gstPre.otherCompany ? { otherCompany: gstPre.otherCompany } : {}) });
+        }
+      } catch (e) {
+        if (sendGstRegistrationError(res, e)) return;
+        throw e;
+      }
+
       let customerCode =
         (existingCustomer && existingCustomer.customerCode) ||
         (onboardingDoc as any).customerCode ||
@@ -2125,13 +2180,9 @@ router.post(
     form.website ||
     "",
 
-  // Tax identifiers
-  gstNumber:
-    form.gstNumber ||
-    onboardingDoc.gstNumber ||
-    onboardingDoc.gstin ||
-    "",
-
+  // Tax identifiers. The GSTIN is NOT written here: it becomes the default
+  // GST registration (services/gstRegistrations.ts) once the Customer exists,
+  // which also sets gstNumber as its mirror.
   panNumber:
     form.panNumber ||
     onboardingDoc.pan ||
@@ -2269,6 +2320,18 @@ router.post(
       if (String(customer.workspaceId || "") !== String(tenantWorkspace._id)) {
         customer.workspaceId = tenantWorkspace._id;
         await customer.save();
+      }
+
+      // Default GST registration from the form (validated above). After the
+      // workspace exists, so its GSTIN mirror is written too.
+      try {
+        await ensureRegistrationFromOnboarding(customer._id, promoteForm, {
+          actorId: String((req as any).user?._id || (req as any).user?.id || ""),
+          source: "POST /master-data/:id/promote-customer",
+        }, { strict: true });
+      } catch (e) {
+        if (sendGstRegistrationError(res, e)) return;
+        throw e;
       }
 
       (onboardingDoc as any).customerCode = customerCode;

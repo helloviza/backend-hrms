@@ -6,10 +6,11 @@ import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requirePermission } from "../middleware/requirePermission.js";
 import Customer from "../models/Customer.js";
 import { GST_STATE_CODES } from "../utils/gstDetection.js";
+import { normalizeGstin } from "../utils/gstinState.js";
+import { addRegistration, checkGstin } from "../services/gstRegistrations.js";
 
 const router = Router();
 
-const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/;
 const PAN_RE   = /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -59,12 +60,23 @@ router.post(
         return res.status(400).json({ error: "A valid email is required" });
       }
 
-      if (gstNumber && !GSTIN_RE.test(String(gstNumber).toUpperCase())) {
-        return res.status(400).json({ error: "Invalid GSTIN format (15-char alphanumeric)" });
-      }
-
       if (panNumber && !PAN_RE.test(String(panNumber).toUpperCase())) {
         return res.status(400).json({ error: "Invalid PAN format (e.g. ABCDE1234F)" });
+      }
+
+      // GSTIN (R2): the same checks as every GST registration — format, check
+      // digit, PAN, a current state code, not on another company — and its
+      // state is the GSTIN's own: a different typed state is refused.
+      const gstin = normalizeGstin(gstNumber);
+      if (gstin) {
+        const chk = await checkGstin({ panNumber: panNumber ? String(panNumber).toUpperCase() : "", gstRegistrations: [] }, gstin);
+        if (!chk.ok) {
+          return res.status(chk.code === "GSTIN_ON_OTHER_COMPANY" ? 409 : 400).json({ error: chk.error, code: chk.code, ...(chk.otherCompany ? { otherCompany: chk.otherCompany } : {}) });
+        }
+        const typed = gstRegisteredState ? String(gstRegisteredState).trim() : "";
+        if (typed && typed.toLowerCase() !== String(chk.state).toLowerCase()) {
+          return res.status(400).json({ error: `GSTIN ${gstin} is registered in ${chk.state}, not ${typed}.`, code: "STATE_FROM_GSTIN" });
+        }
       }
 
       const wsId = req.workspaceObjectId;
@@ -109,9 +121,11 @@ router.post(
         pincode: String(address.pincode || "").trim(),
       } : {};
 
-      const gstState = gstRegisteredState ? String(gstRegisteredState).trim() : undefined;
+      // A GSTIN-less customer may still carry a typed state; with a GSTIN the
+      // registration service sets the state (and gstNumber) from it.
+      const gstState = !gstin && gstRegisteredState ? String(gstRegisteredState).trim() : undefined;
 
-      const doc = await Customer.create({
+      let doc: any = await Customer.create({
         workspaceId:          wsId,
         customerType:         "DIRECT",
         customerCode,
@@ -121,11 +135,9 @@ router.post(
         email,
         phone:                phone ? String(phone).trim() : undefined,
         address:              normalizedAddress,
-        gstNumber:            gstNumber ? String(gstNumber).toUpperCase().trim() : undefined,
-        // A GSTIN given here was format-checked above → REGISTERED. Without
-        // one the status stays unset (NOT_SET) for staff to mark — never
-        // assumed UNREGISTERED.
-        gstStatus:            gstNumber ? "REGISTERED" : undefined,
+        // Without a GSTIN the status stays unset (NOT_SET) for staff to mark —
+        // never assumed UNREGISTERED. With one, addRegistration below makes
+        // the company REGISTERED.
         gstRegisteredState:   gstState,
         gstRegisteredStateCode: gstState ? (GST_STATE_CODES[gstState] || "") : undefined,
         panNumber:            panNumber ? String(panNumber).toUpperCase().trim() : undefined,
@@ -134,6 +146,15 @@ router.post(
         status:               "ACTIVE",
         createdBy:            new mongoose.Types.ObjectId(String(req.user._id || req.user.id || req.user.sub)),
       } as any);
+
+      if (gstin) {
+        await addRegistration(
+          doc._id,
+          { gstin },
+          { actorId: String(req.user._id || req.user.id || req.user.sub || ""), source: "POST /admin/direct-customers" },
+        );
+        doc = await Customer.findById(doc._id).lean();
+      }
 
       return res.status(201).json({
         ok: true,

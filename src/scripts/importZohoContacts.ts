@@ -14,6 +14,19 @@ import path from "path";
 import { connectDb } from "../config/db.js";
 import Customer from "../models/Customer.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
+import { applyLegacyGstin } from "../services/gstRegistrations.js";
+
+/** The Zoho GSTIN becomes the company's default GST registration (validated
+ *  like any other). An invalid one is reported and skipped — never stored raw,
+ *  never failing the rest of the import. */
+async function importGstin(customerId: unknown, gstNumber: string | undefined, label: string) {
+  if (!gstNumber) return;
+  try {
+    await applyLegacyGstin(customerId, gstNumber, { source: "importZohoContacts", actorId: "script" });
+  } catch (err: any) {
+    console.warn(`⚠️  GSTIN SKIPPED [${label}] ${gstNumber} → ${err?.code || ""} ${err?.message || err}`);
+  }
+}
 
 const require = createRequire(import.meta.url);
 const XLSX = require("xlsx");
@@ -154,7 +167,7 @@ function buildCustomerData(row: ZohoRow, isBusinessType: boolean) {
     type: "CUSTOMER",
     status: statusFromZoho(row["Status"]),
     ...(isBusinessType ? {} : { segment: "individual" }),
-    gstNumber: opt(row["GST Identification Number (GSTIN)"]),
+    // GSTIN: applied after the upsert through services/gstRegistrations.ts (R2).
     gstTreatment: opt(row["GST Treatment"]),
     subType: opt(row["Customer Sub Type"]),
     zohoContactId: opt(row["Contact ID"]),
@@ -350,7 +363,6 @@ async function main() {
 
         const workspaceEnrichment = {
           companyName: companyName || name || undefined,
-          gstNumber,
           website: opt(row["Website"]),
           phone: opt(row["Phone"]),
           email,
@@ -382,6 +394,7 @@ async function main() {
           await Customer.findByIdAndUpdate(exists._id, {
             $set: { workspaceId: workspace._id },
           });
+          await importGstin(exists._id, gstNumber, displayLabel);
 
           console.log(`🔄 UPDATED  [BUSINESS] ${displayLabel}`);
           stats.business.updated++;
@@ -402,6 +415,7 @@ async function main() {
         await Customer.findByIdAndUpdate(customer._id, {
           $set: { workspaceId: workspace._id },
         });
+        await importGstin(customer._id, gstNumber, displayLabel);
 
         console.log(`✅ CREATED  [BUSINESS] ${displayLabel}`);
         stats.business.created++;

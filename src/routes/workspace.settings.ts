@@ -4,7 +4,11 @@ import { requireWorkspace, isCustomerUser } from "../middleware/requireWorkspace
 import { requireRoles } from "../middleware/roles.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
-import { normalizeGstStatus, type GstStatus } from "../utils/customerGst.js";
+import mongoose from "mongoose";
+import { normalizeGstStatus, validateRegisteredGstin, type GstStatus } from "../utils/customerGst.js";
+import { normalizeGstin } from "../utils/gstinState.js";
+import { GST_ACCESS_REQUIRED_MESSAGE, applyLegacyGstFields, sendGstRegistrationError } from "../services/gstRegistrations.js";
+import { canManageGstRegistrations } from "../services/gstRegistrationAccess.js";
 
 const r = Router();
 
@@ -208,23 +212,75 @@ r.patch(
       if (typeof req.body.pan === "string") {
         update.pan = req.body.pan.trim().toUpperCase();
       }
-      if (typeof req.body.gstNumber === "string") {
-        update.gstNumber = req.body.gstNumber.trim().toUpperCase();
-      }
-
-      if (Object.keys(update).length === 0) {
+      if (typeof req.body.gstNumber !== "string" && Object.keys(update).length === 0) {
         return res.status(400).json({ success: false, error: "No valid fields to update." });
       }
 
-      const ws = await CustomerWorkspace.findByIdAndUpdate(
-        workspaceId,
-        { $set: update },
-        { new: true },
-      )
-        .select("pan gstNumber")
-        .lean();
+      // Staff GSTIN edit (R2). A workspace that belongs to a company: the GSTIN
+      // becomes that company's default GST registration through the service
+      // (validated, Customer + workspace mirrors). A workspace with no company
+      // (SaaS signup): validated, then stored on the workspace as before.
+      if (typeof req.body.gstNumber === "string") {
+        const wsDoc: any = await CustomerWorkspace.findById(workspaceId).select("customerId").lean();
+        const customerId = String(wsDoc?.customerId || "");
+        const hasCustomer = mongoose.Types.ObjectId.isValid(customerId) && !!(await Customer.exists({ _id: customerId }));
+        if (hasCustomer) {
+          try {
+            await applyLegacyGstFields(customerId, { gstNumber: req.body.gstNumber }, {
+              actorId: String(user?._id || user?.id || ""),
+              source: "PATCH /workspace/settings/pan",
+            }, { canManageGst: await canManageGstRegistrations(req) });
+          } catch (e) {
+            if (sendGstRegistrationError(res, e)) return;
+            throw e;
+          }
+        } else {
+          // A workspace with no company: the same grant, same rule (a change
+          // to the stored GSTIN needs it; re-sending the same value does not).
+          const g = normalizeGstin(req.body.gstNumber);
+          const curWs: any = await CustomerWorkspace.findById(workspaceId).select("gstNumber").lean();
+          if (g !== normalizeGstin(curWs?.gstNumber) && !(await canManageGstRegistrations(req))) {
+            return res.status(403).json({ success: false, code: "GST_REGISTRATIONS_ACCESS_REQUIRED", error: GST_ACCESS_REQUIRED_MESSAGE });
+          }
+          const err = g ? validateRegisteredGstin(g, update.pan) : null;
+          if (err) return res.status(400).json({ success: false, error: err, code: "GSTIN_INVALID" });
+          update.gstNumber = g;
+        }
+      }
+
+      const ws = Object.keys(update).length
+        ? await CustomerWorkspace.findByIdAndUpdate(workspaceId, { $set: update }, { new: true }).select("pan gstNumber").lean()
+        : await CustomerWorkspace.findById(workspaceId).select("pan gstNumber").lean();
 
       return res.json({ success: true, pan: (ws as any)?.pan || "", gstNumber: (ws as any)?.gstNumber || "" });
+    } catch (err) {
+      return next(err);
+    }
+  },
+);
+
+/* ─── GET /gst-registrations — the company's GST registrations, read-only ───
+ * Client portal → Company & Billing (D2: staff edit them in Business
+ * Profiles). Own company only, resolved from the session's workspace; a
+ * customer session on the HOUSE workspace gets nothing (same guard as GET /). */
+r.get(
+  "/gst-registrations",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const workspaceId = String(req.workspaceId || "");
+      if (isCustomerUser((req as any).user) && workspaceId === PLUMTRIPS_HOUSE_WORKSPACE_ID) {
+        return res.json({ registrations: [] });
+      }
+      const ws: any = workspaceId ? await CustomerWorkspace.findById(workspaceId).select("customerId").lean() : null;
+      const customerId = String(ws?.customerId || "");
+      if (!mongoose.Types.ObjectId.isValid(customerId)) return res.json({ registrations: [] });
+      const cust: any = await Customer.findById(customerId).select("gstRegistrations gstStatus").lean();
+      if (normalizeGstStatus(cust?.gstStatus) === "UNREGISTERED") return res.json({ registrations: [] });
+      const registrations = ((cust?.gstRegistrations || []) as any[])
+        .filter((r) => r.active)
+        .map((r) => ({ _id: String(r._id), gstin: r.gstin, state: r.state, stateCode: r.stateCode, legalName: r.legalName || "", label: r.label || "", isDefault: !!r.isDefault }))
+        .sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || a.state.localeCompare(b.state));
+      return res.json({ registrations });
     } catch (err) {
       return next(err);
     }

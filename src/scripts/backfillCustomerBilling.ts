@@ -1,4 +1,6 @@
 import mongoose from 'mongoose'
+// Billing backfill for promoted customers: legal name, registered address, phone,
+// official email (from the onboarding form).
 import Customer from '../models/Customer.js'
 import Onboarding from '../models/Onboarding.js'
 import dotenv from 'dotenv'
@@ -12,6 +14,9 @@ async function backfill() {
   console.log('Connected to MongoDB')
   console.log('Starting Customer billing backfill...')
 
+  // The GSTIN is no longer WRITTEN here: a company's GSTIN is its GST
+  // registration, created from the onboarding form by
+  // scripts/migrate-gst-registrations.ts (R2 / P2). The selection is unchanged.
   const customers = await Customer.find({
     $or: [
       { gstNumber: { $in: ['', null, undefined] } },
@@ -46,9 +51,6 @@ async function backfill() {
 
       if (!customer.legalName && (p.legalName || p.companyName)) {
         updates.legalName = p.legalName || p.companyName
-      }
-      if (!customer.gstNumber && (p.gstNumber || p.gstin)) {
-        updates.gstNumber = p.gstNumber || p.gstin
       }
       if (!customer.registeredAddress && p.registeredAddress) {
         updates.registeredAddress = p.registeredAddress

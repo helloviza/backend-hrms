@@ -109,6 +109,11 @@ type ModulesTemplate = {
   // only, NONE everywhere below; each also needs invoices WRITE.
   invoiceDelete:     ModulePermission
   invoiceReissue:    ModulePermission
+  // Client GST registrations (2026-11-07, services/gstRegistrationAccess.ts):
+  // add / edit / set default / deactivate / reactivate a company's GSTINs and
+  // any GSTIN or GST state change on the legacy edit paths. Level only, HOUSE
+  // staff only, per-user: NONE everywhere below.
+  gstRegistrations:  ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -166,6 +171,7 @@ const L1: ModulesTemplate = {
   loyalty:         NONE,
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
+  gstRegistrations: NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -258,6 +264,7 @@ const L6: ModulesTemplate = {
   loyalty:         NONE,
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
+  gstRegistrations: NONE,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -280,6 +287,7 @@ const L7: ModulesTemplate = {
   loyalty:         NONE,
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
+  gstRegistrations: NONE,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -337,6 +345,7 @@ const L8: ModulesTemplate = {
   loyalty:         NONE,
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
+  gstRegistrations: NONE,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -394,6 +403,7 @@ const VENDOR: ModulesTemplate = {
   loyalty:         NONE,
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
+  gstRegistrations: NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -451,6 +461,7 @@ const CUSTOMER_SBT: ModulesTemplate = {
   loyalty:         NONE,
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
+  gstRegistrations: NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -508,6 +519,7 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   loyalty:         NONE,
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
+  gstRegistrations: NONE,
 }
 
 // ── TENANT_ADMIN template ─────────────────────────────────────────────────────
@@ -612,6 +624,7 @@ const TENANT_ADMIN: ModulesTemplate = {
   loyalty:         NONE,
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
+  gstRegistrations: NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

@@ -1,5 +1,37 @@
 import { Schema, model } from "mongoose";
 
+// One client GST registration (a state GSTIN of this company). See
+// services/gstRegistrations.ts for the rules; state/stateCode are derived from
+// the GSTIN and the GSTIN itself never changes once saved.
+const GstRegistrationSchema = new Schema(
+  {
+    gstin: { type: String, required: true, trim: true, uppercase: true },
+    stateCode: { type: String, trim: true },
+    state: { type: String, trim: true },
+    legalName: { type: String, trim: true },
+    tradeName: { type: String, trim: true },
+    address: {
+      line1: { type: String, trim: true },
+      line2: { type: String, trim: true },
+      city: { type: String, trim: true },
+      pincode: { type: String, trim: true },
+      country: { type: String, trim: true },
+    },
+    billingEmail: { type: String, trim: true },
+    label: { type: String, trim: true },
+    isDefault: { type: Boolean, default: false },
+    active: { type: Boolean, default: true },
+    defaultSellerGstin: { type: String, trim: true }, // D6: blank = company Bill From
+    isSez: { type: Boolean, default: false }, // stored; tax handling deferred (accountant Q6)
+    source: { type: String, trim: true },
+    createdAt: { type: Date },
+    createdBy: { type: String },
+    deactivatedAt: { type: Date },
+    deactivatedBy: { type: String },
+  },
+  { _id: true },
+);
+
 const CustomerSchema = new Schema(
   {
     /* ============================================================
@@ -289,6 +321,18 @@ const CustomerSchema = new Schema(
     defaultSellerGstin: { type: String, trim: true },
 
     /* ============================================================
+       CLIENT GST REGISTRATIONS (one company, several state GSTINs)
+       ============================================================ */
+    // Canonical store (docs/audits/client-multi-gst-audit.md §9.1, D12).
+    // Written ONLY by services/gstRegistrations.ts, which also keeps
+    // gstNumber / gstRegisteredState / gstRegisteredStateCode above (and
+    // CustomerWorkspace.gstNumber) equal to the default registration.
+    // Absent = the company predates registrations (legacy fields rule).
+    gstRegistrations: { type: [GstRegistrationSchema], default: undefined },
+    // Optimistic-concurrency counter for gstRegistrations writes.
+    gstRegistrationsRev: { type: Number },
+
+    /* ============================================================
        TAX
        ============================================================ */
     taxable: { type: Boolean },
@@ -390,6 +434,10 @@ const CustomerSchema = new Schema(
   },
   { timestamps: true }
 );
+
+// Lookup for "is this GSTIN on another company?" (service-level check). NOT
+// unique: the cross-company unique index is built after P5's merges.
+CustomerSchema.index({ "gstRegistrations.gstin": 1 });
 
 // The value the pre-save hook stores in legalNameNormalized. Exported so a
 // route's duplicate-name pre-check computes the SAME key the unique index

@@ -85,6 +85,9 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   // opens nothing because the route is HOUSE-only.
   // loyalty is deliberately UNMAPPED for the same reason: the Loyalty Points
   // admin (routes/admin.loyalty.ts) gates on requireHouse + the grant alone.
+  // gstRegistrations is deliberately UNMAPPED too: Business Profiles is HOUSE
+  // staff only, and services/gstRegistrationAccess.ts refuses any caller
+  // outside HOUSE whatever their grant says.
 };
 
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";

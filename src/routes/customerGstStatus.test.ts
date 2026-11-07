@@ -324,9 +324,12 @@ describe("REGISTERED company", () => {
     const keep = await staff(request(app).patch(`/api/master-data/${ob._id}`)).send({ gstNumber: "", phone: "" });
     expect(keep.status).toBe(200);
     expect(((await Customer.findById(cust._id).lean()) as any).gstNumber).toBe(GSTIN_HR);
+    // R2 (D11): the GSTIN is now a GST registration, so the company is
+    // REGISTERED — NOT_SET is refused while a registration is active.
     const blank = await staff(request(app).patch(`/api/master-data/${ob._id}`)).send({ gstStatus: "NOT_SET", gstNumber: "" });
-    expect(blank.status).toBe(200);
-    expect(((await Customer.findById(cust._id).lean()) as any).gstNumber).toBe(GSTIN_HR);
+    expect(blank.status).toBe(409);
+    expect(blank.body.code).toBe("ACTIVE_REGISTRATIONS");
+    expect(((await Customer.findById(cust._id).lean()) as any)).toMatchObject({ gstNumber: GSTIN_HR, gstStatus: "REGISTERED" });
   });
 
   it("F9: a blank GSTIN on an issued invoice is shown blank + flagged, never back-filled from today's record", async () => {
@@ -363,10 +366,18 @@ describe("NOT_SET company", () => {
     expect(list.body.items.find((i: any) => i.id === String(c._id)).gstStatus).toBe("NOT_SET");
   });
 
-  it("a NOT_SET company saves with any GSTIN, as today (no validation)", async () => {
+  // R2: every GSTIN is a GST registration, validated whatever the status (it
+  // used to be stored raw for a NOT_SET company). A valid one makes it REGISTERED.
+  it("a NOT_SET company's GSTIN is validated, and a valid one becomes its default registration", async () => {
     const { c } = await company({ legalName: "Loose Co" });
-    const res = await staff(request(app).patch(`/api/customers/${c._id}`)).send({ gstNumber: "whatever" });
-    expect(res.status).toBe(200);
+    const bad = await staff(request(app).patch(`/api/customers/${c._id}`)).send({ gstNumber: "whatever" });
+    expect(bad.status).toBe(400);
+    expect(bad.body.code).toBe("GSTIN_INVALID");
+    const ok = await staff(request(app).patch(`/api/customers/${c._id}`)).send({ gstNumber: GSTIN_DL });
+    expect(ok.status).toBe(200);
+    const after: any = await Customer.findById(c._id).lean();
+    expect(after).toMatchObject({ gstNumber: GSTIN_DL, gstStatus: "REGISTERED", gstRegisteredState: "Delhi" });
+    expect(after.gstRegistrations).toHaveLength(1);
   });
 });
 
@@ -391,7 +402,9 @@ describe("GST details are locked for the client", () => {
     expect(pan.body.pan).toBe(PAN);
 
     const asStaff = await request(app).patch("/api/workspace/settings/pan")
-      .set("x-test-user", JSON.stringify({ _id: String(STAFF), roles: ["ADMIN"] })).set("x-test-ws", String(ws._id))
+      // Staff with the GST Registrations grant (SuperAdmin passes without one;
+      // the grant rule itself is routes/gstRegistrations.access.test.ts).
+      .set("x-test-user", JSON.stringify({ _id: String(STAFF), roles: ["SUPERADMIN"] })).set("x-test-ws", String(ws._id))
       .send({ gstNumber: GSTIN_HR });
     expect(asStaff.status).toBe(200);
   });

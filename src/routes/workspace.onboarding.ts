@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import requireAuth from "../middleware/auth.js";
-import { requireWorkspace, isCustomerUser } from "../middleware/requireWorkspace.js";
+import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import { markTenantSetupComplete } from "../utils/tenantSetupHelpers.js";
 
@@ -60,9 +60,24 @@ router.put(
   requireWorkspace,
   async (req: Request, res: Response) => {
     try {
+      // GST is not taken here (R2, decision #8): the configure screen no longer
+      // asks for a GSTIN, and a GSTIN sent anyway is refused — never silently
+      // dropped. A company's GSTINs are its GST registrations, managed by
+      // Plumtrips in Business Profiles.
+      const gstKey = ["gstNumber", "gst", "gstin"].find((k) => {
+        const v = req.body?.[k];
+        return v !== undefined && v !== null && String(v).trim() !== "";
+      });
+      if (gstKey) {
+        res.status(400).json({
+          error: "A GSTIN can't be set here. Plumtrips adds your company's GST registrations — contact your account manager.",
+          code: "GST_NOT_ACCEPTED_HERE",
+        });
+        return;
+      }
+
       const {
         companyLogo,
-        gstNumber,
         pan,
         address,
         leavePolicy,
@@ -77,11 +92,6 @@ router.put(
       }
 
       if (companyLogo !== undefined) workspace.companyLogo = companyLogo;
-      // GST details are Plumtrips-managed (see workspace.settings PATCH /pan):
-      // a client's gstNumber is ignored here. The wizard never sends this key
-      // (it sends `gst`, which this route has never read), so the wizard's
-      // behaviour is unchanged — this only closes the direct-API path.
-      if (gstNumber !== undefined && !isCustomerUser((req as any).user)) workspace.gstNumber = gstNumber;
       if (pan !== undefined) workspace.pan = pan;
       if (address !== undefined) {
         // Wizard sends a single-line string; schema expects { line1, line2, city, state, pincode, country }.
