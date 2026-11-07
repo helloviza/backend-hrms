@@ -110,16 +110,18 @@ describe("PUT /invoices/workspace/:id/declare-payment", () => {
   );
 
   it("404s (not found) for an invoice belonging to a different workspace — never leaks or touches it", async () => {
-    // findOne is called with {_id, workspaceId: req.workspaceObjectId} — a
-    // cross-tenant invoice simply won't match that filter in real Mongo, so
-    // the mock returning null here models that correctly.
+    // findOne is called with {_id, workspaceId: {$in: [the caller's workspace
+    // id, its own Customer id]}} — a cross-tenant invoice simply won't match
+    // that filter in real Mongo, so the mock returning null here models that
+    // correctly. Every id in the filter must be company A's.
     currentInvoice = null;
     const app = makeApp(LEADER);
     const res = await request(app).put("/inv1/declare-payment");
     expect(res.status).toBe(404);
-    expect(invoiceFindOneMock).toHaveBeenCalledWith(
-      expect.objectContaining({ workspaceId: COMPANY_A_ID }),
-    );
+    const filter = invoiceFindOneMock.mock.calls[0][0];
+    const ids = (filter.workspaceId.$in as unknown[]).map(String);
+    expect(ids).toEqual([COMPANY_A_ID]);
+    expect(ids).not.toContain(COMPANY_B_ID);
   });
 
   it("inherits requireInvoiceAccess — a non-leader with canViewBilling=false is denied before any transition logic runs", async () => {

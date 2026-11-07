@@ -201,15 +201,17 @@ export async function collectDuplicateReport(): Promise<{ rows: ReportRow[]; unn
       const either = (extra: AnyObj[] = []) => ({ $or: [...(wsMatch ? [wsMatch] : []), ...extra] });
       const has = Boolean(wsMatch) || custOr.length > 0;
       const count = async (m: mongoose.Model<any>, filter: AnyObj) => (has ? m.countDocuments(filter) : 0);
+      // ManualBooking.workspaceId is a Customer._id; Invoice / CreditNote
+      // .workspaceId is the CustomerWorkspace._id, or the Customer._id when the
+      // client had no workspace at generation. Count every space for each.
+      const bothIds = { workspaceId: { $in: [...(wsId ? [oid(wsId)] : []), ...(isHex(custId) ? [oid(custId)] : [])] } };
       const counts = {
         users: await count(User, either(custOr)),
         approvalRequests: await count(ApprovalRequest, either(custOr)),
         sbtBookings: wsMatch ? (await SBTBooking.countDocuments(wsMatch)) + (await SBTHotelBooking.countDocuments(wsMatch)) : 0,
-        manualBookings: await count(ManualBooking, {
-          workspaceId: { $in: [...(wsId ? [oid(wsId)] : []), ...(isHex(custId) ? [oid(custId)] : [])] },
-        }),
-        invoices: wsMatch ? await Invoice.countDocuments(wsMatch) : 0,
-        creditNotes: wsMatch ? await CreditNote.countDocuments(wsMatch) : 0,
+        manualBookings: await count(ManualBooking, bothIds),
+        invoices: await count(Invoice, bothIds),
+        creditNotes: await count(CreditNote, bothIds),
         walletEntries: wsId ? await SBTWalletLedger.countDocuments({ workspaceId: wsId }) : 0,
       };
       const ob = w?.sbtOfficialBooking || {};

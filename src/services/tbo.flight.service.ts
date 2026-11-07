@@ -601,13 +601,16 @@ export async function bookFlight(params: {
     throw new Error("bookFlight: Passengers array is missing or empty");
   }
 
-  // STALE GUARD — reads GSTCompanyInfo, which the frontend no longer sends (F2a:
-  // GST moved onto the lead passenger). Currently inert because IsGSTMandatory is
-  // never forwarded either. When the F2 track starts forwarding IsGSTMandatory this
-  // WILL false-reject every GST booking — re-point it at the lead pax's GSTNumber
-  // in that commit, not this one.
-  if (params.IsGSTMandatory === true && !params.GSTCompanyInfo) {
-    throw new Error("GST company details are mandatory for this fare. Please provide your company GSTIN.");
+  // IsGSTMandatory is the stored FareQuote's (routes/sbt.flights.ts →
+  // services/sbtQuote.ts applyQuoteGst, which already refused a missing GSTIN).
+  // GST rides on the lead passenger (Book.aspx 5.7-5.11), so that is what this
+  // last guard checks before TBO is called.
+  if (params.IsGSTMandatory === true) {
+    const gstPax: any[] = Array.isArray(params.Passengers) ? params.Passengers : [];
+    const gstLead = gstPax.find((p: any) => p?.IsLeadPax) || gstPax[0];
+    if (!String(gstLead?.GSTNumber ?? "").trim()) {
+      throw new Error("GST company details are mandatory for this fare. Please provide your company GSTIN.");
+    }
   }
 
   // CRITICAL: TBO requires the SAME TokenId across the entire
@@ -963,13 +966,16 @@ export async function ticketLCC(params: {
   isCorporate?: boolean;
   corporatePAN?: string;
 }) {
-  // STALE GUARD — reads GSTCompanyInfo, which the frontend no longer sends (F2a:
-  // GST moved onto the lead passenger). Currently inert because IsGSTMandatory is
-  // never forwarded either. When the F2 track starts forwarding IsGSTMandatory this
-  // WILL false-reject every GST booking — re-point it at the lead pax's GSTNumber
-  // in that commit, not this one.
-  if (params.IsGSTMandatory === true && !params.GSTCompanyInfo) {
-    throw new Error("GST company details are mandatory for this fare. Please provide your company GSTIN.");
+  // IsGSTMandatory is the stored FareQuote's (routes/sbt.flights.ts →
+  // services/sbtQuote.ts applyQuoteGst, which already refused a missing GSTIN).
+  // GST rides on the lead passenger (Book.aspx 5.7-5.11), so that is what this
+  // last guard checks before TBO is called.
+  if (params.IsGSTMandatory === true) {
+    const gstPax: any[] = Array.isArray(params.Passengers) ? params.Passengers : [];
+    const gstLead = gstPax.find((p: any) => p?.IsLeadPax) || gstPax[0];
+    if (!String(gstLead?.GSTNumber ?? "").trim()) {
+      throw new Error("GST company details are mandatory for this fare. Please provide your company GSTIN.");
+    }
   }
 
   const token = await getTBOToken();

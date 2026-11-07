@@ -27,6 +27,7 @@ import { UserPermission } from "../models/UserPermission.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { generateTravelerId } from "../utils/travelerId.js";
 import { GST_STATE_CODES } from "../utils/gstDetection.js";
+import { getCompanySettings } from "../models/CompanySettings.js";
 import { isPlatformStaff } from "../middleware/requirePlatformAdmin.js";
 import { syncMembershipFromUser } from "../services/workspaceMembership.service.js";
 import { promotePersonName, suggestLoginPersonName } from "../services/personNames.js";
@@ -1023,6 +1024,39 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
         const gstErr = validateRegisteredGstin(gstToCheck, panToCheck);
         if (gstErr) return res.status(400).json({ error: gstErr, code: "GSTIN_INVALID" });
       }
+      // "Default GST Registration (Bill From)" = which of OUR GSTINs bills this
+      // client. Invoices read it from Customer.defaultSellerGstin, so it is
+      // stored there (never in formPayload). "" = use our default profile. A
+      // value must be an ACTIVE CompanySettings.gstProfile; checked before any
+      // write. Plumtrips staff only, as on PATCH /customers/:id.
+      if (typeof body.defaultSellerGstin === "string") {
+        const sellerGstin = body.defaultSellerGstin.trim().toUpperCase();
+        if (sellerGstin) {
+          if (!isPlatformStaff(req)) {
+            return res.status(403).json({ error: "Only Plumtrips staff can choose the Bill From GST registration.", code: "DEFAULT_SELLER_GSTIN_FORBIDDEN" });
+          }
+          if (!linkedCustomer) {
+            return res.status(409).json({
+              error: "Promote this business to a customer before choosing its Bill From GST registration.",
+              code: "DEFAULT_SELLER_GSTIN_NOT_PROMOTED",
+            });
+          }
+          const companySettings = await getCompanySettings();
+          const activeGstins = new Set(
+            ((companySettings.gstProfiles || []) as any[])
+              .filter((p) => p.active)
+              .map((p) => String(p.gstin).toUpperCase()),
+          );
+          if (!activeGstins.has(sellerGstin)) {
+            return res.status(400).json({
+              error: `defaultSellerGstin "${body.defaultSellerGstin}" does not match any active company GST registration`,
+              code: "DEFAULT_SELLER_GSTIN_NOT_FOUND",
+            });
+          }
+        }
+        body.defaultSellerGstin = sellerGstin;
+      }
+
       // The legal name now reaches the Customer (invoices print it); refuse a
       // rename onto another company's name before anything is saved.
       if (linkedCustomer && typeof body.legalName === "string" && body.legalName.trim()) {
@@ -1279,6 +1313,12 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
         }
         if (body.registeredAddress) {
           (customer as any).registeredAddress = body.registeredAddress;
+        }
+        // Validated above. Unlike the GSTIN, "" is a real choice here ("use
+        // our default"), so it is written — but only by staff (a tenant admin's
+        // save never touches it).
+        if (typeof body.defaultSellerGstin === "string" && isPlatformStaff(req)) {
+          (customer as any).defaultSellerGstin = body.defaultSellerGstin;
         }
         await customer.save();
       }

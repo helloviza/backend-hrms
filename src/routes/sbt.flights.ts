@@ -84,6 +84,7 @@ import {
   stripFlightBookingFares,
   loadFlightNet,
   applyQuoteFares,
+  applyQuoteGst,
   keepSupplierResponse,
   supplierResponseFor,
   customerFlightBooking,
@@ -117,6 +118,20 @@ async function sendBookingResponse(req: any, res: any, body: any) {
   const bookingId = r?.BookingId ?? r?.FlightItinerary?.BookingId ?? body?.BookingId;
   await keepSupplierResponse(req, bookingId, body);
   return res.json(stripFlightBookingFares(body));
+}
+
+/** Corporate PAN for TBO: the company workspace's `pan`, else the Customer's
+ *  `panNumber` (the field Business Master writes). `customerId` is the
+ *  workspace's own Customer id (or the token's), so only that company's PAN. */
+async function resolveCorporatePan(customerId: unknown): Promise<string> {
+  const cid = String(customerId ?? "").trim();
+  if (!cid) return "";
+  const ws: any = await CustomerWorkspace.findOne({ customerId: cid }).select("pan").lean();
+  const wsPan = String(ws?.pan ?? "").trim();
+  if (wsPan) return wsPan;
+  if (!/^[a-f0-9]{24}$/i.test(cid)) return "";
+  const cust: any = await Customer.findById(cid).select("panNumber").lean();
+  return String(cust?.panNumber ?? "").trim();
 }
 
 /* ── Duplicate booking prevention (24-hour window) ─────────────────────── */
@@ -816,6 +831,9 @@ router.post("/farequote", requireAuth, requireSBT, async (req: any, res: any) =>
             Number(rawFare.SupplierReissueCharges || fareResults?.FareBreakdown?.[0]?.SupplierReissueCharges) || 0,
           netFare: rawFare,
           netFareBreakdown: Array.isArray(fareResults?.FareBreakdown) ? fareResults.FareBreakdown : [],
+          // Whether GST details may / must go to TBO (applyQuoteGst at Book / Ticket).
+          ...(typeof fareResults?.GSTAllowed === "boolean" ? { gstAllowed: fareResults.GSTAllowed } : {}),
+          ...(typeof fareResults?.IsGSTMandatory === "boolean" ? { isGstMandatory: fareResults.IsGSTMandatory } : {}),
         });
       } catch (qErr: any) {
         // Booking needs this quote (the net lives only here): no quote, no fare.
@@ -936,25 +954,21 @@ router.post("/book", requireSBT, requireFlightAccess, ...sbtBookerGuards, requir
       if (dupErr) return res.status(409).json({ error: dupErr, code: "DUPLICATE_BOOKING" });
     }
 
-    // Resolve corporate PAN from workspace
+    // Resolve corporate PAN: the workspace's, else its Customer's panNumber.
     const bookCustomerId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
-    const bookWorkspace = bookCustomerId
-      ? await CustomerWorkspace.findOne({ customerId: bookCustomerId }).select("pan").lean()
-      : null;
-    let bookCorporatePAN = (bookWorkspace as any)?.pan || "";
-    if (!bookCorporatePAN && (bookWorkspace as any)?.customerId) {
-      const bookCustomer = await Customer.findOne({ _id: (bookWorkspace as any).customerId }).select("pan").lean();
-      bookCorporatePAN = (bookCustomer as any)?.pan || "";
-    }
+    const bookCorporatePAN = await resolveCorporatePan(bookCustomerId);
     const bookIsCorporate = req.body.corporateBookingAllowed === true && !!bookCorporatePAN;
 
     // The TBO net fare comes from the server's FareQuote (services/sbtQuote.ts),
     // never from the browser: any client Passengers[].Fare is replaced.
     const bookNet = await loadFlightNet(req, { resultIndex: req.body?.ResultIndex });
     if (isRefusal(bookNet)) return res.status(bookNet.status).json({ error: bookNet.error, code: bookNet.code });
-    const bookNetPassengers = applyQuoteFares(bookPassengers, bookNet.ob);
+    // GST details only where the stored FareQuote allows them (F4).
+    const bookGst = applyQuoteGst(applyQuoteFares(bookPassengers, bookNet.ob), bookNet.ob);
+    if (isRefusal(bookGst)) return res.status(bookGst.status).json({ error: bookGst.error, code: bookGst.code });
+    const bookNetPassengers = bookGst.passengers;
 
-    const data = await bookFlight({ ...req.body, Passengers: bookNetPassengers, isNDC: bookIsNDC, airlineCode: bookAirlineCode, destinationCode: req.body?.destinationCode, isCorporate: bookIsCorporate, corporatePAN: bookCorporatePAN }) as any;
+    const data = await bookFlight({ ...req.body, Passengers: bookNetPassengers, IsGSTMandatory: bookGst.isGstMandatory, isNDC: bookIsNDC, airlineCode: bookAirlineCode, destinationCode: req.body?.destinationCode, isCorporate: bookIsCorporate, corporatePAN: bookCorporatePAN }) as any;
 
     // Check for TBO-level failure
     const responseStatus = data?.Response?.ResponseStatus;
@@ -1152,8 +1166,19 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
         returnResultIndex: splitReturn ? b.returnResultIndex : undefined,
       });
       if (isRefusal(net)) return res.status(net.status).json({ error: net.error, code: net.code });
-      b.Passengers = applyQuoteFares(b.Passengers, net.ob);
-      if (splitReturn && net.ib) b.returnPassengers = applyQuoteFares(b.returnPassengers, net.ib);
+      // GST details only where each leg's stored FareQuote allows them (F4);
+      // IsGSTMandatory is the server's, never the browser's.
+      const obGst = applyQuoteGst(applyQuoteFares(b.Passengers, net.ob), net.ob);
+      if (isRefusal(obGst)) return res.status(obGst.status).json({ error: obGst.error, code: obGst.code });
+      b.Passengers = obGst.passengers;
+      b.IsGSTMandatory = obGst.isGstMandatory;
+      b.returnIsGSTMandatory = obGst.isGstMandatory;
+      if (splitReturn && net.ib) {
+        const ibGst = applyQuoteGst(applyQuoteFares(b.returnPassengers, net.ib), net.ib);
+        if (isRefusal(ibGst)) return res.status(ibGst.status).json({ error: ibGst.error, code: ibGst.code });
+        b.returnPassengers = ibGst.passengers;
+        b.returnIsGSTMandatory = ibGst.isGstMandatory;
+      }
     }
     const { isReturn, returnResultIndex, returnTraceId, returnPassengers, isSpecialReturn, isReturnGDS } = req.body;
 
@@ -1213,16 +1238,9 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
     const lccTicketValErr = validateTBOTicketRequirements(lccFareResults, lccPassengers);
     if (lccTicketValErr) return res.status(400).json({ error: lccTicketValErr });
 
-    // Resolve corporate PAN from workspace
+    // Resolve corporate PAN: the workspace's, else its Customer's panNumber.
     const lccCustomerId = (req as any).workspace?.customerId?.toString() || (req.user as any)?.customerId;
-    const lccWorkspace = lccCustomerId
-      ? await CustomerWorkspace.findOne({ customerId: lccCustomerId }).select("pan").lean()
-      : null;
-    let lccCorporatePAN = (lccWorkspace as any)?.pan || "";
-    if (!lccCorporatePAN && (lccWorkspace as any)?.customerId) {
-      const lccCustomer = await Customer.findOne({ _id: (lccWorkspace as any).customerId }).select("pan").lean();
-      lccCorporatePAN = (lccCustomer as any)?.pan || "";
-    }
+    const lccCorporatePAN = await resolveCorporatePan(lccCustomerId);
     const lccIsCorporate = req.body.corporateBookingAllowed === true && !!lccCorporatePAN;
     const corpParams = lccIsCorporate ? { isCorporate: true as const, corporatePAN: lccCorporatePAN } : {};
 
@@ -1419,7 +1437,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
           ResultIndex: returnResultIndex,
           Passengers: ibPassengers,
           isNDC: ticketIsNDC,
-          ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
+          ...(req.body.returnIsGSTMandatory != null ? { IsGSTMandatory: req.body.returnIsGSTMandatory } : {}),
           ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
           ...corpParams,
         }) as any;
@@ -1476,7 +1494,7 @@ router.post("/ticket-lcc", requireAuth, requireSBT, requireFlightAccess, ...sbtB
           Segments: ibSegments,
           FreeBaggage: ibFreeBaggage,
           ...(req.body.GSTCompanyInfo ? { GSTCompanyInfo: req.body.GSTCompanyInfo } : {}),
-          ...(req.body.IsGSTMandatory != null ? { IsGSTMandatory: req.body.IsGSTMandatory } : {}),
+          ...(req.body.returnIsGSTMandatory != null ? { IsGSTMandatory: req.body.returnIsGSTMandatory } : {}),
           ...corpParams,
         };
         ibResult = await ticketLCC(ibPayload) as any;

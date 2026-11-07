@@ -75,6 +75,9 @@ router.get("/", requireAuth, requireWorkspace, requireAdmin, async (_req: any, r
         mobile: c.mobile || "",
         gstNumber: c.gstNumber || "",
         gstStatus: normalizeGstStatus(c.gstStatus),
+        // Business Profiles' "Bill From" select shows this for every record;
+        // the onboarding detail it loads for promoted records doesn't carry it.
+        defaultSellerGstin: c.defaultSellerGstin || "",
         legalName: c.legalName || c.name,
         website: c.website || "",
         address: c.address || {},

@@ -53,15 +53,29 @@ workspaceRouter.use(requireWorkspace);
 // with routes/myRewards.ts).
 workspaceRouter.use(requireInvoiceAccess);
 
+/**
+ * The caller's own invoices. Invoice.workspaceId holds the CustomerWorkspace._id,
+ * or the Customer._id when the client had no workspace at generation
+ * (resolveInvoiceWorkspace in services/invoiceGeneration.service.ts). Both ids
+ * come from the workspace requireWorkspace resolved for THIS caller
+ * (CustomerWorkspace.customerId is unique, so it names this company only) —
+ * never from the request. Unlike invoiceTenantClause there is no HOUSE
+ * "unrestricted" case: the portal only ever shows the caller's own company.
+ */
+function ownWorkspaceInvoiceClause(req: any): Record<string, any> {
+  const ids = [...new Set([req.workspaceObjectId, req.workspace?.customerId].map((v) => String(v ?? "")))]
+    .filter((v) => /^[a-f0-9]{24}$/i.test(v))
+    .map((v) => new mongoose.Types.ObjectId(v));
+  return ids.length ? { workspaceId: { $in: ids } } : { _id: { $in: [] } };
+}
+
 // GET /api/invoices/workspace/mine
 workspaceRouter.get("/mine", async (req: any, res: any) => {
   try {
     const page  = Math.max(1, parseInt(req.query.page)  || 1);
     const limit = Math.min(100, parseInt(req.query.limit) || 20);
 
-    const filter: Record<string, any> = {
-      workspaceId: req.workspaceObjectId,
-    };
+    const filter: Record<string, any> = ownWorkspaceInvoiceClause(req);
 
     if (req.query.status) filter.status = req.query.status;
 
@@ -98,7 +112,7 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
   try {
     const invoice = await Invoice.collection.findOne({
       _id: new mongoose.Types.ObjectId(req.params.id),
-      workspaceId: req.workspaceObjectId,
+      ...ownWorkspaceInvoiceClause(req),
     });
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 
@@ -135,7 +149,7 @@ workspaceRouter.post("/:id/pdf", async (req: any, res: any) => {
     );
 
     await Invoice.collection.updateOne(
-      { _id: new mongoose.Types.ObjectId(req.params.id), workspaceId: req.workspaceObjectId },
+      { _id: new mongoose.Types.ObjectId(req.params.id), ...ownWorkspaceInvoiceClause(req) },
       { $set: { pdfUrl } },
     );
 
@@ -162,7 +176,7 @@ workspaceRouter.put("/:id/declare-payment", async (req: any, res: any) => {
   try {
     const invoice: any = await Invoice.findOne({
       _id: req.params.id,
-      workspaceId: req.workspaceObjectId,
+      ...ownWorkspaceInvoiceClause(req),
     });
     if (!invoice) return res.status(404).json({ error: "Invoice not found" });
 

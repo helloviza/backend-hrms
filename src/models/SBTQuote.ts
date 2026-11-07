@@ -33,6 +33,11 @@ export interface ISBTQuote extends Document {
   // FLIGHT — TBO's FareQuote Fare and FareBreakdown, untouched (pre-margin).
   netFare?: Record<string, unknown> | null;
   netFareBreakdown?: Array<Record<string, unknown>>;
+  // FLIGHT — TBO's FareQuote GSTAllowed / IsGSTMandatory: whether GST details
+  // may (or must) go on the lead passenger at Book / Ticket (services/sbtQuote.ts
+  // applyQuoteGst). Absent on quotes taken before they were stored.
+  gstAllowed?: boolean;
+  isGstMandatory?: boolean;
   // HOTEL — PreBook cost figures for room 0 (NetAmount is what TBO Book needs).
   netAmount?: number;
   recommendedSellingRate?: number | null;
@@ -68,6 +73,8 @@ const SBTQuoteSchema = new Schema<ISBTQuote>({
   supplierReissueCharges: { type: Number },
   netFare: { type: Schema.Types.Mixed, default: undefined },
   netFareBreakdown: { type: Schema.Types.Mixed, default: undefined },
+  gstAllowed: { type: Boolean },
+  isGstMandatory: { type: Boolean },
   netAmount: { type: Number },
   recommendedSellingRate: { type: Number },
   agentCommission: { type: Number },

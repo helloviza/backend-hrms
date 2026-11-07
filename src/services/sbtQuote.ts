@@ -183,6 +183,45 @@ export function applyQuoteFares<P extends AnyObj>(passengers: P[] | undefined, q
   });
 }
 
+/** The five per-passenger GST nodes of TBO Book / Ticket (Book.aspx 5.7-5.11). */
+export const FLIGHT_GST_PAX_KEYS = ["GSTNumber", "GSTCompanyName", "GSTCompanyAddress", "GSTCompanyContactNumber", "GSTCompanyEmail"] as const;
+
+/**
+ * GST details go to TBO only where the stored FareQuote allows them: GSTAllowed
+ * or IsGSTMandatory (TBO's own flags, kept on the SBTQuote — never the
+ * browser's). Otherwise every passenger's GST nodes are removed. When the fare
+ * makes GST mandatory, the lead passenger must carry a GSTIN or the booking is
+ * refused before TBO is called. A quote taken before these flags were stored
+ * (no boolean on it) passes through unchanged, as before.
+ */
+export function applyQuoteGst<P extends AnyObj>(
+  passengers: P[] | undefined,
+  quote: AnyObj,
+): { ok: true; passengers: P[]; isGstMandatory: boolean } | Refusal {
+  const list = Array.isArray(passengers) ? passengers : [];
+  const known = typeof quote?.gstAllowed === "boolean" || typeof quote?.isGstMandatory === "boolean";
+  if (!known) return { ok: true, passengers: list, isGstMandatory: false };
+  const isGstMandatory = quote.isGstMandatory === true;
+  const allowed = quote.gstAllowed === true || isGstMandatory;
+  const out = allowed
+    ? list
+    : list.map((p) => {
+        const copy: AnyObj = { ...p };
+        for (const k of FLIGHT_GST_PAX_KEYS) delete copy[k];
+        return copy as P;
+      });
+  if (isGstMandatory) {
+    const lead: AnyObj | undefined = out.find((p) => p?.IsLeadPax) || out[0];
+    if (!String(lead?.GSTNumber ?? "").trim()) {
+      return {
+        ok: false, status: 400, code: "GST_REQUIRED",
+        error: "This fare needs your company's GST details. Add the GSTIN on the passenger page and try again.",
+      };
+    }
+  }
+  return { ok: true, passengers: out, isGstMandatory };
+}
+
 /** The quotes a Book / Ticket call may draw its net from: the payment row's
  *  (server-set by the gate or the checkout), else the request's. */
 function quoteIdsFor(req: AnyObj): string[] {
