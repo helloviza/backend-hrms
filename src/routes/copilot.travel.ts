@@ -54,10 +54,24 @@ import {
   mapTBOFlight,
   searchFlightsForChat,
 } from "../utils/plutoFlightSearch.js";
-import { parseDateToISO, extractPromptDateRange } from "../utils/plutoDate.js";
+import { parseDateToISO, extractPromptDateRange, resolveRelativeDate } from "../utils/plutoDate.js";
+import {
+  mentionsOffice,
+  mentionsNearMe,
+  isOfficePlace,
+  resolveOfficeCity,
+  suggestCurrentCity,
+  officeDisclosure,
+  parseCityAnswer,
+  spliceFlightAnswer,
+  OFFICE_ASK_TEXT,
+  OFFICE_ASK_CHIP,
+  OTHER_CITY_CHIP,
+} from "../utils/plutoUserLocation.js";
 import {
   isHotelRequest,
   extractHotelCity,
+  extractNamedPlaceCandidate,
   extractStarFilter,
   searchHotelsForChat,
   nightsBetween,
@@ -67,7 +81,7 @@ import {
   resolveHotelDestination,
   type HotelDestination,
 } from "../utils/plutoHotelDestination.js";
-import { countryFor } from "../data/destinationLookup.js";
+import { countryFor, lookupDestination } from "../data/destinationLookup.js";
 import {
   extractFlightDesignator,
   extractStatusDate,
@@ -617,7 +631,21 @@ async function runConciergeTurn(
   const requestId = crypto.randomUUID();
   const workspaceId = String((req as any).workspaceObjectId || "");
   try {
-    const { prompt, context, lastReply, videoAnalysisId } = req.body;
+    const { prompt, context: rawContext, lastReply, videoAnalysisId } = req.body;
+    // ONE-TURN "pending question" marker. Set (in the returned context) only
+    // when Pluto has just asked the user for a city — the flight origin, the
+    // office city, or "search here?" for a near-me hotel ask — so the short
+    // answer that follows ("Pune", a tapped suggestion) is routed back to the
+    // ask it answers. Consumed here and STRIPPED from the context every other
+    // branch round-trips, so it can never outlive the turn that answers it.
+    const pending: any =
+      rawContext && typeof rawContext === "object" && (rawContext as any).pending
+        ? (rawContext as any).pending
+        : null;
+    const context: any =
+      rawContext && typeof rawContext === "object" && "pending" in rawContext
+        ? (({ pending: _drop, ...rest }: any) => rest)(rawContext)
+        : rawContext;
     onStage?.("understanding");
 
     if (!prompt || typeof prompt !== "string") {
@@ -775,13 +803,39 @@ async function runConciergeTurn(
     // Returns a rich card with real booking links. Never passes to Pluto (no flight search there).
 
     // Match explicit AND implicit follow-up flight search requests
-    const isFlightRouteSearch = Boolean(
-      /(find|search|show|get|look up|check).{0,30}flight/i.test(prompt) ||
-      /flights?\s+(from|between|on|available|for)/i.test(prompt) ||
-      /flight\s+(option|price|fare|deal|available)/i.test(prompt) ||
-      /available.*flight/i.test(prompt) ||
-      /fly(ing)?\s+from\s+.{2,30}\s+to\s+/i.test(prompt)
+    const looksLikeFlightRouteSearch = (t: string) => Boolean(
+      /(find|search|show|get|look up|check).{0,30}flight/i.test(t) ||
+      // "to" added 2026-11-09: "Flights to Mumbai next week" (a My Space chip)
+      // is plainly a route search, and the frontend's hasPlanningIntent gate
+      // already treats "flights to" as one.
+      /flights?\s+(from|between|on|available|for|to)/i.test(t) ||
+      /flight\s+(option|price|fare|deal|available)/i.test(t) ||
+      /available.*flight/i.test(t) ||
+      /fly(ing)?\s+from\s+.{2,30}\s+to\s+/i.test(t)
     );
+
+    // A short answer to a pending FLIGHT question (we asked for the origin, or
+    // for the office city) → re-run the ORIGINAL ask with the answer spliced
+    // in, so every extractor below reads one consistent sentence. The answer
+    // is the user's own words (typed, or a suggestion they tapped), so it is
+    // treated exactly like a city they typed in the first place.
+    let flightPrompt: string = prompt;
+    let flightAnswered = false;
+    if (
+      pending?.kind === "flight" &&
+      typeof pending.prompt === "string" &&
+      (pending.need === "origin" || pending.need === "destination") &&
+      !looksLikeFlightRouteSearch(prompt)
+    ) {
+      const answer = parseCityAnswer(prompt);
+      const answerCity = answer ? lookupDestination(answer)?.city || answer : null;
+      if (answerCity && resolveIATA(answerCity)) {
+        flightPrompt = spliceFlightAnswer(pending.prompt, pending.need, answerCity);
+        flightAnswered = true;
+      }
+    }
+
+    const isFlightRouteSearch = flightAnswered || looksLikeFlightRouteSearch(prompt);
 
     if (isFlightRouteSearch) {
       // ── Multi-city: not supported in the chat path yet → LOUD downgrade ──
@@ -789,7 +843,7 @@ async function runConciergeTurn(
       // destination regex capture "A to B", which then fails IATA resolution and
       // would wrongly hit the unknown-city clarify. Detect up front, emit the
       // metric, and offer a single-leg search or a full-trip request instead.
-      if (isMultiCityIntent(prompt)) {
+      if (isMultiCityIntent(flightPrompt)) {
         await emitMetric(
           multicityDowngraded({ workspaceId, requestId, reason: "chat_unsupported" })
         );
@@ -809,12 +863,27 @@ async function runConciergeTurn(
       }
 
       // ── Extract from prompt with robust terminators ──
-      // Origin: "from <city> to/on/for/,"
-      const promptOriginMatch = prompt.match(/\bfrom\s+([A-Za-z][a-zA-Z ]{1,25}?)(?:\s+to\b|\s+on\b|\s+for\b|,|\.|$)/i);
-      // Destination: "to <city> on/by/for/,"  — includes "for" so "to Delhi for 8th March" works
-      const promptDestMatch   = prompt.match(/\bto\s+([A-Za-z][a-zA-Z ]{1,25}?)(?:\s+on\b|\s+by\b|\s+for\b|\s+and\b|,|\.|$)/i);
+      // The city capture is lazy, so it stops at the FIRST terminator. Time
+      // words are terminators: without them "flights to Mumbai next week"
+      // captured "Mumbai next week" — a city that resolves to no airport, so
+      // the turn asked "which airport?" about a city the user had just named.
+      // A digit ("to Mumbai 20 May"), "(", "?" and "!" end the city too.
+      const TIME_WORDS = String.raw`next|this|tomorrow|today|tonight|day\s+after|in|returning|return|back|week|weekend`;
+      // Origin: "from <city> to/on/for/<time word>/,"
+      const promptOriginMatch = flightPrompt.match(new RegExp(
+        String.raw`\bfrom\s+([A-Za-z][a-zA-Z ]{1,25}?)(?=\s+to\b|\s+on\b|\s+for\b|\s+by\b|\s+(?:${TIME_WORDS})\b|\s+\d|\s*\(|,|\.|\?|!|$)`, "i"));
+      // Destination: "to <city> on/by/for/and/from/<time word>/,"  — includes "for" so "to Delhi for 8th March" works
+      const promptDestMatch   = flightPrompt.match(new RegExp(
+        String.raw`\bto\s+([A-Za-z][a-zA-Z ]{1,25}?)(?=\s+on\b|\s+by\b|\s+for\b|\s+and\b|\s+from\b|\s+(?:${TIME_WORDS})\b|\s+\d|\s*\(|,|\.|\?|!|$)`, "i"));
       // Date: natural language or numeric
-      const dateMatch = prompt.match(/(\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)/i);
+      const dateMatch = flightPrompt.match(/(\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s+\d{4})?|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?|\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)/i);
+      // Relative date ("today", "tomorrow", "next week", "this weekend") → a
+      // concrete IST date, ONLY when no explicit date was typed. The rule used
+      // is said back to the user (relDateNote) so the choice is never silent.
+      const relDate = dateMatch ? null : resolveRelativeDate(flightPrompt);
+      const relDateNote = relDate
+        ? ` I read "${relDate.phrase}" as ${relDate.rule} (IST) — tell me if you meant another day.`
+        : "";
 
       // ── Context fallback — ONLY use locked trip data, NOT user profile/device location ──
       // locked.origin = explicitly set trip origin (e.g. "Delhi" from "plan trip from Delhi")
@@ -824,9 +893,9 @@ async function runConciergeTurn(
       const ctxDate   = context?.locked?.dates?.start  || null;
 
       // Extract passenger count
-      const paxMatch = prompt.match(
+      const paxMatch = flightPrompt.match(
         /\bfor\s+(\d+)\s*(?:people|persons?|pax|passengers?|travell?ers?|adults?)/i
-      ) || prompt.match(
+      ) || flightPrompt.match(
         /(\d+)\s*(?:people|persons?|pax|passengers?|travell?ers?|adults?)/i
       );
       const extractedAdults = paxMatch ? Math.min(parseInt(paxMatch[1]), 9) : 1;
@@ -837,12 +906,12 @@ async function runConciergeTurn(
       // "cheapest" ask). Require "<cabin> class" or a flight verb before the
       // word, and never treat a cabin word glued to a lodging noun as a cabin.
       const extractedCabin: "Economy" | "Premium Economy" | "Business" | "First" =
-        /\bpremium\s+economy\b/i.test(prompt) ? "Premium Economy"
-        : /\bfirst\s+class\b/i.test(prompt) ? "First"
+        /\bpremium\s+economy\b/i.test(flightPrompt) ? "Premium Economy"
+        : /\bfirst\s+class\b/i.test(flightPrompt) ? "First"
         : (
-            (/\bbusiness\s+class\b/i.test(prompt) ||
-             /\b(?:in|fly|flying|book|travel|travell?ing)\s+business\b/i.test(prompt)) &&
-            !/\bbusiness\s+(?:hotel|stay|accommodation|accomodation|property|resort)\b/i.test(prompt)
+            (/\bbusiness\s+class\b/i.test(flightPrompt) ||
+             /\b(?:in|fly|flying|book|travel|travell?ing)\s+business\b/i.test(flightPrompt)) &&
+            !/\bbusiness\s+(?:hotel|stay|accommodation|accomodation|property|resort)\b/i.test(flightPrompt)
           ) ? "Business"
         : "Economy";
 
@@ -851,9 +920,48 @@ async function runConciergeTurn(
       };
       const extractedCabinClass = cabinClassMap_chat[extractedCabin] ?? 2;
 
-      const rawOrigin      = promptOriginMatch?.[1]?.trim() || ctxOrigin || null;
-      const rawDestination = promptDestMatch?.[1]?.trim()   || ctxDest   || null;
-      const travelDate     = dateMatch?.[0]?.trim()         || ctxDate   || null;
+      let rawOrigin: string | null      = promptOriginMatch?.[1]?.trim() || ctxOrigin || null;
+      let rawDestination: string | null = promptDestMatch?.[1]?.trim()   || ctxDest   || null;
+      const travelDate     = dateMatch?.[0]?.trim() || relDate?.display || ctxDate || null;
+
+      // ── OFFICE as an endpoint ("flights from my office to Mumbai") ──
+      // The office comes from the PROFILE (User.jobLocation → Employee.location),
+      // only when it resolves to exactly one city, and the reply SAYS so. No
+      // profile city → ask for it; never a guess, never the device location.
+      let officeNote = "";
+      const officeEnd: "origin" | "destination" | null =
+        isOfficePlace(promptOriginMatch?.[1]) ? "origin"
+        : isOfficePlace(promptDestMatch?.[1]) ? "destination"
+        : null;
+      if (officeEnd) {
+        const office = await resolveOfficeCity(req);
+        const officeIATA = office.status === "RESOLVED" ? resolveIATA(office.city.cityName) : null;
+        if (office.status === "RESOLVED" && officeIATA) {
+          if (officeEnd === "origin") rawOrigin = office.city.cityName;
+          else rawDestination = office.city.cityName;
+          officeNote = officeDisclosure(
+            office.city.cityName,
+            officeEnd === "origin" ? "flight_origin" : "flight_destination",
+          );
+        } else {
+          return res.json({
+            ok: true,
+            reply: {
+              title: OFFICE_ASK_CHIP,
+              context: office.status === "RESOLVED"
+                ? `Your profile lists your office as ${office.city.cityName}, but I can't match it to an airport — which city should I fly ${officeEnd === "origin" ? "from" : "to"}?`
+                : OFFICE_ASK_TEXT,
+              nextSteps: [OFFICE_ASK_CHIP],
+              handoff: false,
+            },
+            context: {
+              ...(context && typeof context === "object" ? context : {}),
+              id: conversationId,
+              pending: { kind: "flight", need: officeEnd, prompt: flightPrompt },
+            },
+          });
+        }
+      }
 
       // ── Smart country → airport resolution ──
       // "Japan" → use most specific city from context (Osaka/Tokyo/etc.) if known
@@ -893,6 +1001,52 @@ async function runConciergeTurn(
       ].filter(Boolean);
 
       if (!originIATA || !destIATA) {
+        // ── No origin, destination known → maybe a CURRENT-LOCATION suggestion.
+        // Offered as a one-tap chip the user must confirm — the origin is NOT
+        // filled in (see the "BLR bug" exclusion above: device location must
+        // never silently become a trip origin). Only when the IP genuinely
+        // resolved (source "ip") through the strict ladder; otherwise the
+        // reply is exactly today's question. Either way the turn remembers
+        // what it asked (pending), so a bare "Pune" next turn is the answer.
+        if (!rawOrigin && destIATA) {
+          const askedContext = {
+            ...(context && typeof context === "object" ? context : {}),
+            id: conversationId,
+            pending: { kind: "flight", need: "origin", prompt: flightPrompt },
+          };
+          const here = await suggestCurrentCity(req);
+          const hereIATA = here ? resolveIATA(here.cityName) : null;
+          if (here && hereIATA && hereIATA !== destIATA) {
+            return res.json({
+              ok: true,
+              reply: {
+                title: "Where are you flying from?",
+                context:
+                  `I can search flights to ${destination}${travelDate ? ` on ${travelDate}` : ""}.${relDateNote} ` +
+                  `Where are you flying from?`,
+                nextSteps: [
+                  `Flying from ${here.cityName}? (based on your current location)`,
+                  OTHER_CITY_CHIP,
+                ],
+                handoff: false,
+              },
+              context: askedContext,
+            });
+          }
+          return res.json({
+            ok: true,
+            reply: {
+              title: "Which airport should I search?",
+              context: `I need both a departure and destination city to search flights. Could you give me the city name or its 3-letter airport code (e.g. "Delhi" or "DEL")?${relDateNote}`,
+              nextSteps: [
+                "Tell me the departure city or airport code",
+                "Tell me the destination city or airport code",
+              ],
+              handoff: false,
+            },
+            context: askedContext,
+          });
+        }
         const askWhich = unresolvedCities.length > 0
           ? `I couldn't match ${unresolvedCities.join(" and ")} to an airport.`
           : `I need both a departure and destination city to search flights.`;
@@ -921,7 +1075,7 @@ async function runConciergeTurn(
       // ── Round-trip: search both legs (JourneyType 2) when a return date is
       // known. (Multi-city was already handled + returned at the top.) ──
       const { wantsRoundTrip, returnDateRaw } =
-        resolveRoundTripIntent(prompt, context?.locked?.dates?.end || null, isoDate);
+        resolveRoundTripIntent(flightPrompt, context?.locked?.dates?.end || null, isoDate);
       const isoReturnDate = returnDateRaw ? parseDateToISO(returnDateRaw) : "";
       const journeyType: 1 | 2 = wantsRoundTrip && isoReturnDate ? 2 : 1;
 
@@ -937,10 +1091,10 @@ async function runConciergeTurn(
           : {};
       const mergedLocked: any = { ...priorLocked };
       if (!mergedLocked.origin && rawOrigin && originIATA) {
-        mergedLocked.origin = { city: origin, iata: originIATA, source: "user" };
+        mergedLocked.origin = { city: origin, iata: originIATA, source: officeNote && officeEnd === "origin" ? "profile" : "user" };
       }
       if (!mergedLocked.destination && rawDestination && destIATA) {
-        mergedLocked.destination = { name: destination, iata: destIATA, source: "user" };
+        mergedLocked.destination = { name: destination, iata: destIATA, source: officeNote && officeEnd === "destination" ? "profile" : "user" };
       }
       if (!mergedLocked.dates && isoDate) {
         mergedLocked.dates = { start: isoDate, ...(isoReturnDate ? { end: isoReturnDate } : {}), source: "user" };
@@ -978,7 +1132,7 @@ async function runConciergeTurn(
           ok: true,
           reply: {
             title: `Round trip: ${origin} → ${destination}`,
-            context: `You mentioned a round trip. What's your return date? Once I have it I'll search both the outbound and return legs.`,
+            context: officeNote + `You mentioned a round trip. What's your return date? Once I have it I'll search both the outbound and return legs.` + relDateNote,
             nextSteps: [
               `Tell me your return date (e.g. "20 May 2026")`,
               `Or say "one way" and I'll search just the outbound`,
@@ -1074,7 +1228,7 @@ async function runConciergeTurn(
 
       // State the cabin searched (Amendment S) and, when the user asked for the
       // cheapest, name the lowest fare found (Step 3 qualifier passthrough).
-      const wantsCheapest = /\bcheapest\b|\blowest\s+fare\b|\bbudget\b/i.test(prompt);
+      const wantsCheapest = /\bcheapest\b|\blowest\s+fare\b|\bbudget\b/i.test(flightPrompt);
       const cabinNote = extractedCabin !== "Economy" ? ` Cabin searched: ${extractedCabin}.` : " Cabin: Economy.";
       const cheapestNote = wantsCheapest && chatCheapest
         ? ` Cheapest fare found: ₹${(chatCheapest.fare?.offered ?? chatCheapest.fare?.published ?? 0).toLocaleString("en-IN")}.`
@@ -1126,8 +1280,8 @@ async function runConciergeTurn(
       // inline TBO hotel search is intentionally NOT wired here — there is no
       // chat-hotel helper and TBO hotel creds are environment-gated — so the
       // honest move is to acknowledge + hand off, never fake or drop it.)
-      const hotelAsk = /\b(hotels?|stay|accommodations?|accomodations?|property|resort|lodging)\b/i.test(prompt);
-      const hotelQualMatch = prompt.match(/\b(business|luxury|budget|boutique|premium|five[\s-]?star|5[\s-]?star|four[\s-]?star|4[\s-]?star)\s+(?:hotels?|stay|accommodations?|property|resort)/i);
+      const hotelAsk = /\b(hotels?|stay|accommodations?|accomodations?|property|resort|lodging)\b/i.test(flightPrompt);
+      const hotelQualMatch = flightPrompt.match(/\b(business|luxury|budget|boutique|premium|five[\s-]?star|5[\s-]?star|four[\s-]?star|4[\s-]?star)\s+(?:hotels?|stay|accommodations?|property|resort)/i);
       const hotelQual = hotelQualMatch ? hotelQualMatch[1].toLowerCase().replace(/[\s-]/g, "") : "";
       const hotelQualLabel = (hotelQual === "5star" || hotelQual === "fivestar") ? "5-star "
         : (hotelQual === "4star" || hotelQual === "fourstar") ? "4-star "
@@ -1154,13 +1308,13 @@ async function runConciergeTurn(
         ok: true,
         reply: {
           title: `Flights: ${origin} → ${destination}${travelDate ? "  ·  " + travelDate : ""}`,
-          context: (searchUnavailable
+          context: officeNote + (searchUnavailable
             ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
             : hasLiveFlights
               ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + cabinNote + cheapestNote + roundTripNote + routeInsightsNote + weatherNote
               : !isoDate
                 ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
-                : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`) + durationFlagNote + hotelNote,
+                : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`) + relDateNote + durationFlagNote + hotelNote,
           flightSearch: {
             origin:      { city: origin,      iata: originIATA },
             destination: { city: destination, iata: destIATA   },
@@ -1205,12 +1359,89 @@ async function runConciergeTurn(
     // honestly. It used to require a city, so an unresolvable one fell to the AI
     // path and got answered with a question about dates that were already
     // locked — a dead end no answer could clear.
-    const hotelIntent =
+    let hotelIntent =
       isHotelRequest(prompt) && !/\b(fly|flying|flight|flights)\b/i.test(prompt);
 
-    const hotelDest: HotelDestination = hotelIntent
-      ? await resolveHotelDestination(prompt, hotelLocked)
-      : { status: "NO_CITY" };
+    let hotelDest: HotelDestination = { status: "NO_CITY" };
+    // Where the destination came from, and whether this branch should ask for
+    // dates itself (destination settled by the profile or by an answer to our
+    // own question) rather than fall through to the model.
+    let hotelDestSource: "user" | "profile" = "user";
+    let hotelAskDates = false;
+
+    // Did the user name an actual place this turn? Then THEIR place wins over
+    // anything we know about them ("hotels near my office in Pune" → Pune).
+    const hotelNamedPlace = (() => {
+      if (!hotelIntent) return false;
+      if (extractHotelCity(prompt)) return true;
+      const named = extractNamedPlaceCandidate(prompt);
+      return Boolean(named && !isOfficePlace(named.raw));
+    })();
+
+    if (hotelIntent && !hotelNamedPlace && mentionsOffice(prompt)) {
+      /* ── OFFICE ("hotels near my office") — from the PROFILE, disclosed.
+       * User.jobLocation (fallback Employee.location), strict ladder, exactly
+       * one city. Anything else is a specific question — never UNSUPPORTED
+       * ("Hotels in my office"), never a guess, never the device location. */
+      const office = await resolveOfficeCity(req);
+      if (office.status !== "RESOLVED" || !office.city.cityCode || !office.city.countryCode) {
+        return res.json({
+          ok: true,
+          reply: {
+            title: OFFICE_ASK_CHIP,
+            context:
+              office.status === "RESOLVED"
+                ? `Your profile lists your office as ${office.city.cityName}, but I can't reach hotel inventory for it right now — try again shortly, or tell me another city.`
+                : OFFICE_ASK_TEXT,
+            nextSteps: [OFFICE_ASK_CHIP],
+            handoff: false,
+          },
+          context: { ...hotelCtx, id: conversationId, pending: { kind: "hotel", reason: "office" } },
+        });
+      }
+      hotelDest = {
+        status: "RESOLVED",
+        cityName: office.city.cityName,
+        countryCode: office.city.countryCode,
+        cityCode: office.city.cityCode,
+      };
+      hotelDestSource = "profile";
+      hotelAskDates = true;
+    } else if (hotelIntent && !hotelNamedPlace && mentionsNearMe(prompt)) {
+      /* ── NEAR ME — a one-tap CURRENT-LOCATION suggestion, never a search.
+       * Only when the IP genuinely resolved through the strict ladder; else
+       * this turn behaves exactly as it did before (today's question). */
+      const here = await suggestCurrentCity(req);
+      if (here && here.cityCode) {
+        return res.json({
+          ok: true,
+          reply: {
+            title: "Hotels near you",
+            context: `You seem to be around ${here.cityName} right now (based on your current location). Search there?`,
+            nextSteps: [`Search hotels in ${here.cityName} (my current location)`, OTHER_CITY_CHIP],
+            handoff: false,
+          },
+          context: { ...hotelCtx, id: conversationId, pending: { kind: "hotel", reason: "near_me" } },
+        });
+      }
+      hotelDest = await resolveHotelDestination(prompt, hotelLocked);
+    } else if (!hotelIntent && pending?.kind === "hotel") {
+      /* ── ANSWER to our own hotel question ("which city is your office in?",
+       * "other city — which one?"). The city is the user's own words, so it
+       * goes through the full honest ladder (ambiguous → ask, unknown →
+       * unsupported) exactly like "hotels in <city>" would. */
+      const answer = parseCityAnswer(prompt);
+      if (answer) {
+        const answered = await resolveHotelDestination(`hotels in ${answer}`, {});
+        if (answered.status !== "NO_CITY") {
+          hotelIntent = true;
+          hotelDest = answered;
+          hotelAskDates = answered.status === "RESOLVED";
+        }
+      }
+    } else if (hotelIntent) {
+      hotelDest = await resolveHotelDestination(prompt, hotelLocked);
+    }
     const hotelCity = hotelDest.status === "RESOLVED" ? hotelDest.cityName : null;
     const hotelCountry = hotelDest.status === "RESOLVED" ? hotelDest.countryCode : null;
 
@@ -1335,6 +1566,36 @@ async function runConciergeTurn(
       });
     }
 
+    /* ── DESTINATION SETTLED HERE (office profile, or an answer to our own
+     * city question), NO DATES. Same shape as the country branch above: ask
+     * only for the dates and lock the destination, so the next turn does not
+     * re-ask it. The profile source is disclosed in the reply itself. */
+    if (hotelLed && hotelAskDates && !(checkIn && checkOut)) {
+      return res.json({
+        ok: true,
+        reply: {
+          title: `Hotels in ${hotelCity}`,
+          context:
+            hotelDestSource === "profile"
+              ? `${officeDisclosure(hotelCity as string, "hotels_pending")}Which dates are you staying?`
+              : `Hotels in ${hotelCity} — which dates are you staying?`,
+          nextSteps: [
+            `What are your hotel check-in and check-out dates in ${hotelCity}?`,
+            "Search hotels in a different city",
+          ],
+          handoff: false,
+        },
+        context: {
+          ...hotelCtx,
+          id: conversationId,
+          locked: {
+            ...(hotelLocked || {}),
+            destination: { name: hotelCity, source: hotelDestSource },
+          },
+        },
+      });
+    }
+
     if (hotelLed && hotelCountry && checkIn && checkOut) {
       // When the gate fired on dates/city read from THIS prompt, they must be
       // locked here too. The branch returns before the locked-facts block below
@@ -1349,9 +1610,12 @@ async function runConciergeTurn(
           if (spanDays > 0) hotelLockedOut.duration = { days: spanDays, source: "derived" };
         }
       }
-      if (!hotelLockedOut.destination) {
-        hotelLockedOut.destination = { name: hotelCity, source: "user" };
+      // A profile-office search was explicitly asked for THIS turn, so it
+      // replaces any destination an earlier turn had locked.
+      if (!hotelLockedOut.destination || hotelDestSource === "profile") {
+        hotelLockedOut.destination = { name: hotelCity, source: hotelDestSource };
       }
+      const officeHotelNote = hotelDestSource === "profile" ? officeDisclosure(hotelCity as string, "hotels") : "";
       const hotelReturnContext = { ...hotelCtx, id: conversationId, locked: hotelLockedOut };
 
       onStage?.("checking_policy");
@@ -1398,7 +1662,7 @@ async function runConciergeTurn(
           ok: true,
           reply: {
             title: `Hotels in ${hotelCity}`,
-            context: `${why} Rather than guess at options, I'd rather hand this to our team — they can source and hold rooms directly.`,
+            context: `${officeHotelNote}${why} Rather than guess at options, I'd rather hand this to our team — they can source and hold rooms directly.`,
             nextSteps: [
               "Raise a request and our team will source options",
               "Try different dates",
@@ -1427,6 +1691,8 @@ async function runConciergeTurn(
         reply: {
           title: `Hotels in ${hotelResult.cityName || hotelCity}`,
           context:
+            // The office-profile source is disclosed BEFORE the results too.
+            officeHotelNote +
             // Disclose a country→city substitution BEFORE the results, so the
             // user is never left to infer that "Qatar" silently became "Doha".
             (hotelDest.status === "RESOLVED" && hotelDest.viaCountry
@@ -2126,10 +2392,10 @@ ${prompt}
      *   3. City doesn't resolve at all (UNSUPPORTED) → honest handoff,
      *      still no fabrication — mirrors the standalone hotel lane's own
      *      UNSUPPORTED branch above.
-     * NO_CITY is not handled separately: canPlan (which gates the model
-     * ever drafting an itinerary at all) already requires a locked or
-     * assumed destination, so resolveHotelDestination always has at least
-     * a name to classify as RESOLVED or UNSUPPORTED by the time this runs.
+     *   4. NO_CITY → strip and log. canPlan gates the ITINERARY on a known
+     *      destination, but nothing stops the model emitting hotels[] on a
+     *      gather turn with no city at all (audit 2026-11-09); those can
+     *      only be invented, so they never reach the user.
      *
      * Scope: hotels only. The itinerary skeleton (fullReply.itinerary) and
      * flight section are untouched by this block.
@@ -2195,6 +2461,18 @@ ${prompt}
         };
       } else if (itineraryDest.status === "UNSUPPORTED") {
         fullReply.hotels = undefined;
+      } else if (itineraryDest.status === "NO_CITY") {
+        // The model listed hotels while NO city is known — not named this
+        // turn, none locked. Nothing it listed can be searched or booked, so
+        // it is invented by construction ("hotels near my office" with no
+        // office on file was the live shape of this). Strip and log it.
+        const strippedCount = fullReply.hotels?.length ?? 0;
+        fullReply.hotels = undefined;
+        console.warn("[Pluto] stripped model-generated hotels on a NO_CITY turn", {
+          requestId,
+          conversationId: conversationContext.id,
+          count: strippedCount,
+        });
       }
     }
 

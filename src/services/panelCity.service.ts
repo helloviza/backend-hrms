@@ -14,7 +14,12 @@
 //      collection with a shared bookedAt).
 //   2. User.address.city
 //   3. CustomerWorkspace.address.city
-//   4. null — the caller must not render the two city-scoped sections, and
+//   4. The request IP's city (MaxMind via location.service), ONLY when the geo
+//      DB genuinely looked it up (source "ip") and the city canonicalised
+//      through the strict destinationLookup. Source "ip" — the UI labels it
+//      "around you", never "For you in" as if it were home. Read-only: no
+//      ActorLocation row is written for this. Added 2026-11-09.
+//   5. null — the caller must not render the two city-scoped sections, and
 //      the frontend offers a one-time inline "Where are you based?" prompt
 //      instead of guessing.
 
@@ -22,8 +27,13 @@ import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import TravelBooking from "../models/TravelBooking.js";
 import { lookupDestination } from "../data/destinationLookup.js";
+import { resolveCityFromIpBounded } from "./location.service.js";
 
-export type PanelCitySource = "booking" | "user" | "workspace" | null;
+export type PanelCitySource = "booking" | "user" | "workspace" | "ip" | null;
+
+/** The panel must never wait on geo: a cold instance's first lookup downloads
+ * the database and simply times out here, falling through to null. */
+const PANEL_IP_TIMEOUT_MS = 800;
 
 export interface PanelCityResult {
   city: string | null;
@@ -61,7 +71,10 @@ async function resolveFromBooking(userId: string): Promise<string | null> {
   return null;
 }
 
-export async function resolvePanelCity(userId: string): Promise<PanelCityResult> {
+export async function resolvePanelCity(
+  userId: string,
+  opts: { ip?: string | null } = {},
+): Promise<PanelCityResult> {
   const bookingCity = await resolveFromBooking(userId);
   if (bookingCity) return { city: bookingCity, source: "booking" };
 
@@ -74,6 +87,11 @@ export async function resolvePanelCity(userId: string): Promise<PanelCityResult>
     const ws = await CustomerWorkspace.findById(workspaceId).select("address").lean();
     const wsCity = (ws as any)?.address?.city?.trim();
     if (wsCity) return { city: wsCity, source: "workspace" };
+  }
+
+  if (opts.ip) {
+    const loc = await resolveCityFromIpBounded(opts.ip, PANEL_IP_TIMEOUT_MS);
+    if (loc.source === "ip" && loc.city) return { city: loc.city, source: "ip" };
   }
 
   return { city: null, source: null };

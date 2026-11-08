@@ -21,7 +21,8 @@ router.get("/city", async (req: any, res) => {
     const userId = req.user?.id || req.user?.sub;
     if (!userId) return res.json({ ok: true, city: null, source: null });
 
-    const result = await resolvePanelCity(userId);
+    // req.ip is the client address under server.ts's `trust proxy = 1`.
+    const result = await resolvePanelCity(userId, { ip: req.ip ?? null });
     return res.json({ ok: true, ...result });
   } catch {
     // Never fail the panel: city resolution is an enhancement, never a gate.

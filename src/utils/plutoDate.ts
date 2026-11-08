@@ -74,6 +74,85 @@ export function parseDateToISO(raw: string | null, now: Date = new Date()): stri
   return "";
 }
 
+/* ───────── Relative dates ("today", "tomorrow", "next week", "this weekend") ─────────
+ *
+ * Resolved against the IST calendar date (Asia/Kolkata, UTC+5:30, no DST) —
+ * the platform's working timezone — never the server's local clock.
+ *
+ * The rules, stated so the reply can say them back to the user:
+ *   today              → today (IST)
+ *   tomorrow           → today + 1
+ *   day after tomorrow → today + 2
+ *   next week          → the Monday of next week (today is a Monday → +7;
+ *                        Sunday → tomorrow)
+ *   this weekend       → the coming Saturday (today if Saturday; on a Sunday,
+ *                        today — the weekend is still on)
+ *   next weekend       → the Saturday of next week
+ * A relative phrase is a SINGLE departure date; it never invents a return.
+ */
+export interface RelativeDate {
+  /** YYYY-MM-DD */
+  iso: string;
+  /** "16 Nov 2026" — day-first so parseDateToISO reads it back unchanged. */
+  display: string;
+  /** The phrase the user typed, lower-case ("next week"). */
+  phrase: string;
+  /** Plain-English rule, for saying it back ("the Monday of next week"). */
+  rule: string;
+}
+
+const SHORT_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const WEEKDAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+
+/** IST calendar date of `now` as a UTC-midnight Date (so arithmetic is DST-free). */
+function istToday(now: Date): Date {
+  const ist = new Date(now.getTime() + 330 * 60 * 1000);
+  return new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()));
+}
+
+function addDays(d: Date, n: number): Date {
+  return new Date(d.getTime() + n * 86400000);
+}
+
+export function resolveRelativeDate(text: string | null | undefined, now: Date = new Date()): RelativeDate | null {
+  if (!text) return null;
+  const p = String(text).toLowerCase();
+  const today = istToday(now);
+  const dow = today.getUTCDay(); // 0 = Sunday … 6 = Saturday
+
+  let phrase: string | null = null;
+  let date: Date | null = null;
+  let rule = "";
+
+  if (/\bday\s+after\s+tomorrow\b/.test(p)) {
+    phrase = "day after tomorrow"; date = addDays(today, 2); rule = "two days from today";
+  } else if (/\btomorrow\b/.test(p)) {
+    phrase = "tomorrow"; date = addDays(today, 1); rule = "tomorrow";
+  } else if (/\b(?:today|tonight)\b/.test(p)) {
+    phrase = /\btonight\b/.test(p) ? "tonight" : "today"; date = today; rule = "today";
+  } else if (/\bnext\s+weekend\b/.test(p)) {
+    phrase = "next weekend";
+    const toSat = (6 - dow + 7) % 7; // this week's Saturday (0 if today)
+    // Mon-start weeks: on a Sunday, "next week" starts tomorrow → its Saturday is +6.
+    date = addDays(today, dow === 0 ? 6 : toSat + 7);
+    rule = "the Saturday of next week";
+  } else if (/\bthis\s+weekend\b|\b(?:on\s+)?the\s+weekend\b/.test(p)) {
+    phrase = "this weekend";
+    date = dow === 0 ? today : addDays(today, (6 - dow + 7) % 7);
+    rule = dow === 0 ? "today (the weekend is still on)" : "the coming Saturday";
+  } else if (/\bnext\s+week\b/.test(p)) {
+    phrase = "next week";
+    const isoDow = dow === 0 ? 7 : dow; // Mon=1 … Sun=7
+    date = addDays(today, 8 - isoDow);
+    rule = "the Monday of next week";
+  }
+
+  if (!phrase || !date) return null;
+  const iso = date.toISOString().slice(0, 10);
+  const display = `${date.getUTCDate()} ${SHORT_MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()}`;
+  return { iso, display, phrase, rule: `${rule} — ${WEEKDAYS[date.getUTCDay()]} ${display}` };
+}
+
 /* ───────── Prompt date-range extraction (the "locked facts" parser) ─────────
  *
  * Lifted VERBATIM out of copilot.travel.ts's locked-facts block so the hotel
