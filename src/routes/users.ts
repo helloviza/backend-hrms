@@ -3,7 +3,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import User from "../models/User.js";
 import { Onboarding } from "../models/Onboarding.js";
 import { requireAuth } from "../middleware/auth.js";
-import { requirePermission } from "../middleware/requirePermission.js";
+import { requirePermission, hasModulePermission } from "../middleware/requirePermission.js";
 import { requireRoles } from "../middleware/roles.js";
 import { clearMembershipCache, requireWorkspace } from "../middleware/requireWorkspace.js";
 import WorkspaceMembership from "../models/WorkspaceMembership.js";
@@ -32,6 +32,9 @@ import { renameUser } from "../services/personNames.js";
 import { personName } from "../services/actorNames.js";
 
 const r = Router();
+
+/** My Space accent swatch ids — the ONLY values POST /profile/update accepts. */
+export const MY_SPACE_ACCENTS = new Set(["black", "navy", "plum", "terracotta", "emerald"]);
 
 /**
  * Tenant isolation (multi-domain / multi-account safe)
@@ -289,6 +292,12 @@ r.get(
         // HRMS Access
         hrmsAccessRole:  u.hrmsAccessRole || "EMPLOYEE",
         hrmsAccessLevel: u.hrmsAccessLevel || "EMPLOYEE",
+
+        // My Space (audit H5): the SAME check POST /profile/update and
+        // /profile/avatar/confirm enforce (requirePermission("people","WRITE")),
+        // so the UI never offers an edit the server will refuse.
+        canEditProfile: await hasModulePermission(req, "people", "WRITE"),
+        mySpaceAccent:  u.mySpaceAccent || "black",
       });
     } catch (err) {
       next(err);
@@ -335,7 +344,10 @@ r.post(
   // fields on this route require. Every other field still needs it, unchanged.
   (req: Request, res: Response, next: NextFunction) => {
     const bodyKeys = Object.keys(req.body || {});
-    const isThemeOnly = bodyKeys.length > 0 && bodyKeys.every((k) => k === "uiThemePreset");
+    // mySpaceAccent (My Space swatch picker) is the same kind of personal UI
+    // preference, kept in its own field so it never clobbers uiThemePreset.
+    const isThemeOnly =
+      bodyKeys.length > 0 && bodyKeys.every((k) => k === "uiThemePreset" || k === "mySpaceAccent");
     if (isThemeOnly) return next();
     return requirePermission("people", "WRITE")(req, res, next);
   },
@@ -344,9 +356,15 @@ r.post(
       const userId = (req as any).user?.sub;
       if (!userId) return res.status(401).json({ error: "Unauthorized" });
 
-      const { name, phone, department, jobLocation, avatarKey, uiThemePreset } = req.body || {};
+      const { name, phone, department, jobLocation, avatarKey, uiThemePreset, mySpaceAccent } = req.body || {};
 
       const $set: any = {};
+      if (mySpaceAccent !== undefined) {
+        if (!MY_SPACE_ACCENTS.has(String(mySpaceAccent))) {
+          return res.status(400).json({ error: "Invalid mySpaceAccent" });
+        }
+        $set.mySpaceAccent = String(mySpaceAccent);
+      }
       if (name !== undefined) $set.name = name;
       if (phone !== undefined) $set.phone = phone;
       if (department !== undefined) $set.department = department;

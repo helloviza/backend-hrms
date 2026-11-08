@@ -54,6 +54,9 @@ const UserSchema = new Schema(
      * a schema migration.
      */
     uiThemePreset: { type: String, trim: true, default: "default" },
+    // My Space accent swatch (routes/users.ts MY_SPACE_ACCENTS). Separate from
+    // uiThemePreset, which belongs to the Travel Spend palette picker.
+    mySpaceAccent: { type: String, trim: true, enum: ["black", "navy", "plum", "terracotta", "emerald"], default: "black" },
 
     phone: { type: String, trim: true },
     personalContact: { type: String, trim: true }, // personal mobile

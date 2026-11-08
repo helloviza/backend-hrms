@@ -1,6 +1,6 @@
 // Test-database guard: tests (and seeds) only ever run against a local DB.
 import { describe, it, expect, afterEach } from "vitest";
-import { isLocalMongoUri, assertLocalDatabase } from "./assertLocalDatabase.js";
+import { isLocalMongoUri, assertLocalDatabase } from "../seed/assertLocalDatabase.js";
 import {
   guardTestDatabase,
   guardTestStorage,

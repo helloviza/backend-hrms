@@ -58,6 +58,8 @@ import bookingHistory from "./routes/bookingHistory.js";
 // Newly added modules
 import users from "./routes/users.js";
 import stats from "./routes/stats.js";
+import mySpaceRouter from "./routes/mySpace.js";
+import myApprovalsRouter from "./routes/myApprovals.js";
 import logs from "./routes/logs.js";
 import stubs from "./routes/stubs.js";
 import passwordRoutes from "./routes/password.js";
@@ -712,6 +714,9 @@ app.use("/api/users", users);
 // HRMS
 app.use("/api/employees", employeesRouter);
 app.use("/api/stats", stats);
+// My Space (/profile/me) — caller-own aggregates, see docs/design/my-space-v3/build-plan.md
+app.use("/api/my-space", mySpaceRouter);
+app.use("/api/my-approvals", myApprovalsRouter);
 app.use("/api/logs", logs);
 app.use("/api/attendance", attendance);
 app.use("/api/leaves", leaves);

@@ -10,6 +10,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireWorkspace } from "../middleware/requireWorkspace.js";
 import { requireTravelMode, requireTravelModeFor } from "../middleware/travelModeGuard.js";
 import Proposal from "../models/Proposal.js";
+import { proposalInboxFor } from "../services/approvalInbox.service.js";
 import ApprovalRequest from "../models/ApprovalRequest.js";
 import User from "../models/User.js";
 
@@ -815,39 +816,14 @@ router.get("/inbox", requireAnyAuth, requireWorkspace, async (req: Request, res:
     const userEmail = normEmail(aReq.user?.email);
     if (!userEmail) return res.status(401).json({ error: "Unauthenticated" });
 
-    const proposalFilter: any = {
-      status: "SUBMITTED",
-      workspaceId: (req as any).workspaceObjectId,
-    };
-    const proposals = await Proposal.find(proposalFilter)
-      .sort({ updatedAt: -1 })
-      .limit(200)
-      .lean();
-
-    if (!proposals.length) return res.json({ ok: true, items: [] });
-
-    const reqObjIds: mongoose.Types.ObjectId[] = [];
-    for (const p of proposals as any[]) {
-      const rid = String(p?.requestId || "").trim();
-      if (mongoose.Types.ObjectId.isValid(rid)) reqObjIds.push(new mongoose.Types.ObjectId(rid));
-    }
-    if (!reqObjIds.length) return res.json({ ok: true, items: [] });
-
-    const reqDocs = await ApprovalRequest.find({ _id: { $in: reqObjIds } }).lean();
-    const reqMap = new Map<string, AnyObj>();
-    for (const r of reqDocs as any[]) reqMap.set(String(r._id), r);
-
-    const out: AnyObj[] = [];
-
-    for (const p of proposals as any[]) {
-      const rid = String(p?.requestId || "").trim();
-      const ar = reqMap.get(rid);
-      if (!ar) continue;
-
-      if (!(await proposalDeciders(ar)).includes(userEmail)) continue;
-
-      out.push({ ...(p as any), _canDecide: true });
-    }
+    // SUBMITTED proposals this caller may decide (proposalDeciders), filtered
+    // BEFORE the 200 cap — services/approvalInbox.service.ts, shared with My
+    // Space's GET /api/my-approvals so its card lists exactly this inbox.
+    const { items: out } = await proposalInboxFor({
+      workspaceObjectId: (req as any).workspaceObjectId,
+      email: userEmail,
+    });
+    if (!out.length) return res.json({ ok: true, items: [] });
 
     const enriched = await enrichProposalsWithRequestData(out);
     return res.json({ ok: true, items: enriched.map((p: AnyObj) => sanitizeApprovalForViewer(p, aReq.user)) });

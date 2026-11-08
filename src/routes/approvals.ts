@@ -67,6 +67,7 @@ import ApprovalSelectionSnapshot from "../models/ApprovalSelectionSnapshot.js";
 import { markRequestDone, notifyRequesterProgress, latestProposalsFor, closedCaseRefusal } from "../services/approvalProgress.js";
 import { requestDocumentsVisibleTo, sendRequestDocument } from "../services/bookingDocuments.js";
 import { actsAsWorkspaceLeader, getActiveMembership } from "../services/activeMembership.js";
+import { travelRequestInboxQuery, TRAVEL_INBOX_SORT, type TravelInboxScope } from "../services/approvalInbox.service.js";
 import {
   prepareCartSelections,
   writeSelectionSnapshots,
@@ -793,45 +794,22 @@ router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("A
 
 router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
-    // SBT users must not access approval flow (see /requests/mine)
-    const am = await getActiveMembership(req);
-    if (!am) return res.status(403).json(ACCOUNT_NOT_FOUND);
-    if (am.flags.sbtEnabled === true && !(await actsAsWorkspaceLeader(req))) {
-      return res.status(403).json({ error: "SBT users cannot access approval inbox.", code: "SBT_USER_CANNOT_ACCESS_APPROVALS" });
+    // Who sees what (SBT-user refusal, Workspace Leader = whole workspace,
+    // otherwise managerEmail / meta.ccLeaders, never your own request) lives in
+    // services/approvalInbox.service.ts — shared with My Space's
+    // GET /api/my-approvals so its card lists exactly this inbox.
+    const scope = await travelRequestInboxQuery(req);
+    // (explicit narrowing — tsconfig has strictNullChecks off, so `!scope.ok`
+    // alone does not narrow the union)
+    if (scope.ok === false) {
+      const denied = scope as Extract<TravelInboxScope, { ok: false }>;
+      return res.status(denied.status).json(denied.body);
     }
+    const { email, isWL: isWLInbox, notOwn, query: inboxQuery } = scope as Extract<TravelInboxScope, { ok: true }>;
 
-    const email = normEmail(req.user?.email);
     // ?from&to&by — narrows every tab (utils/dateRange.ts).
     const range = dateRangeOr400(req, res);
     if (range === false) return;
-
-    // WORKSPACE_LEADER sees all pending requests in their workspace (a
-    // Leader in this company — not a Leader of another company they belong to)
-    const isWLInbox = await actsAsWorkspaceLeader(req);
-
-    // Nobody sees their own request as something to approve.
-    const notOwn = { frontlinerEmail: { $not: exactIRegex(email) } };
-
-    const inboxQuery = isWLInbox
-      ? {
-          status: "pending",
-          stage: { $in: ["REQUEST_RAISED", "REQUEST_ON_HOLD"] },
-          workspaceId: req.workspaceObjectId,
-          ...notOwn,
-        }
-      : {
-          $and: [
-            {
-              status: "pending",
-              stage: { $in: ["REQUEST_RAISED", "REQUEST_ON_HOLD"] },
-              workspaceId: req.workspaceObjectId,
-              ...notOwn,
-            },
-            {
-              $or: [{ managerEmail: exactIRegex(email) }, { "meta.ccLeaders": exactIRegex(email) }],
-            },
-          ],
-        };
 
     // ?view=all — the inbox page's tabs: also the requests waiting on the
     // requester's reply (same scope as pending) and the ones this approver
@@ -886,7 +864,7 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
     }
 
     const rows = await ApprovalRequest.find(withDateRange(inboxQuery, range))
-      .sort({ updatedAt: -1, createdAt: -1 })
+      .sort(TRAVEL_INBOX_SORT)
       .lean()
       .exec();
 

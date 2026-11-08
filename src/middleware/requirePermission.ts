@@ -79,6 +79,33 @@ export function requireAnyPermission(
   }
 }
 
+/**
+ * hasModulePermission — the boolean answer to "would requirePermission(module,
+ * minAccess) let this request through?", WITHOUT sending a response.
+ *
+ * Mirrors requirePermission below branch-for-branch (isSuperAdmin → roles
+ * SUPERADMIN → UserPermission.modules[module] access check). requirePermission
+ * itself is intentionally not refactored onto this; parity is pinned by
+ * hasModulePermission.test.ts instead. Used by GET /users/profile to tell the
+ * UI whether the profile-edit routes will accept the caller (audit H5).
+ */
+export async function hasModulePermission(
+  req: Request,
+  module: string,
+  minAccess: 'READ' | 'WRITE' | 'FULL'
+): Promise<boolean> {
+  if (isSuperAdmin(req)) return true
+  const user = (req as any).user
+  const userId = String(user?._id || user?.id || user?.sub || '')
+  if (!userId) return false
+  if (Array.isArray(user.roles) && user.roles.includes('SUPERADMIN')) return true
+  const perm = await UserPermission.findOne({ userId }).lean()
+  if (!perm) return false
+  const mod = (perm.modules as any)?.[module]
+  if (!mod || mod.access === 'NONE') return false
+  return hasAccess(mod.access, minAccess)
+}
+
 export function requirePermission(
   module: string,
   minAccess: 'READ' | 'WRITE' | 'FULL'
