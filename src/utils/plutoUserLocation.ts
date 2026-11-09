@@ -28,6 +28,7 @@ import { lookupDestination, countryFor } from "../data/destinationLookup.js";
 import { normalizeSearch } from "../jobs/static-data-refresh.js";
 import { findCatalogMatches, pickCatalogCity, cityNameVariants } from "./plutoHotelDestination.js";
 import { resolveCityFromIpBounded } from "../services/location.service.js";
+import { resolveIATA } from "./plutoIata.js";
 
 /* ───────── Phrase detection ───────── */
 
@@ -264,17 +265,138 @@ export async function suggestCurrentCity(
   req: any,
   opts: { timeoutMs?: number; deps?: StrictDeps } = {},
 ): Promise<StrictCity | null> {
+  let loc: ResolvedLocation | null = null;
   try {
-    const loc = await resolveCityFromIpBounded(req?.ip ?? null, opts.timeoutMs ?? IP_SUGGESTION_TIMEOUT_MS);
-    if (loc.source !== "ip" || !loc.city) return null;
+    loc = await resolveCityFromIpBounded(req?.ip ?? null, opts.timeoutMs ?? IP_SUGGESTION_TIMEOUT_MS);
+    if (loc.source !== "ip" || !loc.city) {
+      logSuggestion("hotel", loc, loc.source === "ip" ? "city_not_in_lookup" : "no_ip_city");
+      return null;
+    }
     const r = await resolveCityStrict(loc.city, opts.deps ?? DEFAULT_DEPS);
+    logSuggestion("hotel", loc, r.status === "ONE" ? "offered" : "not_strict");
     return r.status === "ONE" ? r.city : null;
   } catch {
+    logSuggestion("hotel", loc, "error");
     return null;
   }
 }
 
+type ResolvedLocation = Awaited<ReturnType<typeof resolveCityFromIpBounded>>;
+
+/** What kind of address the lookup saw — derived, so no IP is ever needed in a log. */
+function ipKindOf(loc: ResolvedLocation | null): string {
+  if (!loc) return "unknown";
+  if (loc.source === "private-ip") return "private";
+  if (loc.source === "unavailable-non-http") return "none";
+  if (String(loc.reason || "").startsWith("invalid_ip")) return "invalid";
+  return "public";
+}
+
+/**
+ * One line per current-location suggestion, so a missing chip is
+ * explainable from the logs. source / reason / ipKind / outcome ONLY —
+ * never the IP, never the city (it is the user's location).
+ */
+function logSuggestion(surface: "flight" | "hotel", loc: ResolvedLocation | null, outcome: string): void {
+  console.log(
+    `[pluto-location] suggestion ${JSON.stringify({
+      surface,
+      source: loc?.source ?? null,
+      reason: loc?.reason ?? null,
+      ipKind: ipKindOf(loc),
+      outcome,
+    })}`,
+  );
+}
+
+/**
+ * Cities the geo database reports that have NO airport of their own, mapped
+ * to the airport city people there actually fly from. Used ONLY for the
+ * flight-origin suggestion chip, and the chip says so ("nearest airport to
+ * Gurugram"). Never used for hotels: a hotel in Gurugram is in Gurugram.
+ * Keys are normalizeSearch() forms; India only.
+ */
+export const NEAREST_AIRPORT_CITY: Readonly<Record<string, string>> = {
+  gurugram: "Delhi",
+  gurgaon: "Delhi",
+  noida: "Delhi",
+  faridabad: "Delhi",
+  ghaziabad: "Delhi",
+  thane: "Mumbai",
+};
+
+export interface FlightOriginSuggestion {
+  /** The airport city to fly from (already strict-resolved). */
+  city: StrictCity;
+  iata: string;
+  /** Set when the user is in a city with no airport: the city they are in. */
+  nearestTo: string | null;
+}
+
+/**
+ * The flight-origin chip's city: the IP city when it has an airport, else
+ * its nearest airport city from NEAREST_AIRPORT_CITY. Same rules as
+ * suggestCurrentCity — source "ip" only, strict ladder, suggestion only,
+ * never throws, never blocks longer than the timeout.
+ */
+export async function suggestFlightOrigin(
+  req: any,
+  opts: { timeoutMs?: number; deps?: StrictDeps; iata?: (city: string) => string | null } = {},
+): Promise<FlightOriginSuggestion | null> {
+  const deps = opts.deps ?? DEFAULT_DEPS;
+  const iataOf = opts.iata ?? resolveIATA;
+  let loc: ResolvedLocation | null = null;
+  try {
+    loc = await resolveCityFromIpBounded(req?.ip ?? null, opts.timeoutMs ?? IP_SUGGESTION_TIMEOUT_MS);
+    if (loc.source !== "ip" || !(loc.city || loc.rawCity)) {
+      logSuggestion("flight", loc, "no_ip_city");
+      return null;
+    }
+
+    if (loc.city) {
+      const r = await resolveCityStrict(loc.city, deps);
+      const iata = r.status === "ONE" ? iataOf(r.city.cityName) : null;
+      if (r.status === "ONE" && iata) {
+        logSuggestion("flight", loc, "offered");
+        return { city: r.city, iata, nearestTo: null };
+      }
+    }
+
+    const here = loc.city || loc.rawCity || "";
+    const airportCity = loc.country === "IN" ? NEAREST_AIRPORT_CITY[normalizeSearch(here)] : undefined;
+    if (airportCity) {
+      const r = await resolveCityStrict(airportCity, deps);
+      const iata = r.status === "ONE" ? iataOf(r.city.cityName) : null;
+      if (r.status === "ONE" && iata) {
+        logSuggestion("flight", loc, "offered_nearest_airport");
+        return { city: r.city, iata, nearestTo: here };
+      }
+    }
+
+    logSuggestion("flight", loc, loc.city ? "no_airport" : "city_not_in_lookup");
+    return null;
+  } catch {
+    logSuggestion("flight", loc, "error");
+    return null;
+  }
+}
+
+/** The chip text for a flight-origin suggestion. Ends the question at "?" so
+ * a tap submits "Flying from <city>?" and parseCityAnswer reads <city>.
+ * The note must NEVER contain " to ": a tapped chip is checked by
+ * looksLikeFlightRouteSearch first, and "Flying from X … to Y" would read as a
+ * brand-new route search instead of the answer. */
+export function flightOriginChip(s: FlightOriginSuggestion): string {
+  return s.nearestTo
+    ? `Flying from ${s.city.cityName}? (nearest airport for your current location, ${s.nearestTo})`
+    : `Flying from ${s.city.cityName}? (based on your current location)`;
+}
+
 export const OTHER_CITY_CHIP = "Other city — which one?";
+
+/** The origin question when there is no location chip to offer. Ends in "?"
+ * so the concierge prefills it and the user completes it with the city. */
+export const FLIGHT_ORIGIN_ASK_CHIP = "Flying from which city?";
 
 /* ───────── Answers to a pending question ───────── */
 

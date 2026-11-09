@@ -19,6 +19,7 @@ const H = vi.hoisted(() => ({
   searchFlightsMock: vi.fn(),
   officeMock: vi.fn(),
   hereMock: vi.fn(),
+  flightHereMock: vi.fn(),
   resolveHotelDestinationMock: vi.fn(),
   searchHotelsForChatMock: vi.fn(),
   invokePlutoMock: vi.fn(),
@@ -45,7 +46,12 @@ vi.mock("../utils/plutoMemory.js", () => ({
 }));
 vi.mock("../utils/plutoUserLocation.js", async (importOriginal) => {
   const actual: any = await importOriginal();
-  return { ...actual, resolveOfficeCity: H.officeMock, suggestCurrentCity: H.hereMock };
+  return {
+    ...actual,
+    resolveOfficeCity: H.officeMock,
+    suggestCurrentCity: H.hereMock,
+    suggestFlightOrigin: (...a: any[]) => H.flightHereMock(...a),
+  };
 });
 vi.mock("../utils/plutoHotelDestination.js", async (importOriginal) => {
   const actual: any = await importOriginal();
@@ -59,7 +65,8 @@ vi.mock("../utils/plutoHotelSearch.js", async (importOriginal) => {
 import express from "express";
 import request from "supertest";
 import router from "./copilot.travel.js";
-import { OFFICE_ASK_TEXT, OFFICE_ASK_CHIP, OTHER_CITY_CHIP } from "../utils/plutoUserLocation.js";
+import { OFFICE_ASK_TEXT, OFFICE_ASK_CHIP, OTHER_CITY_CHIP, FLIGHT_ORIGIN_ASK_CHIP, flightOriginChip } from "../utils/plutoUserLocation.js";
+import { resolveIATA } from "../utils/plutoIata.js";
 
 const WS = "656565656565656565656565";
 const app = express();
@@ -100,6 +107,14 @@ beforeEach(() => {
   Object.values(H).forEach((m) => m.mockReset());
   H.searchFlightsMock.mockResolvedValue(oneFlight);
   H.hereMock.mockResolvedValue(null);
+  // The flight lane's suggestion, driven by the same "IP city" mock so every
+  // "IP never consulted" assertion below covers both lanes. A city with an
+  // airport is offered as itself; nearest-airport cases set this directly.
+  H.flightHereMock.mockImplementation(async (req: any) => {
+    const c = await H.hereMock(req);
+    const iata = c ? resolveIATA(c.cityName) : null;
+    return c && iata ? { city: c, iata, nearestTo: null } : null;
+  });
   H.officeMock.mockResolvedValue({ status: "ASK", raw: null, reason: "empty" });
   H.resolveHotelDestinationMock.mockResolvedValue({ status: "NO_CITY" });
   H.invokePlutoMock.mockResolvedValue({ title: "Sure", context: "Tell me more.", nextSteps: [] });
@@ -171,19 +186,50 @@ describe("#2a — no origin: current location is a SUGGESTION, never a silent fi
     expect(H.searchFlightsMock).toHaveBeenCalledWith(expect.objectContaining({ origin: "PNQ", destination: "BOM" }));
   });
 
-  it("IP unavailable → today's question, no location chip; a typed 'Pune' still answers it", async () => {
+  it("IP unavailable → asks for the ORIGIN only (destination is known); one '?' chip; a typed 'Pune' answers it", async () => {
     const ask = await chat("Find flights to Mumbai next week");
-    expect(ask.reply.title).toBe("Which airport should I search?");
-    expect(ask.reply.context).toMatch(/^I need both a departure and destination city to search flights\./);
-    expect(ask.reply.nextSteps.join(" ")).not.toMatch(/current location/);
+    expect(ask.reply.title).toBe("Where are you flying from?");
+    expect(ask.reply.context).toBe(
+      `I can search flights to Mumbai on 16 Nov 2026. I read "next week" as the Monday of next week — Monday 16 Nov 2026 (IST) — tell me if you meant another day. Where are you flying from? A city name or 3-letter airport code works (e.g. "Delhi" or "DEL").`,
+    );
+    expect(ask.reply.context).not.toMatch(/both a departure and destination/);
+    expect(ask.reply.nextSteps).toEqual([FLIGHT_ORIGIN_ASK_CHIP]);
+    expect(JSON.stringify(ask.reply.nextSteps)).not.toMatch(/destination/i);
     await chat("Pune", ask.context);
     expect(H.searchFlightsMock).toHaveBeenCalledWith(expect.objectContaining({ origin: "PNQ", destination: "BOM" }));
   });
 
-  it("an IP city equal to the destination is not offered", async () => {
+  it("the '?' chip prefilled + completed ('Flying from which city? Hyderabad') → HYD→BOM", async () => {
+    const ask = await chat("Find flights to Mumbai next week");
+    await chat(`${FLIGHT_ORIGIN_ASK_CHIP} Hyderabad`, ask.context);
+    expect(H.searchFlightsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ origin: "HYD", destination: "BOM", departDate: "2026-11-16" }),
+    );
+  });
+
+  it("an IP city equal to the destination is not offered — the origin question instead", async () => {
     H.hereMock.mockResolvedValue({ cityName: "Mumbai", countryCode: "IN", cityCode: "144306" });
     const body = await chat("Find flights to Mumbai next week");
-    expect(body.reply.nextSteps.join(" ")).not.toMatch(/current location/);
+    expect(body.reply.nextSteps).toEqual([FLIGHT_ORIGIN_ASK_CHIP]);
+  });
+
+  it("no airport where the user is (Gurugram) → nearest airport offered and disclosed; tap → DEL→BOM", async () => {
+    // The REAL chip builder, so a wording change that breaks the tap fails here.
+    H.flightHereMock.mockResolvedValue({
+      city: { cityName: "Delhi", countryCode: "IN", cityCode: null }, iata: "DEL", nearestTo: "Gurugram",
+    });
+    expect(flightOriginChip({ city: { cityName: "Delhi", countryCode: "IN", cityCode: null }, iata: "DEL", nearestTo: "Gurugram" }))
+      .toBe("Flying from Delhi? (nearest airport for your current location, Gurugram)");
+    const ask = await chat("Find flights to Mumbai next week");
+    expect(ask.reply.nextSteps).toEqual([
+      "Flying from Delhi? (nearest airport for your current location, Gurugram)",
+      OTHER_CITY_CHIP,
+    ]);
+    expect(ask.context.locked?.origin).toBeUndefined();
+    await chat(ask.reply.nextSteps[0], ask.context);
+    expect(H.searchFlightsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ origin: "DEL", destination: "BOM", departDate: "2026-11-16" }),
+    );
   });
 
   it("a stale pending marker never hijacks a NEW request", async () => {

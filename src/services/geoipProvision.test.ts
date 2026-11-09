@@ -9,7 +9,15 @@
 // parser and nothing else.
 
 import { describe, it, expect } from "vitest";
-import { findMmdbInTar, buildDateFromMemberName, GEOLITE2_ATTRIBUTION, GEOIP_DB_PATH } from "./geoipProvision.js";
+import {
+  findMmdbInTar,
+  buildDateFromMemberName,
+  parseSha256Sidecar,
+  describeUrl,
+  describeBuild,
+  GEOLITE2_ATTRIBUTION,
+  GEOIP_DB_PATH,
+} from "./geoipProvision.js";
 
 /** A single POSIX (ustar) tar member: 512-byte header + NUL-padded payload. */
 function tarMember(name: string, payload: Buffer, typeFlag = "0"): Buffer {
@@ -100,6 +108,46 @@ describe("buildDateFromMemberName", () => {
 
   it("is null when the path carries no date", () => {
     expect(buildDateFromMemberName("GeoLite2-City/GeoLite2-City.mmdb")).toBeNull();
+  });
+});
+
+describe("parseSha256Sidecar — fail closed on anything that is not a digest", () => {
+  const hex = "83bc1378c56dc56b5c6b0728707f8e7d70b1383a7ec4b92b4a994cd41b2986ff";
+  it("reads MaxMind's '<hex>  <filename>' format", () => {
+    expect(parseSha256Sidecar(`${hex}  GeoLite2-City_20261104.tar.gz\n`)).toBe(hex);
+    expect(parseSha256Sidecar(hex.toUpperCase())).toBe(hex);
+  });
+  it.each(["", "   ", "Invalid license key", "<html>error</html>", hex.slice(0, 63), `${hex}0`])(
+    "rejects %j",
+    (body) => expect(parseSha256Sidecar(body)).toBeNull(),
+  );
+});
+
+describe("describeUrl — what is allowed into a log line", () => {
+  it("drops the licence key and keeps only edition/suffix/date", () => {
+    const out = describeUrl(
+      "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=SECRETKEY123&suffix=tar.gz",
+    );
+    expect(out).toBe("https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&suffix=tar.gz");
+    expect(out).not.toContain("SECRETKEY123");
+  });
+  it("drops a signed storage redirect's query string entirely", () => {
+    const out = describeUrl("https://mm-prod.r2.example.com/GeoLite2-City.tar.gz?X-Amz-Signature=abc&X-Amz-Credential=def");
+    expect(out).toBe("https://mm-prod.r2.example.com/GeoLite2-City.tar.gz");
+  });
+  it("never throws on junk", () => {
+    expect(describeUrl("not a url license_key=SECRET")).toBe("<unparseable url>");
+  });
+});
+
+describe("describeBuild — 'which edition loaded'", () => {
+  it("formats type + build date from reader metadata", () => {
+    expect(describeBuild({ databaseType: "GeoLite2-City", buildEpoch: new Date("2026-11-04T12:00:00Z") })).toBe(
+      "GeoLite2-City build 2026-11-04",
+    );
+  });
+  it("is still a line when metadata is missing", () => {
+    expect(describeBuild(undefined)).toBe("GeoLite2-City build unknown-date");
   });
 });
 

@@ -14,7 +14,7 @@ import express from "express";
 // already on the boot path via routes/manualBookings.ts → services/
 // location.service.ts, so importing it here adds nothing new to load, and its
 // self-execution guard (isMainModule) is false under `node dist/server.js`.
-import { ensureGeoipDatabase } from "./services/geoipProvision.js";
+import { ensureGeoipDatabase, startGeoipRefresh } from "./services/geoipProvision.js";
 import cookieParser from "cookie-parser";
 import { requestLogger } from "./utils/requestLogger.js";
 import compression from "compression";
@@ -1536,8 +1536,21 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
          * blocking or throwing boot step is precisely the shape that
          * rolled a previous release back. Failure is already non-fatal
          * inside the provisioner; this catch is the second guard, not the
-         * first. */
-        void ensureGeoipDatabase().catch(() => {});
+         * first.
+         *
+         * ── NEVER SILENT (2026-11-09) ────────────────────────────────
+         * This used to be `.catch(() => {})`. With the pinned build aged
+         * out, that hid ten weeks of failed downloads. Both outcomes now
+         * log; the provisioner adds the HTTP status (key never logged).
+         * The background refresh keeps the build current from here on. */
+        void ensureGeoipDatabase()
+          .then((p) => logger.info(`[geoip] boot warm: database ready at ${p}`))
+          .catch((err) =>
+            logger.error(
+              `[geoip] boot warm FAILED — IP location stays unresolved (geo_db_unavailable) until a retry succeeds: ${err?.message || err}`,
+            ),
+          );
+        startGeoipRefresh();
       });
 
       const shutdown = async () => {

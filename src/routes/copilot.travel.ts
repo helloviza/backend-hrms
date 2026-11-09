@@ -61,12 +61,15 @@ import {
   isOfficePlace,
   resolveOfficeCity,
   suggestCurrentCity,
+  suggestFlightOrigin,
+  flightOriginChip,
   officeDisclosure,
   parseCityAnswer,
   spliceFlightAnswer,
   OFFICE_ASK_TEXT,
   OFFICE_ASK_CHIP,
   OTHER_CITY_CHIP,
+  FLIGHT_ORIGIN_ASK_CHIP,
 } from "../utils/plutoUserLocation.js";
 import {
   isHotelRequest,
@@ -1014,34 +1017,33 @@ async function runConciergeTurn(
             id: conversationId,
             pending: { kind: "flight", need: "origin", prompt: flightPrompt },
           };
-          const here = await suggestCurrentCity(req);
-          const hereIATA = here ? resolveIATA(here.cityName) : null;
-          if (here && hereIATA && hereIATA !== destIATA) {
+          // The destination IS known here — the reply asks for the origin
+          // only, whether or not there is a location chip to offer.
+          const askOrigin =
+            `I can search flights to ${destination}${travelDate ? ` on ${travelDate}` : ""}.${relDateNote} ` +
+            `Where are you flying from?`;
+          const here = await suggestFlightOrigin(req);
+          if (here && here.iata !== destIATA) {
             return res.json({
               ok: true,
               reply: {
                 title: "Where are you flying from?",
-                context:
-                  `I can search flights to ${destination}${travelDate ? ` on ${travelDate}` : ""}.${relDateNote} ` +
-                  `Where are you flying from?`,
-                nextSteps: [
-                  `Flying from ${here.cityName}? (based on your current location)`,
-                  OTHER_CITY_CHIP,
-                ],
+                context: askOrigin,
+                nextSteps: [flightOriginChip(here), OTHER_CITY_CHIP],
                 handoff: false,
               },
               context: askedContext,
             });
           }
+          // No usable location (unavailable, private IP, no airport nearby,
+          // or the same airport as the destination): ask, with one chip that
+          // ends in "?" so the concierge prefills it for the user to finish.
           return res.json({
             ok: true,
             reply: {
-              title: "Which airport should I search?",
-              context: `I need both a departure and destination city to search flights. Could you give me the city name or its 3-letter airport code (e.g. "Delhi" or "DEL")?${relDateNote}`,
-              nextSteps: [
-                "Tell me the departure city or airport code",
-                "Tell me the destination city or airport code",
-              ],
+              title: "Where are you flying from?",
+              context: `${askOrigin} A city name or 3-letter airport code works (e.g. "Delhi" or "DEL").`,
+              nextSteps: [FLIGHT_ORIGIN_ASK_CHIP],
               handoff: false,
             },
             context: askedContext,

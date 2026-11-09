@@ -35,7 +35,12 @@
 import crypto from "crypto";
 import type { Request } from "express";
 import type { Reader } from "maxmind";
-import { ensureGeoipDatabase, GEOLITE2_ATTRIBUTION } from "./geoipProvision.js";
+import {
+  ensureGeoipDatabase,
+  describeBuild,
+  onGeoipDatabaseUpdated,
+  GEOLITE2_ATTRIBUTION,
+} from "./geoipProvision.js";
 import { lookupDestination } from "../data/destinationLookup.js";
 import {
   upsertCurrentLocation,
@@ -255,10 +260,15 @@ export function getGeoLookupAttempts(): number {
 export function __resetLocationServiceState(): void {
   readerPromise = null;
   geoLookupAttempts = 0;
+  lastReaderFailLogAt = 0;
   cache.clear();
   warnedNoSalt = false;
   warnedProxyDepth = false;
 }
+
+/** Throttle for the "reader unavailable" line: one per minute is enough to see it. */
+const READER_FAIL_LOG_EVERY_MS = 60_000;
+let lastReaderFailLogAt = 0;
 
 function getReader(): Promise<Reader<any>> {
   if (readerPromise) return readerPromise;
@@ -266,15 +276,32 @@ function getReader(): Promise<Reader<any>> {
     // Self-heals if the build-time provisioning step was skipped or failed.
     const dbPath = await ensureGeoipDatabase();
     const maxmind = (await import("maxmind")).default;
-    return maxmind.open<any>(dbPath);
+    const reader = await maxmind.open<any>(dbPath);
+    // "Which edition is live?" must be answerable from the logs alone.
+    console.log(`[location] geo reader loaded: ${describeBuild(reader.metadata)}`);
+    return reader;
   })().catch((err) => {
     // Don't poison the memo — the next caller retries. In practice this
     // retries a download, which is why the cache below caches failures too.
     readerPromise = null;
+    // Never silent again: this is the path that hid ten weeks of
+    // geo_db_unavailable. The provisioner's own messages carry no key.
+    if (Date.now() - lastReaderFailLogAt >= READER_FAIL_LOG_EVERY_MS) {
+      lastReaderFailLogAt = Date.now();
+      console.error(`[location] geo reader unavailable (lookups return geo_db_unavailable): ${err?.message || err}`);
+    }
     throw err;
   });
   return readerPromise;
 }
+
+// A background refresh swapped a newer database onto disk: drop the open
+// reader and the short-lived answer cache so the next lookup opens the new
+// build (and logs "geo reader loaded" with its date).
+onGeoipDatabaseUpdated(() => {
+  readerPromise = null;
+  cache.clear();
+});
 
 /* ────────────────────────────────────────────────────────────────────────
  * CACHE
