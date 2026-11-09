@@ -2,12 +2,12 @@
 //
 // GET  /api/v1/pluto/panel/city — resolves "the user's city" for Pluto's
 //      right panel ("For you in <city>" / "Get inspired"). See
-//      services/panelCity.service.ts for the resolution order and the
-//      2026-08-06 coverage investigation behind it. Reports its own source
+//      services/panelCity.service.ts for the resolution order (profile city,
+//      then current-location IP; bookings and the company address are NOT
+//      person-scoped and are not used). Reports its own source
 //      rather than ever defaulting to a fixed city.
 // POST /api/v1/pluto/panel/city — the inline "Where are you based?" prompt's
-//      write-back, for the ~60% of users none of the other three sources
-//      resolve.
+//      write-back, for users with no profile city on file.
 
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
@@ -19,14 +19,14 @@ router.use(requireAuth);
 router.get("/city", async (req: any, res) => {
   try {
     const userId = req.user?.id || req.user?.sub;
-    if (!userId) return res.json({ ok: true, city: null, source: null });
+    if (!userId) return res.json({ ok: true, city: null, source: null, profileCity: null, currentCity: null });
 
     // req.ip is the client address under server.ts's `trust proxy = 1`.
     const result = await resolvePanelCity(userId, { ip: req.ip ?? null });
     return res.json({ ok: true, ...result });
   } catch {
     // Never fail the panel: city resolution is an enhancement, never a gate.
-    return res.json({ ok: true, city: null, source: null });
+    return res.json({ ok: true, city: null, source: null, profileCity: null, currentCity: null });
   }
 });
 
