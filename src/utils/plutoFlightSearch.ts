@@ -6,8 +6,9 @@
 // that construct at import time).
 //
 // The hardened POST /flights/search path imports CABIN_LABELS,
-// dedupeRawTBOFlights and mapTBOFlight from here — their behaviour is
-// byte-for-byte the same as before extraction. Do NOT change it.
+// dedupeRawTBOFlights and mapTBOFlight from here, so both endpoints map rows
+// identically. One deliberate change since extraction (Pluto Hotfix A, F-04):
+// `duration` now includes layovers and every row carries `durationMin`.
 
 import { searchFlights as tboSearchFlights } from "../services/tbo.flight.service.js";
 import {
@@ -18,6 +19,32 @@ import {
 import { recordFareObservations } from "../services/fareObservations.js";
 import { sellingFlight } from "../services/sbtQuote.js";
 import { flightRouteMargins, type RouteMargins } from "../services/sbtMargin.js";
+import { airportAnnotation, partitionRowsByAirport } from "./plutoAirportMatch.js";
+
+/** Rows kept per group after the airport split (MATCH rows are what tiers see). */
+export const MATCH_ROW_CAP = 30;
+export const OTHER_AIRPORT_ROW_CAP = 10;
+
+/**
+ * Dedupe one leg's raw rows, then split them by airport (plutoAirportMatch)
+ * BEFORE capping, so rows into a nearby airport can never crowd the requested
+ * airport's rows out of the 30. `legOrigin`/`legDest` are the leg's own
+ * direction — for the return leg that is destination → origin.
+ */
+export function splitLegRows(
+  raw: any[],
+  legOrigin: string,
+  legDest: string,
+): { match: any[]; other: any[] } {
+  const { match, other } = partitionRowsByAirport(dedupeRawTBOFlights(raw), legOrigin, legDest);
+  return { match: match.slice(0, MATCH_ROW_CAP), other: other.slice(0, OTHER_AIRPORT_ROW_CAP) };
+}
+
+/** Additive airport fields on a mapped row (airportMatch + labels). */
+export function withAirportFields(mapped: any, raw: any, legOrigin: string, legDest: string): any {
+  if (!mapped) return mapped;
+  return Object.assign(mapped, airportAnnotation(raw, legOrigin, legDest));
+}
 
 // In-policy first, then needs-approval, then out-of-policy. Stable, so the
 // within-rank fare ordering from dedupeRawTBOFlights is preserved.
@@ -70,6 +97,31 @@ export function dedupeRawTBOFlights(rawResults: any[]): any[] {
   );
 }
 
+/**
+ * Door-to-door elapsed minutes for one leg, from TBO's own durations — which
+ * are time-zone-correct, unlike subtracting the offset-less local DepTime and
+ * ArrTime. Multi-segment: the last segment's AccumulatedDuration (TBO's total
+ * including layovers) when TBO sends it; otherwise each segment's Duration plus
+ * the GroundTime (layover) before every segment after the first. The old sum
+ * of Durations alone dropped the layovers.
+ */
+export function tboElapsedMinutes(segs: any[]): number {
+  const list = Array.isArray(segs) ? segs : [];
+  if (list.length === 0) return 0;
+  const num = (v: unknown): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+  if (list.length > 1) {
+    const acc = num(list[list.length - 1]?.AccumulatedDuration);
+    if (acc > 0) return acc;
+  }
+  return list.reduce(
+    (s: number, seg: any, i: number) => s + num(seg?.Duration) + (i > 0 ? num(seg?.GroundTime) : 0),
+    0,
+  );
+}
+
 // Single source of truth: maps one TBO Result row → SBT-aligned flight object
 // that the concierge UI's `toSBTFlight` mapper can consume.
 // Used by BOTH the structured /flights/search endpoint AND the chat NLP
@@ -92,7 +144,7 @@ export function mapTBOFlight(
   const arrRawIso = last.Destination?.ArrTime || "";
   const depDt = new Date(depRawIso);
   const arrDt = new Date(arrRawIso);
-  const totalMin = segs.reduce((s: number, seg: any) => s + (seg.Duration || 0), 0);
+  const totalMin = tboElapsedMinutes(segs);
   const h = Math.floor(totalMin / 60);
   const m = totalMin % 60;
 
@@ -149,6 +201,10 @@ export function mapTBOFlight(
       date: isoDateOf(arrRawIso, arrDt),
     },
     duration: `${h}h ${m}m`,
+    // The one duration every surface renders and "Fastest" ranks on. Never
+    // re-derive it from DepTime/ArrTime: those are airport-LOCAL times with no
+    // offset, so BLR 20:55 → AUH 23:45 subtracts to 2h50m for a 4h20m flight.
+    durationMin: totalMin,
     stops: segs.length - 1,
     fare: {
       // Both carry the SELLING total: TBO's OfferedFare is our net-of-commission
@@ -184,8 +240,12 @@ export type ChatFlightSearchReason = "TBO_ERROR" | "SEARCH_EXCEPTION";
 export interface ChatFlightSearchResult {
   ok: boolean;
   reason: ChatFlightSearchReason | null;
+  /** Rows that depart the requested origin city and land in the requested destination city. */
   flights: any[];
   inbound: any[];
+  /** Rows into (or out of) a different airport — never tiered, shown as their own group. */
+  otherAirportFlights: any[];
+  inboundOtherAirport: any[];
   traceId: string;
 }
 
@@ -258,7 +318,7 @@ export async function searchFlightsForChat(params: {
         destination,
         departDate,
       });
-      return { ok: false, reason: "TBO_ERROR", flights: [], inbound: [], traceId };
+      return { ok: false, reason: "TBO_ERROR", flights: [], inbound: [], otherAirportFlights: [], inboundOtherAirport: [], traceId };
     }
 
     const resultsArr: any[] = Array.isArray(tboResult?.Response?.Results)
@@ -277,32 +337,38 @@ export async function searchFlightsForChat(params: {
     // top-by-fare slice toward a single low-cost airline.
     // Each mapped flight is ANNOTATED with an additive `policy` field
     // (never filtered), then chat results are sorted in-policy first.
-    const mapAnnotate = (rows: any[]): any[] =>
+    // Rows are also split by airport (plutoAirportMatch): only rows serving the
+    // requested airports are `flights`/`inbound`; the rest come back separately.
+    const mapAnnotate = (rows: any[], legOrigin: string, legDest: string): any[] =>
       rows
         .map((r: any) => {
-          const f = mapTBOFlight(r, opts);
+          const f = withAirportFields(mapTBOFlight(r, opts), r, legOrigin, legDest);
           if (f) f.policy = evaluateFlightPolicy(flightForPolicyFromTBO(r), policyRules);
           return f;
         })
         .filter(Boolean);
 
-    const outboundTop = dedupeRawTBOFlights(outboundRaw).slice(0, 30);
-    const flights = sortInPolicyFirst(mapAnnotate(outboundTop));
+    const out = splitLegRows(outboundRaw, origin, destination);
+    const flights = sortInPolicyFirst(mapAnnotate(out.match, origin, destination));
+    const otherAirportFlights = sortInPolicyFirst(mapAnnotate(out.other, origin, destination));
 
-    // Passive fare logging (fire-and-forget; never affects this search).
+    // Passive fare logging (fire-and-forget; never affects this search). MATCH
+    // rows only: an AUH fare is not a DXB fare and must not shape DXB history.
     recordFareObservations({
       workspaceObjectId,
       origin,
       destination,
       departDate,
       requestId,
-      rawRows: outboundTop,
+      rawRows: out.match,
     });
-    const inbound = journeyType === 2
-      ? sortInPolicyFirst(mapAnnotate(dedupeRawTBOFlights(inboundRaw).slice(0, 30)))
-      : [];
+    const back = journeyType === 2
+      ? splitLegRows(inboundRaw, destination, origin)
+      : { match: [], other: [] };
+    const inbound = sortInPolicyFirst(mapAnnotate(back.match, destination, origin));
+    const inboundOtherAirport = sortInPolicyFirst(mapAnnotate(back.other, destination, origin));
 
-    return { ok: true, reason: null, flights, inbound, traceId };
+    return { ok: true, reason: null, flights, inbound, otherAirportFlights, inboundOtherAirport, traceId };
   } catch (err: any) {
     console.error("[ConciergeFlights] TBO search failed", {
       requestId,
@@ -311,6 +377,6 @@ export async function searchFlightsForChat(params: {
       destination,
       departDate,
     });
-    return { ok: false, reason: "SEARCH_EXCEPTION", flights: [], inbound: [], traceId: "" };
+    return { ok: false, reason: "SEARCH_EXCEPTION", flights: [], inbound: [], otherAirportFlights: [], inboundOtherAirport: [], traceId: "" };
   }
 }

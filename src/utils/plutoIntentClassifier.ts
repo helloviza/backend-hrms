@@ -2,11 +2,10 @@
 export type PlutoIntent = "DISCOVERY" | "PLANNING" | "REFINEMENT" | "PIVOT";
 
 /**
- * GATE 2 of 2 on the SAME prompt text a fresh conversation's message has to
- * clear on the frontend first (see hasPlanningIntent, apps/frontend/src/
- * pages/concierge/ConciergePage.tsx) — and this one runs in the opposite
- * direction. Frontend gate: must MATCH a planning-ish pattern or the message
- * never reaches this function at all (short-circuited to a canned reply).
+ * The one keyword gate on a fresh conversation's prompt. (There used to be a
+ * second, frontend gate — hasPlanningIntent in ConciergePage.tsx — that
+ * dropped any first message without a planning-ish word; it was removed in
+ * Pluto Hotfix A, F-01, so every non-empty message now reaches the backend.)
  * This gate: the prompt must NOT contain "itinerary" or the word "plan"
  * (in any of its plan/plans/planning/planned forms) — or the conversation
  * jumps straight into PLANNING state (resolvePlutoState,

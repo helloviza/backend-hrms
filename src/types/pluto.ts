@@ -78,5 +78,10 @@ export interface PlutoReplyV1 {
 
   nextSteps: string[];
 
+  // In-app pages that answer the ask (e.g. the HR redirect's "Open Leaves" →
+  // /leaves/my). Rendered as link chips that navigate; never sent as a prompt.
+  // Internal paths only ("/…").
+  links?: Array<{ label: string; href: string }>;
+
   handoff: boolean;             // 🔑 Auto-handoff signal (Fix #4)
 }

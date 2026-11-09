@@ -50,10 +50,12 @@ import { sellingFlight, customerHotelResults } from "../services/sbtQuote.js";
 import { flightRouteMargins } from "../services/sbtMargin.js";
 import {
   CABIN_LABELS,
-  dedupeRawTBOFlights,
   mapTBOFlight,
   searchFlightsForChat,
+  splitLegRows,
+  withAirportFields,
 } from "../utils/plutoFlightSearch.js";
+import { airportLabel } from "../utils/plutoAirportMatch.js";
 import { parseDateToISO, extractPromptDateRange, resolveRelativeDate } from "../utils/plutoDate.js";
 import {
   mentionsOffice,
@@ -160,9 +162,9 @@ import {
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { personName } from "../services/actorNames.js";
 
-// CABIN_LABELS, dedupeRawTBOFlights, mapTBOFlight and searchFlightsForChat now
-// live in ../utils/plutoFlightSearch.ts (extracted for unit-testability). The
-// hardened /flights/search path imports the first three; behaviour unchanged.
+// CABIN_LABELS, mapTBOFlight, splitLegRows (dedupe + airport split + cap) and
+// searchFlightsForChat live in ../utils/plutoFlightSearch.ts (extracted for
+// unit-testability); the hardened /flights/search path uses the same helpers.
 
 const router = Router();
 
@@ -502,30 +504,35 @@ router.post("/flights/search", async (req, res) => {
     const policyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
     // Annotate each result with an ADDITIVE `policy` field. Order is preserved
     // (unlike the chat path) to keep the FlightSearchPanel contract stable.
-    const annotate = (rows: any[]): any[] =>
+    const annotate = (rows: any[], legOrigin: string, legDest: string): any[] =>
       rows
         .map((r: any) => {
-          const f = mapTBOFlight(r, mapperOpts);
+          const f = withAirportFields(mapTBOFlight(r, mapperOpts), r, legOrigin, legDest);
           if (f) f.policy = evaluateFlightPolicy(flightForPolicyFromTBO(r), policyRules);
           return f;
         })
         .filter(Boolean);
 
-    // Dedupe + cap mirrors searchFlightsForChat; both endpoints must produce
-    // the same set so the FlightSearchPanel renders identically regardless of
-    // trigger (chat NLP vs explicit Search button).
-    const outboundTop = dedupeRawTBOFlights(outboundRaw).slice(0, 30);
-    const results = annotate(outboundTop);
-    const inbound = annotate(dedupeRawTBOFlights(inboundRaw).slice(0, 30));
+    // Dedupe + airport split + cap mirrors searchFlightsForChat; both endpoints
+    // must produce the same set so the FlightSearchPanel renders identically
+    // regardless of trigger (chat NLP vs explicit Search button). Rows into a
+    // different airport (AUH for a DXB search) come back as `otherAirport`.
+    const out = splitLegRows(outboundRaw, originIATA, destIATA);
+    const back = splitLegRows(inboundRaw, destIATA, originIATA);
+    const results = annotate(out.match, originIATA, destIATA);
+    const otherAirport = annotate(out.other, originIATA, destIATA);
+    const inbound = annotate(back.match, destIATA, originIATA);
+    const inboundOtherAirport = annotate(back.other, destIATA, originIATA);
 
     // Passive fare logging (fire-and-forget; never affects the response).
+    // MATCH rows only — see searchFlightsForChat.
     recordFareObservations({
       workspaceObjectId: (req as any).workspaceObjectId,
       origin: originIATA,
       destination: destIATA,
       departDate: date,
       requestId,
-      rawRows: outboundTop,
+      rawRows: out.match,
     });
 
     const inPolicyCount = results.filter((f: any) => f?.policy?.status === "IN_POLICY").length;
@@ -535,6 +542,8 @@ router.post("/flights/search", async (req, res) => {
 
     const response: any = { ok: true, results, traceId };
     if (inbound.length > 0) response.inbound = inbound;
+    if (otherAirport.length > 0) response.otherAirport = otherAirport;
+    if (inboundOtherAirport.length > 0) response.inboundOtherAirport = inboundOtherAirport;
     return res.json(response);
 
   } catch (err: any) {
@@ -673,16 +682,19 @@ async function runConciergeTurn(
     const conversationId =
       context?.id || req.body?.conversationId || crypto.randomUUID();
 
-    // 1️⃣ Must be travel-related at all (skip for follow-ups).
-    // Off-domain (clearly HR/payroll/admin) → graceful concierge redirect
-    // in the SAME PlutoReplyV1 shape the frontend renders. Never a 500.
-    // A travel question that merely contains a flagged substring
-    // (e.g. "leave for the airport", "baggage policy") is NOT redirected.
-    if (!isFollowUp && isOffDomainQuery(prompt)) {
+    // 1️⃣ Must be travel-related at all.
+    // Off-domain (clearly HR/payroll/attendance) → graceful concierge redirect
+    // in the SAME PlutoReplyV1 shape the frontend renders, with a link to the
+    // HRMS page that answers it. Never a 500. Runs on follow-ups too, but there
+    // only on the unambiguous HR shapes ("how many leaves", "payslip") — the
+    // broad words (policy, approval…) are first-turn only. A travel question
+    // that merely contains a flagged word ("leave for the airport", "baggage
+    // policy") is NOT redirected. The trip context round-trips untouched.
+    if (isOffDomainQuery(prompt, { followUp: isFollowUp })) {
       // Carry the stable id even on the redirect so no reply is ever id-less.
       return res.json({
         ok: true,
-        reply: buildOffDomainRedirect(),
+        reply: buildOffDomainRedirect(prompt),
         context: { ...(context && typeof context === "object" ? context : {}), id: conversationId },
       });
     }
@@ -809,8 +821,7 @@ async function runConciergeTurn(
     const looksLikeFlightRouteSearch = (t: string) => Boolean(
       /(find|search|show|get|look up|check).{0,30}flight/i.test(t) ||
       // "to" added 2026-11-09: "Flights to Mumbai next week" (a My Space chip)
-      // is plainly a route search, and the frontend's hasPlanningIntent gate
-      // already treats "flights to" as one.
+      // is plainly a route search.
       /flights?\s+(from|between|on|available|for|to)/i.test(t) ||
       /flight\s+(option|price|fare|deal|available)/i.test(t) ||
       /available.*flight/i.test(t) ||
@@ -1147,6 +1158,10 @@ async function runConciergeTurn(
 
       let chatFlights: any[] = [];
       let chatInbound: any[] = [];
+      // Rows into / out of a different airport than the one searched (AUH for
+      // DXB, NMI for BOM). Never tiered, never "Best" — their own group.
+      let chatOtherAirport: any[] = [];
+      let chatInboundOtherAirport: any[] = [];
       let chatTraceId = "";
       // Distinguishes a genuine upstream outage (searchUnavailable = true) from
       // a genuine zero-results route (searchUnavailable = false, flights empty).
@@ -1180,6 +1195,8 @@ async function runConciergeTurn(
         if (chatResult.ok) {
           chatFlights = chatResult.flights;
           chatInbound = chatResult.inbound;
+          chatOtherAirport = chatResult.otherAirportFlights || [];
+          chatInboundOtherAirport = chatResult.inboundOtherAirport || [];
           chatTraceId = chatResult.traceId;
         } else {
           searchUnavailable = true;
@@ -1198,19 +1215,33 @@ async function runConciergeTurn(
         console.warn("[FlightSearch] No parseable date — skipping live search", { requestId });
       }
 
-      // Use the SBT-aligned shape (fare.offered, duration "Xh Ym") for sort.
-      const parseDurationMins = (d: string): number => {
-        const m = (d || "").match(/(\d+)h\s*(\d+)?m?/);
-        return m ? parseInt(m[1]) * 60 + parseInt(m[2] || "0") : 9999;
-      };
+      // Cheapest / fastest over the rows that serve the requested airports only
+      // (chatFlights). Fastest ranks on the backend's time-zone-correct
+      // durationMin — the same number every card renders.
+      const minsOf = (f: any): number =>
+        Number.isFinite(Number(f?.durationMin)) && Number(f?.durationMin) > 0 ? Number(f.durationMin) : Infinity;
       const chatCheapest = chatFlights.length
         ? chatFlights.reduce((a: any, b: any) => ((a.fare?.offered || a.fare?.published || 0) < (b.fare?.offered || b.fare?.published || 0)) ? a : b)
         : null;
       const chatFastest = chatFlights.length
-        ? chatFlights.reduce((a: any, b: any) => (parseDurationMins(a.duration) < parseDurationMins(b.duration) ? a : b))
+        ? chatFlights.reduce((a: any, b: any) => (minsOf(a) <= minsOf(b) ? a : b))
         : null;
 
       const hasLiveFlights = chatFlights.length > 0;
+      // Nothing lands at the requested airport, but TBO did return rows into a
+      // nearby one. Said plainly; those rows are shown as their own group.
+      const otherAirportOnly = !hasLiveFlights && chatOtherAirport.length > 0;
+      const otherAirportCodes = Array.from(
+        new Set(
+          chatOtherAirport
+            .flatMap((f: any) => [f?.destination?.code, f?.origin?.code])
+            .filter((c: any) => c && c !== originIATA && c !== destIATA),
+        ),
+      ) as string[];
+      const otherAirportNames = otherAirportCodes.map((c) => airportLabel(c)).join(", ");
+      const otherAirportNote = hasLiveFlights && chatOtherAirport.length > 0
+        ? ` ${chatOtherAirport.length} more option${chatOtherAirport.length > 1 ? "s use" : " uses"} a different airport (${otherAirportNames}) — listed separately under "Other nearby airports".`
+        : "";
 
       // Policy telemetry + "clear why" copy when nothing is in policy.
       const inPolicyCount = chatFlights.filter((f: any) => f?.policy?.status === "IN_POLICY").length;
@@ -1300,6 +1331,9 @@ async function runConciergeTurn(
       ] : hasLiveFlights ? [
         "Click Book on a flight to continue in our booking flow",
         "I'll pre-fill the search and take you straight to passenger details",
+      ] : otherAirportOnly ? [
+        "Try a different date",
+        "Or use the flight search panel above to pick another airport",
       ] : [
         "Try a slightly different date or route",
         "Or use the flight search panel above for full results",
@@ -1313,7 +1347,9 @@ async function runConciergeTurn(
           context: officeNote + (searchUnavailable
             ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
             : hasLiveFlights
-              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + cabinNote + cheapestNote + roundTripNote + routeInsightsNote + weatherNote
+              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + cabinNote + cheapestNote + roundTripNote + routeInsightsNote + weatherNote + otherAirportNote
+              : otherAirportOnly
+                ? `I found no flights ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. The ${chatOtherAirport.length} option${chatOtherAirport.length > 1 ? "s" : ""} I did find use ${otherAirportNames} instead — shown below under "Other nearby airports" so you can decide.`
               : !isoDate
                 ? `I couldn't parse the date for ${originIATA} → ${destIATA}. Try a date like "20 May 2026" and I'll pull live fares.`
                 : `I couldn't find any live flights for ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. Try a different date or a nearby route.`) + relDateNote + durationFlagNote + hotelNote,
@@ -1326,10 +1362,12 @@ async function runConciergeTurn(
             journeyType,
             flights:     chatFlights,
             inbound:     chatInbound,
+            otherAirport:        chatOtherAirport,
+            inboundOtherAirport: chatInboundOtherAirport,
             cheapest:    chatCheapest,
             fastest:     chatFastest,
             traceId:     chatTraceId,
-            source:      searchUnavailable ? "unavailable" : hasLiveFlights ? "tbo" : "none",
+            source:      searchUnavailable ? "unavailable" : (hasLiveFlights || otherAirportOnly) ? "tbo" : "none",
             tipLines:    buildFlightTipLines(originIATA, destIATA, travelDate),
           },
           // Additive: tenant-scoped route history (null when thin data).

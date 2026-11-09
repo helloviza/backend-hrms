@@ -345,16 +345,20 @@ describe("flight pricing paths use the caller's company margin, by the route's o
   });
 
   it("concierge search and concierge chat price like SBT", async () => {
+    // The fixture answers every search with DEL→BOM + DEL→DXB rows, so for this
+    // DEL→GOI search both land in the "other airport" group (Pluto Hotfix A).
+    // Pricing is what's under test here: read it across both groups.
+    const all = (a: any[] = [], b: any[] = []) =>
+      [...a, ...b].map((f: any) => f.fare.published).sort((x: number, y: number) => x - y);
     const r = await as(request(app).post("/api/v1/copilot/travel/flights/search")).send({ origin: "DEL", destination: "GOI", date: "2026-11-01", ...LYING });
     expect(r.status).toBe(200);
-    const prices = r.body.results.map((f: any) => f.fare.published).sort((x: number, y: number) => x - y);
-    expect(prices).toEqual([WS_DOM, ALL_INTL]);
+    expect(all(r.body.results, r.body.otherAirport)).toEqual([WS_DOM, ALL_INTL]);
     const chat = await searchFlightsForChat({ origin: "DEL", destination: "GOI", departDate: "2026-11-01", workspaceObjectId: WS });
     expect(chat.ok).toBe(true);
-    expect(chat.flights.map((f: any) => f.fare.published).sort((x: number, y: number) => x - y)).toEqual([WS_DOM, ALL_INTL]);
+    expect(all(chat.flights, chat.otherAirportFlights)).toEqual([WS_DOM, ALL_INTL]);
     // No workspace → the defaults, never net.
     const anon = await searchFlightsForChat({ origin: "DEL", destination: "GOI", departDate: "2026-11-01" });
-    expect(anon.flights.map((f: any) => f.fare.published).sort((x: number, y: number) => x - y)).toEqual([WS2_DOM, ALL_INTL]);
+    expect(all(anon.flights, anon.otherAirportFlights)).toEqual([WS2_DOM, ALL_INTL]);
   });
 });
 
