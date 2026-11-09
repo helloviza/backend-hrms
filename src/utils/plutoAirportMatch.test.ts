@@ -23,6 +23,7 @@ const row = (dep: string, arr: string, via?: string) => ({
 
 describe("cityAirports — the catalog's city grouping", () => {
   it("Dubai: DXB and DWC (both cityCode DXB); Abu Dhabi is NOT Dubai", () => {
+    // (XNB/XHB/ZXZ also carry cityCode DXB in the catalog — excluded as non-airports, see below.)
     const g = cityAirports("DXB");
     expect(g.has("DXB")).toBe(true);
     expect(g.has("DWC")).toBe(true);
@@ -71,6 +72,47 @@ describe("classifyRow — first departure AND final arrival", () => {
     const { match, other } = partitionRowsByAirport(rows, "BLR", "DXB");
     expect(match).toEqual([rows[1], rows[3]]);
     expect(other).toEqual([rows[0], rows[2]]);
+  });
+});
+
+// A row of explicit segments: [[from, to], [from, to], …].
+const segRow = (...legs: Array<[string, string]>) => ({
+  Segments: [legs.map(([o, d]) => ({ Origin: { Airport: { AirportCode: o } }, Destination: { Airport: { AirportCode: d } } }))],
+});
+
+describe("real airports only — surface legs are never a same-city arrival", () => {
+  it("Dubai's group holds only airports: XNB / XHB / ZXZ (catalog cityCode DXB) are out", () => {
+    const g = cityAirports("DXB");
+    expect([...g].sort()).toEqual(["DWC", "DXB"]);
+  });
+
+  it("the prod EY-239 shape — BLR→AUH flight + AUH→XNB coach — is OTHER, labelled with the real landing airport", () => {
+    const ey239 = segRow(["BLR", "AUH"], ["AUH", "XNB"]);
+    expect(classifyRow(ey239, "BLR", "DXB")).toBe("OTHER");
+    expect(airportAnnotation(ey239, "BLR", "DXB")).toEqual({
+      airportMatch: "OTHER",
+      arrivalAirportLabel: "Abu Dhabi Int'l (AUH) · coach to Dubai Bus Station (XNB)",
+    });
+  });
+
+  it("return leg mirror — XNB→AUH coach + AUH→BLR flight — is OTHER, labelled on the departure side", () => {
+    const back = segRow(["XNB", "AUH"], ["AUH", "BLR"]);
+    expect(classifyRow(back, "DXB", "BLR")).toBe("OTHER");
+    expect(airportAnnotation(back, "DXB", "BLR").departureAirportLabel).toBe(
+      "Abu Dhabi Int'l (AUH) · after coach from Dubai Bus Station (XNB)",
+    );
+  });
+
+  it("a non-airport under ANOTHER city: London Kings Cross rail (QQK, cityCode LON) is not a London arrival", () => {
+    expect(cityAirports("LHR").has("QQK")).toBe(false);
+    expect(cityAirports("LHR").has("LGW")).toBe(true);
+    const viaRail = segRow(["BOM", "CDG"], ["CDG", "QQK"]);
+    expect(classifyRow(viaRail, "BOM", "LHR")).toBe("OTHER");
+    expect(airportAnnotation(viaRail, "BOM", "LHR").arrivalAirportLabel).toMatch(/\(CDG\) · train to .*\(QQK\)$/);
+  });
+
+  it("a genuine connection through a station-free hub stays MATCH (BLR→AUH→DXB)", () => {
+    expect(classifyRow(segRow(["BLR", "AUH"], ["AUH", "DXB"]), "BLR", "DXB")).toBe("MATCH");
   });
 });
 

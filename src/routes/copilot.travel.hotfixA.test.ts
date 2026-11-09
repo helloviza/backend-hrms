@@ -55,6 +55,28 @@ describe("F-02 — a Dubai search never answers with Abu Dhabi", () => {
     expect(body.reply.context).toMatch(/2 more options use a different airport \(Abu Dhabi Int'l \(AUH\)\)/);
   });
 
+  it("the prod EY-239 shape (BLR→AUH + coach to XNB 'Dubai Bus Station') is never Best — it's in otherAirport, labelled", async () => {
+    const ey239 = {
+      ResultIndex: "EY239", IsLCC: false, IsRefundable: false,
+      Fare: { PublishedFare: 13352, OfferedFare: 13352, Currency: "INR" },
+      Segments: [[
+        { CabinClass: 2, Duration: 260, Airline: { AirlineCode: "EY", AirlineName: "Etihad Airways", FlightNumber: "239" },
+          Origin: { DepTime: "2026-11-16T22:00:00", Airport: { AirportCode: "BLR" } },
+          Destination: { ArrTime: "2026-11-17T00:50:00", Airport: { AirportCode: "AUH" } } },
+        { CabinClass: 2, Duration: 105, GroundTime: 70, Airline: { AirlineCode: "EY", AirlineName: "Etihad Airways", FlightNumber: "5413" },
+          Origin: { DepTime: "2026-11-17T02:00:00", Airport: { AirportCode: "AUH" } },
+          Destination: { ArrTime: "2026-11-17T03:45:00", Airport: { AirportCode: "XNB" } } },
+      ]],
+    };
+    searchFlightsMock.mockResolvedValue(tbo([ey239, row("DXB-1", "BLR", "DXB", 18000, 245)]));
+    const body = await chat("find flights from Bangalore to Dubai on 16 Nov 2026");
+    const fs = body.reply.flightSearch;
+    expect(fs.flights.map((f: any) => f.ResultIndex)).toEqual(["DXB-1"]);
+    expect(fs.cheapest.ResultIndex).toBe("DXB-1");
+    expect(fs.otherAirport.map((f: any) => f.ResultIndex)).toEqual(["EY239"]);
+    expect(fs.otherAirport[0].arrivalAirportLabel).toBe("Abu Dhabi Int'l (AUH) · coach to Dubai Bus Station (XNB)");
+  });
+
   it("zero MATCH rows: says so plainly and still shows the other-airport group", async () => {
     searchFlightsMock.mockResolvedValue(tbo([row("AUH-1", "BLR", "AUH", 14000, 260)]));
     const body = await chat("find flights from Bangalore to Dubai on 16 Nov 2026");

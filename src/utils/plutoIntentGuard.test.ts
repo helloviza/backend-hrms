@@ -67,7 +67,8 @@ describe("buildOffDomainRedirect — links to the right HRMS page", () => {
   it("leave question → Leaves link only", () => {
     const r = buildOffDomainRedirect("how many leaves do I have");
     expect(r.links).toEqual([{ label: "Open Leaves", href: "/leaves/my" }]);
-    expect(r.context).toMatch(/leave balance/i);
+    expect(r.context).toMatch(/You'll find your leave balance and requests in HRMS — the link below opens it\./);
+    expect(r.context).not.toMatch(/requests is/);
   });
 
   it("payslip question → Payslips link", () => {

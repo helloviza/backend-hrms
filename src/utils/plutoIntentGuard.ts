@@ -112,7 +112,7 @@ export function buildOffDomainRedirect(prompt = ""): PlutoReplyV1 {
   const shown: HrTopic[] = topics.length > 0 ? topics : ["leave", "pay", "attendance"];
   const where =
     topics.length > 0
-      ? `Your ${topics.map((t) => TOPIC_WORDS[t]).join(" and ")} ${topics.length > 1 ? "are" : "is"} in HRMS — the link below opens ${topics.length > 1 ? "them" : "it"}.`
+      ? `You'll find your ${topics.map((t) => TOPIC_WORDS[t]).join(" and ")} in HRMS — ${topics.length > 1 ? "the links below open them" : "the link below opens it"}.`
       : "For leave, payslips or attendance, the links below open the right HRMS page.";
   return {
     title: "That's one for HRMS",

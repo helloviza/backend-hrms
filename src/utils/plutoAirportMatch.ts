@@ -24,6 +24,7 @@
 import { readFileSync } from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { isAirportCode, nonAirportKind } from "./plutoNonAirports.js";
 
 export type AirportMatch = "MATCH" | "OTHER";
 
@@ -76,6 +77,9 @@ export function cityAirports(iata: string): Set<string> {
     const cityName = norm(self.city);
     const country = String(self.countryCode || "").toUpperCase();
     for (const a of catalog().values()) {
+      // Real airports only: XNB "Dubai Bus Station" shares cityCode DXB, but
+      // a coach into it is not a flight into Dubai (plutoNonAirports.ts).
+      if (!isAirportCode(a.code)) continue;
       const sameCityCode = cityCode && String(a.cityCode || "").toUpperCase() === cityCode;
       const sameNamedCity =
         cityName && norm(a.city) === cityName && String(a.countryCode || "").toUpperCase() === country;
@@ -116,18 +120,48 @@ export interface RowAirports {
   arrCode: string;
   depName: string;
   arrName: string;
+  /**
+   * The real airport the row takes off from / lands at. Differs from
+   * depCode / arrCode only when the row starts or ends with a surface leg
+   * (a coach, train or ferry to or from a non-airport code): e.g. EY-239
+   * BLR → AUH + coach to XNB lands at AUH.
+   */
+  takeoffCode: string;
+  takeoffName: string;
+  landingCode: string;
+  landingName: string;
 }
 
-/** First departure and FINAL arrival airport of a raw TBO row (Segments[0]). */
+const segCode = (p: any): string => String(p?.Airport?.AirportCode || "").toUpperCase();
+const segName = (p: any): string => String(p?.Airport?.AirportName || "");
+
+/** First departure and FINAL arrival of a raw TBO row (Segments[0]), plus the real take-off / landing airports. */
 export function rowAirports(raw: any): RowAirports {
   const segs: any[] = raw?.Segments?.[0] || [];
   const first = segs[0];
   const last = segs[segs.length - 1];
+  // Walk in from each end past any segment that touches a non-airport code.
+  let landing = last?.Destination;
+  for (let i = segs.length - 1; i >= 0; i--) {
+    const d = segs[i]?.Destination;
+    if (isAirportCode(segCode(d))) { landing = d; break; }
+    landing = segs[i]?.Origin; // a surface final leg starts at the landing airport
+  }
+  let takeoff = first?.Origin;
+  for (let i = 0; i < segs.length; i++) {
+    const o = segs[i]?.Origin;
+    if (isAirportCode(segCode(o))) { takeoff = o; break; }
+    takeoff = segs[i]?.Destination;
+  }
   return {
-    depCode: String(first?.Origin?.Airport?.AirportCode || "").toUpperCase(),
-    arrCode: String(last?.Destination?.Airport?.AirportCode || "").toUpperCase(),
-    depName: String(first?.Origin?.Airport?.AirportName || ""),
-    arrName: String(last?.Destination?.Airport?.AirportName || ""),
+    depCode: segCode(first?.Origin),
+    arrCode: segCode(last?.Destination),
+    depName: segName(first?.Origin),
+    arrName: segName(last?.Destination),
+    takeoffCode: segCode(takeoff),
+    takeoffName: segName(takeoff),
+    landingCode: segCode(landing),
+    landingName: segName(landing),
   };
 }
 
@@ -135,11 +169,13 @@ export function rowAirports(raw: any): RowAirports {
  * MATCH / OTHER for one raw row against the leg it was searched for. A row
  * with no airport codes at all can't be checked, so it is trusted as MATCH
  * rather than hidden (TBO always sends codes; this only guards fixtures).
+ * A row that starts or ends at a NON-airport (a coach / train / ferry leg) is
+ * always OTHER, whatever city the catalog files that station under.
  */
 export function classifyRow(raw: any, legOrigin: string, legDest: string): AirportMatch {
   const { depCode, arrCode } = rowAirports(raw);
-  const depOk = !depCode || isSameCityAirport(legOrigin, depCode);
-  const arrOk = !arrCode || isSameCityAirport(legDest, arrCode);
+  const depOk = !depCode || (isAirportCode(depCode) && isSameCityAirport(legOrigin, depCode));
+  const arrOk = !arrCode || (isAirportCode(arrCode) && isSameCityAirport(legDest, arrCode));
   return depOk && arrOk ? "MATCH" : "OTHER";
 }
 
@@ -150,6 +186,9 @@ export function classifyRow(raw: any, legOrigin: string, legDest: string): Airpo
  *    airport (OTHER rows, and a same-city alternate like DWC), and ALWAYS for
  *    an airport with a name override (NMI is "Navi Mumbai (NMI)" on every card).
  *  - departureAirportLabel: same rule for the first departure.
+ * A surface leg is named after the real airport, e.g. the card reads
+ * "Arrives Abu Dhabi Int'l (AUH) · coach to Dubai Bus Station (XNB)" and
+ * "Departs Abu Dhabi Int'l (AUH) · after coach from Dubai Bus Station (XNB)".
  */
 export function airportAnnotation(
   raw: any,
@@ -157,14 +196,28 @@ export function airportAnnotation(
   legDest: string,
 ): { airportMatch: AirportMatch; arrivalAirportLabel?: string; departureAirportLabel?: string } {
   const match = classifyRow(raw, legOrigin, legDest);
-  const { depCode, arrCode, depName, arrName } = rowAirports(raw);
+  const r = rowAirports(raw);
   const out: { airportMatch: AirportMatch; arrivalAirportLabel?: string; departureAirportLabel?: string } = {
     airportMatch: match,
   };
   const wantsLabel = (actual: string, requested: string) =>
     Boolean(actual) && (actual !== String(requested || "").toUpperCase() || Boolean(NAME_OVERRIDES[actual]));
-  if (wantsLabel(arrCode, legDest)) out.arrivalAirportLabel = airportLabel(arrCode, arrName);
-  if (wantsLabel(depCode, legOrigin)) out.departureAirportLabel = airportLabel(depCode, depName);
+
+  const arrKind = nonAirportKind(r.arrCode);
+  if (arrKind && r.landingCode && r.landingCode !== r.arrCode) {
+    out.arrivalAirportLabel =
+      `${airportLabel(r.landingCode, r.landingName)} · ${arrKind} to ${airportLabel(r.arrCode, r.arrName)}`;
+  } else if (wantsLabel(r.arrCode, legDest)) {
+    out.arrivalAirportLabel = airportLabel(r.arrCode, r.arrName);
+  }
+
+  const depKind = nonAirportKind(r.depCode);
+  if (depKind && r.takeoffCode && r.takeoffCode !== r.depCode) {
+    out.departureAirportLabel =
+      `${airportLabel(r.takeoffCode, r.takeoffName)} · after ${depKind} from ${airportLabel(r.depCode, r.depName)}`;
+  } else if (wantsLabel(r.depCode, legOrigin)) {
+    out.departureAirportLabel = airportLabel(r.depCode, r.depName);
+  }
   return out;
 }
 
