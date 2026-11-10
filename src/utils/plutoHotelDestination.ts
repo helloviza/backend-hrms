@@ -37,7 +37,7 @@ import {
   TBOHotelMaster,
   normalizeSearch,
 } from "../jobs/static-data-refresh.js";
-import { countryFor } from "../data/destinationLookup.js";
+import { countryFor, lookupDestinationFuzzy } from "../data/destinationLookup.js";
 import { extractHotelCity, extractNamedPlaceCandidate } from "./plutoHotelSearch.js";
 import { normalizeCityNameWithLLM } from "./plutoCityNormalize.js";
 
@@ -70,7 +70,19 @@ export type HotelDestination =
       query: string;
       candidates: AmbiguousCity[];
     }
-  | { status: "UNSUPPORTED"; cityName: string }
+  | {
+      status: "UNSUPPORTED";
+      cityName: string;
+      /**
+       * Strict mode only (PLUTO_STATE_V2, QC F-24): the user NAMED this place as
+       * the destination this turn and it did not resolve. The caller asks
+       * "Did you mean <suggestion>?" or "Which city is <cityName> in?" and never
+       * answers about the locked destination instead.
+       */
+      named?: true;
+      /** The closest bookable city, plus what was left over ("Soho"). */
+      suggestion?: { cityName: string; countryCode: string; cityCode: string; rest?: string };
+    }
   | { status: "NO_CITY" };
 
 /** One option offered by an AMBIGUOUS result. */
@@ -557,17 +569,90 @@ export function classifyHotelDestination(input: {
   return { status: "NO_CITY" };
 }
 
+/** "near Burj Khalifa", "close to BKC": a landmark inside the trip's city, not a destination. */
+function namedAsLandmark(prompt: string, raw: string): boolean {
+  const esc = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    String.raw`\b(?:near|around|close\s+to|next\s+to|walking\s+distance\s+(?:to|from|of))\s+(?:the\s+)?${esc}\b`,
+    "i",
+  ).test(prompt);
+}
+
+/**
+ * The closest bookable city to a name that did not resolve: a leading or
+ * trailing part of it ("London Soho" → London, rest "Soho"), the curated
+ * table's fuzzy match, then the LLM normaliser. Only ever OFFERED as a
+ * question — never searched without the user saying yes.
+ */
+async function suggestCatalogCity(
+  raw: string,
+): Promise<{ cityName: string; countryCode: string; cityCode: string; rest?: string } | null> {
+  const words = raw.trim().split(/\s+/).filter(Boolean);
+  const one = async (key: string, rest?: string) => {
+    if (!key.trim()) return null;
+    const rows = await findCatalogMatches(key);
+    if (!rows.length) return null;
+    const pick = await pickCatalogCity(rows, key);
+    if (pick.kind !== "ONE") return null;
+    return {
+      cityName: tidyCatalogCityName(pick.city.name),
+      countryCode: pick.city.countryCode,
+      cityCode: pick.city.code,
+      ...(rest ? { rest } : {}),
+    };
+  };
+  for (let k = words.length - 1; k >= 1; k--) {
+    const hit = await one(words.slice(0, k).join(" "), words.slice(k).join(" "));
+    if (hit) return hit;
+  }
+  for (let k = 1; k < words.length; k++) {
+    const hit = await one(words.slice(k).join(" "), words.slice(0, k).join(" "));
+    if (hit) return hit;
+  }
+  const fuzzy = lookupDestinationFuzzy(raw)?.city;
+  if (fuzzy && fuzzy.toLowerCase() !== raw.toLowerCase()) {
+    const hit = await one(fuzzy);
+    if (hit) return hit;
+  }
+  const normalized = await normalizeCityNameWithLLM(raw);
+  if (normalized && normalized.toLowerCase() !== raw.toLowerCase()) {
+    const hit = await one(normalized);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 /**
  * Full resolution for a hotel-led turn: curated table → global catalog →
  * honest UNSUPPORTED / NO_CITY. Never invents a destination.
+ *
+ * `strictNamed` (PLUTO_STATE_V2 only; QC F-24): when the user names a
+ * DESTINATION this turn ("Executive stay in London Soho"), the locked city is
+ * not a fallback key — it used to be, so a name that missed the catalogue
+ * silently became "Dubai". A name that does not resolve comes back as
+ * UNSUPPORTED with `named` and, when one exists, the closest `suggestion`; a
+ * renamed match (LLM / fuzzy) is only suggested, never searched. A landmark
+ * ("near Burj Khalifa") still sits in the locked city. Without the option the
+ * behaviour is unchanged.
  */
 export async function resolveHotelDestination(
   prompt: string,
   locked: any,
+  opts: { strictNamed?: boolean } = {},
 ): Promise<HotelDestination> {
   const tableCity = extractHotelCity(prompt);
   const named = extractNamedPlaceCandidate(prompt);
-  const lockedName = locked?.destination?.name ? String(locked.destination.name) : null;
+  const rawLocked = locked?.destination?.name ? String(locked.destination.name) : null;
+  const strict = Boolean(opts.strictNamed);
+  const namedDestination = Boolean(named) && !namedAsLandmark(prompt, (named as { raw: string }).raw);
+  // Strict: a destination named THIS turn is the only place asked about.
+  // "Goa, India" (a model-written lock, QC F-07c) is looked up as "Goa".
+  const lockedName =
+    strict && (tableCity || namedDestination)
+      ? null
+      : strict && rawLocked && rawLocked.includes(",")
+        ? rawLocked.split(",")[0].trim()
+        : rawLocked;
 
   /* STAGE 0 — CANDIDATE KEYS, not one string.
    *
@@ -614,6 +699,17 @@ export async function resolveHotelDestination(
       ambiguous = pick.candidates;
       ambiguousQuery = key;
       break;
+    }
+  }
+
+  /* STRICT (v2) — a destination named this turn missed every key. Never the
+   * locked city, never a silent rename: say what didn't match and offer the
+   * closest bookable city, unless it is a COUNTRY (handled below as today). */
+  if (strict && namedDestination && !tableCity && !catalog && !ambiguous && named) {
+    const asCountry = await findCountryByName(named.raw);
+    if (!asCountry) {
+      const suggestion = await suggestCatalogCity(named.raw);
+      return { status: "UNSUPPORTED", cityName: named.raw, named: true, ...(suggestion ? { suggestion } : {}) };
     }
   }
 

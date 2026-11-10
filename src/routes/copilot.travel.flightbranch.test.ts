@@ -68,7 +68,14 @@ describe("Amendment T — the flight branch writes route/dates into locked", () 
     const body = await chat("flights from Delhi to Mumbai on 20 May 2026 returning 24 May 2026");
     expect(body.context.locked.origin.city).toBe("Delhi");
     expect(body.context.locked.dates.start).toBe("2026-05-20");
-    expect(body.context.locked.dates.end).toBe("2026-05-24");
+    // PLUTO_STATE_V2 keeps the flight's return apart from a hotel stay's end
+    // (design §1.2): a return in `end` turned later searches into round trips.
+    if (/^(on|true|1)$/i.test(String(process.env.PLUTO_STATE_V2 ?? "").trim())) {
+      expect(body.context.locked.dates.returnDate).toBe("2026-05-24");
+      expect(body.context.locked.dates.end).toBeUndefined();
+    } else {
+      expect(body.context.locked.dates.end).toBe("2026-05-24");
+    }
   });
 
   it("keeps a previously-locked destination (set-if-absent) while adding origin/dates", async () => {

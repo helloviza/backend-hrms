@@ -162,6 +162,37 @@ describe("parseParkTask (F-06)", () => {
   });
 });
 
+describe("whole-message parsers tolerate filler (S2 a)", () => {
+  it.each([
+    "[QC3] ok leave flights for now",
+    "ok leave flights for now 🙏",
+    "okay, leave flights for now!",
+    "hey Pluto, leave flights for now please",
+    "pls leave flights for now thanks",
+    "hi, no flights for now",
+  ])("park: %s", (p) => expect(parseParkTask(p)).toEqual({ kind: "flight" }));
+
+  it.each(["thanks! skip hotels", "[QC] skip hotels 🙂", "hey, hotels can wait"])("park hotels: %s", (p) =>
+    expect(parseParkTask(p)).toEqual({ kind: "hotel" }));
+
+  it.each(["[QC3] Back to flights", "ok back to flights please", "hey Pluto, show the flights again 🙂", "go back to flights"])(
+    "resume: %s",
+    (p) => expect(isResumeFlights(p)).toBe(true),
+  );
+
+  it.each([
+    ["[QC3] bengaluru to mumbai on 20 nov, morning flights only", "flights from bengaluru to mumbai on 20 nov, morning flights only"],
+    ["hi Pluto, bengaluru to mumbai on 20 nov, morning flights only 🙂", "flights from bengaluru to mumbai on 20 nov, morning flights only"],
+    ["please BLR-DEL 5 Dec thanks", "flights from BLR to DEL 5 Dec"],
+    ["ok, Delhi to Goa", "flights from Delhi to Goa"],
+  ])("X to Y: %s", (p, rewritten) => expect(matchXToYRoute(p)?.prompt).toBe(rewritten));
+
+  it("filler never turns a non-park into a park", () => {
+    expect(parseParkTask("ok skip hotels, show me flights to Goa")).toBeNull();
+    expect(parseParkTask("[QC3] flights for 2 adults from DEL to BOM on 5 Dec")).toBeNull();
+  });
+});
+
 describe("projectForClient", () => {
   it("strips rows, shownRefs and the timestamp; keeps the rest", () => {
     const state = {

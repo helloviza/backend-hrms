@@ -334,7 +334,8 @@ describe("#1 — 'hotels near my office'", () => {
     H.officeMock.mockResolvedValue(officeAt(BLR));
     await chat("hotels near my office in Pune");
     expect(H.officeMock).not.toHaveBeenCalled();
-    expect(H.resolveHotelDestinationMock).toHaveBeenCalledWith("hotels near my office in Pune", {});
+    // (prompt, locked) — with PLUTO_STATE_V2 on a third arg, { strictNamed: true }, follows.
+    expect(H.resolveHotelDestinationMock.mock.calls.map((c: any[]) => c.slice(0, 2))).toContainEqual(["hotels near my office in Pune", {}]);
   });
 });
 
@@ -353,7 +354,8 @@ describe("#2b — 'hotels near me': current location as a suggestion only", () =
     H.hereMock.mockResolvedValue(BLR);
     const ask = await chat("hotels nearby");
     await chat(ask.reply.nextSteps[0], ask.context);
-    expect(H.resolveHotelDestinationMock).toHaveBeenCalledWith("Search hotels in Bengaluru (my current location)", {});
+    // (prompt, locked) — with PLUTO_STATE_V2 on a third arg, { strictNamed: true }, follows.
+    expect(H.resolveHotelDestinationMock.mock.calls.map((c: any[]) => c.slice(0, 2))).toContainEqual(["Search hotels in Bengaluru (my current location)", {}]);
   });
 
   it("IP unavailable → today's behaviour (normal resolution, model asks)", async () => {

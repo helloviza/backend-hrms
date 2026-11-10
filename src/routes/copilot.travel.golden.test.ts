@@ -87,7 +87,8 @@ vi.mock("../utils/plutoMemory.js", () => ({
 import express from "express";
 import request from "supertest";
 import router from "./copilot.travel.js";
-import { GOLDEN, FLIGHTS, HOTELS, HOTEL_CITIES, type Golden, type TurnExpect } from "./copilot.travel.golden.fixtures.js";
+import { GOLDEN, HOTELS, HOTEL_CITIES, CATALOG_ONLY, flightRowsFor, type Golden, type TurnExpect } from "./copilot.travel.golden.fixtures.js";
+import { extractNamedPlaceCandidate } from "../utils/plutoHotelSearch.js";
 
 const WS = "656565656565656565656565";
 const USER_A = "64b000000000000000000001";
@@ -110,8 +111,11 @@ beforeEach(() => {
   H.store.clear();
   for (const k of ["searchFlights", "searchHotelsForChat", "resolveHotelDestination", "invokePluto", "emitMetric"] as const) H[k].mockReset();
   H.searchFlights.mockImplementation(async (p: any) => {
-    const key = `${p.origin}-${p.destination}-${p.departDate}`;
-    return { Response: { TraceId: `T-${p.origin}-${p.destination}`, ResponseStatus: 1, Results: [FLIGHTS[key] || []] } };
+    const out = flightRowsFor(p.origin, p.destination, p.departDate);
+    const results = p.JourneyType === 2 && p.returnDate
+      ? [out, flightRowsFor(p.destination, p.origin, p.returnDate)]
+      : [out];
+    return { Response: { TraceId: `T-${p.origin}-${p.destination}`, ResponseStatus: 1, Results: results } };
   });
   H.searchHotelsForChat.mockImplementation(async (a: any) => {
     const rows = HOTELS[`${a.cityName}|${a.checkIn}|${a.checkOut}`];
@@ -119,7 +123,29 @@ beforeEach(() => {
       ? { ok: true, reason: null, hotels: rows, cityName: a.cityName, searchId: "S1" }
       : { ok: false, reason: "NO_AVAILABILITY", hotels: [], cityName: a.cityName };
   });
-  H.resolveHotelDestination.mockImplementation(async (prompt: string, locked: any) => {
+  // The real ladder is DB-backed (proved in plutoHotelDestination.strict.test.ts);
+  // this emulates its two modes. Default (v1): any known city in the prompt,
+  // else the locked one. Strict (v2): a destination NAMED this turn is looked
+  // up exactly and never falls back to the locked city; a landmark ("near
+  // Burj Khalifa") still means the locked one.
+  H.resolveHotelDestination.mockImplementation(async (prompt: string, locked: any, opts?: { strictNamed?: boolean }) => {
+    if (opts?.strictNamed) {
+      const named = extractNamedPlaceCandidate(prompt);
+      const landmark = named && new RegExp(String.raw`\b(?:near|around|close\s+to)\s+${named.raw}`, "i").test(prompt);
+      if (named && !landmark) {
+        const key = named.raw.toLowerCase();
+        const cat = { ...HOTEL_CITIES, ...CATALOG_ONLY };
+        if (cat[key]) return { status: "RESOLVED", ...cat[key] };
+        const words = named.raw.split(/\s+/);
+        const lead = cat[words[0].toLowerCase()];
+        return {
+          status: "UNSUPPORTED",
+          cityName: named.raw,
+          named: true,
+          ...(lead && words.length > 1 ? { suggestion: { ...lead, rest: words.slice(1).join(" ") } } : {}),
+        };
+      }
+    }
     const text = `${prompt} ${locked?.destination?.name || ""}`.toLowerCase();
     const hit = Object.keys(HOTEL_CITIES).find((k) => text.includes(k));
     return hit ? { status: "RESOLVED", ...HOTEL_CITIES[hit] } : { status: "NO_CITY" };
@@ -146,6 +172,7 @@ function check(exp: TurnExpect | undefined, ctx: { reply: any; stored: any; flig
   if (exp.flightCalls !== undefined) expect(ctx.flightCalls).toBe(exp.flightCalls);
   if (exp.hotelCalls !== undefined) expect(ctx.hotelCalls).toBe(exp.hotelCalls);
   if (exp.lastFlightArgs) expect(H.searchFlights.mock.calls.at(-1)?.[0]).toMatchObject(exp.lastFlightArgs);
+  if (exp.lastHotelArgs) expect(H.searchHotelsForChat.mock.calls.at(-1)?.[0]).toMatchObject(exp.lastHotelArgs);
   if (exp.reply) exp.reply(ctx.reply);
   if (exp.stored) exp.stored(ctx.stored);
   if (exp.aiPrompt) {

@@ -10,6 +10,7 @@
 
 import { resolveIATA } from "./plutoIata.js";
 import { lookupDestination } from "../data/destinationLookup.js";
+import { stripFiller } from "./plutoTripEdit.js";
 
 export function isStateV2Enabled(): boolean {
   const v = String(process.env.PLUTO_STATE_V2 ?? "").trim().toLowerCase();
@@ -297,7 +298,8 @@ function resolveCityToIATA(raw: string): string | null {
  * flight branch's extractors already read ("flights from X to Y …").
  */
 export function matchXToYRoute(prompt: string): { origin: string; destination: string; prompt: string } | null {
-  const t = String(prompt ?? "").trim();
+  // "hi Pluto, bengaluru to mumbai…", "[QC3] bengaluru to mumbai…" (S2 a).
+  const t = stripFiller(prompt);
   if (!t || t.length > 140) return null;
   if (/\bfrom\b/i.test(t)) return null; // the "from … to" form is already read
   if (NOT_A_ROUTE_RX.test(t)) return null;
@@ -329,7 +331,7 @@ const PARK_LEAD = String.raw`^(?:(?:ok(?:ay)?|okk+|fine|alright|cool|hmm+|no|nah
  * slice S4). kind null = no task named ("not now").
  */
 export function parseParkTask(prompt: string): { kind: "flight" | "hotel" | null } | null {
-  const t = String(prompt ?? "").trim();
+  const t = stripFiller(prompt);
   if (!t || t.length > 80) return null;
   const verb = new RegExp(
     String.raw`${PARK_LEAD}(?:leave|skip|park|pause|drop|forget(?:\s+about)?|hold\s+off(?:\s+on)?|hold)\s+(?:the\s+|my\s+)?(flights?|hotels?|stays?)${PARK_TIME}[\s.!]*$`,
@@ -352,7 +354,7 @@ export function parseParkTask(prompt: string): { kind: "flight" | "hotel" | null
 
 /** "back to flights", "resume flights", "show the flights again". */
 export function isResumeFlights(prompt: string): boolean {
-  return /^\s*(?:ok(?:ay)?[\s,]*)?(?:back\s+to|resume|show(?:\s+me)?)\s+(?:the\s+|my\s+)?flights?(?:\s+again)?[\s.!]*$/i.test(String(prompt ?? ""));
+  return /^\s*(?:ok(?:ay)?[\s,]*)?(?:(?:go\s+)?back\s+to|resume|show(?:\s+me)?)\s+(?:the\s+|my\s+)?flights?(?:\s+again)?[\s.!]*$/i.test(stripFiller(prompt));
 }
 
 /* ───────────────────────── Client projection ───────────────────────── */

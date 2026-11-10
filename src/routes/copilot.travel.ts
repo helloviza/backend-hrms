@@ -49,6 +49,19 @@ import {
   projectForClient,
   type FlightFilters,
 } from "../utils/plutoTurnState.js";
+import {
+  stripFiller,
+  parseTripEdit,
+  tripEditBranch,
+  parseStayAnswer,
+  resolveStayWindow,
+  roomsFor,
+  nearLabel,
+  stayLabel,
+  dayLabel,
+  addDaysISO,
+  nightsBetweenISO,
+} from "../utils/plutoTripEdit.js";
 import { invokePlutoGemini, GEMINI_FALLBACK_INVALID } from "../utils/plutoGeminiInvoke.js";
 import { parseBudget, describeBudget } from "../utils/plutoBudget.js";
 import {
@@ -983,6 +996,19 @@ async function runConciergeTurnInner(
       /fly(ing)?\s+from\s+.{2,30}\s+to\s+/i.test(t)
     );
 
+    /* v2 S2 hand-offs: a trip edit or a hotel-stay answer settles the facts
+     * here and RE-RUNS a search through the existing flight / hotel branch
+     * below, so there is one search path and one reply shape. */
+    let flightForce: { prompt: string } | null = null;
+    let hotelForce: {
+      city: string; cityCode?: string; countryCode?: string;
+      start: string; end: string; nights: number; near?: string | null;
+    } | null = null;
+    let editNote = "";
+    let editBranch: string | null = null;
+    let editChips: string[] = [];
+    let carryFilters: FlightFilters | null = null;
+
     /* ───────── v2: PARK · RESUME · REFINE (deterministic, never the AI) ─────────
      * Design §3.1 / §3.6. Runs BEFORE the route detector: "ok leave flights for
      * now" matches its /flights?\s+for/ and used to re-run the very search the
@@ -1036,6 +1062,164 @@ async function runConciergeTurnInner(
         });
       }
 
+      const MON3 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+      const longDay = (iso: string): string => {
+        const [y, m, d] = iso.split("-").map((x) => parseInt(x, 10));
+        return `${d} ${MON3[m - 1]} ${y}`;
+      };
+      const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+
+      // ── ANSWER to "How many nights?" / "Which dates?" (S2, design §3.7).
+      // The hotel search the question was for runs with the answer — never the AI.
+      if (pending?.kind === "hotel" && (pending.need === "checkout" || pending.need === "dates") && pending.city) {
+        const stay = parseStayAnswer(prompt, pending.need === "checkout" ? pending.checkIn || null : null, new Date());
+        if (stay) {
+          editBranch = "answer_pending";
+          const prevDates: any = lockedNow.dates || {};
+          context.locked = {
+            ...lockedNow,
+            dates: { ...prevDates, start: stay.start, end: stay.end, nights: stay.nights, source: "user" },
+            duration: { days: stay.nights + 1, source: "derived" },
+          };
+          hotelForce = {
+            city: pending.city, cityCode: pending.cityCode, countryCode: pending.countryCode,
+            start: stay.start, end: stay.end, nights: stay.nights, near: pending.near || null,
+          };
+        }
+      }
+
+      // ── TRIP EDITS (S2, design §3.3): change the date / add a return / one
+      // way / travellers / cabin / nights. The trip's facts change HERE, then
+      // the last search re-runs with them and with its filters — the
+      // destination and origin are kept (QC F-08: "change to 21 Nov" used to
+      // wipe the trip and search nothing).
+      if (!hotelForce) {
+        const prevDates: any = lockedNow.dates || {};
+        const lfx: any = ls.flight && typeof ls.flight === "object" ? ls.flight : null;
+        const lhx: any = ls.hotel && typeof ls.hotel === "object" ? ls.hotel : null;
+        const prevStart: string | null = prevDates.start || lfx?.date || lhx?.checkIn || null;
+        const edit = parseTripEdit(prompt, { start: prevStart, now: new Date() });
+        if (edit && (prevStart || lfx || lhx || edit.adults !== undefined || edit.adultsDelta || edit.cabin)) {
+          editBranch = tripEditBranch(edit);
+          let start: string | null = prevStart;
+          if (edit.start) start = edit.start;
+          if (edit.shiftDays && start) start = addDaysISO(start, edit.shiftDays);
+          let returnDate: string | undefined =
+            prevDates.returnDate || (lfx?.journeyType === 2 ? lfx.returnDate : undefined);
+          if (edit.shiftDays && returnDate) returnDate = addDaysISO(returnDate, edit.shiftDays);
+          if (edit.returnDate) returnDate = edit.returnDate;
+          if (edit.oneWay) returnDate = undefined;
+          const notes: string[] = [];
+          if (returnDate && start && returnDate <= start) {
+            notes.push(`Your return (${dayLabel(returnDate)}) was no longer after the new date, so it's one way for now.`);
+            returnDate = undefined;
+          }
+          const prevNights =
+            Number(prevDates.nights) ||
+            (prevStart && prevDates.end ? nightsBetweenISO(prevStart, prevDates.end) : 0) ||
+            (lhx ? nightsBetweenISO(lhx.checkIn, lhx.checkOut) : 0) ||
+            0;
+          let nights = prevNights;
+          if (edit.nights !== undefined) nights = edit.nights;
+          if (edit.nightsDelta) nights = (nights || 0) + edit.nightsDelta;
+          const prevAdults: number | undefined = lockedNow.travellers?.adults ?? lfx?.adults ?? undefined;
+          const adults: number | undefined =
+            edit.adults ?? (edit.adultsDelta ? (prevAdults || 1) + edit.adultsDelta : prevAdults);
+          const cabin: string | undefined = edit.cabin ?? lockedNow.cabin?.value ?? lfx?.cabin;
+          const separate = Boolean(edit.separateRooms || lockedNow.travellers?.separateRooms);
+
+          const L: any = { ...lockedNow };
+          if (start) {
+            const d: any = { ...prevDates, start, source: "user" };
+            if (returnDate) d.returnDate = returnDate;
+            else delete d.returnDate;
+            if (nights > 0) {
+              d.nights = nights;
+              d.end = addDaysISO(start, nights);
+              L.duration = { days: nights + 1, source: "derived" };
+            } else if (prevDates.end && edit.shiftDays) {
+              d.end = addDaysISO(prevDates.end, edit.shiftDays);
+            }
+            L.dates = d;
+          }
+          if (adults !== undefined || edit.separateRooms) {
+            L.travellers = {
+              ...(lockedNow.travellers || {}),
+              ...(adults !== undefined ? { adults } : {}),
+              ...(separate ? { separateRooms: true } : {}),
+              source: "user",
+            };
+          }
+          if (edit.cabin) L.cabin = { value: edit.cabin, source: "user" };
+          context.locked = L;
+
+          if ((edit.start || edit.shiftDays) && start) {
+            notes.unshift(prevStart && prevStart !== start ? `Moved to ${dayLabel(start)} (was ${dayLabel(prevStart)}).` : `Date set to ${dayLabel(start)}.`);
+          }
+          if (edit.returnDate && returnDate) notes.push(`Return on ${dayLabel(returnDate)}.`);
+          if (edit.oneWay) notes.push("One way now.");
+          if ((edit.nights !== undefined || edit.nightsDelta) && start && nights > 0) {
+            notes.push(`${plural(nights, "night")} (${stayLabel(start, addDaysISO(start, nights))}).`);
+          }
+          if ((edit.adults !== undefined || edit.adultsDelta) && adults !== undefined) notes.push(`${plural(adults, "traveller")}.`);
+          if (edit.cabin) notes.push(`${edit.cabin} class.`);
+          if (edit.separateRooms) notes.push("Separate rooms.");
+          editNote = notes.length ? `${notes.join(" ")} ` : "";
+
+          const datesChanged = Boolean(edit.start || edit.shiftDays);
+          const flightHit = datesChanged || Boolean(edit.returnDate || edit.oneWay || edit.adults !== undefined || edit.adultsDelta || edit.cabin);
+          const hotelHit = datesChanged || edit.nights !== undefined || Boolean(edit.nightsDelta || edit.adults !== undefined || edit.adultsDelta || edit.separateRooms);
+          const pick: "flight" | "hotel" | null =
+            ls.active === "flight" && lfx && flightHit ? "flight"
+            : ls.active === "hotel" && lhx && hotelHit && nights > 0 ? "hotel"
+            : lfx && flightHit ? "flight"
+            : lhx && hotelHit && nights > 0 ? "hotel"
+            : null;
+          const destLabel: string = lockedNow.destination?.name || lfx?.destinationCity || lhx?.city || "";
+
+          if (pick === "flight" && start) {
+            const fromCity = lfx.originCity || lockedNow.origin?.city || lfx.origin;
+            const toCity = lfx.destinationCity || lockedNow.destination?.name || lfx.destination;
+            const n = adults || lfx.adults || 1;
+            flightForce = {
+              prompt:
+                `flights from ${fromCity} to ${toCity} on ${longDay(start)}` +
+                (returnDate ? ` returning on ${longDay(returnDate)}` : "") +
+                ` for ${n} ${n === 1 ? "adult" : "adults"}` +
+                (cabin && cabin !== "Economy" ? ` ${cabin.toLowerCase()} class` : ""),
+            };
+            carryFilters = lfx.filters || {};
+            // The other search is NOT re-run on its own (§3.3) — offered.
+            if (lhx && datesChanged && nights > 0 && destLabel) {
+              editChips.push(`Hotels in ${destLabel} for ${stayLabel(start, addDaysISO(start, nights))}`);
+            }
+          } else if (pick === "hotel" && start) {
+            hotelForce = {
+              city: lhx.city, cityCode: lhx.cityCode, countryCode: lhx.countryCode,
+              start, end: addDaysISO(start, nights), nights, near: lhx.filters?.near?.label || null,
+            };
+            if (lfx && datesChanged) {
+              editChips.push(`Flights from ${lfx.originCity || lfx.origin} to ${lfx.destinationCity || lfx.destination} on ${longDay(start)}`);
+            }
+          } else {
+            // Nothing to re-run: say what changed and offer the next step.
+            trace.branch = editBranch;
+            return res.json({
+              ok: true,
+              reply: {
+                title: "Trip updated",
+                context: `Got it. ${editNote.trim()}${destLabel ? ` Want flights or hotels${start ? ` for ${dayLabel(start)}` : ""}?` : ""}`.trim(),
+                nextSteps: destLabel
+                  ? [`Flights to ${destLabel}${start ? ` on ${longDay(start)}` : ""}`, `Hotels in ${destLabel}`]
+                  : [],
+                handoff: false,
+              },
+              context: { ...v2Ctx, locked: L, id: conversationId },
+            });
+          }
+        }
+      }
+
       // ── RESUME / REFINE the last flight search.
       const lf: any = ls.flight && typeof ls.flight === "object" ? ls.flight : null;
       const resume = isResumeFlights(prompt);
@@ -1049,7 +1233,7 @@ async function runConciergeTurnInner(
         Boolean(extractPromptDateRange(prompt)) ||
         Boolean(resolveRelativeDate(prompt));
       const aboutFlights = ls.active === "flight" || /\bflights?\b/i.test(prompt);
-      if (lf && !isHotelRequest(prompt) && (resume || (aboutFlights && !namesNewSearch))) {
+      if (lf && !flightForce && !hotelForce && !isHotelRequest(prompt) && (resume || (aboutFlights && !namesNewSearch))) {
         const parsed = resume ? null : parseFlightRefinement(prompt, lf.rows?.flights || []);
         if (resume || parsed) {
           trace.branch = resume ? "resume_flight" : "refine_flight";
@@ -1123,6 +1307,14 @@ async function runConciergeTurnInner(
           if (narrowing.length && fare(overall) < fare(cheapest)) {
             text += ` Without the filters, the cheapest is ${inr(fare(overall))} (${overall.flightNo}, ${stops(overall.stops)}, ${overall.duration}).`;
           }
+          // "cheaper?" / "fastest" ADDS a sort on top of the filters: say so up
+          // front and list everything now active (QC A3: the reply used to read
+          // exactly like the previous one).
+          const sortLabel = filters.sort === "price" ? "Cheapest first" : filters.sort === "duration" ? "Fastest first" : "";
+          const sortAdded = Boolean(parsed && "filters" in parsed && parsed.filters.sort && parsed.filters.sort !== prevFilters.sort);
+          if (sortLabel && narrowing.length) {
+            text = `${sortAdded ? `${sortLabel}. ` : ""}${text} Active filters: ${labels.join(", ")}.`;
+          }
 
           const chips: string[] = [];
           if (filters.maxStops === undefined) chips.push("Non-stop only");
@@ -1178,7 +1370,8 @@ async function runConciergeTurnInner(
       (pending.need === "origin" || pending.need === "destination") &&
       !looksLikeFlightRouteSearch(prompt)
     ) {
-      const answer = parseCityAnswer(prompt);
+      // v2: "ok Pune please" answers as "Pune" (S2 a).
+      const answer = parseCityAnswer(v2 ? stripFiller(prompt) : prompt);
       const answerCity = answer ? lookupDestination(answer)?.city || answer : null;
       if (answerCity && resolveIATA(answerCity)) {
         flightPrompt = spliceFlightAnswer(pending.prompt, pending.need, answerCity);
@@ -1193,15 +1386,18 @@ async function runConciergeTurnInner(
     // Applied even when the legacy detector also fired ("…morning flights only"
     // matches its /flights?\s+on/) — that detector would claim the turn with no
     // origin. matchXToYRoute already refuses any message containing "from".
-    if (v2 && !flightAnswered) {
+    if (v2 && !flightAnswered && !flightForce && !hotelForce) {
       xToY = matchXToYRoute(prompt);
       if (xToY) flightPrompt = xToY.prompt;
     }
+    // v2 S2: a trip edit re-runs the last flight search with the new facts.
+    if (flightForce) flightPrompt = flightForce.prompt;
 
-    const isFlightRouteSearch = flightAnswered || looksLikeFlightRouteSearch(prompt) || Boolean(xToY);
+    const isFlightRouteSearch =
+      !hotelForce && (flightAnswered || looksLikeFlightRouteSearch(prompt) || Boolean(xToY) || Boolean(flightForce));
 
     if (isFlightRouteSearch) {
-      trace.branch = flightAnswered ? "answer_pending" : "flight_route";
+      trace.branch = editBranch || (flightAnswered ? "answer_pending" : "flight_route");
       // ── Multi-city: not supported in the chat path yet → LOUD downgrade ──
       // Detect BEFORE single-leg extraction: a "to A to B" prompt would make the
       // destination regex capture "A to B", which then fails IATA resolution and
@@ -1265,15 +1461,23 @@ async function runConciergeTurnInner(
       ) || flightPrompt.match(
         /(\d+)\s*(?:people|persons?|pax|passengers?|travell?ers?|adults?)/i
       );
-      const extractedAdults = paxMatch ? Math.min(parseInt(paxMatch[1]), 9) : 1;
+      // v2: travellers stated earlier are reused until the user changes them (§1.2).
+      const lockedAdults = v2 ? Number(context?.locked?.travellers?.adults) || 0 : 0;
+      const extractedAdults = paxMatch ? Math.min(parseInt(paxMatch[1]), 9) : lockedAdults > 0 ? Math.min(lockedAdults, 9) : 1;
 
       // Extract cabin class — FLIGHT-ADJACENT ONLY. A bare "business" must never
       // upgrade the search: "business hotel and cheapest flight" used to match
       // "business" and silently search Business class (₹1.7L+ fares for a
       // "cheapest" ask). Require "<cabin> class" or a flight verb before the
       // word, and never treat a cabin word glued to a lodging noun as a cabin.
+      const cabinStated =
+        /\bpremium\s+economy\b|\bfirst\s+class\b|\beconomy\b/i.test(flightPrompt) ||
+        ((/\bbusiness\s+class\b/i.test(flightPrompt) || /\b(?:in|fly|flying|book|travel|travell?ing)\s+business\b/i.test(flightPrompt)) &&
+          !/\bbusiness\s+(?:hotel|stay|accommodation|accomodation|property|resort)\b/i.test(flightPrompt));
+      const lockedCabin: string | null = v2 && !cabinStated ? context?.locked?.cabin?.value || null : null;
       const extractedCabin: "Economy" | "Premium Economy" | "Business" | "First" =
-        /\bpremium\s+economy\b/i.test(flightPrompt) ? "Premium Economy"
+        lockedCabin === "Premium Economy" || lockedCabin === "Business" || lockedCabin === "First" ? lockedCabin
+        : /\bpremium\s+economy\b/i.test(flightPrompt) ? "Premium Economy"
         : /\bfirst\s+class\b/i.test(flightPrompt) ? "First"
         : (
             (/\bbusiness\s+class\b/i.test(flightPrompt) ||
@@ -1445,8 +1649,13 @@ async function runConciergeTurnInner(
 
       // ── Round-trip: search both legs (JourneyType 2) when a return date is
       // known. (Multi-city was already handled + returned at the top.) ──
-      const { wantsRoundTrip, returnDateRaw } =
-        resolveRoundTripIntent(flightPrompt, context?.locked?.dates?.end || null, isoDate);
+      // v2: the flight's own return (dates.returnDate) — never a hotel check-out
+      // (dates.end), which used to turn the next flight search into a round trip.
+      const { wantsRoundTrip, returnDateRaw } = resolveRoundTripIntent(
+        flightPrompt,
+        (v2 ? context?.locked?.dates?.returnDate : context?.locked?.dates?.end) || null,
+        isoDate,
+      );
       const isoReturnDate = returnDateRaw ? parseDateToISO(returnDateRaw) : "";
       const journeyType: 1 | 2 = wantsRoundTrip && isoReturnDate ? 2 : 1;
 
@@ -1461,14 +1670,48 @@ async function runConciergeTurnInner(
           ? { ...context.locked }
           : {};
       const mergedLocked: any = { ...priorLocked };
-      if (!mergedLocked.origin && rawOrigin && originIATA) {
-        mergedLocked.origin = { city: origin, iata: originIATA, source: officeNote && officeEnd === "origin" ? "profile" : "user" };
-      }
-      if (!mergedLocked.destination && rawDestination && destIATA) {
-        mergedLocked.destination = { name: destination, iata: destIATA, source: officeNote && officeEnd === "destination" ? "profile" : "user" };
-      }
-      if (!mergedLocked.dates && isoDate) {
-        mergedLocked.dates = { start: isoDate, ...(isoReturnDate ? { end: isoReturnDate } : {}), source: "user" };
+      if (!v2) {
+        if (!mergedLocked.origin && rawOrigin && originIATA) {
+          mergedLocked.origin = { city: origin, iata: originIATA, source: officeNote && officeEnd === "origin" ? "profile" : "user" };
+        }
+        if (!mergedLocked.destination && rawDestination && destIATA) {
+          mergedLocked.destination = { name: destination, iata: destIATA, source: officeNote && officeEnd === "destination" ? "profile" : "user" };
+        }
+        if (!mergedLocked.dates && isoDate) {
+          mergedLocked.dates = { start: isoDate, ...(isoReturnDate ? { end: isoReturnDate } : {}), source: "user" };
+        }
+      } else {
+        // v2 (S2): what the user typed THIS turn replaces the lock — origin,
+        // date, return, travellers, cabin (QC F-08: set-if-absent kept the old
+        // date after "change to 21 Nov"). The destination stays set-if-absent
+        // until S3, which also clears the old city's summary when it changes.
+        const typedOrigin = Boolean(promptOriginMatch?.[1]) || officeEnd === "origin";
+        const typedDate = Boolean(dateMatch || relDate);
+        if (rawOrigin && originIATA && (typedOrigin || !mergedLocked.origin)) {
+          mergedLocked.origin = { city: origin, iata: originIATA, source: officeNote && officeEnd === "origin" ? "profile" : "user" };
+        }
+        if (!mergedLocked.destination && rawDestination && destIATA) {
+          mergedLocked.destination = { name: destination, iata: destIATA, source: officeNote && officeEnd === "destination" ? "profile" : "user" };
+        }
+        if (isoDate && (typedDate || !mergedLocked.dates?.start)) {
+          const prev: any = mergedLocked.dates || {};
+          const keepNights = Number(prev.nights) > 0 ? Number(prev.nights) : 0;
+          mergedLocked.dates = {
+            ...prev,
+            start: isoDate,
+            ...(keepNights ? { end: addDaysISO(isoDate, keepNights) } : {}),
+            source: "user",
+          };
+        }
+        if (mergedLocked.dates) {
+          if (journeyType === 2 && isoReturnDate) mergedLocked.dates = { ...mergedLocked.dates, returnDate: isoReturnDate };
+          else if (typedDate) {
+            const { returnDate: _r, ...rest } = mergedLocked.dates;
+            mergedLocked.dates = rest;
+          }
+        }
+        if (paxMatch) mergedLocked.travellers = { ...(mergedLocked.travellers || {}), adults: extractedAdults, source: "user" };
+        if (cabinStated) mergedLocked.cabin = { value: extractedCabin, source: "user" };
       }
 
       // ── Step 4 — DURATION CONSISTENCY. When the stated dates span a different
@@ -1585,16 +1828,25 @@ async function runConciergeTurnInner(
         const priorSearch: any = (lockedReturnContext as any).lastSearch || {};
         const { flight: _oldFlight, ...otherSearches } = priorSearch;
         if (isoDate && !searchUnavailable && (chatFlights.length > 0 || chatOtherAirport.length > 0)) {
-          const typed = parseFlightRefinement(flightPrompt, chatFlights);
-          const initialFilters: FlightFilters = typed && "filters" in typed ? typed.filters : {};
+          // A trip edit's re-run carries the filters already chosen (B8: "change
+          // to 21 Nov" keeps "morning only"); a typed route adds its own.
+          const typed = flightForce ? null : parseFlightRefinement(flightPrompt, chatFlights);
+          const typedFilters: FlightFilters = typed && "filters" in typed ? typed.filters : {};
+          const initialFilters: FlightFilters = carryFilters ? mergeFlightFilters(carryFilters, typedFilters) : typedFilters;
           const allFlights = chatFlights;
           const allInbound = chatInbound;
+          const allOther = chatOtherAirport;
+          const allInboundOther = chatInboundOtherAirport;
           if (Object.keys(initialFilters).length) {
             const labels = describeFlightFilters(initialFilters, allFlights);
             const narrowed = applyFlightFilters(allFlights, initialFilters, { leg: "out", legDate: isoDate });
             if (narrowed.length > 0) {
               chatFlights = narrowed;
               chatInbound = applyFlightFilters(chatInbound, initialFilters, { leg: "in", legDate: isoReturnDate || null });
+              // The "Other nearby airports" group obeys the same filters (prod
+              // QC 2026-11-10: "morning only" still listed 15:10 / 22:55 NMI rows).
+              chatOtherAirport = applyFlightFilters(chatOtherAirport, initialFilters, { leg: "out", legDate: isoDate });
+              chatInboundOtherAirport = applyFlightFilters(chatInboundOtherAirport, initialFilters, { leg: "in", legDate: isoReturnDate || null });
               initialFilterNote = ` Filtered to ${labels.join(", ")}: ${narrowed.length} of ${allFlights.length}.`;
             } else {
               initialFilterNote = ` None of the ${allFlights.length} flights match ${labels.join(", ")}, so all are shown.`;
@@ -1620,8 +1872,8 @@ async function runConciergeTurnInner(
               rows: {
                 flights: allFlights,
                 inbound: allInbound,
-                otherAirport: chatOtherAirport,
-                inboundOtherAirport: chatInboundOtherAirport,
+                otherAirport: allOther,
+                inboundOtherAirport: allInboundOther,
               },
               shownRefs: chatFlights.map((f: any) => f.ResultIndex),
             },
@@ -1756,13 +2008,13 @@ async function runConciergeTurnInner(
         "Try a slightly different date or route",
         "Or use the flight search panel above for full results",
       ];
-      const nextSteps = hotelTrigger ? [hotelTrigger, ...baseNextSteps] : baseNextSteps;
+      const nextSteps = [...editChips, ...(hotelTrigger ? [hotelTrigger, ...baseNextSteps] : baseNextSteps)];
 
       return res.json({
         ok: true,
         reply: {
           title: `Flights: ${origin} → ${destination}${travelDate ? "  ·  " + travelDate : ""}`,
-          context: officeNote + (searchUnavailable
+          context: officeNote + editNote + (searchUnavailable
             ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
             : hasLiveFlights
               ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + cabinNote + cheapestNote + roundTripNote + routeInsightsNote + weatherNote + otherAirportNote + initialFilterNote
@@ -1818,8 +2070,8 @@ async function runConciergeTurnInner(
     // path and got answered with a question about dates that were already
     // locked — a dead end no answer could clear.
     let hotelIntent =
-      isHotelRequest(prompt) && !/\b(fly|flying|flight|flights)\b/i.test(prompt);
-    if (hotelIntent) trace.branch = "hotel_search";
+      Boolean(hotelForce) || (isHotelRequest(prompt) && !/\b(fly|flying|flight|flights)\b/i.test(prompt));
+    if (hotelIntent) trace.branch = editBranch || "hotel_search";
 
     let hotelDest: HotelDestination = { status: "NO_CITY" };
     // Where the destination came from, and whether this branch should ask for
@@ -1831,13 +2083,19 @@ async function runConciergeTurnInner(
     // Did the user name an actual place this turn? Then THEIR place wins over
     // anything we know about them ("hotels near my office in Pune" → Pune).
     const hotelNamedPlace = (() => {
-      if (!hotelIntent) return false;
+      if (!hotelIntent || hotelForce) return false;
       if (extractHotelCity(prompt)) return true;
       const named = extractNamedPlaceCandidate(prompt);
       return Boolean(named && !isOfficePlace(named.raw));
     })();
 
-    if (hotelIntent && !hotelNamedPlace && mentionsOffice(prompt)) {
+    if (hotelForce) {
+      // v2 S2: the city the stay question / the last hotel search was for.
+      hotelDest =
+        hotelForce.cityCode && hotelForce.countryCode
+          ? { status: "RESOLVED", cityName: hotelForce.city, countryCode: hotelForce.countryCode, cityCode: hotelForce.cityCode }
+          : await resolveHotelDestination(`hotels in ${hotelForce.city}`, {});
+    } else if (hotelIntent && !hotelNamedPlace && mentionsOffice(prompt)) {
       /* ── OFFICE ("hotels near my office") — from the PROFILE, disclosed.
        * User.jobLocation (fallback Employee.location), strict ladder, exactly
        * one city. Anything else is a specific question — never UNSUPPORTED
@@ -1900,7 +2158,11 @@ async function runConciergeTurnInner(
         }
       }
     } else if (hotelIntent) {
-      hotelDest = await resolveHotelDestination(prompt, hotelLocked);
+      // v2: a destination named this turn never falls back to the locked city
+      // (QC F-24 — "Executive stay in London Soho" became Dubai).
+      hotelDest = v2
+        ? await resolveHotelDestination(prompt, hotelLocked, { strictNamed: true })
+        : await resolveHotelDestination(prompt, hotelLocked);
     }
     const hotelCity = hotelDest.status === "RESOLVED" ? hotelDest.cityName : null;
     const hotelCountry = hotelDest.status === "RESOLVED" ? hotelDest.countryCode : null;
@@ -1911,9 +2173,22 @@ async function runConciergeTurnInner(
     // on turn 1 the bag is always empty and the user had to repeat themselves.
     // Both readers now share ONE parser (resolveHotelSearchWindow), so they
     // cannot drift apart again.
-    const hotelWindow = resolveHotelSearchWindow(prompt, hotelLocked);
+    // v2 (S2): dates typed THIS turn win; then the locked start with its nights,
+    // end, or the flight's return; a start alone is ASKED about below (never
+    // handed to the model, which asked for dates it already had — QC F-07).
+    const stayV2 = !v2
+      ? null
+      : hotelForce
+        ? { start: hotelForce.start, end: hotelForce.end, nights: hotelForce.nights, source: "forced" as const }
+        : resolveStayWindow(prompt, hotelLocked, new Date());
+    const hotelWindow = v2
+      ? stayV2 && stayV2.end
+        ? { start: stayV2.start, end: stayV2.end, source: stayV2.source === "locked" || stayV2.source === "return" ? ("locked" as const) : ("prompt" as const) }
+        : null
+      : resolveHotelSearchWindow(prompt, hotelLocked);
     const checkIn = hotelWindow?.start || null;
     const checkOut = hotelWindow?.end || null;
+    const hotelNear: string | null = v2 ? hotelForce?.near ?? nearLabel(prompt) : null;
 
     // OWNERSHIP RULE: this branch takes the turn ONLY when a real search can
     // actually run — hotel-led prompt, a city we can resolve to a country, and
@@ -1973,6 +2248,46 @@ async function runConciergeTurnInner(
       });
     }
 
+    /* ── v2 (QC F-24): a destination NAMED this turn that does not resolve.
+     * Never answered about the locked city: offer the closest bookable city
+     * ("London Soho" → London, around Soho) or ask which city it is in. The
+     * trip itself is untouched — switching it is S3. */
+    if (v2 && hotelIntent && hotelDest.status === "UNSUPPORTED" && hotelDest.named) {
+      await emitMetric(
+        searchError({ workspaceId, requestId, reason: "hotel_city_unresolved_named" }),
+      );
+      const sugg = hotelDest.suggestion;
+      if (sugg) {
+        return res.json({
+          ok: true,
+          reply: {
+            title: `Did you mean ${sugg.cityName}?`,
+            context:
+              `I couldn't find "${hotelDest.cityName}" as a city I can book. ` +
+              `Did you mean ${sugg.cityName}${sugg.rest ? `, around ${sugg.rest}` : ""}?`,
+            nextSteps: [
+              `Hotels in ${sugg.cityName}${sugg.rest ? ` near ${sugg.rest}` : ""}`,
+              OTHER_CITY_CHIP,
+            ],
+            handoff: false,
+          },
+          context: { ...hotelCtx, id: conversationId, pending: { kind: "hotel", need: "city" } },
+        });
+      }
+      return res.json({
+        ok: true,
+        reply: {
+          title: `Which city is ${hotelDest.cityName} in?`,
+          context:
+            `I couldn't find "${hotelDest.cityName}" in the hotel inventory I can search. ` +
+            `Which city is it in? I'll search there — or our travel desk can source options.`,
+          nextSteps: ["Raise a request and our team will source options"],
+          handoff: false,
+        },
+        context: { ...hotelCtx, id: conversationId, pending: { kind: "hotel", need: "city" } },
+      });
+    }
+
     if (hotelIntent && hotelDest.status === "UNSUPPORTED") {
       await emitMetric(
         searchError({ workspaceId, requestId, reason: "hotel_city_unsupported" }),
@@ -2026,6 +2341,60 @@ async function runConciergeTurnInner(
       });
     }
 
+    /* ── v2 (S2): a plain hotel ask without a full stay → ASK for what is
+     * missing, in code, and remember the question (pending), so "3 nights" or
+     * "16 to 19 nov" next turn runs this search. The check-in from the flight
+     * is reused and said back (A7′, B5). A planning ask still goes to the AI. */
+    const v2StartOnly = stayV2 && stayV2.source === "start_only" ? stayV2.start : null;
+    if (
+      v2 &&
+      hotelLed &&
+      hotelCountry &&
+      !hotelForce &&
+      !(checkIn && checkOut) &&
+      // The office / our-own-city-question path keeps its disclosed dates ask
+      // below when there is no check-in to offer.
+      !(hotelAskDates && !v2StartOnly) &&
+      !/\b(?:plan|planning|itinerary|trip|days?\s+in)\b/i.test(prompt)
+    ) {
+      const resolved = hotelDest as Extract<HotelDestination, { status: "RESOLVED" }>;
+      const startOnly = v2StartOnly;
+      const lockedOut: any = {
+        ...(hotelLocked || {}),
+        ...(!(hotelLocked as any)?.destination ? { destination: { name: hotelCity, source: hotelDestSource } } : {}),
+      };
+      const ask: any = {
+        kind: "hotel",
+        need: startOnly ? "checkout" : "dates",
+        city: hotelCity,
+        cityCode: resolved.cityCode,
+        countryCode: hotelCountry,
+        ...(startOnly ? { checkIn: startOnly } : {}),
+        ...(hotelNear ? { near: hotelNear } : {}),
+      };
+      const fromFlight =
+        Boolean(startOnly) && (hotelCtx as any)?.lastSearch?.flight?.date === startOnly ? " (from your flight)" : "";
+      const title = `Hotels in ${hotelCity}${hotelNear ? ` near ${hotelNear}` : ""}`;
+      const profileNote = hotelDestSource === "profile" ? officeDisclosure(hotelCity as string, "hotels_pending") : "";
+      return res.json({
+        ok: true,
+        reply: startOnly
+          ? {
+              title,
+              context: `${profileNote}Check-in ${dayLabel(startOnly)}${fromFlight}. How many nights?`,
+              nextSteps: [1, 2, 3].map((n) => `${n} night${n > 1 ? "s" : ""} (till ${dayLabel(addDaysISO(startOnly, n))})`),
+              handoff: false,
+            }
+          : {
+              title,
+              context: `Which dates in ${hotelCity}? For example "16 to 19 Nov".`,
+              nextSteps: [],
+              handoff: false,
+            },
+        context: { ...hotelCtx, id: conversationId, locked: lockedOut, pending: ask },
+      });
+    }
+
     /* ── DESTINATION SETTLED HERE (office profile, or an answer to our own
      * city question), NO DATES. Same shape as the country branch above: ask
      * only for the dates and lock the destination, so the next turn does not
@@ -2062,7 +2431,15 @@ async function runConciergeTurnInner(
       // ever runs, so without this the very thing the ownership comment protects
       // would break: the next turn would re-ask for what the user just typed.
       const hotelLockedOut: any = { ...(hotelLocked || {}) };
-      if (hotelWindow?.source === "prompt" && !hotelLockedOut.dates) {
+      if (v2) {
+        // The stay the user stated (typed range, "for 3 nights", a stay answer,
+        // a trip edit) replaces the lock, with nights (§1.2).
+        if (stayV2 && stayV2.source !== "locked" && stayV2.source !== "return") {
+          const n = nightsBetweenISO(checkIn, checkOut);
+          hotelLockedOut.dates = { ...(hotelLockedOut.dates || {}), start: checkIn, end: checkOut, nights: n, source: "user" };
+          hotelLockedOut.duration = { days: n + 1, source: "derived" };
+        }
+      } else if (hotelWindow?.source === "prompt" && !hotelLockedOut.dates) {
         hotelLockedOut.dates = { start: checkIn, end: checkOut, source: "user" };
         if (!hotelLockedOut.duration) {
           const spanDays =
@@ -2083,8 +2460,12 @@ async function runConciergeTurnInner(
 
       // Occupancy is the one thing we assume (TBO requires PaxRooms). It is
       // DISCLOSED in the reply so the user can correct it, never silently applied.
-      const hotelAdults = 2;
-      const hotelRooms = 1;
+      // v2 (S2, Q6): the trip's travellers when known; rooms = ceil(adults / 2)
+      // unless they asked for separate rooms.
+      const lockedTrav: any = v2 ? (hotelLockedOut as any).travellers : null;
+      const knownAdults = v2 && Number(lockedTrav?.adults) > 0 ? Math.min(Number(lockedTrav.adults), 9) : 0;
+      const hotelAdults = knownAdults || 2;
+      const hotelRooms = v2 ? roomsFor(hotelAdults, Boolean(lockedTrav?.separateRooms)) : 1;
 
       // TBO prices by CityCode, never by city NAME: searchHotels rejects with a
       // 400 before any network call when it is missing, which is how this lane
@@ -2160,18 +2541,30 @@ async function runConciergeTurnInner(
             adults: hotelAdults,
             rooms: hotelRooms,
             searchId: hotelResult.searchId,
-            filters: {},
+            filters: hotelNear ? { near: { label: hotelNear } } : {},
             rows: hotelResult.hotels,
           },
         };
       }
 
       onStage?.("assembling");
+      const guestsWord = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+      const occupancyLine = v2
+        ? `Prices are live, in INR, for ${guestsWord(hotelAdults, "guest")} in ${guestsWord(hotelRooms, "room")}` +
+          (knownAdults ? "." : " — tell me if that's not right and I'll re-search.")
+        : `Prices are live, in INR, for ${hotelAdults} guests in ${hotelRooms} room — tell me if that's not right and I'll re-search.`;
+      const hotelChips = [
+        ...editChips,
+        "Tap a hotel to continue to booking",
+        "Add one to your trip",
+        ...(v2 && hotelRooms < hotelAdults ? ["Separate rooms"] : []),
+      ];
       return res.json({
         ok: true,
         reply: {
-          title: `Hotels in ${hotelResult.cityName || hotelCity}`,
+          title: `Hotels in ${hotelResult.cityName || hotelCity}${v2 && hotelNear ? ` near ${hotelNear}` : ""}`,
           context:
+            editNote +
             // The office-profile source is disclosed BEFORE the results too.
             officeHotelNote +
             // Disclose a country→city substitution BEFORE the results, so the
@@ -2180,7 +2573,7 @@ async function runConciergeTurnInner(
               ? `You asked about ${hotelDest.viaCountry}, so I searched ${hotelResult.cityName || hotelCity} — the city we have the most properties in. Tell me another city if you meant somewhere else. `
               : "") +
             `Found ${hotelResult.hotels.length} available ${hotelResult.hotels.length === 1 ? "property" : "properties"} in ${hotelResult.cityName || hotelCity} for ${checkIn} → ${checkOut} (${nights} ${nights === 1 ? "night" : "nights"}). ` +
-            `Prices are live, in INR, for ${hotelAdults} guests in ${hotelRooms} room — tell me if that's not right and I'll re-search.`,
+            occupancyLine,
           hotelSearch: {
             city: hotelResult.cityName || hotelCity,
             countryCode: hotelCountry,
@@ -2189,15 +2582,12 @@ async function runConciergeTurnInner(
             nights,
             adults: hotelAdults,
             rooms: hotelRooms,
-            assumedOccupancy: true,
+            assumedOccupancy: v2 ? !knownAdults : true,
             hotels: hotelResult.hotels,
             searchId: hotelResult.searchId,
             source: "tbo",
           },
-          nextSteps: [
-            "Tap a hotel to continue to booking",
-            "Add one to your trip",
-          ],
+          nextSteps: hotelChips,
           handoff: false,
         },
         context: hotelReturnContext,
@@ -2410,6 +2800,17 @@ async function runConciergeTurnInner(
         if (/\bbusiness\b|\bwork trip\b|\bconference\b/i.test(prompt)) L.tripType = "business";
         else if (/\bholiday\b|\bleisure\b|\bvacation\b|\bhoneymoon\b|\bgetaway\b|\banniversary\b/i.test(prompt)) L.tripType = "holiday";
         else if (/\boffsite\b|\bretreat\b|\bmice\b|\bteam\s+trip\b/i.test(prompt)) L.tripType = "mice";
+      }
+
+      // v2 (S2): travellers the user states ("2 of us", "for 3 people") are
+      // kept for every later search until they change them (§1.2).
+      if (v2) {
+        const pax =
+          prompt.match(/\b(?:for\s+)?(\d)\s+(?:people|persons|pax|passengers|adults|travell?ers|guests)\b/i) ||
+          prompt.match(/\b(\d)\s+of\s+us\b/i);
+        if (pax && parseInt(pax[1], 10) >= 1) {
+          L.travellers = { ...(L.travellers || {}), adults: parseInt(pax[1], 10), source: "user" };
+        }
       }
 
       // Budget — "under USD 200", "beyond USD 500", "between ₹5k and ₹8k",
@@ -2892,6 +3293,11 @@ ${prompt}
       const itineraryDates = conversationContext.locked?.dates;
       const itineraryCheckIn: string | null = itineraryDates?.start || null;
       const itineraryCheckOut: string | null = itineraryDates?.end || null;
+      // v2 (S2): the trip's travellers, two to a room (Q6); otherwise as before.
+      const itinTrav: any = v2 ? conversationContext.locked?.travellers : null;
+      const itinAdults = v2 && Number(itinTrav?.adults) > 0 ? Math.min(Number(itinTrav.adults), 9) : 2;
+      const itinRooms = v2 ? roomsFor(itinAdults, Boolean(itinTrav?.separateRooms)) : 1;
+      const itinAssumed = !(v2 && Number(itinTrav?.adults) > 0);
 
       if (itineraryDest.status === "RESOLVED" && itineraryCheckIn && itineraryCheckOut) {
         const itineraryPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
@@ -2901,8 +3307,8 @@ ${prompt}
           countryCode: itineraryDest.countryCode,
           checkIn: itineraryCheckIn,
           checkOut: itineraryCheckOut,
-          adults: 2,
-          rooms: 1,
+          adults: itinAdults,
+          rooms: itinRooms,
           starRating: extractStarFilter(prompt),
           guestNationality: (req as any).user?.nationality || "IN",
           policyRules: itineraryPolicyRules,
@@ -2925,8 +3331,8 @@ ${prompt}
                 countryCode: itineraryDest.countryCode,
                 checkIn: itineraryCheckIn,
                 checkOut: itineraryCheckOut,
-                adults: 2,
-                rooms: 1,
+                adults: itinAdults,
+                rooms: itinRooms,
                 searchId: itineraryHotelResult.searchId,
                 filters: {},
                 rows: itineraryHotelResult.hotels,
@@ -2939,9 +3345,9 @@ ${prompt}
             checkIn: itineraryCheckIn,
             checkOut: itineraryCheckOut,
             nights: nightsBetween(itineraryCheckIn, itineraryCheckOut),
-            adults: 2,
-            rooms: 1,
-            assumedOccupancy: true,
+            adults: itinAdults,
+            rooms: itinRooms,
+            assumedOccupancy: itinAssumed,
             hotels: itineraryHotelResult.hotels,
             searchId: itineraryHotelResult.searchId,
             source: "tbo",

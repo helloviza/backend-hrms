@@ -21,6 +21,7 @@ export interface TurnExpect {
   flightCalls?: number;
   hotelCalls?: number;
   lastFlightArgs?: Record<string, any>;
+  lastHotelArgs?: Record<string, any>;
   reply?: (reply: any) => void;
   /** The stored conversation after this turn (the in-memory store). */
   stored?: (state: any) => void;
@@ -90,13 +91,37 @@ const BLR_DXB = [
 
 const D20 = "2026-11-20";
 const D21 = "2026-11-21";
-/** BLR → BOM, Fri 20 Nov: two morning departures, one afternoon, one red-eye. */
+/** BLR → BOM, Fri 20 Nov: two morning departures, one afternoon, one red-eye;
+ *  plus two into Navi Mumbai (NMI) — the "Other nearby airports" group. */
 const BLR_BOM = [
   rawFlight("M-6E5301", "6E", "IndiGo", "5301", 5200, [{ from: "BLR", to: "BOM", dep: `${D20}T06:00:00`, arr: `${D20}T07:45:00`, mins: 105 }]),
   rawFlight("M-AI639", "AI", "Air India", "639", 6100, [{ from: "BLR", to: "BOM", dep: `${D20}T08:30:00`, arr: `${D20}T10:15:00`, mins: 105 }]),
   rawFlight("A-IX1581", "IX", "Air India Express", "1581", 4900, [{ from: "BLR", to: "BOM", dep: `${D20}T15:10:00`, arr: `${D20}T16:55:00`, mins: 105 }]),
   rawFlight("N-SG633", "SG", "SpiceJet", "633", 4500, [{ from: "BLR", to: "BOM", dep: `${D20}T23:20:00`, arr: `${D21}T01:20:00`, mins: 120 }]),
+  rawFlight("O-QP1313", "QP", "Akasa Air", "1313", 6212, [{ from: "BLR", to: "NMI", dep: `${D20}T10:05:00`, arr: `${D20}T11:50:00`, mins: 105 }]),
+  rawFlight("O-IX1360", "IX", "Air India Express", "1360", 6928, [{ from: "BLR", to: "NMI", dep: `${D20}T22:55:00`, arr: `${D21}T00:45:00`, mins: 110 }]),
 ];
+/** BOM → BLR return leg (any date). */
+const BOM_BLR = (date: string) => [
+  rawFlight("R-6E5302", "6E", "IndiGo", "5302", 5400, [{ from: "BOM", to: "BLR", dep: `${date}T18:00:00`, arr: `${date}T19:45:00`, mins: 105 }]),
+];
+
+const nextDayISO = (iso: string) => {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+};
+
+/** TBO rows for a leg: the fixed table, else BLR→BOM / BOM→BLR re-dated (date edits, §5 G-F). */
+export function flightRowsFor(origin: string, dest: string, date: string): any[] {
+  const fixed = FLIGHTS[`${origin}-${dest}-${date}`];
+  if (fixed) return fixed;
+  if (origin === "BLR" && dest === "BOM") {
+    return JSON.parse(JSON.stringify(BLR_BOM).split(D21).join(nextDayISO(date)).split(D20).join(date));
+  }
+  if (origin === "BOM" && dest === "BLR") return BOM_BLR(date);
+  return [];
+}
 
 const BLR_DEL_D5 = [
   rawFlight("D-6E2001", "6E", "IndiGo", "2001", 6400, [{ from: "BLR", to: "DEL", dep: "2026-12-05T07:00:00", arr: "2026-12-05T09:45:00", mins: 165 }]),
@@ -126,6 +151,9 @@ export const HOTELS: Record<string, any[]> = {
     hotel("DXB1", "Asiana Grand", 21000, 3, true),
     hotel("DXB2", "Rove Downtown", 24600, 3, false),
   ],
+  "Mumbai|2026-11-20|2026-11-22": [hotel("BOM1", "Trident BKC", 32000, 2, true)],
+  "London|2026-11-16|2026-11-19": [hotel("LON1", "Soho Hotel", 96000, 3, true)],
+  "Goa|2026-12-12|2026-12-14": [hotel("GOI1", "Taj Fort Aguada", 38000, 2, true)],
 };
 
 /** Hotel-city catalogue stub (the real one is DB-backed). */
@@ -134,6 +162,11 @@ export const HOTEL_CITIES: Record<string, { cityName: string; countryCode: strin
   singapore: { cityName: "Singapore", countryCode: "SG", cityCode: "138673" },
   goa: { cityName: "Goa", countryCode: "IN", cityCode: "120806" },
   mumbai: { cityName: "Mumbai", countryCode: "IN", cityCode: "144306" },
+};
+/** Catalogue cities only an exact (strict, v2) lookup finds — so v1's
+ *  substring emulation keeps answering "London Soho" with the locked city. */
+export const CATALOG_ONLY: Record<string, { cityName: string; countryCode: string; cityCode: string }> = {
+  london: { cityName: "London", countryCode: "GB", cityCode: "126632" },
 };
 
 /** The IP-based origin suggestion every scenario sees (QC ran from Bengaluru). */
@@ -250,6 +283,9 @@ export const GOLDEN: Golden[] = [
             expect(r.context).toMatch(/Cheapest match ₹18,420/);
             expect(r.context).toMatch(/Without the filters, the cheapest is ₹11,576/);
             expect(r.context).not.toMatch(/holiday|months in advance/i);
+            // S2 b: the added sort is said up front, with every active filter (prod QC A3).
+            expect(r.context).toMatch(/^Cheapest first\. Non-stop: 4 of 6 flights\./);
+            expect(r.context).toMatch(/Active filters: non-stop, cheapest first\.$/);
           },
           stored: (s) => expect(s.lastSearch.flight.filters).toEqual({ maxStops: 0, sort: "price" }),
         },
@@ -295,8 +331,90 @@ export const GOLDEN: Golden[] = [
     ],
   },
   { name: "A6 · famous attractions in dubai → no itinerary unless asked", modes: { off: "todo", on: "todo" }, note: "S3 (PLAN_READINESS gate)", turns: [] },
-  { name: "A7 · hotels near Burj Khalifa for 3 nights → 16→19 Nov, no dates-ask", modes: { off: "todo", on: "todo" }, note: "S2 (nights)", turns: [] },
-  { name: "A7′–A8′ · hotel dates-ask → '16 to 19 nov, same as the flight' searches", modes: { off: "todo", on: "todo" }, note: "S2 (hotel pending)", turns: [] },
+  {
+    name: "A7 · hotels near Burj Khalifa for 3 nights → 16→19 Nov from the flight, no dates-ask (F-07a)",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "Flights to Dubai next week" },
+      { user: HERE_CHIP, expect: { flightCalls: 1 } },
+      {
+        user: "hotels near Burj Khalifa for 3 nights",
+        expect: {
+          branch: "hotel_search",
+          aiCalled: false,
+          hotelCalls: 1,
+          lastHotelArgs: { cityName: "Dubai", checkIn: D16, checkOut: "2026-11-19" },
+          reply: (r) => {
+            expect(r.title).toBe("Hotels in Dubai near Burj Khalifa");
+            expect(r.context).toMatch(/\(3 nights\)/);
+            expect(r.context).not.toMatch(/which dates|how many nights/i);
+            expect(r.hotelSearch.hotels).toHaveLength(2);
+          },
+          stored: (s) => {
+            expect(s.locked.dates).toMatchObject({ start: D16, end: "2026-11-19", nights: 3 });
+            expect(s.locked.duration.days).toBe(4);
+            expect(s.lastSearch.active).toBe("hotel");
+            expect(s.lastSearch.hotel.filters.near.label).toBe("Burj Khalifa");
+            expect(s.lastSearch.flight.rows.flights).toHaveLength(6); // the flight search is kept
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "A7′–A8′ · 'hotels near Burj Khalifa' asks the nights (check-in from the flight); '16 to 19 nov, same as the flight' searches (F-07b)",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "Flights to Dubai next week" },
+      { user: HERE_CHIP, expect: { flightCalls: 1 } },
+      {
+        user: "hotels near Burj Khalifa",
+        expect: {
+          branch: "hotel_search",
+          aiCalled: false,
+          hotelCalls: 0,
+          reply: (r) => {
+            expect(r.title).toBe("Hotels in Dubai near Burj Khalifa");
+            expect(r.context).toBe("Check-in Mon 16 Nov (from your flight). How many nights?");
+            expect(r.nextSteps).toEqual(["1 night (till Tue 17 Nov)", "2 nights (till Wed 18 Nov)", "3 nights (till Thu 19 Nov)"]);
+            expect(r.itinerary).toBeUndefined();
+          },
+          stored: (s) => expect(s.pending).toMatchObject({ kind: "hotel", need: "checkout", city: "Dubai", checkIn: D16, near: "Burj Khalifa" }),
+        },
+      },
+      {
+        user: "16 to 19 nov, same as the flight",
+        expect: {
+          branch: "answer_pending",
+          aiCalled: false,
+          hotelCalls: 1,
+          lastHotelArgs: { cityName: "Dubai", checkIn: D16, checkOut: "2026-11-19" },
+          reply: (r) => {
+            expect(r.hotelSearch.hotels).toHaveLength(2);
+            expect(r.itinerary).toBeUndefined();
+          },
+          stored: (s) => {
+            expect(s.pending).toBeUndefined();
+            expect(s.locked.dates).toMatchObject({ start: D16, end: "2026-11-19", nights: 3 });
+            expect(s.lastSearch.hotel.filters.near.label).toBe("Burj Khalifa");
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "A8′ (filler) · the nights chip answer, and 'pls 3 nights thanks 🙏' (S2 a)",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "Flights to Dubai next week" },
+      { user: HERE_CHIP, expect: { flightCalls: 1 } },
+      { user: "hotels near Burj Khalifa", expect: { hotelCalls: 0 } },
+      {
+        user: "pls 3 nights thanks 🙏",
+        expect: { branch: "answer_pending", hotelCalls: 1, lastHotelArgs: { checkIn: D16, checkOut: "2026-11-19" } },
+      },
+    ],
+  },
   { name: "A13 · plan 3 days → itinerary allowed, Burj Khalifa base passed", modes: { off: "todo", on: "todo" }, note: "S3", turns: [] },
 
   /* ── B · Mumbai business ── */
@@ -318,6 +436,10 @@ export const GOLDEN: Golden[] = [
             expect(f.length).toBe(2);
             expect(f.every((x: any) => depMin(x) >= 5 * 60 && depMin(x) < 12 * 60)).toBe(true);
             expect(r.context).toMatch(/Filtered to morning departures \(05:00–11:59\): 2 of 4/);
+            // Prod QC 2026-11-10: the "Other nearby airports" group obeys the
+            // filter too (the 22:55 NMI row used to stay).
+            const other = r.flightSearch.otherAirport;
+            expect(other.map((x: any) => x.ResultIndex)).toEqual(["O-QP1313"]);
           },
           stored: (s) => {
             expect(s.lastSearch.flight.filters).toEqual({ departWindow: "morning" });
@@ -340,8 +462,79 @@ export const GOLDEN: Golden[] = [
     modes: { off: "active", on: "active" },
     turns: [{ user: "bengaluru to goa trip ideas", expect: { branch: "ai", aiCalled: true, flightCalls: 0 } }],
   },
-  { name: "B5 · hotel near BKC → check-in 20 Nov known, asks check-out", modes: { off: "todo", on: "todo" }, note: "S2", turns: [] },
-  { name: "B8–B9 · change to 21 Nov → re-search; round trip back on 22nd → JourneyType 2", modes: { off: "todo", on: "todo" }, note: "S2", turns: [] },
+  {
+    name: "B5 · hotel near BKC → check-in 20 Nov known, asks the nights; 'till the 22nd' searches",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "flights from Bengaluru to Mumbai on 20 Nov", expect: { flightCalls: 1 } },
+      {
+        user: "hotel near BKC",
+        expect: {
+          hotelCalls: 0,
+          aiCalled: false,
+          reply: (r) => {
+            expect(r.context).toBe("Check-in Fri 20 Nov (from your flight). How many nights?");
+            expect(r.nextSteps[0]).toBe("1 night (till Sat 21 Nov)");
+          },
+        },
+      },
+      {
+        user: "till the 22nd",
+        expect: {
+          branch: "answer_pending",
+          hotelCalls: 1,
+          aiCalled: false,
+          lastHotelArgs: { cityName: "Mumbai", checkIn: D20, checkOut: "2026-11-22" },
+          reply: (r) => expect(r.title).toBe("Hotels in Mumbai near BKC"),
+        },
+      },
+    ],
+  },
+  {
+    name: "B8–B9 · change to 21 Nov keeps Mumbai and 'morning'; round trip back on 22nd → JourneyType 2 (F-08)",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "bengaluru to mumbai on 20 nov, morning flights only", expect: { flightCalls: 1 } },
+      {
+        user: "change to 21 Nov",
+        expect: {
+          branch: "change_dates",
+          aiCalled: false,
+          flightCalls: 1,
+          lastFlightArgs: { origin: "BLR", destination: "BOM", departDate: D21, JourneyType: 1 },
+          reply: (r) => {
+            expect(r.context).toMatch(/^Moved to Sat 21 Nov \(was Fri 20 Nov\)\. /);
+            expect(r.context).toMatch(/Filtered to morning departures \(05:00–11:59\): 2 of 4/);
+            expect(r.context).not.toMatch(/Date Change Confirmed/);
+            expect(rows(r).every((x: any) => depMin(x) >= 5 * 60 && depMin(x) < 12 * 60)).toBe(true);
+          },
+          stored: (s) => {
+            expect(s.locked.dates.start).toBe(D21);
+            expect(s.locked.destination.name).toMatch(/mumbai/i);
+            expect(s.lastSearch.flight.filters).toEqual({ departWindow: "morning" });
+            expect(s.lastSearch.flight.date).toBe(D21);
+          },
+        },
+      },
+      {
+        user: "round trip back on 22nd",
+        expect: {
+          branch: "add_return",
+          aiCalled: false,
+          flightCalls: 1,
+          lastFlightArgs: { origin: "BLR", destination: "BOM", departDate: D21, returnDate: "2026-11-22", JourneyType: 2 },
+          reply: (r) => {
+            expect(r.flightSearch.journeyType).toBe(2);
+            expect(r.flightSearch.inbound.length).toBeGreaterThan(0);
+            expect(r.itinerary).toBeUndefined();
+            expect(r.context).toMatch(/^Return on Sun 22 Nov\./);
+            expect(r.context).not.toMatch(/share your origin/);
+          },
+          stored: (s) => expect(s.locked.dates).toMatchObject({ start: D21, returnDate: "2026-11-22" }),
+        },
+      },
+    ],
+  },
 
   /* ── C · Goa weekend ── */
   { name: "C1–C3 · plan a goa weekend → hotels 12–14 dec (adults 2) → how to get around", modes: { off: "todo", on: "todo" }, note: "S2/S3", turns: [] },
@@ -375,7 +568,254 @@ export const GOLDEN: Golden[] = [
   { name: "E3-guard · model titles 'Must-See Places in Dubai' → retried, rebuilt", modes: { off: "todo", on: "todo" }, note: "S3", turns: [] },
 
   /* ── F · date edits ── */
-  { name: "F · change to 21 Nov / a day later / round trip back on the 2nd / one way / 2 of us, business class", modes: { off: "todo", on: "todo" }, note: "S2", turns: [] },
+  {
+    name: "F · change to 21 Nov / a day later / round trip back on the 2nd / one way / 2 of us, business class",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "flights from Bengaluru to Mumbai on 20 Nov", expect: { flightCalls: 1 } },
+      {
+        user: "change to 21 Nov",
+        expect: { branch: "change_dates", flightCalls: 1, lastFlightArgs: { departDate: D21 }, stored: (s) => expect(s.locked.dates.start).toBe(D21) },
+      },
+      {
+        user: "a day later",
+        expect: {
+          branch: "change_dates",
+          flightCalls: 1,
+          lastFlightArgs: { departDate: "2026-11-22" },
+          reply: (r) => expect(r.context).toMatch(/^Moved to Sun 22 Nov \(was Sat 21 Nov\)\./),
+        },
+      },
+      {
+        // the 2nd has passed relative to a 22 Nov start → 2 Dec
+        user: "round trip back on the 2nd",
+        expect: {
+          branch: "add_return",
+          flightCalls: 1,
+          lastFlightArgs: { departDate: "2026-11-22", returnDate: "2026-12-02", JourneyType: 2 },
+          stored: (s) => expect(s.locked.dates.returnDate).toBe("2026-12-02"),
+        },
+      },
+      {
+        user: "one way",
+        expect: {
+          branch: "change_dates",
+          flightCalls: 1,
+          lastFlightArgs: { departDate: "2026-11-22", JourneyType: 1 },
+          reply: (r) => expect(r.flightSearch.journeyType).toBe(1),
+          stored: (s) => expect(s.locked.dates.returnDate).toBeUndefined(),
+        },
+      },
+      {
+        user: "2 of us, business class",
+        expect: {
+          branch: "change_travellers",
+          flightCalls: 1,
+          lastFlightArgs: { departDate: "2026-11-22", adults: 2, cabinClass: 4 },
+          stored: (s) => {
+            expect(s.locked.travellers.adults).toBe(2);
+            expect(s.locked.cabin.value).toBe("Business");
+            expect(s.locked.destination.name).toBe("Mumbai");
+          },
+        },
+      },
+      {
+        // travellers and cabin stick for a new search typed afterwards
+        user: "flights from Bengaluru to Mumbai on 25 Nov",
+        expect: { branch: "flight_route", flightCalls: 1, lastFlightArgs: { departDate: "2026-11-25", adults: 2, cabinClass: 4 } },
+      },
+    ],
+  },
+  {
+    name: "F · an edit with nothing searched yet is acknowledged, never searched",
+    modes: { off: "todo", on: "active" },
+    turns: [{
+      user: "we are 3",
+      expect: {
+        branch: "change_travellers",
+        aiCalled: false,
+        flightCalls: 0,
+        hotelCalls: 0,
+        reply: (r) => expect(r.context).toMatch(/^Got it\. 3 travellers\./),
+        stored: (s) => expect(s.locked.travellers.adults).toBe(3),
+      },
+    }],
+  },
+
+  /* ── F-24 · a destination named this turn that does not resolve ── */
+  {
+    name: "F-24 · 'Executive stay in London Soho' in a Dubai chat → 'Did you mean London?'; never searches or plans Dubai",
+    // off: FAILS — proof of the bug (the named place falls back to the locked
+    // Dubai and Dubai hotels are searched).
+    modes: { off: "fails", on: "active" },
+    turns: [
+      { user: "hotels in dubai 16 to 19 nov", expect: { hotelCalls: 1 } },
+      {
+        user: "Executive stay in London Soho",
+        expect: {
+          aiCalled: false,
+          hotelCalls: 0,
+          flightCalls: 0,
+          reply: (r) => {
+            expect(r.title).toBe("Did you mean London?");
+            expect(r.context).toBe(`I couldn't find "London Soho" as a city I can book. Did you mean London, around Soho?`);
+            expect(`${r.title} ${r.context}`).not.toMatch(/Dubai/);
+            expect(r.itinerary).toBeUndefined();
+            expect(r.hotelSearch).toBeUndefined();
+            expect(r.nextSteps[0]).toBe("Hotels in London near Soho");
+          },
+          stored: (s) => {
+            expect(s.locked.destination.name).toBe("Dubai"); // the trip is untouched (the switch is S3)
+            expect(s.pending).toMatchObject({ kind: "hotel", need: "city" });
+          },
+        },
+      },
+      {
+        user: "Hotels in London near Soho",
+        expect: {
+          branch: "hotel_search",
+          hotelCalls: 1,
+          lastHotelArgs: { cityName: "London", checkIn: D16, checkOut: "2026-11-19" },
+          reply: (r) => expect(r.title).toBe("Hotels in London near Soho"),
+        },
+      },
+    ],
+  },
+  {
+    name: "F-24 · no close match → 'Which city is Wakanda Heights in?' (never Dubai)",
+    modes: { off: "fails", on: "active" },
+    turns: [
+      { user: "hotels in dubai 16 to 19 nov", expect: { hotelCalls: 1 } },
+      {
+        user: "Executive stay in Wakanda Heights",
+        expect: {
+          aiCalled: false,
+          hotelCalls: 0,
+          reply: (r) => {
+            expect(r.title).toBe("Which city is Wakanda Heights in?");
+            expect(`${r.title} ${r.context}`).not.toMatch(/Dubai/);
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "F-24 · a landmark ('near Burj Khalifa') still means the trip's city",
+    modes: { off: "active", on: "active" },
+    turns: [
+      { user: "hotels in dubai 16 to 19 nov", expect: { hotelCalls: 1 } },
+      { user: "hotels near Burj Khalifa", expect: { hotelCalls: 1, lastHotelArgs: { cityName: "Dubai" } } },
+    ],
+  },
+
+  /* ── Q6 · travellers feed hotels; two to a room, disclosed; separate rooms ── */
+  {
+    name: "Q6 · 3 travellers → 2 rooms, disclosed; 'Separate rooms' re-searches with 3",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "we are 3", expect: { hotelCalls: 0 } },
+      {
+        user: "hotels in dubai 16 to 19 nov",
+        expect: {
+          hotelCalls: 1,
+          lastHotelArgs: { adults: 3, rooms: 2 },
+          reply: (r) => {
+            expect(r.context).toMatch(/for 3 guests in 2 rooms\.$/);
+            expect(r.hotelSearch).toMatchObject({ adults: 3, rooms: 2, assumedOccupancy: false });
+            expect(r.nextSteps).toContain("Separate rooms");
+          },
+        },
+      },
+      {
+        user: "Separate rooms",
+        expect: {
+          branch: "change_travellers",
+          aiCalled: false,
+          hotelCalls: 1,
+          lastHotelArgs: { cityName: "Dubai", checkIn: D16, checkOut: "2026-11-19", adults: 3, rooms: 3 },
+          reply: (r) => {
+            expect(r.context).toMatch(/^Separate rooms\. /);
+            expect(r.nextSteps).not.toContain("Separate rooms");
+          },
+          stored: (s) => expect(s.locked.travellers).toMatchObject({ adults: 3, separateRooms: true }),
+        },
+      },
+    ],
+  },
+  {
+    name: "Q6 · nobody said how many → 2 guests in 1 room, said as an assumption",
+    modes: { off: "active", on: "active" },
+    turns: [{
+      user: "hotels in dubai 16 to 19 nov",
+      expect: { hotelCalls: 1, lastHotelArgs: { adults: 2, rooms: 1 }, reply: (r) => expect(r.context).toMatch(/tell me if that's not right/) },
+    }],
+  },
+
+  /* ── C2 · travellers from the planning turn reach the hotel search ── */
+  {
+    name: "C2 · 'Trip to Goa for 2 people' → 'ok show hotels for this, 12 to 14 dec' searches Goa for 2 (never a flight ask)",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "Trip to Goa for 2 people, what should I pack?", ai: { title: "Packing for Goa", context: "Light cottons." }, expect: { branch: "ai" } },
+      {
+        user: "ok show hotels for this, 12 to 14 dec",
+        expect: {
+          branch: "hotel_search",
+          aiCalled: false,
+          hotelCalls: 1,
+          lastHotelArgs: { cityName: "Goa", checkIn: "2026-12-12", checkOut: "2026-12-14", adults: 2, rooms: 1 },
+          reply: (r) => {
+            expect(r.hotelSearch.hotels.length).toBeGreaterThan(0);
+            expect(r.context).not.toMatch(/these hotel options|which city will you be flying from/i);
+          },
+        },
+      },
+    ],
+  },
+
+  /* ── S2 a · every whole-message parser tolerates filler ── */
+  {
+    name: "Filler · '[QC3] ok leave flights for now 🙏' parks; 'hey Pluto, back to flights please' resumes",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "find flights from Bengaluru to Dubai on 16 Nov", expect: { flightCalls: 1 } },
+      { user: "[QC3] ok leave flights for now 🙏", expect: { branch: "park", flightCalls: 0, aiCalled: false } },
+      { user: "hey Pluto, back to flights please", expect: { branch: "resume_flight", flightCalls: 0, reply: (r) => expect(rows(r)).toHaveLength(6) } },
+    ],
+  },
+  {
+    name: "Filler · 'hi Pluto, bengaluru to mumbai on 20 nov, morning flights only 🙂' is a route ask",
+    modes: { off: "todo", on: "active" },
+    turns: [{
+      user: "hi Pluto, bengaluru to mumbai on 20 nov, morning flights only 🙂",
+      expect: {
+        branch: "flight_route",
+        flightCalls: 1,
+        lastFlightArgs: { origin: "BLR", destination: "BOM", departDate: D20 },
+        reply: (r) => {
+          expect(r.title).not.toMatch(/Where are you flying from/);
+          expect(rows(r)).toHaveLength(2);
+        },
+      },
+    }],
+  },
+  {
+    name: "Filler · '[QC3] bengaluru to mumbai on 20 nov, morning flights only' is a route ask",
+    modes: { off: "todo", on: "active" },
+    turns: [{
+      user: "[QC3] bengaluru to mumbai on 20 nov, morning flights only",
+      expect: { branch: "flight_route", flightCalls: 1, reply: (r) => expect(rows(r)).toHaveLength(2) },
+    }],
+  },
+  {
+    name: "Filler · 'okay change to 21 Nov please' edits the date; 'ok Bengaluru please' answers the origin ask",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "Flights to Dubai next week" },
+      { user: "ok Bengaluru please", expect: { branch: "answer_pending", flightCalls: 1, lastFlightArgs: { origin: "BLR", destination: "DXB" } } },
+      { user: "okay change to 17 Nov please", expect: { branch: "change_dates", flightCalls: 1, lastFlightArgs: { departDate: "2026-11-17" } } },
+    ],
+  },
 
   /* ── P · negatives: these must NOT park or refine ── */
   {
