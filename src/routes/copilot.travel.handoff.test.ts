@@ -69,6 +69,9 @@ const readyContext = () => ({
   state: "EXECUTION",
   locked: {
     tripType: "business",
+    // PLUTO_STATE_V2 (S3, design §6.1): a legacy tripType is not trusted; the
+    // hand-off's trip type is the purpose the user stated.
+    purpose: { value: "business", source: "user", phrase: "business trip" },
     destination: "Goa",
     dates: { start: "2026-05-20", end: "2026-05-27" },
     policyStatus: "IN_POLICY",

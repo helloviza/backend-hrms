@@ -40,6 +40,10 @@ export type PlutoMetricEventType =
   // Which branch answered a concierge turn (and whether the model was called) —
   // the share of turns that reach the AI, and the regression suite's seam.
   | "pluto.turn.branch"
+  // State v2 S3 guardrails (design §4)
+  | "pluto.guard.tz_stripped"
+  | "pluto.guard.stale_destination"
+  | "pluto.guard.claims_without_cards"
   // Arrival concierge (Phase 4 — Arrive)
   | "pluto.arrive.session_opened"
   | "pluto.arrive.expired"

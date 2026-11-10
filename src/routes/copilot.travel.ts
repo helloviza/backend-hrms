@@ -62,6 +62,23 @@ import {
   addDaysISO,
   nightsBetweenISO,
 } from "../utils/plutoTripEdit.js";
+import {
+  detectSwitchIntent,
+  resolvePlaceSync,
+  sameCity,
+  saysSameDates,
+  parseUndoAnswer,
+  parseSameDatesAnswer,
+} from "../utils/plutoDestinationSwitch.js";
+import { properCityName, tzSentence, stripTzSentences, offsetMinutes, timeZoneFor, hoursLabel } from "../utils/plutoPlaces.js";
+import {
+  claimsResultsWithoutCards,
+  stripClaimSentences,
+  staleDestinationIn,
+  replaceStaleDestination,
+  staleDestinationRetry,
+  claimsRetry,
+} from "../utils/plutoReplyGuards.js";
 import { invokePlutoGemini, GEMINI_FALLBACK_INVALID } from "../utils/plutoGeminiInvoke.js";
 import { parseBudget, describeBudget } from "../utils/plutoBudget.js";
 import {
@@ -187,6 +204,7 @@ import {
   replyThinAccepted,
   replyReaskedLocked,
   turnBranch,
+  guardFired,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { personName } from "../services/actorNames.js";
@@ -695,7 +713,7 @@ async function loadTurnState(req: any): Promise<LoadedTurnState> {
   // No stored doc to prefer (new / missing / no store) → the client's copy,
   // as today; a stored doc, once one exists, always wins.
   // Search rows render as cards, so they only ever come from the server.
-  const { rev: _rev, id: _id, lastSearch: _ls, ...clientState } = client;
+  const { rev: _rev, id: _id, lastSearch: _ls, undo: _undo, ...clientState } = client;
   if (!clientId) {
     return { state: clientState, id: crypto.randomUUID(), rev: 0, isFollowUp: false, source: "new" };
   }
@@ -777,6 +795,9 @@ async function runConciergeTurn(
     // (the hotel lane, the asks and the redirects never saved before).
     // `rev` counts writes; last write wins for now (design §8 Q9).
     const state = { ...body.context, v: 2, id: body.context.id || loaded.id, rev: loaded.rev + 1 };
+    // The "Keep <old> instead" undo is good for the NEXT turn only (§3.5b):
+    // any other committed turn clears it.
+    if (state.undo && state.undo.rev !== state.rev) delete state.undo;
     await saveConversationContext({
       workspaceObjectId: (req as any).workspaceObjectId,
       userId: (req as any).user?._id,
@@ -1008,6 +1029,8 @@ async function runConciergeTurnInner(
     let editBranch: string | null = null;
     let editChips: string[] = [];
     let carryFilters: FlightFilters | null = null;
+    // v2 S3: this turn switched the trip's destination (design §3.5 / §3.5b).
+    let switched = false;
 
     /* ───────── v2: PARK · RESUME · REFINE (deterministic, never the AI) ─────────
      * Design §3.1 / §3.6. Runs BEFORE the route detector: "ok leave flights for
@@ -1068,6 +1091,184 @@ async function runConciergeTurnInner(
         return `${d} ${MON3[m - 1]} ${y}`;
       };
       const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
+      const todayIST = (): string => new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+      const fresh = (at: any) => {
+        const age = Date.now() - Number(at || 0);
+        return age >= 0 && age < FLIGHT_ROWS_FRESH_MS;
+      };
+
+      // ── TIME DIFFERENCE — computed in code at the trip date, never by the
+      // model (design §4.6; prod F-24 had Dubai "1.5 h ahead" of Bengaluru).
+      if (/\btime\s*(?:difference|zones?)\b|\bwhat\s+(?:is\s+the\s+)?time\s+(?:is\s+it\s+)?in\b|\bhours?\s+(?:ahead|behind)\b/i.test(prompt)) {
+        const date: string = lockedNow.dates?.start || todayIST();
+        const origin = lockedNow.origin?.city ? { name: String(lockedNow.origin.city), iata: lockedNow.origin.iata || null } : null;
+        const dest = lockedNow.destination?.name ? { name: String(lockedNow.destination.name).split(",")[0].trim(), iata: lockedNow.destination.iata || null } : null;
+        const named = stripFiller(prompt)
+          .split(/\b(?:with|in|and|between|of|to|from|vs|versus)\b/i)
+          .slice(1)
+          .map((chunk) => resolvePlaceSync(chunk.replace(/[^A-Za-z\s'-]/g, " ").trim()))
+          .filter(Boolean) as Array<{ city: string; iata: string | null }>;
+        const subject = named.find((p) => !sameCity(p.city, origin?.name) || !origin) || dest;
+        const subj = subject ? ("city" in subject ? { name: subject.city, iata: subject.iata } : subject) : null;
+        const zs = subj ? timeZoneFor(subj) : null;
+        const os = zs ? offsetMinutes(zs, date) : null;
+        if (subj && os !== null) {
+          const refs = [origin, dest].filter((r) => r && !sameCity(r.name, subj.name)) as Array<{ name: string; iata: string | null }>;
+          const parts = refs
+            .map((r) => {
+              const zr = timeZoneFor(r);
+              const or = zr ? offsetMinutes(zr, date) : null;
+              if (or === null) return null;
+              const d = os - or;
+              return d === 0 ? `on the same time as ${r.name}` : `${hoursLabel(d)} ${d > 0 ? "ahead of" : "behind"} ${r.name}`;
+            })
+            .filter(Boolean);
+          const when = lockedNow.dates?.start ? `On ${dayLabel(date)} (your travel date)` : "Today";
+          const text = parts.length
+            ? `${when}, ${subj.name} is ${parts.join(" and ")}.`
+            : (tzSentence({ name: subj.name, iata: subj.iata }, null, date) || "").replace(/\.$/, ` (${when.toLowerCase()}).`);
+          trace.branch = "time_zone";
+          return res.json({
+            ok: true,
+            reply: {
+              title: `Time in ${subj.name}`,
+              context: `${text} Worked out from the time zones themselves, so daylight saving is included.`,
+              nextSteps: dest ? [`Things to do in ${dest.name}`] : [],
+              handoff: false,
+            },
+            context: { ...v2Ctx, id: conversationId },
+          });
+        }
+      }
+
+      // ── UNDO a destination switch: "Keep Dubai instead" (design §3.5b, rule
+      // 5u). The trip AND its last results come back exactly as they were —
+      // no supplier call, no model. Good for the turn right after the switch.
+      const undoSnap: any = v2Ctx.undo && typeof v2Ctx.undo === "object" ? v2Ctx.undo : null;
+      if (undoSnap?.kind === "destination" && undoSnap.rev === v2.rev && undoSnap.from && parseUndoAnswer(prompt, undoSnap.from)) {
+        trace.branch = "undo_destination";
+        const from: string = undoSnap.from;
+        const RL: any = undoSnap.locked || {};
+        const RS: any = undoSnap.lastSearch && typeof undoSnap.lastSearch === "object" ? undoSnap.lastSearch : null;
+        const { undo: _u, lastSearch: _l, summary: _s, ...restCtx } = v2Ctx;
+        const prevList: string[] = Array.isArray(v2Ctx.previousDestinations) ? v2Ctx.previousDestinations.slice(0, -1) : [];
+        const outCtx: any = {
+          ...restCtx,
+          id: conversationId,
+          locked: RL,
+          previousDestinations: prevList,
+          ...(RS ? { lastSearch: RS } : {}),
+          ...(undoSnap.summary ? { summary: undoSnap.summary } : {}),
+        };
+        const d: any = RL.dates || {};
+        const when = d.start ? (d.end ? stayLabel(d.start, d.end) : dayLabel(d.start)) : "";
+        const bits = [when, RL.origin?.city ? `from ${RL.origin.city}` : ""].filter(Boolean).join(", ");
+        const reply: any = { title: `Kept ${from}`, context: `Kept ${from}${bits ? ` — ${bits}` : ""}.`, nextSteps: [], handoff: false };
+        const h: any = RS?.hotel;
+        const f: any = RS?.flight;
+        if (RS?.active === "hotel" && Array.isArray(h?.rows) && h.rows.length) {
+          const near = h.filters?.near?.label ? ` near ${h.filters.near.label}` : "";
+          if (fresh(h.at)) {
+            reply.title = `Hotels in ${h.city}${near}`;
+            reply.context += ` Your ${h.city} hotels are back, as they were.`;
+            reply.hotelSearch = {
+              city: h.city, countryCode: h.countryCode, checkIn: h.checkIn, checkOut: h.checkOut,
+              nights: nightsBetweenISO(h.checkIn, h.checkOut), adults: h.adults, rooms: h.rooms,
+              assumedOccupancy: !(Number(RL.travellers?.adults) > 0), hotels: h.rows, searchId: h.searchId, source: "tbo",
+            };
+            reply.nextSteps = ["Tap a hotel to continue to booking", "Add one to your trip"];
+          } else {
+            reply.context += " Those hotel prices are more than 12 minutes old, so I won't show them again.";
+            reply.nextSteps = [`Hotels in ${h.city}${near} for ${stayLabel(h.checkIn, h.checkOut)}`];
+          }
+        } else if (RS?.active === "flight" && Array.isArray(f?.rows?.flights) && f.rows.flights.length) {
+          const fromCity = f.originCity || f.origin;
+          const toCity = f.destinationCity || f.destination;
+          const day = f.displayDate || shortDay(f.date);
+          if (fresh(f.at)) {
+            const filters: FlightFilters = f.filters || {};
+            const out = applyFlightFilters(f.rows.flights, filters, { leg: "out", legDate: f.date });
+            const shown = out.length ? out : f.rows.flights;
+            reply.title = `Flights: ${fromCity} → ${toCity} · ${day}`;
+            reply.context += ` Your ${fromCity} → ${toCity} flights are back, as they were.`;
+            reply.flightSearch = {
+              origin: { city: fromCity, iata: f.origin }, destination: { city: toCity, iata: f.destination },
+              date: day, isoDate: f.date, isoReturnDate: f.journeyType === 2 ? f.returnDate : undefined,
+              journeyType: f.journeyType || 1, flights: shown,
+              inbound: applyFlightFilters(f.rows.inbound || [], filters, { leg: "in", legDate: f.returnDate }),
+              otherAirport: applyFlightFilters(f.rows.otherAirport || [], filters, { leg: "out", legDate: f.date }),
+              inboundOtherAirport: applyFlightFilters(f.rows.inboundOtherAirport || [], filters, { leg: "in", legDate: f.returnDate }),
+              traceId: f.traceId, source: "tbo", tipLines: buildFlightTipLines(f.origin, f.destination, day),
+              activeFilters: describeFlightFilters(filters, f.rows.flights),
+            };
+            reply.nextSteps = ["Click Book on a flight to continue in our booking flow"];
+          } else {
+            reply.context += " Those fares are more than 12 minutes old, so I won't show them again.";
+            reply.nextSteps = [`Search flights from ${fromCity} to ${toCity} on ${day}`];
+          }
+        } else if (RL.destination?.name) {
+          reply.nextSteps = [`Hotels in ${from}`, `Flights to ${from}`];
+        }
+        return res.json({ ok: true, reply, context: outCtx });
+      }
+
+      // ── ANSWER to "Same dates?" after a switch (design §3.7 same_dates_confirm).
+      if (pending?.kind === "trip" && pending.need === "same_dates_confirm") {
+        const ans = parseSameDatesAnswer(prompt);
+        const dNow: any = lockedNow.dates || {};
+        const destNow: string = lockedNow.destination?.name || "";
+        const lhNow: any = ls.hotel && typeof ls.hotel === "object" ? ls.hotel : null;
+        const whenNow = dNow.start ? (dNow.end ? stayLabel(dNow.start, dNow.end) : dayLabel(dNow.start)) : "";
+        if (ans === "same") {
+          trace.branch = "answer_pending";
+          return res.json({
+            ok: true,
+            reply: {
+              title: destNow ? `${destNow} · ${whenNow}` : "Dates kept",
+              context: `Keeping ${whenNow || "your dates"}${destNow ? ` for ${destNow}` : ""}.`,
+              nextSteps: destNow ? [ls.active === "hotel" ? `Flights to ${destNow}` : `Hotels in ${destNow}`, `Things to do in ${destNow}`] : [],
+              handoff: false,
+            },
+            context: { ...v2Ctx, id: conversationId },
+          });
+        }
+        if (ans === "different") {
+          trace.branch = "answer_pending";
+          return res.json({
+            ok: true,
+            reply: {
+              title: destNow ? `Dates for ${destNow}` : "New dates",
+              context: lhNow ? `Which dates in ${lhNow.city}? For example "16 to 19 Nov".` : `Which date? For example "change to 21 Nov".`,
+              nextSteps: [],
+              handoff: false,
+            },
+            context: {
+              ...v2Ctx,
+              id: conversationId,
+              ...(lhNow
+                ? { pending: { kind: "hotel", need: "dates", city: lhNow.city, cityCode: lhNow.cityCode, countryCode: lhNow.countryCode, ...(lhNow.filters?.near?.label ? { near: lhNow.filters.near.label } : {}) } }
+                : {}),
+            },
+          });
+        }
+        // A date range typed as the answer re-runs the hotel search with it.
+        const typedRange = extractPromptDateRange(stripFiller(prompt));
+        if (typedRange?.start && typedRange.end && lhNow) {
+          const n = nightsBetweenISO(typedRange.start, typedRange.end);
+          if (n > 0) {
+            editBranch = "answer_pending";
+            context.locked = {
+              ...lockedNow,
+              dates: { ...dNow, start: typedRange.start, end: typedRange.end, nights: n, source: "user" },
+              duration: { days: n + 1, source: "derived" },
+            };
+            hotelForce = {
+              city: lhNow.city, cityCode: lhNow.cityCode, countryCode: lhNow.countryCode,
+              start: typedRange.start, end: typedRange.end, nights: n, near: lhNow.filters?.near?.label || null,
+            };
+          }
+        }
+      }
 
       // ── ANSWER to "How many nights?" / "Which dates?" (S2, design §3.7).
       // The hotel search the question was for runs with the answer — never the AI.
@@ -1088,12 +1289,212 @@ async function runConciergeTurnInner(
         }
       }
 
+      // ── DESTINATION SWITCH (S3, design §3.5 / §3.5b), settled HERE — before
+      // any search and before the model, which used to keep the old city
+      // ("your confirmed destination is Dubai", QC F-03 / F-24). With a pivot
+      // cue ("actually Singapore instead") or a trip action naming another
+      // city ("Executive stay in London Soho"); never across an add-on
+      // connector ("and then London", "via Dubai"). The old trip is kept as a
+      // one-level undo ("Keep Dubai instead"); dates are kept and asked about
+      // once; the old city's summary and results are dropped.
+      if (!hotelForce) {
+        const curDest: string | null = lockedNow.destination?.name ? String(lockedNow.destination.name) : null;
+        // A video-locked destination is final (plutoDecisionLocker HARD RULE).
+        const sw = lockedNow.destination?.source === "video" ? null : detectSwitchIntent(prompt, curDest);
+        if (sw) {
+          let target: { city: string; iata: string | null; rest?: string; cityCode?: string; countryCode?: string } | null = null;
+          let samePhrase: string | null = null;
+          for (const ph of sw.phrases) {
+            const hit = resolvePlaceSync(ph);
+            if (!hit) continue;
+            if (sameCity(hit.city, curDest)) {
+              if (hit.rest && !samePhrase) samePhrase = ph;
+              continue;
+            }
+            if (sameCity(hit.city, lockedNow.origin?.city)) continue;
+            target = hit;
+            break;
+          }
+          // A hotel ask for a city only the hotel catalogue knows. A leading
+          // match ("London Soho" → London) counts; a fuzzy / LLM rename is only
+          // ever offered, by the hotel lane below.
+          if (!target && !samePhrase && sw.action === "hotel") {
+            for (const ph of sw.phrases) {
+              const r: any = await resolveHotelDestination(`hotels in ${ph}`, {}, { strictNamed: true });
+              const pick =
+                r.status === "RESOLVED" ? { city: r.cityName, cityCode: r.cityCode, countryCode: r.countryCode }
+                : r.status === "UNSUPPORTED" && r.suggestion?.via === "prefix"
+                  ? { city: r.suggestion.cityName, cityCode: r.suggestion.cityCode, countryCode: r.suggestion.countryCode, rest: r.suggestion.rest }
+                  : null;
+              if (pick && !sameCity(pick.city, curDest) && !sameCity(pick.city, lockedNow.origin?.city)) {
+                target = { iata: null, ...pick };
+                break;
+              }
+            }
+          }
+
+          const dPrev: any = lockedNow.dates || {};
+          const lhPrev: any = ls.hotel && typeof ls.hotel === "object" ? ls.hotel : null;
+          const prevNights =
+            Number(dPrev.nights) ||
+            (dPrev.start && dPrev.end ? nightsBetweenISO(dPrev.start, dPrev.end) : 0) ||
+            (lhPrev ? nightsBetweenISO(lhPrev.checkIn, lhPrev.checkOut) : 0);
+
+          if (target && curDest) {
+            switched = true;
+            editBranch = "change_destination";
+            const old = curDest.split(",")[0].trim();
+            const typed = extractPromptDateRange(stripFiller(prompt));
+            const same = saysSameDates(prompt);
+            // The undo snapshot: the whole trip and its results, as they were.
+            v2Ctx.undo = {
+              kind: "destination",
+              from: old,
+              rev: v2.rev + 1,
+              locked: JSON.parse(JSON.stringify(lockedNow)),
+              ...(v2Ctx.lastSearch ? { lastSearch: JSON.parse(JSON.stringify(v2Ctx.lastSearch)) } : {}),
+              ...(v2Ctx.summary ? { summary: v2Ctx.summary } : {}),
+            };
+            v2Ctx.previousDestinations = [
+              ...(Array.isArray(v2Ctx.previousDestinations) ? v2Ctx.previousDestinations : [])
+                .filter((p: string) => !sameCity(p, old) && !sameCity(p, target!.city)),
+              old,
+            ];
+            delete v2Ctx.summary;
+            delete v2Ctx.lastSearch;
+
+            const L: any = { ...lockedNow };
+            delete L.hotels;
+            delete L.itineraryLocked;
+            delete L.tripType; // never trusted by v2 (§6.1); purpose stays if the user said it
+            L.destination = {
+              name: target.city,
+              ...(target.iata ? { iata: target.iata } : {}),
+              ...(target.cityCode ? { cityCode: target.cityCode, countryCode: target.countryCode } : {}),
+              source: "user",
+            };
+            let start: string | null = dPrev.start || null;
+            let nights = prevNights;
+            const datesTyped = Boolean(typed?.start);
+            if (typed?.start) {
+              start = typed.start;
+              nights = typed.end ? nightsBetweenISO(typed.start, typed.end) : nights;
+            }
+            if (start) {
+              L.dates = { ...dPrev, start, ...(nights > 0 ? { nights, end: addDaysISO(start, nights) } : {}), source: "user" };
+              if (nights > 0) L.duration = { days: nights + 1, source: "derived" };
+            }
+            context.locked = L;
+
+            const subArea = target.rest ? ` (${target.rest})` : "";
+            const head = sw.cue ? `Switched to ${target.city}${subArea}` : `Switched from ${old} to ${target.city}${subArea}`;
+            const kind: "hotel" | "flight" | null =
+              sw.action === "hotel" ? "hotel"
+              : sw.action === "flight" ? "flight"
+              : sw.action === "trip" ? null
+              : ls.active === "hotel" || ls.active === "flight" ? ls.active : null;
+            const when = start ? (kind === "flight" || !(nights > 0) ? dayLabel(start) : stayLabel(start, addDaysISO(start, nights))) : "";
+            const askDates = Boolean(start) && !same && !datesTyped;
+            const datesLine = !start
+              ? ""
+              : datesTyped
+                ? ` ${when}${kind !== "flight" && nights > 0 ? ` (${plural(nights, "night")})` : ""}.`
+                : ` Same ${kind === "flight" ? "date" : "dates"} — ${when}${kind !== "flight" && nights > 0 ? ` (${plural(nights, "night")})` : ""}.`;
+            editNote = `${head}.${datesLine} `;
+            editChips = [`Keep ${old} instead`];
+            if (askDates) {
+              editChips.push(`Same dates (${when})`, "Different dates");
+              context.pending = { kind: "trip", need: "same_dates_confirm" };
+            }
+
+            if (kind === "hotel" && start && nights > 0) {
+              let codes = target.cityCode && target.countryCode ? { cityCode: target.cityCode, countryCode: target.countryCode, city: target.city } : null;
+              if (!codes) {
+                const r: any = await resolveHotelDestination(`hotels in ${target.city}`, {}, { strictNamed: true });
+                if (r.status === "RESOLVED") codes = { cityCode: r.cityCode, countryCode: r.countryCode, city: r.cityName };
+              }
+              hotelForce = {
+                city: codes?.city || target.city,
+                ...(codes ? { cityCode: codes.cityCode, countryCode: codes.countryCode } : {}),
+                start, end: addDaysISO(start, nights), nights, near: target.rest || null,
+              };
+            } else if (
+              kind === "flight" &&
+              (Boolean(matchXToYRoute(prompt)) ||
+                (/\bfrom\b[\s\S]{1,40}\bto\b/i.test(prompt) && Boolean(extractPromptDateRange(prompt) || resolveRelativeDate(prompt))))
+            ) {
+              // A complete new route ("…from Bengaluru to Mumbai on 20 Nov"):
+              // searched exactly as typed (its filter words too); the switch
+              // note and the undo still come with the results.
+              editBranch = null;
+            } else if (kind === "flight") {
+              const fromCity = L.origin?.city || null;
+              const ret: string | undefined = L.dates?.returnDate;
+              const n = Number(L.travellers?.adults) || 1;
+              const cabin: string | undefined = L.cabin?.value;
+              flightForce = {
+                prompt:
+                  `flights ${fromCity ? `from ${fromCity} ` : ""}to ${target.city}` +
+                  (start ? ` on ${longDay(start)}` : "") +
+                  (start && ret && ret > start ? ` returning on ${longDay(ret)}` : "") +
+                  ` for ${n} ${n === 1 ? "adult" : "adults"}` +
+                  (cabin && cabin !== "Economy" ? ` ${cabin.toLowerCase()} class` : ""),
+              };
+            } else if (kind === "hotel") {
+              // No stay known yet: switched, and the stay is asked for.
+              delete context.pending;
+              trace.branch = editBranch;
+              let codes: any = target.cityCode ? { cityCode: target.cityCode, countryCode: target.countryCode } : null;
+              if (!codes) {
+                const r: any = await resolveHotelDestination(`hotels in ${target.city}`, {}, { strictNamed: true });
+                if (r.status === "RESOLVED") codes = { cityCode: r.cityCode, countryCode: r.countryCode };
+              }
+              return res.json({
+                ok: true,
+                reply: {
+                  title: `Hotels in ${target.city}${target.rest ? ` near ${target.rest}` : ""}`,
+                  context: `${head}. ${start ? `Check-in ${dayLabel(start)}. How many nights?` : `Which dates? For example "16 to 19 Nov".`}`,
+                  nextSteps: start
+                    ? [`Keep ${old} instead`, ...[1, 2, 3].map((k) => `${k} night${k > 1 ? "s" : ""} (till ${dayLabel(addDaysISO(start as string, k))})`)]
+                    : [`Keep ${old} instead`],
+                  handoff: false,
+                },
+                context: {
+                  ...v2Ctx,
+                  locked: L,
+                  id: conversationId,
+                  ...(codes
+                    ? { pending: { kind: "hotel", need: start ? "checkout" : "dates", city: target.city, ...codes, ...(start ? { checkIn: start } : {}), ...(target.rest ? { near: target.rest } : {}) } }
+                    : {}),
+                },
+              });
+            }
+            // kind === null (a trip / plan / visit ask): the AI answers with the
+            // new trip — the switch note and the undo chip are added to its reply.
+          } else if (!target && samePhrase && sw.action === "hotel" && !sw.cue) {
+            // "hotels in Dubai Marina" in a Dubai trip: the same city, a sub-area
+            // (D-N4) — searched in the trip's city with the area kept.
+            const stayStart: string | null = dPrev.start || lhPrev?.checkIn || null;
+            if (stayStart && prevNights > 0 && (lhPrev?.cityCode || lockedNow.destination?.cityCode)) {
+              editBranch = "hotel_search";
+              hotelForce = {
+                city: lhPrev?.city || String(curDest).split(",")[0].trim(),
+                cityCode: lhPrev?.cityCode || lockedNow.destination?.cityCode,
+                countryCode: lhPrev?.countryCode || lockedNow.destination?.countryCode,
+                start: stayStart, end: addDaysISO(stayStart, prevNights), nights: prevNights,
+                near: properCityName(samePhrase),
+              };
+            }
+          }
+        }
+      }
+
       // ── TRIP EDITS (S2, design §3.3): change the date / add a return / one
       // way / travellers / cabin / nights. The trip's facts change HERE, then
       // the last search re-runs with them and with its filters — the
       // destination and origin are kept (QC F-08: "change to 21 Nov" used to
       // wipe the trip and search nothing).
-      if (!hotelForce) {
+      if (!hotelForce && !flightForce && !switched) {
         const prevDates: any = lockedNow.dates || {};
         const lfx: any = ls.flight && typeof ls.flight === "object" ? ls.flight : null;
         const lhx: any = ls.hotel && typeof ls.hotel === "object" ? ls.hotel : null;
@@ -1233,7 +1634,7 @@ async function runConciergeTurnInner(
         Boolean(extractPromptDateRange(prompt)) ||
         Boolean(resolveRelativeDate(prompt));
       const aboutFlights = ls.active === "flight" || /\bflights?\b/i.test(prompt);
-      if (lf && !flightForce && !hotelForce && !isHotelRequest(prompt) && (resume || (aboutFlights && !namesNewSearch))) {
+      if (lf && !flightForce && !hotelForce && !switched && !isHotelRequest(prompt) && (resume || (aboutFlights && !namesNewSearch))) {
         const parsed = resume ? null : parseFlightRefinement(prompt, lf.rows?.flights || []);
         if (resume || parsed) {
           trace.branch = resume ? "resume_flight" : "refine_flight";
@@ -1493,7 +1894,13 @@ async function runConciergeTurnInner(
 
       let rawOrigin: string | null      = promptOriginMatch?.[1]?.trim() || ctxOrigin || null;
       let rawDestination: string | null = promptDestMatch?.[1]?.trim()   || ctxDest   || null;
-      const travelDate     = dateMatch?.[0]?.trim() || relDate?.display || ctxDate || null;
+      // v2 (F-19): "20 nov" is shown as "20 Nov".
+      const typedDateText = dateMatch?.[0]?.trim()
+        ? v2
+          ? dateMatch[0].trim().replace(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)([a-z]*)/i, (_m, a: string, b: string) => a[0].toUpperCase() + a.slice(1).toLowerCase() + b.toLowerCase())
+          : dateMatch[0].trim()
+        : null;
+      const travelDate     = typedDateText || relDate?.display || ctxDate || null;
 
       // ── OFFICE as an endpoint ("flights from my office to Mumbai") ──
       // The office comes from the PROFILE (User.jobLocation → Employee.location),
@@ -1557,8 +1964,10 @@ async function runConciergeTurnInner(
         return raw;
       };
 
-      const origin      = resolveCity(rawOrigin,      false);
-      const destination = resolveCity(rawDestination, true);
+      // v2 (QC F-19): titles, the stored trip and the pill use the proper city
+      // name ("Bengaluru → Mumbai"), never the user's casing.
+      const origin      = v2 && rawOrigin ? properCityName(resolveCity(rawOrigin, false)) : resolveCity(rawOrigin, false);
+      const destination = v2 && rawDestination ? properCityName(resolveCity(rawDestination, true)) : resolveCity(rawDestination, true);
 
       // resolveIATA returns null for anything it can't map (and never guesses a
       // 3-letter code). If a city the user actually named can't be resolved, ask
@@ -1683,14 +2092,28 @@ async function runConciergeTurnInner(
       } else {
         // v2 (S2): what the user typed THIS turn replaces the lock — origin,
         // date, return, travellers, cabin (QC F-08: set-if-absent kept the old
-        // date after "change to 21 Nov"). The destination stays set-if-absent
-        // until S3, which also clears the old city's summary when it changes.
+        // date after "change to 21 Nov"). S3: a destination typed with the
+        // route replaces it too; the old city goes to previousDestinations and
+        // its summary is dropped, so the model never answers about it again.
         const typedOrigin = Boolean(promptOriginMatch?.[1]) || officeEnd === "origin";
+        const typedDest = Boolean(promptDestMatch?.[1]) || officeEnd === "destination";
         const typedDate = Boolean(dateMatch || relDate);
         if (rawOrigin && originIATA && (typedOrigin || !mergedLocked.origin)) {
           mergedLocked.origin = { city: origin, iata: originIATA, source: officeNote && officeEnd === "origin" ? "profile" : "user" };
         }
-        if (!mergedLocked.destination && rawDestination && destIATA) {
+        const oldDest: string | null = mergedLocked.destination?.name || null;
+        const replacesDest =
+          Boolean(oldDest) && typedDest && !sameCity(oldDest, destination) && mergedLocked.destination?.source !== "video";
+        if (rawDestination && destIATA && (!mergedLocked.destination || replacesDest)) {
+          if (replacesDest && oldDest && !switched) {
+            const ctxAny: any = context;
+            const oldName = String(oldDest).split(",")[0].trim();
+            ctxAny.previousDestinations = [
+              ...(Array.isArray(ctxAny.previousDestinations) ? ctxAny.previousDestinations : []).filter((p: string) => !sameCity(p, oldName)),
+              oldName,
+            ];
+            delete ctxAny.summary;
+          }
           mergedLocked.destination = { name: destination, iata: destIATA, source: officeNote && officeEnd === "destination" ? "profile" : "user" };
         }
         if (isoDate && (typedDate || !mergedLocked.dates?.start)) {
@@ -2642,6 +3065,9 @@ async function runConciergeTurnInner(
     if (!conversationContext.locked) {
       conversationContext.locked = {};
     }
+    // v2: was the trip already set up before this turn? The message that sets
+    // it up ("3-day business trip to Tokyo") is a planning opener.
+    const tripKnownAtStart = Boolean(conversationContext.locked?.destination?.name || conversationContext.locked?.dates?.start);
 
     /* ───────── VIDEO CONTEXT ATTACHMENT (PRODUCTION SAFE) ───────── */
     // ✅ FIX: attachVideoContext runs FIRST (soft signals only)
@@ -2796,7 +3222,19 @@ async function runConciergeTurnInner(
       }
 
       // Trip purpose / type — only if not already committed.
-      if (!L.tripType) {
+      // v2 (S3, §1.2 / §4.4): no trip type is ever inferred. `purpose` is set
+      // only from the user's own phrase — "business class" and "business
+      // hotel" are not a purpose, and "Executive stay" is nothing at all.
+      if (v2) {
+        if (!L.purpose) {
+          const pm = prompt.match(/\b(business\s+trip|work\s+trip|client\s+meeting|conference|off-?site|holiday|vacation|honeymoon)\b/i);
+          if (pm) {
+            const phrase = pm[1].toLowerCase();
+            const value = /holiday|vacation|honeymoon/.test(phrase) ? "holiday" : /off-?site/.test(phrase) ? "mice" : "business";
+            L.purpose = { value, source: "user", phrase };
+          }
+        }
+      } else if (!L.tripType) {
         if (/\bbusiness\b|\bwork trip\b|\bconference\b/i.test(prompt)) L.tripType = "business";
         else if (/\bholiday\b|\bleisure\b|\bvacation\b|\bhoneymoon\b|\bgetaway\b|\banniversary\b/i.test(prompt)) L.tripType = "holiday";
         else if (/\boffsite\b|\bretreat\b|\bmice\b|\bteam\s+trip\b/i.test(prompt)) L.tripType = "mice";
@@ -2805,8 +3243,15 @@ async function runConciergeTurnInner(
       // v2 (S2): travellers the user states ("2 of us", "for 3 people") are
       // kept for every later search until they change them (§1.2).
       if (v2) {
+        // S3 (C1): "plan a goa weekend" names the destination too — only when
+        // the word is a real city (curated table / airport), never a guess.
+        if (!L.destination) {
+          const wk = prompt.match(/\b(?:a|an|the|our|my)\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)\s+(?:weekend|trip|holiday|getaway|vacation|break)\b/i);
+          const place = wk ? resolvePlaceSync(wk[1]) : null;
+          if (place) L.destination = { name: place.city, ...(place.iata ? { iata: place.iata } : {}), source: "user" };
+        }
         const pax =
-          prompt.match(/\b(?:for\s+)?(\d)\s+(?:people|persons|pax|passengers|adults|travell?ers|guests)\b/i) ||
+          prompt.match(/\b(?:for\s+)?(\d)\s+(?:people|persons|pax|passengers|adults|travell?ers|guests|friends|colleagues)\b/i) ||
           prompt.match(/\b(\d)\s+of\s+us\b/i);
         if (pax && parseInt(pax[1], 10) >= 1) {
           L.travellers = { ...(L.travellers || {}), adults: parseInt(pax[1], 10), source: "user" };
@@ -2968,20 +3413,19 @@ async function runConciergeTurnInner(
       ? `\n[INTERNAL NOTE FROM HUMAN MANAGER]: ${conversationContext.locked.lastRmNote}\n(Respect this note as authoritative over previous AI suggestions.)\n`
       : "";
 
-    /* ───────── Hotel-only refinement ───────── */
-    // A prior HOTEL shortlist (lastReply.hotels[]) counts as much as an
-    // itinerary[] — otherwise a hotel→hotel follow-up (e.g. "show me hotels
-    // beyond USD 500") drops out of this guarded branch into the generic path
-    // and the model reverts to re-asking locked facts.
-    const isHotelOnlyFollowup =
-      /hotel|stay|accommodation/i.test(prompt) &&
-      typeof lastReply === "object" &&
-      (Array.isArray(lastReply?.itinerary) || Array.isArray(lastReply?.hotels));
+    // (The "hotel-only refinement" prompt branch that lived here keyed off
+    // `lastReply`, which the page never sends — dead code, removed in S3 with
+    // the equally dead flight-search suppression block below. Design §4.5.)
 
+    // v2: legacy keys the model wrote (tripType, hotels, itineraryLocked) are
+    // never shown back to it as decisions (§6.1).
+    const lockedForPrompt = v2
+      ? (({ tripType: _t, hotels: _h, itineraryLocked: _i, lastRmNote: _r, ...rest }: any) => rest)(conversationContext.locked)
+      : conversationContext.locked;
     const lockedContext =
-      Object.keys(conversationContext.locked).length > 0
+      Object.keys(lockedForPrompt).length > 0
         ? `\nLOCKED DECISIONS:\n${JSON.stringify(
-            conversationContext.locked,
+            lockedForPrompt,
             null,
             2
           )}\n`
@@ -3070,9 +3514,43 @@ Confidence: ${conversationContext.assumed.destination.confidence}\n`
     // Plan-readiness signal — reinforces the ALWAYS-GIVE-VALUE rule per turn and
     // gates the substance enforce-retry below.
     const canPlan = (hasLockedDestination || hasAssumedDestination) && hasLockedDuration;
-    const planReadinessString = canPlan
+    // v2 (S3, §4.2): an itinerary only when one is asked for — a planning
+    // turn ("plan 3 days", "itinerary", "5 days in Goa"). "best taxi app in
+    // Dubai?" or "must see places there" is answered, not turned into a plan.
+    const planningTurn =
+      intent === "PLANNING" ||
+      /\b\d+\s*-?\s*(?:days?|nights?)\b[^.?!]{0,30}?\b(?:in|at|trip|itinerary|plan|holiday|getaway)\b|\b(?:day[\s-]+by[\s-]+day|schedule\s+for)\b/i.test(prompt) ||
+      // the turn that first describes the trip (its destination or dates)
+      (!tripKnownAtStart && Boolean(conversationContext.locked?.destination?.name || conversationContext.locked?.dates?.start));
+    const planReadinessString = canPlan && (!v2 || planningTurn)
       ? `\nPLAN_READINESS: destination and duration are KNOWN — you MUST include a draft day-by-day "itinerary" skeleton (clearly marked as a draft to refine) and a "context" of at least 2-3 substantive sentences. Do not merely echo the destination.\n`
       : "";
+    // v2: facts worked out in code the model may repeat but never restate in
+    // its own words — the time difference at the trip date (§4.6), the hotel
+    // base or sub-area the user picked (A13, §3.5b).
+    let v2TzLine: string | null = null;
+    let v2Facts = "";
+    if (v2) {
+      const Lk: any = conversationContext.locked || {};
+      const destName = Lk.destination?.name ? String(Lk.destination.name).split(",")[0].trim() : null;
+      if (destName) {
+        v2TzLine = tzSentence(
+          { name: destName, iata: Lk.destination.iata || null },
+          Lk.origin?.city ? { name: String(Lk.origin.city), iata: Lk.origin.iata || null } : null,
+          Lk.dates?.start || new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10),
+        );
+      }
+      const near: string | null = conversationContext.lastSearch?.hotel?.filters?.near?.label || null;
+      const facts = [
+        v2TzLine ? `Time: ${v2TzLine}` : null,
+        near ? `Hotel base: near ${near}${destName ? `, ${destName}` : ""} — plan around it.` : null,
+      ].filter(Boolean);
+      v2Facts =
+        (facts.length ? `\nFACTS (computed, authoritative — repeat verbatim if useful):\n${facts.map((f) => `- ${f}`).join("\n")}\n` : "") +
+        `\nNever state a time-zone difference or a UTC/GMT offset in your own words; use the FACTS line or say nothing.\n` +
+        (Lk.purpose?.value ? "" : `\nThe trip's purpose is NOT known: do not call it a business trip, a holiday or anything else.\n`) +
+        (planningTurn ? "" : `\nThis turn is NOT a planning request: answer the question directly and do NOT include an "itinerary".\n`);
+    }
 
     // Budget steer — respect the locked budget in hotel suggestions, and (since
     // this is an INR platform) state the conversion basis when the budget is USD.
@@ -3095,26 +3573,14 @@ Confidence: ${conversationContext.assumed.destination.confidence}\n`
       ? `\nLOCKED FACTS ARE GROUND TRUTH: the ${lockedGroundTruthList.join(", ")} in LOCKED DECISIONS are CONFIRMED. A reply that asks the user for ANY of these is INVALID — never re-ask them; use them directly to answer the request.\n`
       : "";
 
-    /* ───────── Detect if last reply was a flight search (suppress redundant follow-ups) ───────── */
-    const lastReplyWasFlightSearch = lastReply && typeof lastReply === "object" && Boolean(lastReply.flightSearch);
-
-    const flightSearchSuppression = lastReplyWasFlightSearch
-      ? `
-CRITICAL RULE — FLIGHT SEARCH CONTEXT:
-The previous response already provided flight search links to the user.
-DO NOT ask any more questions about: departure time, budget, stops, airline preferences, or flight parameters.
-The user can open the links to see all options. 
-Your nextSteps should ONLY be about completing the trip plan (itinerary refinements, hotel bookings, visa tips etc.).
-`
-      : "";
-
     /* ───────── Construct Persona-Driven Prompt ───────── */
     const promptHeader =
       `SYSTEM INSTRUCTION: ${PLUTO_SYSTEM_PROMPT}\n\n` +
       `CRITICAL: When flight data is provided, your "context" field must ONLY reflect the cities and airports in that data. Do not use your own memory for routes.\n` +
       `CURRENT CONVERSATION STATE: ${conversationContext.state}\n` +
-      `${flightSearchSuppression}\n` +
+      `\n` +
       `${planReadinessString}\n` +
+      `${v2Facts}` +
       `${budgetGuidanceString}\n` +
       `${lockedGroundTruthString}\n` +
       `${missingFieldsString}\n` +
@@ -3125,15 +3591,9 @@ Your nextSteps should ONLY be about completing the trip plan (itinerary refineme
 
     let effectivePrompt = "";
 
-    if (isHotelOnlyFollowup) {
-      effectivePrompt = `
-${promptHeader}
-
-USER INTENT: HOTEL REFINEMENT
-Request: ${prompt}
-Instruction: User wants ONLY additional hotel suggestions. Do NOT modify the existing itinerary.
-`;
-    } else if (conversationContext.summary) {
+    // v2: the summary of a city the user has just left never reaches the
+    // model (it is also deleted on the switch itself, §3.5).
+    if (conversationContext.summary && !(v2 && switched)) {
       effectivePrompt = `
 ${promptHeader}
 
@@ -3177,7 +3637,8 @@ ${prompt}
     // reask-locked reply earns ONE corrective retry inside invoke*; if it still
     // fails it is ACCEPTED (never an error) and the matching metric fires.
     const invokeOpts = {
-      requireSubstance: canPlan,
+      // v2: substance (a draft itinerary) is demanded only on planning turns.
+      requireSubstance: canPlan && (!v2 || planningTurn),
       onThinAccepted: () => {
         void emitMetric(
           replyThinAccepted({
@@ -3199,6 +3660,25 @@ ${prompt}
           })
         );
       },
+    };
+
+    // One model call (OpenAI, then Gemini on failure). Used again, once, by a
+    // v2 guard below with a corrective instruction appended.
+    const callModel = async (p: string): Promise<PlutoDeltaReply> => {
+      try {
+        return await invokePluto(p, invokeOpts);
+      } catch (openaiErr: any) {
+        await emitMetric(
+          aiFallback({
+            workspaceId,
+            requestId,
+            conversationId: conversationContext.id,
+            reason: openaiErr?.message || "openai_error",
+          })
+        );
+        console.warn("[Pluto] OpenAI failed, switching to Gemini backup", { requestId });
+        return await invokePlutoGemini(p, invokeOpts);
+      }
     };
 
     try {
@@ -3231,11 +3711,38 @@ ${prompt}
       }
     }
 
+    /* ───────── v2 guard: a reply about a city the user has left (§4.3, E3) ─────────
+     * One corrective retry; if the model still answers about the old city, the
+     * title is rebuilt in code and the stale sentences go. */
+    const prevDests: string[] = v2 && Array.isArray(conversationContext.previousDestinations) ? conversationContext.previousDestinations : [];
+    const curDestName: string | null = v2 ? conversationContext.locked?.destination?.name || null : null;
+    if (v2 && curDestName && prevDests.length) {
+      const stale = staleDestinationIn(deltaReply, prevDests, curDestName);
+      if (stale) {
+        let retried = false;
+        try {
+          const again = await callModel(effectivePrompt + staleDestinationRetry(stale, curDestName));
+          retried = true;
+          if (again && typeof again === "object") deltaReply = again;
+        } catch {
+          // keep the first reply; it is rebuilt below
+        }
+        const still = staleDestinationIn(deltaReply, prevDests, curDestName);
+        if (still) replaceStaleDestination(deltaReply, still, curDestName);
+        void emitMetric(guardFired({ workspaceId, requestId, conversationId: conversationContext.id, guard: "stale_destination", retried }));
+      }
+    }
+
     /* 🔒 Promote ONCE to full reply */
     const fullReply: PlutoReplyV1 = deltaReply as PlutoReplyV1;
 
-    if (isHotelOnlyFollowup && Array.isArray(lastReply?.itinerary)) {
-      fullReply.itinerary = lastReply.itinerary;
+    if (v2) {
+      // §4.2: no itinerary unless one was asked for.
+      if (!planningTurn && fullReply.itinerary !== undefined) delete (fullReply as any).itinerary;
+      // §4.4: the trip type is the user's stated purpose, or nothing (Q7).
+      const purposeValue = conversationContext.locked?.purpose?.value;
+      if (purposeValue) (fullReply as any).tripType = purposeValue;
+      else delete (fullReply as any).tripType;
     }
 
     /* ───────── Itinerary hotel section — live lane supersedes fabrication ─────────
@@ -3388,6 +3895,84 @@ ${prompt}
       }
     }
 
+    if (v2) {
+      /* ── §4.1: no claimed results without cards (C2-guard). One corrective
+       * retry for the wording; still claiming → the sentence goes and a chip
+       * offers the real search. */
+      if (claimsResultsWithoutCards(fullReply)) {
+        let retried = false;
+        try {
+          const again: any = await callModel(effectivePrompt + claimsRetry());
+          retried = true;
+          if (again && typeof again === "object") {
+            for (const k of ["title", "context", "plutoInsights"] as const) {
+              if (again[k] !== undefined) (fullReply as any)[k] = again[k];
+            }
+          }
+        } catch {
+          // keep the first wording; it is cleaned below
+        }
+        if (claimsResultsWithoutCards(fullReply)) {
+          fullReply.context = stripClaimSentences(fullReply.context || "");
+          if (/\b(?:these|here\s+are|the\s+following)\b/i.test(fullReply.title || "")) fullReply.title = stripClaimSentences(fullReply.title || "") || fullReply.title;
+          const Lk: any = conversationContext.locked || {};
+          const dn = Lk.destination?.name ? String(Lk.destination.name).split(",")[0].trim() : null;
+          if (dn) {
+            const d: any = Lk.dates || {};
+            const chip = /\bflights?\b/i.test(JSON.stringify(deltaReply))
+              ? `Flights to ${dn}${d.start ? ` on ${dayLabel(d.start)}` : ""}`
+              : `Search hotels in ${dn}${d.start && d.end ? ` for ${stayLabel(d.start, d.end)}` : ""}`;
+            fullReply.nextSteps = [chip, ...(fullReply.nextSteps || []).filter((s) => s !== chip)];
+          }
+        }
+        void emitMetric(guardFired({ workspaceId, requestId, conversationId: conversationContext.id, guard: "claims_without_cards", retried }));
+      }
+
+      /* ── §4.6: time-zone sentences come from code. The model's are stripped
+       * from the title, the context and the itinerary; the computed line is
+       * added when something was stripped, or on the first answer for a new
+       * destination in another time zone. */
+      let tzStripped = 0;
+      for (const k of ["title", "context"] as const) {
+        const v = (fullReply as any)[k];
+        if (typeof v === "string") {
+          const r = stripTzSentences(v);
+          tzStripped += r.stripped;
+          (fullReply as any)[k] = r.text;
+        }
+      }
+      if (Array.isArray(fullReply.itinerary)) {
+        for (const day of fullReply.itinerary as any[]) {
+          if (Array.isArray(day?.details)) {
+            day.details = day.details
+              .map((t: any) => {
+                if (typeof t !== "string") return t;
+                const r = stripTzSentences(t);
+                tzStripped += r.stripped;
+                return r.text;
+              })
+              .filter((t: any) => t !== "");
+          }
+        }
+      }
+      if (tzStripped > 0) {
+        void emitMetric(guardFired({ workspaceId, requestId, conversationId: conversationContext.id, guard: "tz_stripped", count: tzStripped }));
+      }
+      const destKey = conversationContext.locked?.destination?.name ? String(conversationContext.locked.destination.name).split(",")[0].trim().toLowerCase() : null;
+      const otherZone = Boolean(v2TzLine) && !/^Same time\b/.test(v2TzLine as string) && !/\bis on UTC\+5:30\.$/.test(v2TzLine as string);
+      if (v2TzLine && (tzStripped > 0 || (otherZone && destKey && conversationContext.tzShownFor !== destKey))) {
+        fullReply.context = `${(fullReply.context || "").trim()}${fullReply.context ? " " : ""}Time: ${v2TzLine}`;
+        if (destKey) conversationContext.tzShownFor = destKey;
+      }
+
+      // A switch answered by the AI ("plan a trip to London instead") still
+      // says what changed and offers the undo.
+      if (switched) {
+        fullReply.context = `${editNote}${fullReply.context || ""}`.trim();
+        fullReply.nextSteps = [...editChips, ...(fullReply.nextSteps || []).filter((s) => !editChips.includes(s))];
+      }
+    }
+
     /* ───────── Context Evolution ───────── */
     if (fullReply.context) {
       conversationContext.summary = fullReply.context;
@@ -3397,7 +3982,8 @@ ${prompt}
     conversationContext.locked = lockDecisions(
       fullReply,
       conversationContext.locked,
-      intent
+      intent,
+      { stateV2: Boolean(v2) },
     );
 
     if (conversationContext.locked.lastRmNote) {
@@ -3405,9 +3991,14 @@ ${prompt}
     }
 
     /* ───────── Handoff readiness ───────── */
+    // v2: the hand-off's trip type is the user's stated purpose, never one the
+    // model inferred (§4.4); without one the desk gets it as unspecified.
+    const handoffLocked: any = v2
+      ? { ...conversationContext.locked, tripType: conversationContext.locked?.purpose?.value }
+      : conversationContext.locked;
     fullReply.handoff = isHandoffReady(
       conversationContext.state,
-      conversationContext.locked,
+      v2 ? { ...handoffLocked, tripType: handoffLocked.tripType || "unspecified" } : conversationContext.locked,
       fullReply.nextSteps
     );
 
@@ -3430,7 +4021,7 @@ ${prompt}
         const payload = buildHandoffPayload(
           fullReply,
           conversationContext.state,
-          conversationContext.locked
+          handoffLocked
         );
 
         const reqUser = (req as any).user || {};

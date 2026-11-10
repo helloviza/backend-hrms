@@ -384,5 +384,7 @@ export function projectForClient(state: any): any {
       ...(ls.hotel ? { hotel: strip(ls.hotel) } : {}),
     };
   }
+  // The undo snapshot (S3) holds the previous trip and its rows: server-only.
+  if (out.undo && typeof out.undo === "object") out.undo = { kind: out.undo.kind, from: out.undo.from };
   return out;
 }

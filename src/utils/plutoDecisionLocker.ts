@@ -4,7 +4,11 @@ import type { PlutoIntent } from "./plutoIntentClassifier.js";
 export function lockDecisions(
   reply: PlutoReplyV1,
   locked: Record<string, any>,
-  intent: PlutoIntent
+  intent: PlutoIntent,
+  // PLUTO_STATE_V2 (S3, design §4.3): a destination switch is settled BEFORE
+  // the model runs, so PIVOT purges nothing here, and the model never writes
+  // the trip type (purpose comes only from the user's own words).
+  opts: { stateV2?: boolean } = {}
 ) {
   /* ─────────────────────────────────────────────
    * 🔒 HARD RULE
@@ -27,7 +31,7 @@ export function lockDecisions(
   /* ─────────────────────────────────────────────
    * PIVOT handling
    * ───────────────────────────────────────────── */
-  if (intent === "PIVOT") {
+  if (intent === "PIVOT" && !opts.stateV2) {
     delete locked.destination;
     delete locked.hotels;
     delete locked.itineraryLocked;
@@ -56,7 +60,7 @@ export function lockDecisions(
   /* ─────────────────────────────────────────────
    * Planner-driven locks (SAFE ONLY)
    * ───────────────────────────────────────────── */
-  if (!locked.tripType && reply.tripType) {
+  if (!opts.stateV2 && !locked.tripType && reply.tripType) {
     locked.tripType = reply.tripType;
   }
 

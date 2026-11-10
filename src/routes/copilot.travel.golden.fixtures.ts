@@ -11,6 +11,7 @@
 //   todo   — specified, lands in a later slice (it.todo)
 //   fails  — must FAIL (it.fails): proof that today's code has the bug
 import { expect } from "vitest";
+import { PLUTO_AI_SYSTEM_PROMPT } from "../prompts/plutoSystemPrompt.js";
 
 export type Mode = "active" | "todo" | "fails";
 
@@ -27,6 +28,10 @@ export interface TurnExpect {
   stored?: (state: any) => void;
   /** The prompt the model received this turn. */
   aiPrompt?: (prompt: string) => void;
+  /** Model calls made during THIS turn (a guard's retry makes 2). */
+  aiCalls?: number;
+  /** Metric events emitted during THIS turn. */
+  metrics?: (events: any[]) => void;
 }
 
 export interface Turn {
@@ -37,6 +42,8 @@ export interface Turn {
   advanceMs?: number;
   /** Canned model reply for this turn (when it reaches the AI). */
   ai?: any;
+  /** More canned replies, queued after `ai` (a guard's corrective retry). */
+  aiSeq?: any[];
   expect?: TurnExpect;
   /** Extra checks only with PLUTO_STATE_V2 on. */
   expectOn?: TurnExpect;
@@ -153,6 +160,7 @@ export const HOTELS: Record<string, any[]> = {
   ],
   "Mumbai|2026-11-20|2026-11-22": [hotel("BOM1", "Trident BKC", 32000, 2, true)],
   "London|2026-11-16|2026-11-19": [hotel("LON1", "Soho Hotel", 96000, 3, true)],
+  "Singapore|2026-11-16|2026-11-19": [hotel("SIN1", "Marina Bay Sands", 120000, 3, true), hotel("SIN2", "Hotel G", 42000, 3, false)],
   "Goa|2026-12-12|2026-12-14": [hotel("GOI1", "Taj Fort Aguada", 38000, 2, true)],
 };
 
@@ -181,6 +189,18 @@ const depMin = (f: any) => {
   return h * 60 + m;
 };
 const fareOf = (f: any) => Number(f?.fare?.offered ?? f?.fare?.published);
+/** The prompt without the fixed system prompt (whose examples name cities). */
+const turnPart = (p: string) => p.replace(PLUTO_AI_SYSTEM_PROMPT, "");
+const text = (r: any) => `${r?.title || ""} ${r?.context || ""}`;
+const ITIN = [{ day: 1, heading: "Arrive", details: ["Check in and rest."] }];
+
+/** A Dubai trip from Bengaluru, 16–19 Nov, with fresh Dubai hotel results (G-D seed). */
+const DUBAI_TRIP: Turn[] = [
+  { user: "find flights from Bengaluru to Dubai on 16 Nov", expect: { flightCalls: 1 } },
+  { user: "hotels in dubai 16 to 19 nov", expect: { hotelCalls: 1 } },
+];
+/** The trip as stored before D1, captured to prove the undo restores it exactly. */
+const D_SEED: { locked?: any; hotel?: any } = {};
 
 /* ───────────────────────── the fixtures ───────────────────────── */
 
@@ -330,7 +350,53 @@ export const GOLDEN: Golden[] = [
       { user: "ok leave flight right now", expect: { branch: "park", flightCalls: 0, aiCalled: false } },
     ],
   },
-  { name: "A6 · famous attractions in dubai → no itinerary unless asked", modes: { off: "todo", on: "todo" }, note: "S3 (PLAN_READINESS gate)", turns: [] },
+  {
+    name: "A6 · famous attractions in dubai → answered, no itinerary unless asked (PLAN_READINESS only on planning turns)",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      ...DUBAI_TRIP,
+      {
+        user: "famous attractions in dubai",
+        ai: { title: "Dubai's famous sights", context: "The Burj Khalifa, the Dubai Mall and the old souks.", itinerary: ITIN },
+        expect: {
+          branch: "ai",
+          aiCalled: true,
+          flightCalls: 0,
+          hotelCalls: 0,
+          reply: (r) => expect(r.itinerary).toBeUndefined(),
+          aiPrompt: (p) => {
+            expect(p).not.toMatch(/PLAN_READINESS/);
+            expect(turnPart(p)).toMatch(/NOT a planning request/);
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "Q · 'best taxi app in Dubai?' in a trip chat → a plain answer, NO itinerary, no trip type",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      ...DUBAI_TRIP,
+      {
+        user: "best taxi app in Dubai?",
+        ai: { title: "Getting around Dubai", context: "Careem and Uber both work well; the Metro is cheapest.", tripType: "holiday", itinerary: ITIN },
+        expect: {
+          branch: "ai",
+          aiCalled: true,
+          reply: (r) => {
+            expect(r.itinerary).toBeUndefined();
+            expect(r.tripType).toBeUndefined();
+            expect(r.context).toMatch(/^Careem and Uber/);
+          },
+          stored: (s) => {
+            expect(s.locked.tripType).toBeUndefined();
+            expect(s.locked.purpose).toBeUndefined();
+            expect(s.locked.destination.name).toBe("Dubai");
+          },
+        },
+      },
+    ],
+  },
   {
     name: "A7 · hotels near Burj Khalifa for 3 nights → 16→19 Nov from the flight, no dates-ask (F-07a)",
     modes: { off: "todo", on: "active" },
@@ -415,7 +481,30 @@ export const GOLDEN: Golden[] = [
       },
     ],
   },
-  { name: "A13 · plan 3 days → itinerary allowed, Burj Khalifa base passed", modes: { off: "todo", on: "todo" }, note: "S3", turns: [] },
+  {
+    name: "A13 · plan 3 days → itinerary allowed; the Burj Khalifa hotel base reaches the model",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "Flights to Dubai next week" },
+      { user: HERE_CHIP, expect: { flightCalls: 1 } },
+      { user: "hotels near Burj Khalifa for 3 nights", expect: { hotelCalls: 1 } },
+      {
+        user: "plan 3 days for me",
+        ai: { title: "3 days in Dubai", context: "A draft to refine.", itinerary: ITIN },
+        expect: {
+          branch: "ai",
+          aiCalled: true,
+          flightCalls: 0,
+          hotelCalls: 0,
+          reply: (r) => expect(r.itinerary).toHaveLength(1),
+          aiPrompt: (p) => {
+            expect(p).toMatch(/PLAN_READINESS/);
+            expect(turnPart(p)).toMatch(/Hotel base: near Burj Khalifa, Dubai/);
+          },
+        },
+      },
+    ],
+  },
 
   /* ── B · Mumbai business ── */
   { name: "B1–B2 · need to be in Mumbai on 20 Nov → origin ask → 'from bengaluru, morning only'", modes: { off: "todo", on: "todo" }, note: "S4 (arrive-by) / S2", turns: [] },
@@ -537,8 +626,71 @@ export const GOLDEN: Golden[] = [
   },
 
   /* ── C · Goa weekend ── */
-  { name: "C1–C3 · plan a goa weekend → hotels 12–14 dec (adults 2) → how to get around", modes: { off: "todo", on: "todo" }, note: "S2/S3", turns: [] },
-  { name: "C2-guard · 'These hotel options…' with no cards is removed", modes: { off: "todo", on: "todo" }, note: "S3", turns: [] },
+  {
+    name: "C1–C3 · plan a goa weekend for 2 friends → Goa, 2 adults, no purpose, no dates; model hotels stripped; 'how to get around goa' has no itinerary",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      {
+        user: "plan a goa weekend for 2 friends next month, budget 30k each",
+        ai: {
+          title: "A Goa weekend",
+          context: "Goa in winter is lovely: beaches by day, shacks by night.",
+          tripType: "holiday",
+          itinerary: ITIN,
+          hotels: [{ name: "Invented Resort", area: "Calangute", approxPrice: "₹9,000", whyGood: "made up" }],
+        },
+        expect: {
+          branch: "ai",
+          aiCalled: true,
+          hotelCalls: 0,
+          reply: (r) => {
+            expect(r.itinerary).toHaveLength(1);
+            expect(r.hotels).toBeUndefined();
+            expect(r.hotelsAwaitingDates).toEqual({ city: "Goa" });
+            expect(r.tripType).toBeUndefined();
+          },
+          aiPrompt: (p) => {
+            expect(turnPart(p)).toMatch(/"adults": 2/);
+            expect(turnPart(p)).toMatch(/purpose is NOT known/);
+          },
+          stored: (s) => {
+            expect(s.locked.destination.name).toBe("Goa");
+            expect(s.locked.travellers.adults).toBe(2);
+            expect(s.locked.purpose).toBeUndefined();
+            expect(s.locked.tripType).toBeUndefined();
+          },
+        },
+      },
+      {
+        user: "how to get around goa",
+        ai: { title: "Getting around Goa", context: "Rent a scooter, or use the app cabs.", itinerary: ITIN },
+        expect: { branch: "ai", aiCalled: true, reply: (r) => expect(r.itinerary).toBeUndefined() },
+      },
+    ],
+  },
+  {
+    name: "C2-guard · 'These hotel options…' with no cards → one retry; still claiming → the sentence goes, a real-search chip comes",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "Trip to Goa for 2 people, what should I pack?", ai: { title: "Packing for Goa", context: "Light cottons." }, expect: { branch: "ai" } },
+      {
+        user: "what's the vibe like in north goa?",
+        ai: { title: "North Goa", context: "These hotel options balance comfort and price. North Goa is lively after dark." },
+        aiSeq: [{ title: "North Goa", context: "These stays are a good base. North Goa is lively after dark." }],
+        expect: {
+          branch: "ai",
+          aiCalls: 2,
+          hotelCalls: 0,
+          reply: (r) => {
+            expect(r.context).toBe("North Goa is lively after dark.");
+            expect(r.nextSteps[0]).toBe("Search hotels in Goa");
+            expect(r.hotelSearch).toBeUndefined();
+          },
+          metrics: (m) => expect(m.some((e) => e?.type === "pluto.guard.claims_without_cards")).toBe(true),
+        },
+      },
+    ],
+  },
 
   /* ── E · Dubai → Singapore ── */
   {
@@ -564,8 +716,415 @@ export const GOLDEN: Golden[] = [
       },
     }],
   },
-  { name: "E2–E3 · actually singapore instead, same dates → Singapore hotels; 'must see places there' never says Dubai", modes: { off: "todo", on: "todo" }, note: "S3", turns: [] },
-  { name: "E3-guard · model titles 'Must-See Places in Dubai' → retried, rebuilt", modes: { off: "todo", on: "todo" }, note: "S3", turns: [] },
+  {
+    name: "E2–E3 · 'actually let's do singapore instead, same dates' → Singapore hotels 16–19 Nov, no Dubai in the text; 'must see places there' is about Singapore, no itinerary (F-03)",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "hotels in dubai 16 to 19 nov", expect: { hotelCalls: 1 } },
+      {
+        user: "actually let's do singapore instead, same dates",
+        expect: {
+          branch: "change_destination",
+          aiCalled: false,
+          flightCalls: 0,
+          hotelCalls: 1,
+          lastHotelArgs: { cityName: "Singapore", checkIn: D16, checkOut: "2026-11-19" },
+          reply: (r) => {
+            expect(r.title).toBe("Hotels in Singapore");
+            expect(text(r)).not.toMatch(/Dubai|Burj/);
+            expect(r.context).toMatch(/^Switched to Singapore\. Same dates — 16–19 Nov \(3 nights\)\./);
+            expect(r.context).not.toMatch(/4 days/);
+            expect(r.hotelSearch.hotels).toHaveLength(2);
+            expect(r.nextSteps[0]).toBe("Keep Dubai instead");
+            expect(r.nextSteps).not.toContain("Different dates"); // "same dates" was said: no ask
+            expect(r.itinerary).toBeUndefined();
+          },
+          stored: (s) => {
+            expect(s.locked.destination.name).toBe("Singapore");
+            expect(s.previousDestinations).toEqual(["Dubai"]);
+            expect(s.summary).toBeUndefined();
+            expect(s.locked.dates).toMatchObject({ start: D16, end: "2026-11-19", nights: 3 });
+            expect(s.locked.purpose).toBeUndefined();
+            expect(s.locked.tripType).toBeUndefined();
+            expect(s.pending).toBeUndefined();
+            expect(s.lastSearch.hotel.city).toBe("Singapore");
+            expect(s.undo.from).toBe("Dubai");
+          },
+        },
+      },
+      {
+        user: "what are the must see places there",
+        ai: { title: "Must-See Places in Singapore", context: "Gardens by the Bay and the Marina Bay waterfront.", itinerary: ITIN },
+        expect: {
+          branch: "ai",
+          aiCalled: true,
+          aiCalls: 1,
+          reply: (r) => {
+            expect(r.title).toMatch(/Singapore/);
+            expect(text(r)).not.toMatch(/Dubai/);
+            expect(r.itinerary).toBeUndefined();
+          },
+          aiPrompt: (p) => {
+            expect(turnPart(p)).toMatch(/Singapore/);
+            expect(turnPart(p)).not.toMatch(/Dubai/);
+          },
+          stored: (s) => expect(s.undo).toBeUndefined(), // the undo was good for one turn
+        },
+      },
+    ],
+  },
+  {
+    name: "E3-guard · the model titles 'Must-See Places in Dubai' twice → one retry, then rebuilt in code",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "hotels in dubai 16 to 19 nov", expect: { hotelCalls: 1 } },
+      { user: "actually let's do singapore instead, same dates", expect: { hotelCalls: 1 } },
+      {
+        user: "what are the must see places there",
+        ai: { title: "Must-See Places in Dubai", context: "The Burj Khalifa in Dubai is iconic." },
+        aiSeq: [{ title: "Must-See Places in Dubai", context: "Dubai Mall is huge. Singapore's hawker centres are a must." }],
+        expect: {
+          branch: "ai",
+          aiCalls: 2,
+          reply: (r) => {
+            expect(r.title).toBe("Must-See Places in Singapore");
+            expect(text(r)).not.toMatch(/Dubai/);
+            expect(r.context).toMatch(/^Singapore's hawker centres are a must\./);
+          },
+          aiPrompt: (p) => expect(turnPart(p)).not.toMatch(/Dubai/),
+          metrics: (m) => expect(m.some((e) => e?.type === "pluto.guard.stale_destination")).toBe(true),
+        },
+      },
+    ],
+  },
+
+  /* ── D · destination switch without a cue, undo, add-on negatives (F-24) ── */
+  {
+    name: "D1–D2 · 'Executive stay in London Soho' switches Dubai → London (Soho), dates kept + asked once; 'Keep Dubai instead' restores the trip and its results exactly",
+    // off: FAILS — proof of F-24 (the named place falls back to the locked Dubai).
+    modes: { off: "fails", on: "active" },
+    turns: [
+      DUBAI_TRIP[0],
+      {
+        ...DUBAI_TRIP[1],
+        expectOn: { stored: (s) => { D_SEED.locked = JSON.parse(JSON.stringify(s.locked)); D_SEED.hotel = s.lastSearch.hotel; } },
+      },
+      {
+        user: "Executive stay in London Soho",
+        expect: {
+          branch: "change_destination",
+          aiCalled: false,
+          flightCalls: 0,
+          hotelCalls: 1,
+          lastHotelArgs: { cityName: "London", checkIn: D16, checkOut: "2026-11-19" },
+          reply: (r) => {
+            expect(r.context).toMatch(/^Switched from Dubai to London \(Soho\)\. Same dates — 16–19 Nov \(3 nights\)\. /);
+            expect(r.title).toMatch(/London/);
+            expect(r.title).toMatch(/Soho/);
+            expect(r.nextSteps.slice(0, 3)).toEqual(["Keep Dubai instead", "Same dates (16–19 Nov)", "Different dates"]);
+            expect(r.context).not.toMatch(/Dubai is|confirmed destination is Dubai|holiday|where are you flying from|travel dates\?/i);
+            expect(r.itinerary).toBeUndefined();
+            expect(r.hotelSearch.hotels[0].HotelName).toBe("Soho Hotel");
+          },
+          stored: (s) => {
+            expect(s.locked.destination.name).toBe("London");
+            expect(s.lastSearch.hotel.filters.near.label).toBe("Soho");
+            expect(s.lastSearch.flight).toBeUndefined(); // the old city's results are gone
+            expect(s.previousDestinations).toEqual(["Dubai"]);
+            expect(s.locked.dates).toMatchObject({ start: D16, nights: 3 });
+            expect(s.locked.origin.city).toBe("Bengaluru");
+            expect(s.undo).toMatchObject({ kind: "destination", from: "Dubai" });
+            expect(s.pending).toEqual({ kind: "trip", need: "same_dates_confirm" });
+            expect(s.locked.purpose).toBeUndefined();
+            expect(s.locked.tripType).toBeUndefined();
+          },
+        },
+      },
+      {
+        user: "Keep Dubai instead",
+        expect: {
+          branch: "undo_destination",
+          aiCalled: false,
+          flightCalls: 0,
+          hotelCalls: 0,
+          reply: (r) => {
+            expect(r.context).toMatch(/^Kept Dubai — 16–19 Nov, from Bengaluru\./);
+            expect(r.hotelSearch.hotels.map((h: any) => h.HotelCode)).toEqual(["DXB1", "DXB2"]);
+          },
+          stored: (s) => {
+            expect(s.locked).toEqual(D_SEED.locked);
+            expect(s.lastSearch.hotel).toEqual(D_SEED.hotel);
+            expect(s.lastSearch.flight.destination).toBe("DXB");
+            expect(s.previousDestinations).toEqual([]);
+            expect(s.undo).toBeUndefined();
+            expect(s.pending).toBeUndefined();
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "D3 · after the switch, 'same dates' answers the ask once; the undo then expires and 'Keep Dubai instead' is a plain switch back",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      ...DUBAI_TRIP,
+      { user: "Executive stay in London Soho", expect: { hotelCalls: 1 } },
+      {
+        user: "same dates",
+        expect: {
+          branch: "answer_pending",
+          aiCalled: false,
+          flightCalls: 0,
+          hotelCalls: 0,
+          reply: (r) => expect(r.context).toBe("Keeping 16–19 Nov for London."),
+          stored: (s) => {
+            expect(s.pending).toBeUndefined();
+            expect(s.locked.dates).toMatchObject({ start: D16, end: "2026-11-19", nights: 3 });
+            expect(s.undo).toBeUndefined();
+          },
+        },
+      },
+      {
+        user: "things to do in London",
+        expect: { branch: "ai", reply: (r) => expect((r.nextSteps || []).join(" ")).not.toMatch(/Same dates|Keep Dubai/) },
+      },
+      {
+        user: "Keep Dubai instead",
+        expect: {
+          branch: "change_destination",
+          hotelCalls: 1,
+          lastHotelArgs: { cityName: "Dubai", checkIn: D16, checkOut: "2026-11-19" },
+          stored: (s) => {
+            expect(s.locked.destination.name).toBe("Dubai");
+            expect(s.previousDestinations).toEqual(["London"]);
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "D4 · 'flights to London instead' (cue) → BLR → London on the kept date, with the undo chip",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      DUBAI_TRIP[0],
+      {
+        user: "flights to London instead",
+        expect: {
+          branch: "change_destination",
+          aiCalled: false,
+          flightCalls: 1,
+          lastFlightArgs: { origin: "BLR", destination: "LHR", departDate: D16 },
+          reply: (r) => {
+            expect(r.context).toMatch(/^Switched to London\. Same date — Mon 16 Nov\. /);
+            expect(r.title).toMatch(/^Flights: Bengaluru → London/);
+            expect(r.nextSteps[0]).toBe("Keep Dubai instead");
+          },
+          stored: (s) => {
+            expect(s.locked.destination.name).toBe("London");
+            expect(s.previousDestinations).toEqual(["Dubai"]);
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "D-N1 · 'Dubai for 3 nights and then London for 2' is a second leg — never a switch",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      ...DUBAI_TRIP,
+      {
+        user: "Dubai for 3 nights and then London for 2",
+        expect: {
+          reply: (r) => expect(r.context || "").not.toMatch(/Switched/),
+          stored: (s) => {
+            expect(s.locked.destination.name).toBe("Dubai");
+            expect(s.previousDestinations ?? []).toEqual([]);
+            expect(s.undo).toBeUndefined();
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "D-N2 · 'flights to London via Dubai' is a transit — never 'Switched from Dubai'",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      ...DUBAI_TRIP,
+      {
+        user: "flights to London via Dubai",
+        expect: {
+          reply: (r) => expect(r.context || "").not.toMatch(/Switched/),
+          stored: (s) => {
+            expect(s.undo).toBeUndefined();
+            expect(s.previousDestinations ?? []).toEqual([]);
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "D-N3 · 'is London Soho nice in November?' is a question (no trip action) — no switch, no chip",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      ...DUBAI_TRIP,
+      {
+        user: "is London Soho nice in November?",
+        expect: {
+          branch: "ai",
+          aiCalled: true,
+          reply: (r) => expect((r.nextSteps || []).join(" ")).not.toMatch(/Keep Dubai/),
+          stored: (s) => expect(s.locked.destination.name).toBe("Dubai"),
+        },
+      },
+    ],
+  },
+  {
+    name: "D-N4 · 'hotels in Dubai Marina' is the same city with a sub-area — searched in Dubai, near Dubai Marina, no switch",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      ...DUBAI_TRIP,
+      {
+        user: "hotels in Dubai Marina",
+        expect: {
+          branch: "hotel_search",
+          aiCalled: false,
+          hotelCalls: 1,
+          lastHotelArgs: { cityName: "Dubai", checkIn: D16, checkOut: "2026-11-19" },
+          reply: (r) => expect(r.context).not.toMatch(/Switched/),
+          stored: (s) => {
+            expect(s.locked.destination.name).toBe("Dubai");
+            expect(s.lastSearch.hotel.filters.near.label).toBe("Dubai Marina");
+            expect(s.undo).toBeUndefined();
+          },
+        },
+      },
+    ],
+  },
+  {
+    name: "D-N5 · 'Executive stay in Londn Soho' (no match) → asks which city; never a Dubai answer, the trip is untouched",
+    modes: { off: "fails", on: "active" },
+    turns: [
+      ...DUBAI_TRIP,
+      {
+        user: "Executive stay in Londn Soho",
+        expect: {
+          aiCalled: false,
+          hotelCalls: 0,
+          reply: (r) => {
+            expect(r.title).toBe("Which city is Londn Soho in?");
+            expect(text(r)).not.toMatch(/Dubai/);
+          },
+          stored: (s) => {
+            expect(s.locked.destination.name).toBe("Dubai");
+            expect(s.undo).toBeUndefined();
+          },
+        },
+      },
+    ],
+  },
+
+  /* ── T · time-zone differences come from code (§4.6) ── */
+  {
+    name: "T1 · the model's 'Dubai is 1.5 hours ahead of Bengaluru' is stripped; the computed line says 1h 30m BEHIND",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      DUBAI_TRIP[0],
+      {
+        user: "what should I pack?",
+        ai: { title: "Packing for Dubai", context: "Dubai is 1.5 hours ahead of Bengaluru, so plan calls early. Pack light layers." },
+        expect: {
+          branch: "ai",
+          reply: (r) => {
+            expect(r.context).not.toMatch(/1\.5 hours/);
+            expect(r.context).toBe("Pack light layers. Time: Dubai is 1h 30m behind Bengaluru.");
+          },
+          metrics: (m) => {
+            const ev = m.filter((e) => e?.type === "pluto.guard.tz_stripped");
+            expect(ev).toHaveLength(1);
+            expect(ev[0].metadata.count).toBe(1);
+          },
+          aiPrompt: (p) => expect(turnPart(p)).toMatch(/Time: Dubai is 1h 30m behind Bengaluru\./),
+        },
+      },
+    ],
+  },
+  {
+    name: "T2 · 'London is on GMT+0 (5.5 hours behind India)' is stripped and replaced by the code line",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      { user: "find flights from Bengaluru to London on 16 Nov", expect: { flightCalls: 1 } },
+      {
+        user: "what should I pack?",
+        ai: { title: "Packing for London", context: "London is on GMT+0 (5.5 hours behind India). Pack an umbrella." },
+        expect: {
+          branch: "ai",
+          reply: (r) => expect(r.context).toBe("Pack an umbrella. Time: London is 5h 30m behind Bengaluru."),
+        },
+      },
+    ],
+  },
+  {
+    name: "T5 · 'the flight is 4 hours' / 'check-in 2 hours before departure' are NOT stripped",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      DUBAI_TRIP[0],
+      {
+        user: "what should I pack?",
+        ai: { title: "Before you fly", context: "The flight is 4 hours. Check in 2 hours before departure." },
+        expect: {
+          reply: (r) => expect(r.context).toMatch(/^The flight is 4 hours\. Check in 2 hours before departure\./),
+          metrics: (m) => expect(m.some((e) => e?.type === "pluto.guard.tz_stripped")).toBe(false),
+        },
+      },
+    ],
+  },
+  {
+    name: "T-ask · 'what's the time difference with London?' is answered in code at the trip date — never the model",
+    modes: { off: "todo", on: "active" },
+    turns: [
+      DUBAI_TRIP[0],
+      {
+        user: "what's the time difference with London?",
+        expect: {
+          branch: "time_zone",
+          aiCalled: false,
+          reply: (r) => expect(r.context).toMatch(/^On Mon 16 Nov \(your travel date\), London is 5h 30m behind Bengaluru and 4h behind Dubai\./),
+          stored: (s) => expect(s.locked.destination.name).toBe("Dubai"),
+        },
+      },
+      {
+        user: "what's the time difference?",
+        expect: {
+          branch: "time_zone",
+          aiCalled: false,
+          reply: (r) => expect(r.context).toMatch(/^On Mon 16 Nov \(your travel date\), Dubai is 1h 30m behind Bengaluru\./),
+        },
+      },
+    ],
+  },
+
+  /* ── F-19 · proper city names in titles and the trip ── */
+  {
+    name: "F-19 · 'bengaluru to mumbai on 20 nov' → 'Flights: Bengaluru → Mumbai · 20 Nov', stored with proper names",
+    modes: { off: "todo", on: "active" },
+    turns: [{
+      user: "bengaluru to mumbai on 20 nov",
+      expect: {
+        branch: "flight_route",
+        flightCalls: 1,
+        reply: (r) => {
+          expect(r.title).toBe("Flights: Bengaluru → Mumbai  ·  20 Nov");
+          expect(r.flightSearch.origin.city).toBe("Bengaluru");
+          expect(r.flightSearch.destination.city).toBe("Mumbai");
+        },
+        stored: (s) => {
+          expect(s.locked.origin.city).toBe("Bengaluru");
+          expect(s.locked.destination.name).toBe("Mumbai");
+          expect(s.lastSearch.flight.originCity).toBe("Bengaluru");
+        },
+      },
+    }],
+  },
 
   /* ── F · date edits ── */
   {
@@ -643,44 +1202,6 @@ export const GOLDEN: Golden[] = [
   },
 
   /* ── F-24 · a destination named this turn that does not resolve ── */
-  {
-    name: "F-24 · 'Executive stay in London Soho' in a Dubai chat → 'Did you mean London?'; never searches or plans Dubai",
-    // off: FAILS — proof of the bug (the named place falls back to the locked
-    // Dubai and Dubai hotels are searched).
-    modes: { off: "fails", on: "active" },
-    turns: [
-      { user: "hotels in dubai 16 to 19 nov", expect: { hotelCalls: 1 } },
-      {
-        user: "Executive stay in London Soho",
-        expect: {
-          aiCalled: false,
-          hotelCalls: 0,
-          flightCalls: 0,
-          reply: (r) => {
-            expect(r.title).toBe("Did you mean London?");
-            expect(r.context).toBe(`I couldn't find "London Soho" as a city I can book. Did you mean London, around Soho?`);
-            expect(`${r.title} ${r.context}`).not.toMatch(/Dubai/);
-            expect(r.itinerary).toBeUndefined();
-            expect(r.hotelSearch).toBeUndefined();
-            expect(r.nextSteps[0]).toBe("Hotels in London near Soho");
-          },
-          stored: (s) => {
-            expect(s.locked.destination.name).toBe("Dubai"); // the trip is untouched (the switch is S3)
-            expect(s.pending).toMatchObject({ kind: "hotel", need: "city" });
-          },
-        },
-      },
-      {
-        user: "Hotels in London near Soho",
-        expect: {
-          branch: "hotel_search",
-          hotelCalls: 1,
-          lastHotelArgs: { cityName: "London", checkIn: D16, checkOut: "2026-11-19" },
-          reply: (r) => expect(r.title).toBe("Hotels in London near Soho"),
-        },
-      },
-    ],
-  },
   {
     name: "F-24 · no close match → 'Which city is Wakanda Heights in?' (never Dubai)",
     modes: { off: "fails", on: "active" },

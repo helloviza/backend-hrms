@@ -142,7 +142,7 @@ beforeEach(() => {
           status: "UNSUPPORTED",
           cityName: named.raw,
           named: true,
-          ...(lead && words.length > 1 ? { suggestion: { ...lead, rest: words.slice(1).join(" ") } } : {}),
+          ...(lead && words.length > 1 ? { suggestion: { ...lead, rest: words.slice(1).join(" "), via: "prefix" } } : {}),
         };
       }
     }
@@ -164,13 +164,15 @@ function branchOfLastTurn(): { branch?: string; aiCalled?: boolean } {
   return ev?.metadata || {};
 }
 
-function check(exp: TurnExpect | undefined, ctx: { reply: any; stored: any; flightCalls: number; hotelCalls: number; aiPrompt: string | null }) {
+function check(exp: TurnExpect | undefined, ctx: { reply: any; stored: any; flightCalls: number; hotelCalls: number; aiCalls: number; aiPrompt: string | null; metrics: any[] }) {
   if (!exp) return;
   const b = branchOfLastTurn();
   if (exp.branch !== undefined) expect(b.branch).toBe(exp.branch);
   if (exp.aiCalled !== undefined) expect(b.aiCalled).toBe(exp.aiCalled);
   if (exp.flightCalls !== undefined) expect(ctx.flightCalls).toBe(exp.flightCalls);
   if (exp.hotelCalls !== undefined) expect(ctx.hotelCalls).toBe(exp.hotelCalls);
+  if (exp.aiCalls !== undefined) expect(ctx.aiCalls).toBe(exp.aiCalls);
+  if (exp.metrics) exp.metrics(ctx.metrics);
   if (exp.lastFlightArgs) expect(H.searchFlights.mock.calls.at(-1)?.[0]).toMatchObject(exp.lastFlightArgs);
   if (exp.lastHotelArgs) expect(H.searchHotelsForChat.mock.calls.at(-1)?.[0]).toMatchObject(exp.lastHotelArgs);
   if (exp.reply) exp.reply(ctx.reply);
@@ -186,9 +188,12 @@ async function replay(g: Golden, mode: "off" | "on") {
   for (const [i, t] of g.turns.entries()) {
     if (t.advanceMs) vi.setSystemTime(new Date(Date.now() + t.advanceMs));
     if (t.ai) H.invokePluto.mockResolvedValueOnce({ ...DEFAULT_AI, ...t.ai });
+    // A guard's corrective retry consumes the next queued reply (S3).
+    for (const a of t.aiSeq || []) H.invokePluto.mockResolvedValueOnce({ ...DEFAULT_AI, ...a });
     const f0 = H.searchFlights.mock.calls.length;
     const h0 = H.searchHotelsForChat.mock.calls.length;
     const a0 = H.invokePluto.mock.calls.length;
+    const m0 = H.emitMetric.mock.calls.length;
     const sent = t.idOnly ? { id: context?.id } : context;
     const res = await request(app).post("/").send({ prompt: t.user, context: sent, conversationId: sent?.id });
     expect(res.status, `turn ${i + 1} "${t.user}": ${JSON.stringify(res.body).slice(0, 300)}`).toBe(200);
@@ -199,7 +204,10 @@ async function replay(g: Golden, mode: "off" | "on") {
       stored: H.clone(H.store.get(context?.id)?.context),
       flightCalls: H.searchFlights.mock.calls.length - f0,
       hotelCalls: H.searchHotelsForChat.mock.calls.length - h0,
-      aiPrompt: H.invokePluto.mock.calls.length > a0 ? String(H.invokePluto.mock.calls.at(-1)?.[0]) : null,
+      aiCalls: H.invokePluto.mock.calls.length - a0,
+      // The FIRST prompt this turn (a retry appends a correction to it).
+      aiPrompt: H.invokePluto.mock.calls.length > a0 ? String(H.invokePluto.mock.calls[a0]?.[0]) : null,
+      metrics: H.emitMetric.mock.calls.slice(m0).map((c) => c[0]),
     };
     check(t.expect, ctx);
     if (mode === "on") check(t.expectOn, ctx);

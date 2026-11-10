@@ -259,3 +259,23 @@ export function turnBranch(args: {
     metadata: { branch: args.branch, aiCalled: args.aiCalled, stateV2: args.stateV2 },
   };
 }
+
+/** A post-AI guardrail fired (state v2 S3, design §4): what it caught. */
+export function guardFired(args: {
+  workspaceId?: string;
+  requestId?: string;
+  conversationId?: string;
+  guard: "tz_stripped" | "stale_destination" | "claims_without_cards";
+  count?: number;
+  retried?: boolean;
+}): PlutoMetricEvent {
+  return {
+    type: `pluto.guard.${args.guard}`,
+    severity: "info",
+    timestamp: new Date().toISOString(),
+    workspaceId: args.workspaceId,
+    requestId: args.requestId,
+    conversationId: args.conversationId,
+    metadata: { count: args.count ?? 1, retried: Boolean(args.retried) },
+  };
+}

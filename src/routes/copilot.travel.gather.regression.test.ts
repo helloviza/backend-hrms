@@ -92,7 +92,14 @@ describe("concierge gather regression — no state reset across turns", () => {
     // User-stated facts locked on turn 1.
     expect(t1.context.locked.destination).toMatchObject({ name: "Tokyo", source: "user" });
     expect(t1.context.locked.duration).toMatchObject({ days: 3 });
-    expect(t1.context.locked.tripType).toBe("business");
+    // PLUTO_STATE_V2 (S3, design §1.2): the trip type is never inferred; the
+    // user's own phrase "business trip" becomes `purpose`.
+    if (/^(on|true|1)$/i.test(String(process.env.PLUTO_STATE_V2 ?? "").trim())) {
+      expect(t1.context.locked.tripType).toBeUndefined();
+      expect(t1.context.locked.purpose).toMatchObject({ value: "business", source: "user", phrase: "business trip" });
+    } else {
+      expect(t1.context.locked.tripType).toBe("business");
+    }
     // The turn-1 doc was persisted with those locked decisions.
     const save1 = saveCtxMock.mock.calls.at(-1)![0];
     expect(save1.conversationId).toBe(t1.context.id);

@@ -64,7 +64,7 @@ describe("resolveHotelDestination — strict (PLUTO_STATE_V2, QC F-24)", () => {
       status: "UNSUPPORTED",
       cityName: "London Soho",
       named: true,
-      suggestion: { cityName: "London", countryCode: "GB", cityCode: "126632", rest: "Soho" },
+      suggestion: { cityName: "London", countryCode: "GB", cityCode: "126632", rest: "Soho", via: "prefix" },
     });
   });
 
@@ -73,7 +73,7 @@ describe("resolveHotelDestination — strict (PLUTO_STATE_V2, QC F-24)", () => {
       status: "UNSUPPORTED",
       cityName: "Londn",
       named: true,
-      suggestion: { cityName: "London", countryCode: "GB", cityCode: "126632" },
+      suggestion: { cityName: "London", countryCode: "GB", cityCode: "126632", via: "llm" },
     });
     // v1 resolved it silently (unchanged).
     expect(await resolveHotelDestination("hotels in Londn", {})).toMatchObject({ status: "RESOLVED", cityName: "London" });

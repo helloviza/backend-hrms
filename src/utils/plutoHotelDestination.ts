@@ -81,7 +81,12 @@ export type HotelDestination =
        */
       named?: true;
       /** The closest bookable city, plus what was left over ("Soho"). */
-      suggestion?: { cityName: string; countryCode: string; cityCode: string; rest?: string };
+      suggestion?: {
+        cityName: string; countryCode: string; cityCode: string; rest?: string;
+        /** How it was found. Only "prefix" ("London Soho" → London + "Soho") is
+         *  confident enough to switch a trip (S3); the rest are only offered. */
+        via?: "prefix" | "suffix" | "fuzzy" | "llm";
+      };
     }
   | { status: "NO_CITY" };
 
@@ -586,9 +591,9 @@ function namedAsLandmark(prompt: string, raw: string): boolean {
  */
 async function suggestCatalogCity(
   raw: string,
-): Promise<{ cityName: string; countryCode: string; cityCode: string; rest?: string } | null> {
+): Promise<{ cityName: string; countryCode: string; cityCode: string; rest?: string; via: "prefix" | "suffix" | "fuzzy" | "llm" } | null> {
   const words = raw.trim().split(/\s+/).filter(Boolean);
-  const one = async (key: string, rest?: string) => {
+  const one = async (key: string, via: "prefix" | "suffix" | "fuzzy" | "llm", rest?: string) => {
     if (!key.trim()) return null;
     const rows = await findCatalogMatches(key);
     if (!rows.length) return null;
@@ -599,24 +604,25 @@ async function suggestCatalogCity(
       countryCode: pick.city.countryCode,
       cityCode: pick.city.code,
       ...(rest ? { rest } : {}),
+      via,
     };
   };
   for (let k = words.length - 1; k >= 1; k--) {
-    const hit = await one(words.slice(0, k).join(" "), words.slice(k).join(" "));
+    const hit = await one(words.slice(0, k).join(" "), "prefix", words.slice(k).join(" "));
     if (hit) return hit;
   }
   for (let k = 1; k < words.length; k++) {
-    const hit = await one(words.slice(k).join(" "), words.slice(0, k).join(" "));
+    const hit = await one(words.slice(k).join(" "), "suffix", words.slice(0, k).join(" "));
     if (hit) return hit;
   }
   const fuzzy = lookupDestinationFuzzy(raw)?.city;
   if (fuzzy && fuzzy.toLowerCase() !== raw.toLowerCase()) {
-    const hit = await one(fuzzy);
+    const hit = await one(fuzzy, "fuzzy");
     if (hit) return hit;
   }
   const normalized = await normalizeCityNameWithLLM(raw);
   if (normalized && normalized.toLowerCase() !== raw.toLowerCase()) {
-    const hit = await one(normalized);
+    const hit = await one(normalized, "llm");
     if (hit) return hit;
   }
   return null;
