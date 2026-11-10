@@ -240,3 +240,22 @@ export function conversationDropped(
     turnNumber,
   };
 }
+/** Which branch answered a concierge turn (info; persisted per tenant). */
+export function turnBranch(args: {
+  workspaceId?: string;
+  requestId?: string;
+  conversationId?: string;
+  branch: string;
+  aiCalled: boolean;
+  stateV2: boolean;
+}): PlutoMetricEvent {
+  return {
+    type: "pluto.turn.branch",
+    severity: "info",
+    timestamp: new Date().toISOString(),
+    workspaceId: args.workspaceId,
+    requestId: args.requestId,
+    conversationId: args.conversationId,
+    metadata: { branch: args.branch, aiCalled: args.aiCalled, stateV2: args.stateV2 },
+  };
+}

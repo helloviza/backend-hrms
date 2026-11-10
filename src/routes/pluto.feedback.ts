@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { applyRmFeedback } from "../utils/plutoFeedbackApplier.js";
-import { getConversationContext, saveConversationContext } from "../utils/plutoMemory.js";
+import { loadConversationForUser, saveConversationContext } from "../utils/plutoMemory.js";
 import type { PlutoRmFeedback } from "../types/plutoFeedback.js";
 
 const router = Router();
@@ -20,12 +20,17 @@ router.post("/", async (req: any, res) => {
     const workspaceObjectId = (req as any).workspaceObjectId;
     const userId = (req as any).user?._id;
 
-    // 1. Pull the trip memory (workspace-scoped)
-    let conversationContext = await getConversationContext({
+    // 1. Pull the trip memory — OWNER-scoped. Another user's (or an ownerless)
+    // conversation is a 404: it is neither read nor overwritten.
+    const loaded = await loadConversationForUser({
       workspaceObjectId,
       userId,
       conversationId: feedback.conversationId,
     });
+    if (loaded.status === "foreign") {
+      return res.status(404).json({ ok: false, message: "Conversation not found" });
+    }
+    let conversationContext: any = loaded.status === "owned" ? loaded.context : null;
 
     if (!conversationContext) {
       // If it's a new trip, create a blank slate
@@ -42,7 +47,7 @@ router.post("/", async (req: any, res) => {
     conversationContext.locked = updatedLocked;
     conversationContext.state = updatedState;
 
-    // 3. Save it back (workspace-scoped upsert)
+    // 3. Save it back (owner-scoped upsert)
     await saveConversationContext({
       workspaceObjectId,
       userId,

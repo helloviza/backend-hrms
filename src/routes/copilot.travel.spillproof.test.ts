@@ -16,6 +16,7 @@ vi.mock("../services/weatherService.js", () => ({ getDestinationWeather: () => P
 vi.mock("../services/flightService.js", () => ({ getDelightfulFlightStatus: vi.fn().mockResolvedValue(null) }));
 vi.mock("../utils/plutoMemory.js", () => ({
   getConversationContext: vi.fn().mockResolvedValue(null),
+  loadConversationForUser: async () => ({ status: "missing" }),
   saveConversationContext: vi.fn().mockResolvedValue(undefined),
   claimHandoffDelivery: vi.fn().mockResolvedValue(false),
   releaseHandoffDelivery: vi.fn().mockResolvedValue(undefined),

@@ -40,6 +40,7 @@ vi.mock("../utils/plutoStateResolver.js", () => ({ resolvePlutoState: () => "DIS
 vi.mock("../utils/plutoDecisionLocker.js", () => ({ lockDecisions: (_r: any, locked: any) => locked }));
 vi.mock("../utils/plutoMemory.js", () => ({
   getConversationContext: async () => null,
+  loadConversationForUser: async () => ({ status: "missing" }),
   saveConversationContext: async () => {},
   claimHandoffDelivery: async () => false,
   releaseHandoffDelivery: async () => {},

@@ -37,6 +37,9 @@ export type PlutoMetricEventType =
   // Locked-fact enforcement (v2) — a reply that re-asked an already-locked fact,
   // accepted after one corrective retry (visible so we can tune the prompt).
   | "pluto.reply.reasked_locked"
+  // Which branch answered a concierge turn (and whether the model was called) —
+  // the share of turns that reach the AI, and the regression suite's seam.
+  | "pluto.turn.branch"
   // Arrival concierge (Phase 4 — Arrive)
   | "pluto.arrive.session_opened"
   | "pluto.arrive.expired"

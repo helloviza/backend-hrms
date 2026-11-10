@@ -54,7 +54,7 @@ describe("upsert race on the real unique index", () => {
 
     expect(await PlutoConversation.countDocuments({ workspaceId: WS_A, conversationId: "race-1" })).toBe(1);
     // The losing racers retried-as-update, so context reflects a real write.
-    const ctx = await getConversationContext({ workspaceObjectId: WS_A, conversationId: "race-1" });
+    const ctx = await getConversationContext({ workspaceObjectId: WS_A, userId: USER, conversationId: "race-1" });
     expect(ctx).toHaveProperty("n");
   });
 });
@@ -75,8 +75,8 @@ describe("claim race on the real store", () => {
 describe("cross-tenant isolation on real mongo", () => {
   it("workspace B cannot read workspace A's conversationId (→ null, like a miss)", async () => {
     await saveConversationContext({ workspaceObjectId: WS_A, userId: USER, conversationId: "shared-id", context: { summary: "A only" } });
-    expect(await getConversationContext({ workspaceObjectId: WS_A, conversationId: "shared-id" })).toEqual({ summary: "A only" });
-    expect(await getConversationContext({ workspaceObjectId: WS_B, conversationId: "shared-id" })).toBeNull();
+    expect(await getConversationContext({ workspaceObjectId: WS_A, userId: USER, conversationId: "shared-id" })).toEqual({ summary: "A only" });
+    expect(await getConversationContext({ workspaceObjectId: WS_B, userId: USER, conversationId: "shared-id" })).toBeNull();
   });
 });
 
@@ -85,7 +85,7 @@ describe("restart durability", () => {
     await saveConversationContext({ workspaceObjectId: WS_A, userId: USER, conversationId: "persist-1", context: { summary: "survives a restart" } });
     await mongoose.disconnect();
     await mongoose.connect(uri); // same mongod — data persists
-    const ctx = await getConversationContext({ workspaceObjectId: WS_A, conversationId: "persist-1" });
+    const ctx = await getConversationContext({ workspaceObjectId: WS_A, userId: USER, conversationId: "persist-1" });
     expect(ctx).toEqual({ summary: "survives a restart" });
   });
 });

@@ -46,6 +46,7 @@ vi.mock("../utils/plutoHotelSearch.js", async (importOriginal) => {
 
 vi.mock("../utils/plutoMemory.js", () => ({
   getConversationContext: async () => null,
+  loadConversationForUser: async () => ({ status: "missing" }),
   saveConversationContext: async () => {},
   claimHandoffDelivery: async () => false,
   releaseHandoffDelivery: async () => {},

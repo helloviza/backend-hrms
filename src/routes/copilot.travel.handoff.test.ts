@@ -33,6 +33,7 @@ vi.mock("../services/tbo.flight.service.js", () => ({ searchFlights: vi.fn() }))
 const claim = vi.hoisted(() => ({ count: 0 }));
 vi.mock("../utils/plutoMemory.js", () => ({
   getConversationContext: async () => null,
+  loadConversationForUser: async () => ({ status: "missing" }),
   saveConversationContext: async () => {},
   claimHandoffDelivery: async () => (claim.count++ === 0),
   releaseHandoffDelivery: async () => {},

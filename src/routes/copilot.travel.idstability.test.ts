@@ -22,6 +22,8 @@ const store = new Map<string, any>();
 const { getCtxMock, saveCtxMock } = vi.hoisted(() => ({ getCtxMock: vi.fn(), saveCtxMock: vi.fn() }));
 vi.mock("../utils/plutoMemory.js", () => ({
   getConversationContext: getCtxMock,
+  // Owner-scoped load (plutoMemory.ts): a stored doc → owned, none → missing.
+  loadConversationForUser: async (a: any) => { const c = await getCtxMock(a); return c ? { status: "owned", context: c } : { status: "missing" }; },
   saveConversationContext: saveCtxMock,
   claimHandoffDelivery: vi.fn().mockResolvedValue(false),
   releaseHandoffDelivery: vi.fn().mockResolvedValue(undefined),

@@ -47,64 +47,107 @@ export interface MemorySaveArgs extends MemoryReadArgs {
 }
 
 /**
- * Read the conversation context bag for {workspaceId, conversationId}, or null on
- * a miss / wrong-workspace / malformed id / no store / DB blip. Callers treat
- * null as "first turn / expired" and fall back to the client-supplied context.
+ * OWNERSHIP (all reads and writes in this file). A conversation belongs to the
+ * user who created it — `userId`, stamped on insert and never overwritten.
+ * Workspace scope alone let any user in the workspace who held a
+ * conversationId read it and, through the {workspaceId, conversationId}
+ * upsert, overwrite it. A doc with no recorded owner (legacy) is nobody's.
+ *
+ * The outcome of an OWNER-scoped read. The owner is the user
+ * who created the conversation (userId, stamped on insert and never
+ * overwritten). There is no role bypass: a SUPERADMIN reading someone else's
+ * chat gets "foreign" like anyone else.
+ *
+ *   owned       — this user's conversation; `context` is the stored bag
+ *   missing     — no such conversation in this workspace (new / TTL-expired)
+ *   foreign     — it exists but belongs to someone else (or has no owner);
+ *                 the caller must start a FRESH conversation under a new id
+ *   unavailable — no live store, DB error, missing tenant or malformed id
  */
-export async function getConversationContext(args: MemoryReadArgs): Promise<any | null> {
-  const { workspaceObjectId, conversationId } = args || ({} as MemoryReadArgs);
-  // Malformed id or missing tenant → a miss (never reaches a query).
-  if (!workspaceObjectId || !isValidConversationId(conversationId)) return null;
-  // No live store → graceful miss (fall back to client context).
-  if (!connected()) return null;
+export type OwnedConversationLoad =
+  | { status: "owned"; context: any }
+  | { status: "missing" }
+  | { status: "foreign" }
+  | { status: "unavailable" };
+
+export async function loadConversationForUser(args: MemoryReadArgs): Promise<OwnedConversationLoad> {
+  const { workspaceObjectId, userId, conversationId } = args || ({} as MemoryReadArgs);
+  if (!workspaceObjectId || !isValidConversationId(conversationId)) return { status: "unavailable" };
+  if (!connected()) return { status: "unavailable" };
   try {
     const doc: any = await PlutoConversation.findOne({
       workspaceId: workspaceObjectId,
       conversationId,
     }).lean();
-    return doc ? (doc.context ?? null) : null;
+    if (!doc) return { status: "missing" };
+    const owner = doc.userId != null ? String(doc.userId) : "";
+    if (!owner || !userId || owner !== String(userId)) return { status: "foreign" };
+    return { status: "owned", context: doc.context ?? {} };
   } catch (e: any) {
     void emitMetric(memoryReadFailed({ workspaceId: String(workspaceObjectId), reason: e?.message }));
-    return null; // a DB blip must not kill the turn
+    return { status: "unavailable" };
   }
 }
 
 /**
- * UPSERT the context on {workspaceId, conversationId} (Amendment P). Every save
- * $sets the context bag + lastTurnAt; $setOnInsert stamps userId (the
- * originator — never overwritten by later turns) + createdAt. A save can NEVER
- * create a second doc for the same {workspaceId, conversationId}.
+ * Read THIS USER's conversation context bag, or null on a miss / another
+ * user's (or an ownerless) conversation / wrong workspace / malformed id / no
+ * store / DB blip — all indistinguishable. Callers treat null as "first turn /
+ * expired" and fall back to the client-supplied context.
+ */
+export async function getConversationContext(args: MemoryReadArgs): Promise<any | null> {
+  const r = await loadConversationForUser(args);
+  return r.status === "owned" ? (r.context ?? null) : null;
+}
+
+/**
+ * UPSERT this user's context on {workspaceId, conversationId, userId}
+ * (Amendment P + ownership). Every save $sets the context bag + lastTurnAt;
+ * an insert is stamped with this user (the owner, from the filter) and
+ * createdAt. A save can NEVER create a second doc for the same
+ * {workspaceId, conversationId} (unique index), and can never write another
+ * user's doc: that insert collides and is dropped, never retried without the
+ * owner. No userId → no write.
  */
 export async function saveConversationContext(args: MemorySaveArgs): Promise<void> {
   const { workspaceObjectId, userId, conversationId, context, handoffDelivered } =
     args || ({} as MemorySaveArgs);
   if (!workspaceObjectId || !isValidConversationId(conversationId)) return;
   if (!connected()) return;
-  const filter = { workspaceId: workspaceObjectId, conversationId };
   const set: any = { context, lastTurnAt: new Date() };
   if (handoffDelivered !== undefined) set.handoffDelivered = handoffDelivered;
-  try {
-    await PlutoConversation.updateOne(
-      filter,
-      { $set: set, $setOnInsert: { userId: userId ?? null, createdAt: new Date() } },
-      { upsert: true },
-    );
-  } catch (e: any) {
-    // Concurrent-upsert race: two writers hit a cold doc, one inserts, the other
-    // collides on the unique {workspaceId, conversationId} index (E11000). Retry
-    // ONCE as a plain update (the doc now exists) so this writer's context still
-    // lands — never surface a duplicate-key error to the caller.
-    if (e?.code === 11000) {
-      try {
-        await PlutoConversation.updateOne(filter, { $set: set });
-        return;
-      } catch (e2: any) {
-        void emitMetric(memoryWriteFailed({ workspaceId: String(workspaceObjectId), reason: e2?.message }));
+  {
+    // userId is IN the filter, so the upsert either updates this user's own
+    // doc or inserts a new one stamped with this user. Another user's doc with
+    // the same id makes the insert collide on the unique index → dropped, never
+    // a fallback update without the owner (which is exactly the leak).
+    if (!userId) return;
+    try {
+      await PlutoConversation.updateOne(
+        { workspaceId: workspaceObjectId, conversationId, userId },
+        { $set: set, $setOnInsert: { createdAt: new Date() } },
+        { upsert: true },
+      );
+    } catch (e: any) {
+      if (e?.code !== 11000) {
+        void emitMetric(memoryWriteFailed({ workspaceId: String(workspaceObjectId), reason: e?.message }));
         return;
       }
+      // E11000: either this user's own concurrent first write won the insert
+      // (retry as an owner-scoped update), or the id is someone else's (the
+      // owner-scoped update matches nothing — still never their doc).
+      try {
+        const r: any = await PlutoConversation.updateOne(
+          { workspaceId: workspaceObjectId, conversationId, userId },
+          { $set: set },
+        );
+        if (!r?.matchedCount) {
+          void emitMetric(memoryWriteFailed({ workspaceId: String(workspaceObjectId), reason: "owner_mismatch" }));
+        }
+      } catch (e2: any) {
+        void emitMetric(memoryWriteFailed({ workspaceId: String(workspaceObjectId), reason: e2?.message }));
+      }
     }
-    void emitMetric(memoryWriteFailed({ workspaceId: String(workspaceObjectId), reason: e?.message }));
-    // turn still succeeds
   }
 }
 
@@ -131,11 +174,15 @@ export async function claimHandoffDelivery(args: HandoffGuardArgs): Promise<bool
   // No live store → cannot dedup; deliver (best-effort, matches pre-migration).
   if (!connected()) return true;
   try {
+    // Owner-scoped like every other write: the claim can only flip (or
+    // create) this user's own doc.
     await PlutoConversation.findOneAndUpdate(
-      { workspaceId: workspaceObjectId, conversationId, handoffDelivered: false },
+      userId
+        ? { workspaceId: workspaceObjectId, conversationId, userId, handoffDelivered: false }
+        : { workspaceId: workspaceObjectId, conversationId, handoffDelivered: false },
       {
         $set: { handoffDelivered: true, lastTurnAt: new Date() },
-        $setOnInsert: { userId: userId ?? null, createdAt: new Date(), context: {} },
+        $setOnInsert: { ...(userId ? {} : { userId: null }), createdAt: new Date(), context: {} },
       },
       { upsert: true, new: true },
     );

@@ -33,7 +33,22 @@ import {
   saveConversationContext,
   claimHandoffDelivery,
   releaseHandoffDelivery,
+  loadConversationForUser,
 } from "../utils/plutoMemory.js";
+import {
+  isStateV2Enabled,
+  FLIGHT_ROWS_FRESH_MS,
+  parseFlightRefinement,
+  mergeFlightFilters,
+  applyFlightFilters,
+  describeFlightFilters,
+  flightFilterWords,
+  matchXToYRoute,
+  parseParkTask,
+  isResumeFlights,
+  projectForClient,
+  type FlightFilters,
+} from "../utils/plutoTurnState.js";
 import { invokePlutoGemini, GEMINI_FALLBACK_INVALID } from "../utils/plutoGeminiInvoke.js";
 import { parseBudget, describeBudget } from "../utils/plutoBudget.js";
 import {
@@ -158,6 +173,7 @@ import {
   handoffFailed,
   replyThinAccepted,
   replyReaskedLocked,
+  turnBranch,
 } from "../utils/plutoMetricsBuilder.js";
 import { emitMetric } from "../utils/plutoMetricsSink.js";
 import { personName } from "../services/actorNames.js";
@@ -630,20 +646,156 @@ router.post("/hotels/search", async (req, res) => {
 // It still calls res.json / res.status().json exactly as before — /stream drives
 // it through a capture-res shim, so no response call site changed (Amendment N:
 // the getConversationContext/saveConversationContext call sites are untouched).
+//
+// PLUTO_STATE_V2 (default off) wraps it: the stored conversation is loaded ONCE,
+// owner-scoped, before any branch runs, and committed ONCE on every exit. Off,
+// the wrapper only records which branch answered (pluto.turn.branch).
+
+/** Which branch answered, filled in by the turn as it routes. */
+interface TurnTrace {
+  branch: string;
+  aiCalled: boolean;
+}
+
+/** The v2 state for this turn, loaded before any branch runs. */
+interface LoadedTurnState {
+  state: any;
+  id: string;
+  rev: number;
+  isFollowUp: boolean;
+  source: "new" | "server" | "missing" | "foreign" | "client";
+}
+
+/**
+ * Load the conversation for THIS user (design §1.1). Owned → the stored bag
+ * (the client's copy is ignored apart from its id). Missing → the client's
+ * copy under the same id (a conversation from before the switch, or one whose
+ * doc expired). Foreign → a fresh state under a NEW id, so the other user's
+ * conversation is neither read nor overwritten. No store → the client's copy,
+ * exactly today's behaviour.
+ */
+async function loadTurnState(req: any): Promise<LoadedTurnState> {
+  const body = req.body || {};
+  const client = body.context && typeof body.context === "object" ? body.context : {};
+  const asId = (v: any) => (typeof v === "string" && v.length > 0 && v.length <= 64 ? v : null);
+  const clientId = asId(client.id) || asId(body.conversationId);
+  // No stored doc to prefer (new / missing / no store) → the client's copy,
+  // as today; a stored doc, once one exists, always wins.
+  // Search rows render as cards, so they only ever come from the server.
+  const { rev: _rev, id: _id, lastSearch: _ls, ...clientState } = client;
+  if (!clientId) {
+    return { state: clientState, id: crypto.randomUUID(), rev: 0, isFollowUp: false, source: "new" };
+  }
+  const r = await loadConversationForUser({
+    workspaceObjectId: (req as any).workspaceObjectId,
+    userId: (req as any).user?._id,
+    conversationId: clientId,
+  });
+  if (r.status === "owned") {
+    const state = r.context && typeof r.context === "object" ? r.context : {};
+    return { state, id: clientId, rev: Number(state.rev) || 0, isFollowUp: true, source: "server" };
+  }
+  if (r.status === "foreign") {
+    return { state: {}, id: crypto.randomUUID(), rev: 0, isFollowUp: false, source: "foreign" };
+  }
+  return { state: clientState, id: clientId, rev: 0, isFollowUp: true, source: r.status === "missing" ? "missing" : "client" };
+}
+
+function emitTurnBranch(req: any, trace: TurnTrace, conversationId: string | undefined, stateV2: boolean) {
+  void Promise.resolve(
+    emitMetric(turnBranch({
+      workspaceId: String((req as any).workspaceObjectId || ""),
+      conversationId,
+      branch: trace.branch,
+      aiCalled: trace.aiCalled,
+      stateV2,
+    })),
+  ).catch(() => {});
+}
+
 async function runConciergeTurn(
+  req: any,
+  res: any,
+  onStage?: (stage: string, detail?: Record<string, unknown>) => void,
+) {
+  const trace: TurnTrace = { branch: "unknown", aiCalled: false };
+  if (!isStateV2Enabled()) {
+    // OWNERSHIP (switch-independent). A conversationId that belongs to another
+    // user — or to nobody (a legacy doc with no owner) — starts a FRESH
+    // conversation: the client's copy and the id are dropped, so this turn
+    // neither reads nor writes the other conversation (the legacy branches
+    // below trust the client's context and key their saves on the id).
+    const body = req.body || {};
+    const clientId =
+      (body.context && typeof body.context === "object" && typeof body.context.id === "string" && body.context.id) ||
+      (typeof body.conversationId === "string" && body.conversationId) ||
+      null;
+    if (clientId) {
+      const owned = await loadConversationForUser({
+        workspaceObjectId: (req as any).workspaceObjectId,
+        userId: (req as any).user?._id,
+        conversationId: clientId,
+      });
+      if (owned.status === "foreign") {
+        req.body = { ...body, context: {}, conversationId: undefined };
+      }
+    }
+    const captureId: { id?: string } = {};
+    const tapRes: any = {
+      status(code: number) { res.status(code); return tapRes; },
+      json(body: any) { captureId.id = body?.context?.id; return res.json(body); },
+    };
+    const out = await runConciergeTurnInner(req, tapRes, onStage, null, trace);
+    emitTurnBranch(req, trace, captureId.id, false);
+    return out;
+  }
+
+  const loaded = await loadTurnState(req);
+  const captured: { statusCode: number; body: any } = { statusCode: 200, body: undefined };
+  const captureRes: any = {
+    status(code: number) { captured.statusCode = code; return captureRes; },
+    json(body: any) { captured.body = body; return captureRes; },
+  };
+  await runConciergeTurnInner(req, captureRes, onStage, loaded, trace);
+
+  let body = captured.body;
+  if (captured.statusCode < 400 && body?.ok && body.context && typeof body.context === "object") {
+    // COMMIT — one awaited, owner-scoped write on every successful exit
+    // (the hotel lane, the asks and the redirects never saved before).
+    // `rev` counts writes; last write wins for now (design §8 Q9).
+    const state = { ...body.context, v: 2, id: body.context.id || loaded.id, rev: loaded.rev + 1 };
+    await saveConversationContext({
+      workspaceObjectId: (req as any).workspaceObjectId,
+      userId: (req as any).user?._id,
+      conversationId: state.id,
+      context: state,
+    });
+    body = { ...body, context: projectForClient(state) };
+  }
+  emitTurnBranch(req, trace, body?.context?.id, true);
+  return res.status(captured.statusCode).json(body);
+}
+
+async function runConciergeTurnInner(
   req: any,
   res: any,
   // `detail` carries grounded context for the stage label (e.g. the route being
   // searched) so the client can render "Searching live fares BLR → DXB…" without
   // guessing. Optional and additive: POST / still passes no listener at all.
-  onStage?: (stage: string, detail?: Record<string, unknown>) => void,
+  onStage: ((stage: string, detail?: Record<string, unknown>) => void) | undefined,
+  // PLUTO_STATE_V2: the state loaded for this turn; null when the switch is off.
+  v2: LoadedTurnState | null,
+  trace: TurnTrace,
 ) {
   // Per-request correlation id + tenant, threaded into every log line, metric
   // event and error response for this concierge turn.
   const requestId = crypto.randomUUID();
   const workspaceId = String((req as any).workspaceObjectId || "");
   try {
-    const { prompt, context: rawContext, lastReply, videoAnalysisId } = req.body;
+    const { prompt, context: clientContext, lastReply, videoAnalysisId } = req.body;
+    // v2: every branch below reads the STORED state (loaded before this turn),
+    // never the client's echo of it.
+    const rawContext = v2 ? { ...v2.state, id: v2.id } : clientContext;
     // ONE-TURN "pending question" marker. Set (in the returned context) only
     // when Pluto has just asked the user for a city — the flight origin, the
     // office city, or "search here?" for a near-me hotel ask — so the short
@@ -672,15 +824,16 @@ async function runConciergeTurn(
     // ── Is this a continuation of an existing conversation? ──
     // If context.id exists, the user is already mid-conversation.
     // NEVER gate follow-up messages — they are refinements, not new requests.
-    const isFollowUp = Boolean(context?.id || req.body?.conversationId);
+    const isFollowUp = v2 ? v2.isFollowUp : Boolean(context?.id || req.body?.conversationId);
 
     // Establish a stable conversation id up front so EVERY reply — including the
     // pre-AI gather-phase gate below — carries it. Without this, a details-
     // gathering conversation never gets an identity: the client round-trips an
     // id-less context, the next turn's isFollowUp stays false, and the whole
     // conversation resets. Reusing an existing id is a no-op for follow-ups.
-    const conversationId =
-      context?.id || req.body?.conversationId || crypto.randomUUID();
+    const conversationId = v2
+      ? v2.id
+      : context?.id || req.body?.conversationId || crypto.randomUUID();
 
     // 1️⃣ Must be travel-related at all.
     // Off-domain (clearly HR/payroll/attendance) → graceful concierge redirect
@@ -691,6 +844,7 @@ async function runConciergeTurn(
     // that merely contains a flagged word ("leave for the airport", "baggage
     // policy") is NOT redirected. The trip context round-trips untouched.
     if (isOffDomainQuery(prompt, { followUp: isFollowUp })) {
+      trace.branch = "off_domain";
       // Carry the stable id even on the redirect so no reply is ever id-less.
       return res.json({
         ok: true,
@@ -716,6 +870,7 @@ async function runConciergeTurn(
      */
     const looksLikeRouteSearch = /\bfrom\b[\s\S]{1,40}\bto\b/i.test(prompt);
     if (isFlightStatusQuery(prompt) && !looksLikeRouteSearch) {
+      trace.branch = "flight_status";
       const ident = extractFlightDesignator(prompt) as string;
       // Reuse the existing date parser rather than writing a second one; null
       // when the user named no date, which means "next upcoming".
@@ -828,6 +983,188 @@ async function runConciergeTurn(
       /fly(ing)?\s+from\s+.{2,30}\s+to\s+/i.test(t)
     );
 
+    /* ───────── v2: PARK · RESUME · REFINE (deterministic, never the AI) ─────────
+     * Design §3.1 / §3.6. Runs BEFORE the route detector: "ok leave flights for
+     * now" matches its /flights?\s+for/ and used to re-run the very search the
+     * user had just set aside (QC F-06). A refinement ("only non-stop",
+     * "cheaper?") re-filters the rows stored with the last search — no supplier
+     * call, no model — while they are fresh enough to book (12 min).
+     */
+    if (v2) {
+      const v2Ctx: any = context && typeof context === "object" ? context : {};
+      const ls: any = v2Ctx.lastSearch && typeof v2Ctx.lastSearch === "object" ? v2Ctx.lastSearch : {};
+      const lockedNow: any = v2Ctx.locked || {};
+      const shortDay = (iso?: string | null): string => {
+        const m = String(iso || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (!m) return "";
+        const mon = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][parseInt(m[2], 10) - 1];
+        return mon ? `${parseInt(m[3], 10)} ${mon}` : "";
+      };
+      const destName: string =
+        lockedNow.destination?.name || ls.flight?.destinationCity || ls.hotel?.city || "";
+
+      // ── PARK — acknowledge, keep the trip, offer next steps. Never a search.
+      const park = parseParkTask(prompt);
+      if (park) {
+        trace.branch = "park";
+        const kind: "flight" | "hotel" | null = park.kind || (ls.active === "flight" || ls.active === "hotel" ? ls.active : null);
+        const parked = { ...(v2Ctx.parked || {}), ...(kind ? { [kind]: Date.now() } : {}) };
+        const tripBits = [
+          lockedNow.origin?.city ? `from ${lockedNow.origin.city}` : "",
+          shortDay(lockedNow.dates?.start),
+        ].filter(Boolean).join(", ");
+        const kept = destName ? ` Your ${destName} trip${tripBits ? ` (${tripBits})` : ""} is kept.` : "";
+        const chips = (
+          kind === "flight"
+            ? [destName && `Hotels in ${destName}`, destName && `Things to do in ${destName}`, ls.flight && "Back to flights"]
+            : kind === "hotel"
+              ? [destName && `Flights to ${destName}`, destName && `Things to do in ${destName}`]
+              : [destName ? `Flights to ${destName}` : "Search flights", destName ? `Hotels in ${destName}` : "Search hotels"]
+        ).filter(Boolean) as string[];
+        return res.json({
+          ok: true,
+          reply: {
+            title: kind === "flight" ? "Flights on hold" : kind === "hotel" ? "Hotels on hold" : "No problem",
+            context:
+              (kind ? `Parked ${kind === "flight" ? "flights" : "hotels"} for now.` : "Okay, holding here.") +
+              kept +
+              " Pick it up whenever you're ready.",
+            nextSteps: chips,
+            handoff: false,
+          },
+          context: { ...v2Ctx, id: conversationId, parked },
+        });
+      }
+
+      // ── RESUME / REFINE the last flight search.
+      const lf: any = ls.flight && typeof ls.flight === "object" ? ls.flight : null;
+      const resume = isResumeFlights(prompt);
+      // A message that names a place, a route or a date is a NEW search (or a
+      // trip edit, slice S2) — never a filter on the old rows.
+      const placeWord = prompt.match(/\b(?:to|from|via)\s+([A-Za-z]{3,}(?:\s+[A-Za-z]{3,})?)/i);
+      const namesNewSearch =
+        /\bfrom\b[\s\S]{1,40}\bto\b/i.test(prompt) ||
+        Boolean(matchXToYRoute(prompt)) ||
+        Boolean(placeWord && resolveIATA(placeWord[1])) ||
+        Boolean(extractPromptDateRange(prompt)) ||
+        Boolean(resolveRelativeDate(prompt));
+      const aboutFlights = ls.active === "flight" || /\bflights?\b/i.test(prompt);
+      if (lf && !isHotelRequest(prompt) && (resume || (aboutFlights && !namesNewSearch))) {
+        const parsed = resume ? null : parseFlightRefinement(prompt, lf.rows?.flights || []);
+        if (resume || parsed) {
+          trace.branch = resume ? "resume_flight" : "refine_flight";
+          onStage?.("refining");
+          const prevFilters: FlightFilters = lf.filters || {};
+          const filters: FlightFilters = !parsed
+            ? prevFilters
+            : "filters" in parsed
+              ? mergeFlightFilters(prevFilters, parsed.filters)
+              : {};
+          const all: any[] = Array.isArray(lf.rows?.flights) ? lf.rows.flights : [];
+          const fromCity = lf.originCity || lf.origin;
+          const toCity = lf.destinationCity || lf.destination;
+          const route = `${fromCity} → ${toCity}`;
+          const day = lf.displayDate || shortDay(lf.date);
+          const words = flightFilterWords(filters);
+          const searchChip = `Search ${words ? `${words} ` : ""}flights from ${fromCity} to ${toCity} on ${day}`;
+          const parkedOut = { ...(v2Ctx.parked || {}) };
+          delete parkedOut.flight;
+          const baseCtx = { ...v2Ctx, id: conversationId, parked: parkedOut };
+          const ageMs = Date.now() - Number(lf.at || 0);
+
+          // Stale rows: their TraceId may no longer book, and fares move.
+          if (!(ageMs >= 0 && ageMs < FLIGHT_ROWS_FRESH_MS)) {
+            return res.json({
+              ok: true,
+              reply: {
+                title: `Flights: ${route} · ${day}`,
+                context: `The fares I found for ${route} on ${day} are more than 12 minutes old, so I won't filter them: prices and seats change. Shall I search again?`,
+                nextSteps: [searchChip],
+                handoff: false,
+              },
+              context: { ...baseCtx, lastSearch: { ...ls, flight: { ...lf, filters } } },
+            });
+          }
+
+          const labels = describeFlightFilters(filters, all);
+          const out = applyFlightFilters(all, filters, { leg: "out", legDate: lf.date });
+          if (out.length === 0) {
+            // Nothing matches: say so, keep the last filters that DID match.
+            return res.json({
+              ok: true,
+              reply: {
+                title: `No matches: ${route} · ${day}`,
+                context: `None of the ${all.length} flights I found match ${labels.join(", ")}. I can only filter the results I already have; a fresh search may find more.`,
+                nextSteps: [Object.keys(prevFilters).length ? "Clear filters" : "Show all flights", searchChip],
+                handoff: false,
+              },
+              context: baseCtx,
+            });
+          }
+
+          const inbound = applyFlightFilters(lf.rows?.inbound || [], filters, { leg: "in", legDate: lf.returnDate });
+          const other = applyFlightFilters(lf.rows?.otherAirport || [], filters, { leg: "out", legDate: lf.date });
+          const inboundOther = applyFlightFilters(lf.rows?.inboundOtherAirport || [], filters, { leg: "in", legDate: lf.returnDate });
+          const fare = (f: any): number => Number(f?.fare?.offered ?? f?.fare?.published ?? 0) || Infinity;
+          const mins = (f: any): number => (Number(f?.durationMin) > 0 ? Number(f.durationMin) : Infinity);
+          const cheapest = out.reduce((a: any, b: any) => (fare(a) <= fare(b) ? a : b));
+          const fastest = out.reduce((a: any, b: any) => (mins(a) <= mins(b) ? a : b));
+          const overall = all.reduce((a: any, b: any) => (fare(a) <= fare(b) ? a : b));
+          const inr = (n: number) => `₹${Math.round(n).toLocaleString("en-IN")}`;
+          const dep = (f: any) => String(f?.departure?.time || "").slice(0, 5);
+          const stops = (n: any) => (Number(n) === 0 ? "non-stop" : `${n} stop${Number(n) > 1 ? "s" : ""}`);
+          const narrowing = labels.filter((l) => l !== "cheapest first" && l !== "fastest first");
+
+          let text = narrowing.length
+            ? `${narrowing.join(" · ").replace(/^./, (c) => c.toUpperCase())}: ${out.length} of ${all.length} flights.`
+            : `All ${all.length} flights${labels.length ? `, ${labels.join(", ")}` : ""}.`;
+          text += ` Cheapest${narrowing.length ? " match" : ""} ${inr(fare(cheapest))} (${cheapest.flightNo}, ${dep(cheapest)}, ${stops(cheapest.stops)}).`;
+          if (filters.sort === "duration") text += ` Fastest ${fastest.duration} (${fastest.flightNo}).`;
+          if (narrowing.length && fare(overall) < fare(cheapest)) {
+            text += ` Without the filters, the cheapest is ${inr(fare(overall))} (${overall.flightNo}, ${stops(overall.stops)}, ${overall.duration}).`;
+          }
+
+          const chips: string[] = [];
+          if (filters.maxStops === undefined) chips.push("Non-stop only");
+          if (filters.sort !== "price") chips.push("Cheapest first");
+          if (!filters.departWindow && !filters.arriveBy) chips.push("Morning departures only");
+          if (Object.keys(filters).length) chips.push("Clear filters");
+
+          return res.json({
+            ok: true,
+            reply: {
+              title: `Flights: ${route} · ${day}`,
+              context: text,
+              flightSearch: {
+                origin: { city: fromCity, iata: lf.origin },
+                destination: { city: toCity, iata: lf.destination },
+                date: day,
+                isoDate: lf.date,
+                isoReturnDate: lf.journeyType === 2 ? lf.returnDate : undefined,
+                journeyType: lf.journeyType || 1,
+                flights: out,
+                inbound,
+                otherAirport: other,
+                inboundOtherAirport: inboundOther,
+                cheapest,
+                fastest,
+                traceId: lf.traceId,
+                source: "tbo",
+                tipLines: buildFlightTipLines(lf.origin, lf.destination, day),
+                activeFilters: labels,
+              },
+              nextSteps: chips.slice(0, 4),
+              handoff: false,
+            },
+            context: {
+              ...baseCtx,
+              lastSearch: { ...ls, active: "flight", flight: { ...lf, filters, shownRefs: out.map((f: any) => f.ResultIndex) } },
+            },
+          });
+        }
+      }
+    }
+
     // A short answer to a pending FLIGHT question (we asked for the origin, or
     // for the office city) → re-run the ORIGINAL ask with the answer spliced
     // in, so every extractor below reads one consistent sentence. The answer
@@ -849,9 +1186,22 @@ async function runConciergeTurn(
       }
     }
 
-    const isFlightRouteSearch = flightAnswered || looksLikeFlightRouteSearch(prompt);
+    // v2: "bengaluru to mumbai on 20 nov" (no "flights", no "from") is a route
+    // ask too (QC F-11). Rewritten into the "flights from X to Y …" form every
+    // extractor below already reads.
+    let xToY: ReturnType<typeof matchXToYRoute> = null;
+    // Applied even when the legacy detector also fired ("…morning flights only"
+    // matches its /flights?\s+on/) — that detector would claim the turn with no
+    // origin. matchXToYRoute already refuses any message containing "from".
+    if (v2 && !flightAnswered) {
+      xToY = matchXToYRoute(prompt);
+      if (xToY) flightPrompt = xToY.prompt;
+    }
+
+    const isFlightRouteSearch = flightAnswered || looksLikeFlightRouteSearch(prompt) || Boolean(xToY);
 
     if (isFlightRouteSearch) {
+      trace.branch = flightAnswered ? "answer_pending" : "flight_route";
       // ── Multi-city: not supported in the chat path yet → LOUD downgrade ──
       // Detect BEFORE single-leg extraction: a "to A to B" prompt would make the
       // destination regex capture "A to B", which then fails IATA resolution and
@@ -895,7 +1245,10 @@ async function runConciergeTurn(
       // concrete IST date, ONLY when no explicit date was typed. The rule used
       // is said back to the user (relDateNote) so the choice is never silent.
       const relDate = dateMatch ? null : resolveRelativeDate(flightPrompt);
-      const relDateNote = relDate
+      // v2: the note was already said on the ask this turn answers — once is enough.
+      const relDateNoteShown =
+        Boolean(v2) && flightAnswered && Array.isArray(pending?.notesShown) && pending.notesShown.includes("rel_date");
+      const relDateNote = relDate && !relDateNoteShown
         ? ` I read "${relDate.phrase}" as ${relDate.rule} (IST) — tell me if you meant another day.`
         : "";
 
@@ -1026,7 +1379,12 @@ async function runConciergeTurn(
           const askedContext = {
             ...(context && typeof context === "object" ? context : {}),
             id: conversationId,
-            pending: { kind: "flight", need: "origin", prompt: flightPrompt },
+            pending: {
+              kind: "flight",
+              need: "origin",
+              prompt: flightPrompt,
+              ...(v2 && relDateNote ? { notesShown: ["rel_date"] } : {}),
+            },
           };
           // The destination IS known here — the reply asks for the origin
           // only, whether or not there is a location chip to offer.
@@ -1131,12 +1489,15 @@ async function runConciergeTurn(
       }
 
       const lockedReturnContext = { ...(context && typeof context === "object" ? context : {}), id: conversationId, locked: mergedLocked };
-      void saveConversationContext({
-        workspaceObjectId: (req as any).workspaceObjectId,
-        userId: (req as any).user?._id,
-        conversationId,
-        context: lockedReturnContext,
-      });
+      // v2 commits once at the end of the turn instead (runConciergeTurn).
+      if (!v2) {
+        void saveConversationContext({
+          workspaceObjectId: (req as any).workspaceObjectId,
+          userId: (req as any).user?._id,
+          conversationId,
+          context: lockedReturnContext,
+        });
+      }
 
       // Round-trip intent but no usable return date → ASK for it. Never fall
       // through to a silent one-way search (the prior behaviour).
@@ -1213,6 +1574,63 @@ async function runConciergeTurn(
         }
       } else {
         console.warn("[FlightSearch] No parseable date — skipping live search", { requestId });
+      }
+
+      // v2: remember this search (rows server-side only) so a follow-up can
+      // re-filter it, and apply any filter words typed WITH the route ("…,
+      // morning flights only" — QC B3). A failed / dateless search forgets the
+      // previous route's rows: they no longer answer this conversation.
+      let initialFilterNote = "";
+      if (v2) {
+        const priorSearch: any = (lockedReturnContext as any).lastSearch || {};
+        const { flight: _oldFlight, ...otherSearches } = priorSearch;
+        if (isoDate && !searchUnavailable && (chatFlights.length > 0 || chatOtherAirport.length > 0)) {
+          const typed = parseFlightRefinement(flightPrompt, chatFlights);
+          const initialFilters: FlightFilters = typed && "filters" in typed ? typed.filters : {};
+          const allFlights = chatFlights;
+          const allInbound = chatInbound;
+          if (Object.keys(initialFilters).length) {
+            const labels = describeFlightFilters(initialFilters, allFlights);
+            const narrowed = applyFlightFilters(allFlights, initialFilters, { leg: "out", legDate: isoDate });
+            if (narrowed.length > 0) {
+              chatFlights = narrowed;
+              chatInbound = applyFlightFilters(chatInbound, initialFilters, { leg: "in", legDate: isoReturnDate || null });
+              initialFilterNote = ` Filtered to ${labels.join(", ")}: ${narrowed.length} of ${allFlights.length}.`;
+            } else {
+              initialFilterNote = ` None of the ${allFlights.length} flights match ${labels.join(", ")}, so all are shown.`;
+            }
+          }
+          (lockedReturnContext as any).lastSearch = {
+            ...otherSearches,
+            active: "flight",
+            flight: {
+              at: Date.now(),
+              origin: originIATA,
+              destination: destIATA,
+              originCity: origin,
+              destinationCity: destination,
+              date: isoDate,
+              displayDate: travelDate,
+              ...(journeyType === 2 ? { returnDate: isoReturnDate } : {}),
+              journeyType,
+              adults: extractedAdults,
+              cabin: extractedCabin,
+              traceId: chatTraceId,
+              filters: initialFilters,
+              rows: {
+                flights: allFlights,
+                inbound: allInbound,
+                otherAirport: chatOtherAirport,
+                inboundOtherAirport: chatInboundOtherAirport,
+              },
+              shownRefs: chatFlights.map((f: any) => f.ResultIndex),
+            },
+          };
+        } else if (Object.keys(otherSearches).length) {
+          (lockedReturnContext as any).lastSearch = otherSearches;
+        } else {
+          delete (lockedReturnContext as any).lastSearch;
+        }
       }
 
       // Cheapest / fastest over the rows that serve the requested airports only
@@ -1347,7 +1765,7 @@ async function runConciergeTurn(
           context: officeNote + (searchUnavailable
             ? `Flight search is temporarily unavailable for ${originIATA} → ${destIATA} right now. Please retry in a few minutes.`
             : hasLiveFlights
-              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + cabinNote + cheapestNote + roundTripNote + routeInsightsNote + weatherNote + otherAirportNote
+              ? zeroInPolicyNote + `Found ${chatFlights.length} flights for ${originIATA} → ${destIATA} on ${travelDate}. Fares are live, shown in INR.` + cabinNote + cheapestNote + roundTripNote + routeInsightsNote + weatherNote + otherAirportNote + initialFilterNote
               : otherAirportOnly
                 ? `I found no flights ${originIATA} → ${destIATA}${travelDate ? " on " + travelDate : ""}. The ${chatOtherAirport.length} option${chatOtherAirport.length > 1 ? "s" : ""} I did find use ${otherAirportNames} instead — shown below under "Other nearby airports" so you can decide.`
               : !isoDate
@@ -1401,6 +1819,7 @@ async function runConciergeTurn(
     // locked — a dead end no answer could clear.
     let hotelIntent =
       isHotelRequest(prompt) && !/\b(fly|flying|flight|flights)\b/i.test(prompt);
+    if (hotelIntent) trace.branch = "hotel_search";
 
     let hotelDest: HotelDestination = { status: "NO_CITY" };
     // Where the destination came from, and whether this branch should ask for
@@ -1474,6 +1893,7 @@ async function runConciergeTurn(
       if (answer) {
         const answered = await resolveHotelDestination(`hotels in ${answer}`, {});
         if (answered.status !== "NO_CITY") {
+          trace.branch = "answer_pending";
           hotelIntent = true;
           hotelDest = answered;
           hotelAskDates = answered.status === "RESOLVED";
@@ -1656,7 +2076,7 @@ async function runConciergeTurn(
         hotelLockedOut.destination = { name: hotelCity, source: hotelDestSource };
       }
       const officeHotelNote = hotelDestSource === "profile" ? officeDisclosure(hotelCity as string, "hotels") : "";
-      const hotelReturnContext = { ...hotelCtx, id: conversationId, locked: hotelLockedOut };
+      const hotelReturnContext: any = { ...hotelCtx, id: conversationId, locked: hotelLockedOut };
 
       onStage?.("checking_policy");
       const hotelPolicyRules = await loadWorkspacePolicyRules((req as any).workspaceObjectId);
@@ -1725,6 +2145,27 @@ async function runConciergeTurn(
         }),
       );
 
+      // v2: remember this search (rows server-side only) for later turns.
+      if (v2) {
+        hotelReturnContext.lastSearch = {
+          ...((hotelCtx as any).lastSearch || {}),
+          active: "hotel",
+          hotel: {
+            at: Date.now(),
+            city: hotelResult.cityName || hotelCity,
+            cityCode: (hotelDest as Extract<HotelDestination, { status: "RESOLVED" }>).cityCode,
+            countryCode: hotelCountry,
+            checkIn,
+            checkOut,
+            adults: hotelAdults,
+            rooms: hotelRooms,
+            searchId: hotelResult.searchId,
+            filters: {},
+            rows: hotelResult.hotels,
+          },
+        };
+      }
+
       onStage?.("assembling");
       return res.json({
         ok: true,
@@ -1777,11 +2218,15 @@ async function runConciergeTurn(
     // NOTE: gather turns now reach OpenAI (an intended increase in AI calls).
 
     /* ───────── Normalize context (Memory Check) ───────── */
+    trace.branch = "ai_path";
     let conversationContext: any;
 
     const existingId = context?.id || req.body?.conversationId;
 
-    if (existingId) {
+    if (v2) {
+      // Already loaded, owner-scoped, before any branch ran (runConciergeTurn).
+      conversationContext = context && typeof context === "object" ? context : { summary: "" };
+    } else if (existingId) {
       // Tenant-scoped read: identity from req (never the client body). A
       // wrong-workspace or malformed conversationId returns null, exactly like a
       // miss, and falls back to the client-supplied context.
@@ -2307,6 +2752,8 @@ ${prompt}
     }
 
     onStage?.("consulting_ai");
+    trace.branch = "ai";
+    trace.aiCalled = true;
     /* ───────── Invoke AI (OpenAI with Gemini Fallback) ───────── */
     let deltaReply: PlutoDeltaReply;
 
@@ -2467,6 +2914,25 @@ ${prompt}
         fullReply.hotels = undefined;
 
         if (itineraryHotelResult.ok && itineraryHotelResult.hotels.length > 0) {
+          if (v2) {
+            conversationContext.lastSearch = {
+              ...(conversationContext.lastSearch || {}),
+              active: "hotel",
+              hotel: {
+                at: Date.now(),
+                city: itineraryHotelResult.cityName || itineraryDest.cityName,
+                cityCode: itineraryDest.cityCode,
+                countryCode: itineraryDest.countryCode,
+                checkIn: itineraryCheckIn,
+                checkOut: itineraryCheckOut,
+                adults: 2,
+                rooms: 1,
+                searchId: itineraryHotelResult.searchId,
+                filters: {},
+                rows: itineraryHotelResult.hotels,
+              },
+            };
+          }
           fullReply.hotelSearch = {
             city: itineraryHotelResult.cityName || itineraryDest.cityName,
             countryCode: itineraryDest.countryCode,
@@ -2604,12 +3070,15 @@ ${prompt}
     }
 
     /* ───────── Save to Memory (tenant-scoped upsert) ───────── */
-    await saveConversationContext({
-      workspaceObjectId: (req as any).workspaceObjectId,
-      userId: (req as any).user?._id,
-      conversationId: conversationContext.id,
-      context: conversationContext,
-    });
+    // v2 commits once at the end of the turn instead (runConciergeTurn).
+    if (!v2) {
+      await saveConversationContext({
+        workspaceObjectId: (req as any).workspaceObjectId,
+        userId: (req as any).user?._id,
+        conversationId: conversationContext.id,
+        context: conversationContext,
+      });
+    }
 
     /* ───────── Delta API response ───────── */
     const responseDelta = reduceToDelta(fullReply, lastReply);
@@ -2723,7 +3192,8 @@ router.post("/raise-request", requireWorkspace, async (req: any, res: any) => {
     // legacy single-flight path with its strict flightData validation intact.
     let itinerary: any = null;
     if (itineraryId) {
-      itinerary = await Itinerary.findOne({ _id: itineraryId, workspaceId: (req as any).workspaceObjectId });
+      // Owner-scoped: a user can only submit (and mark SUBMITTED) their own.
+      itinerary = await Itinerary.findOne({ _id: itineraryId, workspaceId: (req as any).workspaceObjectId, createdByUserId: user._id });
       if (!itinerary) return res.status(404).json({ error: "Itinerary not found" });
     }
     const outboundItem = itinerary ? itinerary.items.find((i: any) => i.kind === "FLIGHT_OUTBOUND") : null;
@@ -2933,7 +3403,9 @@ router.post("/itinerary", requireWorkspace, async (req: any, res: any) => {
 
     // Reuse the existing DRAFT for this conversation when present (idempotent).
     let doc: any = conversationId
-      ? await Itinerary.findOne({ workspaceId: workspaceObjectId, conversationId, status: "DRAFT" })
+      // Owner-scoped: another user's DRAFT for the same conversationId is never
+      // reused (it used to be updated in place — a cross-user overwrite).
+      ? await Itinerary.findOne({ workspaceId: workspaceObjectId, conversationId, status: "DRAFT", createdByUserId: user._id })
       : null;
 
     const existing = doc ? doc.items : [];
@@ -2982,7 +3454,9 @@ router.post("/itinerary", requireWorkspace, async (req: any, res: any) => {
 router.get("/itinerary/:id", requireWorkspace, async (req: any, res: any) => {
   try {
     const workspaceObjectId = (req as any).workspaceObjectId;
-    const doc = await Itinerary.findOne({ _id: req.params.id, workspaceId: workspaceObjectId });
+    // Owner-only, like the conversation it came from: another user's itinerary
+    // is a 404, indistinguishable from a miss. No role bypass.
+    const doc = await Itinerary.findOne({ _id: req.params.id, workspaceId: workspaceObjectId, createdByUserId: req.user?._id });
     if (!doc) return res.status(404).json({ error: "Itinerary not found" });
     return res.status(200).json({ ok: true, itinerary: doc });
   } catch (err: any) {
@@ -2998,6 +3472,17 @@ router.get("/itinerary/:id", requireWorkspace, async (req: any, res: any) => {
 // wrong-workspace id, or a malformed id — all indistinguishable → a plain 404,
 // which the client treats as "start a clean conversation".
 router.get("/conversation/:id", requireWorkspace, async (req: any, res: any) => {
+  if (isStateV2Enabled()) {
+    // Owner-only: another user's conversation in the same workspace is a 404,
+    // exactly like a miss. No role bypass (SUPERADMIN included).
+    const r = await loadConversationForUser({
+      workspaceObjectId: (req as any).workspaceObjectId,
+      userId: (req as any).user?._id,
+      conversationId: req.params.id,
+    });
+    if (r.status !== "owned") return res.status(404).json({ ok: false, error: "Conversation not found" });
+    return res.status(200).json({ ok: true, context: projectForClient(r.context) });
+  }
   const context = await getConversationContext({
     workspaceObjectId: (req as any).workspaceObjectId,
     userId: (req as any).user?._id,

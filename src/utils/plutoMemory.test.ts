@@ -33,12 +33,21 @@ beforeEach(() => {
   M.updateOne.mockReset();
   M.emit.mockReset();
   M.findOne.mockImplementation((q: any) => ({ lean: async () => store.get(key(q.workspaceId, q.conversationId)) || null }));
+  // Mongo semantics: every filter field must match; an upsert copies the
+  // filter's equality fields (incl. userId) into the insert; an insert that
+  // clashes with the unique {workspaceId, conversationId} key throws E11000.
   M.updateOne.mockImplementation(async (filter: any, update: any, opts: any) => {
     const k = key(filter.workspaceId, filter.conversationId);
     let doc = store.get(k);
-    if (!doc && opts?.upsert) { doc = { workspaceId: filter.workspaceId, conversationId: filter.conversationId, ...(update.$setOnInsert || {}) }; store.set(k, doc); }
-    if (doc) Object.assign(doc, update.$set || {});
-    return { upsertedCount: doc ? 1 : 0 };
+    const matches = doc && (filter.userId === undefined || doc.userId === filter.userId);
+    if (!matches) {
+      if (!opts?.upsert) return { matchedCount: 0 };
+      if (doc) throw Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+      doc = { workspaceId: filter.workspaceId, conversationId: filter.conversationId, ...(filter.userId !== undefined ? { userId: filter.userId } : {}), ...(update.$setOnInsert || {}) };
+      store.set(k, doc);
+    }
+    Object.assign(doc, update.$set || {});
+    return { matchedCount: 1 };
   });
 });
 
@@ -53,18 +62,24 @@ describe("isValidConversationId (Amendment Q hygiene)", () => {
   });
 });
 
-describe("getConversationContext — tenant scoping", () => {
+describe("getConversationContext — tenant + OWNER scoping", () => {
   it("THE cross-tenant test: workspace B cannot read workspace A's conversation", async () => {
     await saveConversationContext({ workspaceObjectId: WS_A, userId: "uA", conversationId: "conv-1", context: { summary: "A secret" } });
-    // Same workspace → reads it.
-    expect(await getConversationContext({ workspaceObjectId: WS_A, conversationId: "conv-1" })).toEqual({ summary: "A secret" });
+    // Same workspace, the owner → reads it.
+    expect(await getConversationContext({ workspaceObjectId: WS_A, userId: "uA", conversationId: "conv-1" })).toEqual({ summary: "A secret" });
     // Different workspace, SAME conversationId → null, indistinguishable from a miss.
-    expect(await getConversationContext({ workspaceObjectId: WS_B, conversationId: "conv-1" })).toBeNull();
+    expect(await getConversationContext({ workspaceObjectId: WS_B, userId: "uA", conversationId: "conv-1" })).toBeNull();
   });
 
-  it("same-workspace roundtrip", async () => {
+  it("THE cross-user test: another user in the SAME workspace cannot read it; no userId reads nothing", async () => {
+    await saveConversationContext({ workspaceObjectId: WS_A, userId: "uA", conversationId: "conv-1", context: { summary: "A secret" } });
+    expect(await getConversationContext({ workspaceObjectId: WS_A, userId: "uB", conversationId: "conv-1" })).toBeNull();
+    expect(await getConversationContext({ workspaceObjectId: WS_A, conversationId: "conv-1" })).toBeNull();
+  });
+
+  it("same-workspace roundtrip (owner)", async () => {
     await saveConversationContext({ workspaceObjectId: WS_A, userId: "uA", conversationId: "c9", context: { state: "EXECUTION" } });
-    expect(await getConversationContext({ workspaceObjectId: WS_A, conversationId: "c9" })).toEqual({ state: "EXECUTION" });
+    expect(await getConversationContext({ workspaceObjectId: WS_A, userId: "uA", conversationId: "c9" })).toEqual({ state: "EXECUTION" });
   });
 
   it("genuine miss → null (fall back to client context)", async () => {
@@ -94,7 +109,7 @@ describe("getConversationContext — tenant scoping", () => {
 describe("saveConversationContext — upsert (Amendment P)", () => {
   it("write failure → write_failed metric, no throw", async () => {
     M.updateOne.mockImplementation(async () => { throw new Error("mongo down"); });
-    await expect(saveConversationContext({ workspaceObjectId: WS_A, conversationId: "c", context: {} })).resolves.toBeUndefined();
+    await expect(saveConversationContext({ workspaceObjectId: WS_A, userId: "uA", conversationId: "c", context: {} })).resolves.toBeUndefined();
     expect(M.emit.mock.calls.map((c) => c[0].type)).toContain("pluto.memory.write_failed");
   });
 
@@ -106,11 +121,18 @@ describe("saveConversationContext — upsert (Amendment P)", () => {
     expect(store.size).toBe(1);
   });
 
-  it("$setOnInsert userId + createdAt (originator not overwritten by later turns)", async () => {
+  it("the originator owns the doc: their later turns $set it; someone else's save never touches it", async () => {
     await saveConversationContext({ workspaceObjectId: WS_A, userId: "originator", conversationId: "c", context: { a: 1 } });
-    await saveConversationContext({ workspaceObjectId: WS_A, userId: "someone-else", conversationId: "c", context: { a: 2 } });
+    await saveConversationContext({ workspaceObjectId: WS_A, userId: "originator", conversationId: "c", context: { a: 2 } });
+    await saveConversationContext({ workspaceObjectId: WS_A, userId: "someone-else", conversationId: "c", context: { a: 3 } });
     const doc = store.get(key(WS_A, "c"));
-    expect(doc.userId).toBe("originator"); // $setOnInsert — not clobbered
-    expect(doc.context).toEqual({ a: 2 }); // context is $set every turn
+    expect(doc.userId).toBe("originator");
+    expect(doc.context).toEqual({ a: 2 });
+    expect(M.emit.mock.calls.map((c) => c[0].reason)).toContain("owner_mismatch");
+  });
+
+  it("no userId → no write", async () => {
+    await saveConversationContext({ workspaceObjectId: WS_A, conversationId: "c", context: { a: 1 } });
+    expect(M.updateOne).not.toHaveBeenCalled();
   });
 });
