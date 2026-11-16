@@ -211,14 +211,16 @@ describe("GET /export — own-scope tier", () => {
 
     const clause = ownScopeClauseOf(captured[0]);
     expect(clause, "export applied no own-scope tier").toBeTruthy();
-    expect(clause.$or[0]).toEqual({ createdBy: me });
-
-    // The two HOUSE intake carve-outs the list has, preserved verbatim.
-    const houseArms = clause.$or.slice(1);
-    expect(houseArms).toHaveLength(2);
-    for (const a of houseArms) expect(String(a.workspaceId)).toBe(HOUSE_CUSTOMER_ID);
-    expect(houseArms[0].assignmentStatus).toBe("PENDING_TO_ASSIGN");
-    expect(String(houseArms[1].assignPerson)).toBe(me);
+    // CHANGED ON PURPOSE 2026-11-16 (shared visibility rule, utils/
+    // bookingAccess.ts bookingScopeClause): OWN = created by OR assigned to the
+    // caller on ANY row (was: assigned only on HOUSE rows), plus the HOUSE
+    // intake triage carve-out, which is kept.
+    expect(clause.$or[0]).toEqual({ createdBy: { $in: [me] } });
+    expect(clause.$or[1].assignPerson.$in.map(String)).toEqual([me]);
+    expect(clause.$or[1].workspaceId).toBeUndefined();
+    expect(String(clause.$or[2].workspaceId)).toBe(HOUSE_CUSTOMER_ID);
+    expect(clause.$or[2].assignmentStatus).toBe("PENDING_TO_ASSIGN");
+    expect(clause.$or).toHaveLength(3);
   });
 
   it("both tiers stack for a non-ALL cross-tenant caller", async () => {

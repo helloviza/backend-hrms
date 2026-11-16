@@ -189,7 +189,32 @@ describe("subStatus / source / assignment — exact match", () => {
 
   it("an unparseable assignPerson matches nothing rather than being ignored", async () => {
     const { list } = await bothPaths("?assignPerson=not-an-id");
+    // CHANGED ON PURPOSE 2026-11-16: was `null`, which Mongo reads as "no
+    // assignee" and so matched every unassigned row. Now a true match-nothing.
+    expect(list.assignPerson).toEqual({ $in: [] });
+  });
+
+  it('assignPerson=none = no assignee (missing or null), on both paths', async () => {
+    const { list, exp } = await bothPaths("?assignPerson=none");
     expect(list.assignPerson).toBeNull();
+    expect(exp.assignPerson).toBeNull();
+  });
+
+  it("createdBefore = cases created strictly before the instant; junk matches nothing", async () => {
+    const at = "2026-11-15T06:30:00.000Z";
+    const { list, exp } = await bothPaths(`?createdBefore=${at}`);
+    expect(list.createdAt).toEqual({ $lt: new Date(at) });
+    expect(exp.createdAt).toEqual({ $lt: new Date(at) });
+    const { list: bad } = await bothPaths("?createdBefore=yesterday-ish");
+    expect(bad.createdAt).toEqual({ $in: [] });
+  });
+
+  it('createdBy=none = no recorded creator; a real id stays an exact match', async () => {
+    const { list, exp } = await bothPaths("?createdBy=none");
+    expect(list.createdBy).toEqual({ $in: [null, ""] });
+    expect(exp.createdBy).toEqual({ $in: [null, ""] });
+    const { list: l2 } = await bothPaths("?createdBy=abc123");
+    expect(l2.createdBy).toBe("abc123");
   });
 });
 

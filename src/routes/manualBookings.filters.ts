@@ -37,6 +37,7 @@ import { enumFilter } from "../utils/filterParams.js";
 import { BOOKING_STATUSES, demoClause } from "../utils/bookingMetrics.js";
 
 const BOOKING_SOURCES = ["MANUAL", "SBT", "ADMIN_QUEUE", "SBT_AUTO"] as const;
+const HOUSE_CUSTOMER_ID = "6a4e0d2ea90c293c9e129f48"; // Customer._id (utils/bookingAccess.ts)
 const ASSIGNMENT_STATUSES = ["PENDING_TO_ASSIGN", "ASSIGNED"] as const;
 
 export function buildSearchFilter(query: Record<string, any>, user?: any) {
@@ -75,10 +76,15 @@ export function buildSearchFilter(query: Record<string, any>, user?: any) {
 
   // assignPerson is a User._id. An unparseable id matches nothing rather than
   // being dropped — same fail-closed choice as workspaceId above.
-  if (query.assignPerson) {
+  // "none" = no assignee at all (the Team Summary's "Unassigned" row links
+  // here). `{assignPerson: null}` matches both a missing and a null field.
+  if (query.assignPerson === "none") {
+    filter.assignPerson = null;
+  } else if (query.assignPerson) {
     filter.assignPerson = mongoose.Types.ObjectId.isValid(String(query.assignPerson))
       ? new mongoose.Types.ObjectId(String(query.assignPerson))
-      : null;
+      // match nothing (was `null`, which in Mongo matches every UNASSIGNED row)
+      : { $in: [] };
   }
 
   if (query.givenBy) filter.givenBy = new RegExp(escapeRegex(String(query.givenBy)), "i");
@@ -88,7 +94,9 @@ export function buildSearchFilter(query: Record<string, any>, user?: any) {
   if (query.sourceBookingId) filter.sourceBookingId = query.sourceBookingId;
 
   // createdBy is stored as a plain string (String(user._id))
-  if (query.createdBy) filter.createdBy = String(query.createdBy);
+  // "none" = no recorded creator (the Team Summary's created-by "No creator" row).
+  if (query.createdBy === "none") filter.createdBy = { $in: [null, ""] };
+  else if (query.createdBy) filter.createdBy = String(query.createdBy);
 
   // Filter bookingDate (what the UI column shows). YYYY-MM-DD inputs are
   // interpreted as IST calendar days; full last day is included.
@@ -96,6 +104,14 @@ export function buildSearchFilter(query: Record<string, any>, user?: any) {
     filter.bookingDate = {};
     if (query.dateFrom) filter.bookingDate.$gte = parseISTStart(query.dateFrom);
     if (query.dateTo)   filter.bookingDate.$lte = parseISTEnd(query.dateTo);
+  }
+
+  // createdBefore (ISO instant): cases created strictly before it — the Team
+  // Summary's "pending > 1 day / > 3 days" counts link here with now − N days.
+  // Unparseable → match nothing (fail closed, like the id filters above).
+  if (query.createdBefore) {
+    const t = new Date(String(query.createdBefore));
+    filter.createdAt = Number.isNaN(t.getTime()) ? { $in: [] } : { $lt: t };
   }
 
   // Travel-date range — a SEPARATE range from bookingDate above, which is why
@@ -119,6 +135,18 @@ export function buildSearchFilter(query: Record<string, any>, user?: any) {
       { "passengers.name": re },
       { sector: re },
       { givenBy: re },
+      // "Client not registered yet" enquiries: the company typed in.
+      { prospectCompanyName: re },
+    ];
+  }
+
+  // prospect=1: only "Client not registered yet" bookings still on HOUSE
+  // (the Team Summary's client filter offers it). Pushed onto $and so it
+  // narrows whatever else is set, workspaceId included.
+  if (query.prospect === "1") {
+    filter.$and = [
+      ...(Array.isArray(filter.$and) ? filter.$and : []),
+      { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), prospectCompanyName: { $exists: true, $nin: [null, ""] } },
     ];
   }
 

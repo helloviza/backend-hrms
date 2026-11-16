@@ -15,6 +15,10 @@
  * (CustomerWorkspace._id) space (verification report, section B3).
  */
 
+import mongoose from "mongoose";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { reportingTreeUserIds } from "./reportingTree.js";
+
 export const HOUSE_CUSTOMER_ID = "6a4e0d2ea90c293c9e129f48"; // Customer._id
 export const HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254"; // CustomerWorkspace._id
 
@@ -42,6 +46,12 @@ export interface BookingAccessContext {
    * helper is ever reached.
    */
   isSuperAdmin?: boolean;
+  /**
+   * permissionScope TEAM only: the caller + their reporting tree
+   * (utils/reportingTree.ts). Absent for TEAM means "not resolved" and the
+   * rule falls back to the caller alone — narrower, never wider.
+   */
+  teamIds?: string[];
 }
 
 export interface BookingAccessRecord {
@@ -86,6 +96,85 @@ function isHouseBookingRecord(booking: BookingAccessRecord): boolean {
   return idOf(booking.workspaceId) === HOUSE_CUSTOMER_ID;
 }
 
+/* ── THE visibility rule (2026-11-16) ─────────────────────────────────
+ * One rule for every Manual Bookings read and write: the list, GET /export,
+ * the Team Summary (bookingScopeClause, a Mongo clause) and every single-
+ * booking route (canAccessBooking, a per-record predicate). Both derive from
+ * bookingVisibility() below, so they cannot drift apart.
+ *
+ *  SUPERADMIN                     → every booking
+ *  scope ALL                      → every booking (inside the tenant gate)
+ *  scope WORKSPACE, HOUSE caller  → every booking (HOUSE staff work every
+ *                                   client). A non-HOUSE WORKSPACE caller
+ *                                   stays on the OWN rule, as before.
+ *  scope TEAM                     → created by OR assigned to anyone in
+ *                                   ctx.teamIds (caller + reporting tree)
+ *  anything else (OWN)            → created by OR assigned to the caller
+ *  TEAM and OWN keep the HOUSE intake triage carve-out: unassigned
+ *  (PENDING_TO_ASSIGN) rows on the HOUSE customer.
+ *
+ * CHANGED 2026-11-16: "assigned to the caller" used to count only on HOUSE-
+ * customer rows; it now counts on any row. The tenant gate still runs first,
+ * so a non-HOUSE caller never reaches another tenant's row.
+ * The ADMIN role gets no automatic widening — scope decides.
+ */
+export type BookingVisibility = { all: boolean; people: string[] };
+
+export function bookingVisibility(ctx: BookingAccessContext): BookingVisibility {
+  if (ctx.isSuperAdmin) return { all: true, people: [] };
+  if (ctx.permissionScope === "ALL") return { all: true, people: [] };
+  if (ctx.permissionScope === "WORKSPACE" && isHouseCallerContext(ctx)) return { all: true, people: [] };
+  if (ctx.permissionScope === "TEAM") {
+    const team = (ctx.teamIds ?? []).map(String);
+    return { all: false, people: [...new Set([ctx.callerId, ...team])].filter(Boolean) };
+  }
+  return { all: false, people: ctx.callerId ? [ctx.callerId] : [] };
+}
+
+/**
+ * The Mongo form of the rule, WITHOUT the tenant gate (that stays in
+ * applyBookingReadGates). null = no restriction.
+ */
+export function bookingScopeClause(ctx: BookingAccessContext): Record<string, any> | null {
+  const v = bookingVisibility(ctx);
+  if (v.all) return null;
+  const oids = v.people
+    .filter((id) => mongoose.Types.ObjectId.isValid(id))
+    .map((id) => new mongoose.Types.ObjectId(id));
+  return {
+    $or: [
+      { createdBy: { $in: v.people } },
+      { assignPerson: { $in: oids } },
+      { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignmentStatus: "PENDING_TO_ASSIGN" },
+    ],
+  };
+}
+
+/** Caller-side context without the TEAM tree (enough for tenant / HOUSE checks). */
+export function bookingAccessBaseContext(req: any): BookingAccessContext {
+  return {
+    callerId: String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? ""),
+    customerId: req.workspace?.customerId ? String(req.workspace.customerId) : null,
+    workspaceObjectId: req.workspaceObjectId,
+    permissionScope: req.permissionScope,
+    isSuperAdmin: isSuperAdmin(req),
+  };
+}
+
+/**
+ * The full context, with the TEAM tree resolved (scope TEAM only; one query
+ * per level). Memoised on the request so a route checking many records walks
+ * the tree once.
+ */
+export async function bookingAccessContext(req: any): Promise<BookingAccessContext> {
+  const ctx = bookingAccessBaseContext(req);
+  if (ctx.permissionScope === "TEAM" && !ctx.isSuperAdmin) {
+    if (!req._bookingTeamIds) req._bookingTeamIds = await reportingTreeUserIds(ctx.callerId);
+    ctx.teamIds = req._bookingTeamIds;
+  }
+  return ctx;
+}
+
 /**
  * canAccessBooking — per-record access predicate for ManualBooking.
  *
@@ -102,10 +191,9 @@ function isHouseBookingRecord(booking: BookingAccessRecord): boolean {
  *     all tenants). Non-HOUSE callers must match the booking's tenant in
  *     either id-space; otherwise denied outright, before any per-record rule
  *     below is even considered.
- *  b. EXISTING per-record rules, unchanged from the prior GET /:id logic:
- *     permissionScope "ALL" (now bounded by the tenant gate above) → allow;
- *     else creator, or a HOUSE PENDING_TO_ASSIGN intake row, or a HOUSE row
- *     assigned to the caller.
+ *  b. THE visibility rule above (bookingVisibility): wide scopes allow;
+ *     else created by / assigned to someone in scope, or a HOUSE
+ *     PENDING_TO_ASSIGN intake row.
  */
 export function canAccessBooking(
   ctx: BookingAccessContext,
@@ -124,13 +212,15 @@ export function canAccessBooking(
     if (!tenantMatches) return false;
   }
 
-  if (ctx.permissionScope === "ALL") return true;
+  const v = bookingVisibility(ctx);
+  if (v.all) return true;
 
-  if (idOf(booking.createdBy) === ctx.callerId) return true;
+  const createdBy = idOf(booking.createdBy);
+  const assignee = idOf(booking.assignPerson);
+  if (createdBy && v.people.includes(createdBy)) return true;
+  if (assignee && v.people.includes(assignee)) return true;
 
-  const houseBooking = isHouseBookingRecord(booking);
-  if (houseBooking && booking.assignmentStatus === "PENDING_TO_ASSIGN") return true;
-  if (houseBooking && idOf(booking.assignPerson) === ctx.callerId) return true;
+  if (isHouseBookingRecord(booking) && booking.assignmentStatus === "PENDING_TO_ASSIGN") return true;
 
   return false;
 }

@@ -28,7 +28,7 @@ import { requirePermission } from "../middleware/requirePermission.js";
 import { requireBillingStaff, isExternalAccount } from "../middleware/requireBillingStaff.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { userOrIpKey } from "../middleware/rateLimit.js";
-import { canAccessBooking, isHouseCallerContext, type BookingAccessContext } from "../utils/bookingAccess.js";
+import { canAccessBooking, isHouseCallerContext, bookingAccessContext, type BookingAccessContext } from "../utils/bookingAccess.js";
 import { invoiceInCallerScope } from "./invoices.js";
 import ManualBooking from "../models/ManualBooking.js";
 import Invoice from "../models/Invoice.js";
@@ -114,7 +114,7 @@ async function subjectInScope(req: Request, subject: Subject, subjectId: unknown
   if (!mongoose.Types.ObjectId.isValid(String(subjectId))) return false;
   if (subject === "BOOKING") {
     const b: any = await ManualBooking.findById(subjectId).select("workspaceId createdBy assignPerson assignmentStatus").lean();
-    return !!b && canAccessBooking(accessCtx(req), b, "WRITE");
+    return !!b && canAccessBooking(await bookingAccessContext(req), b, "WRITE");
   }
   const inv: any = await Invoice.findById(subjectId).lean();
   return !!inv && (await invoiceInCallerScope(req, inv));
@@ -197,7 +197,7 @@ router.get("/summary", async (req: Request, res: Response) => {
     if (!(await gate(req, res, "BOOKING", "READ"))) return;
     if (!ids.length) return res.json({ summaries: {} });
     const bookings: any[] = await ManualBooking.find({ _id: { $in: ids } }).select("workspaceId createdBy assignPerson assignmentStatus").lean();
-    const ctx = accessCtx(req);
+    const ctx = await bookingAccessContext(req);
     const allowed = bookings.filter((b) => canAccessBooking(ctx, b, "READ")).map((b) => new mongoose.Types.ObjectId(String(b._id)));
     res.json({ summaries: await paymentSummaryByBooking(allowed) });
   } catch (err) {

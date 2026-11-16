@@ -311,6 +311,23 @@ export interface IManualBooking extends Document {
   assignmentStatus: "PENDING_TO_ASSIGN" | "ASSIGNED";
   assignPerson?: Schema.Types.ObjectId;
   assignPersonName?: string;
+  /**
+   * "Client not registered yet" (Log Enquiry, 2026-11-16): the company the
+   * enquiry is for, while the booking sits on the HOUSE customer. Written ONLY
+   * by POST /enquiry (never by the create / PUT body whitelists). Kept after
+   * POST /:id/move-client moves the booking to the real client, for reference.
+   */
+  prospectCompanyName?: string;
+  /** Moves HOUSE → real client (POST /:id/move-client), oldest first. Server-written only. */
+  clientMoves?: Array<{
+    at: Date;
+    by: Schema.Types.ObjectId;
+    byName?: string;
+    from: Schema.Types.ObjectId;
+    to: Schema.Types.ObjectId;
+    toName?: string;
+    prospectCompanyName?: string;
+  }>;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -544,6 +561,25 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     },
     assignPerson: { type: Schema.Types.ObjectId, ref: "User", index: true },
     assignPersonName: { type: String, trim: true },
+    // See IManualBooking.prospectCompanyName / clientMoves above.
+    prospectCompanyName: { type: String, trim: true, maxlength: 200 },
+    clientMoves: {
+      type: [
+        new Schema(
+          {
+            at: { type: Date, required: true },
+            by: { type: Schema.Types.ObjectId, ref: "User", required: true },
+            byName: { type: String },
+            from: { type: Schema.Types.ObjectId, ref: "Customer", required: true },
+            to: { type: Schema.Types.ObjectId, ref: "Customer", required: true },
+            toName: { type: String },
+            prospectCompanyName: { type: String },
+          },
+          { _id: false },
+        ),
+      ],
+      default: undefined, // absent until the first move
+    },
   },
   { timestamps: true },
 );

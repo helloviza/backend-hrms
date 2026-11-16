@@ -4,7 +4,7 @@
 // by staff (ManualBookingForm mode="enquiry", /admin/manual-bookings/log-enquiry):
 //   - same create as POST / (tenant gate, base rules, status gate), always
 //     PENDING with no sub status, always MANUAL (no Book Now link);
-//   - the lead passenger needs a phone or an email;
+//   - the lead passenger's phone and email are OPTIONAL (2026-11-16 follow-up);
 //   - the row is tagged metadata.channel = "ADMIN_ENQUIRY" by the ROUTE —
 //     a client can't set metadata on either route;
 //   - an enquiry can't reach Done without supplier / given by (the gate).
@@ -43,7 +43,7 @@ vi.mock("../utils/s3Upload.js", () => ({
 vi.mock("../services/documentExtraction.service.js", async (orig) => ({ ...(await orig<any>()), enqueueExtraction: async () => undefined }));
 vi.mock("../services/location.service.js", async (orig) => ({ ...(await orig<any>()), resolveActorFromRequest: async () => null }));
 
-const { default: manualBookingsRouter, ADMIN_ENQUIRY_CHANNEL, ENQUIRY_CONTACT_REQUIRED } = await import("./manualBookings.js");
+const { default: manualBookingsRouter, ADMIN_ENQUIRY_CHANNEL } = await import("./manualBookings.js");
 
 const HOUSE = new mongoose.Types.ObjectId("69679a7628330a58d29f2254");
 const HOUSE_CUSTOMER = "6a4e0d2ea90c293c9e129f48";
@@ -75,7 +75,7 @@ beforeEach(async () => {
   await mongoose.connection.db!.dropDatabase();
 });
 
-/** Only what the enquiry form requires: type, client, dates, lead name + a contact. */
+/** Only what the enquiry form requires: type, client, dates, lead name (a phone is optional — sent here as a realistic default). */
 const enquiry = (over: any = {}) => ({
   workspaceId: HOUSE_CUSTOMER,
   type: "FLIGHT",
@@ -111,11 +111,22 @@ describe("POST /enquiry", () => {
     expect(res.body.booking.returnDate ?? null).toBeNull();
   });
 
-  it("an email alone is enough contact; neither phone nor email is refused", async () => {
-    expect((await logEnquiry(enquiry({ passengers: [{ name: "A", email: "a@x.test" }] }))).status).toBe(201);
-    const res = await logEnquiry(enquiry({ passengers: [{ name: "A", phone: " ", email: "" }] }));
+  // CHANGED ON PURPOSE 2026-11-16: phone and email are optional on an enquiry
+  // (was: one of them required → 400).
+  it("phone and email are optional: neither, email only, phone only all save", async () => {
+    for (const lead of [{ name: "A" }, { name: "A", phone: " ", email: "" }, { name: "A", email: "a@x.test" }, { name: "A", phone: "+91 98" }]) {
+      const res = await logEnquiry(enquiry({ passengers: [lead] }));
+      expect(res.status, JSON.stringify(lead)).toBe(201);
+    }
+  });
+
+  it("the lead passenger's NAME is still required", async () => {
+    for (const passengers of [[{ name: " ", phone: "+91 98" }], []]) {
+      const r = await logEnquiry(enquiry({ passengers }));
+      expect([r.status, r.body.error]).toEqual([400, "Lead passenger name is required"]);
+    }
+    const res = await logEnquiry(enquiry({ passengers: [{ name: " ", phone: "+91 98" }] }));
     expect(res.status).toBe(400);
-    expect(res.body.error).toBe(ENQUIRY_CONTACT_REQUIRED);
   });
 
   it("is always Pending: any other status is refused", async () => {

@@ -23,7 +23,8 @@ import CustomerMember from "../models/CustomerMember.js";
 import Invoice from "../models/Invoice.js";
 import User from "../models/User.js";
 import { buildSearchFilter, applyInvoiceFilter, applyPartnerFilter, applyReservedNumberFilter, partnerFilterOptions } from "./manualBookings.filters.js";
-import { canAccessBooking, isHouseCallerContext } from "../utils/bookingAccess.js";
+import { canAccessBooking, isHouseCallerContext, bookingAccessContext, bookingAccessBaseContext, bookingScopeClause, bookingVisibility } from "../utils/bookingAccess.js";
+import { buildTeamSummary, parseGroupBy, resolveSummaryRange, filterRowsByPerson, summaryWorkbook } from "../services/manualBookingTeamSummary.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
@@ -94,15 +95,10 @@ router.use(hydrateActorName);
 // Builds the caller-side context canAccessBooking() checks a record against —
 // see utils/bookingAccess.ts for the predicate and infra/audit/
 // manual-bookings-access-verification.md for why each field is needed.
-function bookingAccessContextFromReq(req: any) {
-  return {
-    callerId: String(req.user._id || req.user.id || req.user.sub),
-    customerId: req.workspace?.customerId ?? null,
-    workspaceObjectId: req.workspaceObjectId,
-    permissionScope: req.permissionScope,
-    isSuperAdmin: isSuperAdmin(req),
-  };
-}
+// Async since 2026-11-16: scope TEAM resolves the caller's reporting tree
+// (utils/bookingAccess.ts → bookingAccessContext). One shared visibility rule
+// for the list, export, summary and every single-booking route.
+const bookingAccessContextFromReq = bookingAccessContext;
 
 // Best-guess document type for the extractor, from the booking's own service
 // type. Only a starting hint — extractDocument() overrides it with the model's
@@ -138,9 +134,10 @@ function bookingTypeToVoucherHint(bookingType?: string): VoucherType {
  *     id-spaces because ManualBooking.workspaceId is a Customer._id while
  *     req.workspaceObjectId is a CustomerWorkspace._id. Fails CLOSED.
  *
- *  2. OWN-SCOPE — for non-ALL callers only: their own rows, plus the HOUSE
- *     intake carve-outs (unassigned triage rows, and rows assigned to them).
- *     Booking-workflow specific; this is the tier that has no invoice analogue.
+ *  2. SCOPE — the shared visibility rule (utils/bookingAccess.ts
+ *     bookingScopeClause): ALL / HOUSE-WORKSPACE everything; TEAM the
+ *     caller's reporting tree; OWN their own rows; plus the HOUSE intake
+ *     triage carve-out. Booking-workflow specific; no invoice analogue.
  *
  *  3. SOFT DELETE — deleted rows hidden unless a SUPERADMIN asks for them.
  *
@@ -154,10 +151,8 @@ function bookingTypeToVoucherHint(bookingType?: string): VoucherType {
  * `filter.$or = …` or `filter.$and = […]` anywhere downstream would silently
  * drop every gate above.
  */
-function applyBookingReadGates(req: any, filter: Record<string, any>): void {
-  const accessCtx = bookingAccessContextFromReq(req);
-  const isAllScope = req.permissionScope === "ALL";
-  const selfId = accessCtx.callerId;
+export async function applyBookingReadGates(req: any, filter: Record<string, any>): Promise<void> {
+  const accessCtx = await bookingAccessContextFromReq(req);
 
   const andClauses: any[] = [];
   if (filter.$or) {
@@ -181,19 +176,13 @@ function applyBookingReadGates(req: any, filter: Record<string, any>): void {
     andClauses.push(tenantOr.length ? { $or: tenantOr } : { _id: { $in: [] } });
   }
 
-  // 2. Own-scope gate — own bookings only, plus the HOUSE triage carve-outs.
-  if (!isAllScope) {
-    const scopeOr = [
-      { createdBy: selfId },
-      { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignmentStatus: "PENDING_TO_ASSIGN" },
-      // Once a HOUSE intake row is ASSIGNED, assignmentStatus no longer
-      // matches the clause above and createdBy is still the System Intake
-      // User (never the assignee) — without this, the assignee loses their
-      // own assigned booking from the list the moment it's assigned to them.
-      { workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), assignPerson: new mongoose.Types.ObjectId(selfId) },
-    ];
-    andClauses.push({ $or: scopeOr });
-  }
+  // 2. Scope gate — THE shared visibility rule (utils/bookingAccess.ts
+  //    bookingVisibility): ALL / HOUSE WORKSPACE see everything; TEAM sees
+  //    rows created by or assigned to the caller's reporting tree; OWN the
+  //    caller's own; TEAM and OWN keep the HOUSE intake triage carve-out.
+  //    canAccessBooking (single-booking routes) derives from the same rule.
+  const scopeClause = bookingScopeClause(accessCtx);
+  if (scopeClause) andClauses.push(scopeClause);
 
   if (andClauses.length) {
     filter.$and = [...(filter.$and || []), ...andClauses];
@@ -612,7 +601,7 @@ const WITHHELD_PRICING_FIELDS = [
 ] as const;
 
 export function canSeeBookingInternals(req: any): boolean {
-  const ctx = bookingAccessContextFromReq(req);
+  const ctx = bookingAccessBaseContext(req);
   return Boolean(ctx.isSuperAdmin) || isHouseCallerContext(ctx);
 }
 
@@ -677,6 +666,19 @@ export function formatLineItems(b: any, includeCost = false): string {
 // "Quoted Price" reads as 100% margin, which is a worse answer than an empty
 // cell. The row shape (and therefore the column count and the XLSX totals
 // row) is identical either way.
+/**
+ * The client as shown in the list and the export. A booking still on the
+ * HOUSE customer for a "Client not registered yet" enquiry reads
+ * "<house name> · <prospect company>"; once moved to the real client, just
+ * the client (the prospect name stays on the booking for reference).
+ */
+export function clientLabel(name: string, b: any): string {
+  const prospect = String(b?.prospectCompanyName ?? "").trim();
+  const ws = String(b?.workspaceId?._id ?? b?.workspaceId ?? "");
+  if (!prospect || ws !== HOUSE_CUSTOMER_ID) return name;
+  return `${name || "Plumtrips (House)"} · ${prospect}`;
+}
+
 function bookingToRow(
   b: any,
   srNo: number,
@@ -684,9 +686,11 @@ function bookingToRow(
   tidMap: Record<string, string> = {},
   redacted = false,
 ): (string | number | undefined)[] {
-  const wsName =
-    wsNameMap[b.workspaceId?.toString() ?? ""] ||
-    b.workspaceId?.name || b.workspaceId?.companyName || String(b.workspaceId ?? "");
+  const wsName = clientLabel(
+    wsNameMap[String(b.workspaceId?._id ?? b.workspaceId ?? "")] ||
+      b.workspaceId?.name || b.workspaceId?.companyName || String(b.workspaceId ?? ""),
+    b,
+  );
   const invoiceDocDate    = fmtDateDMY(b.invoiceId?.invoiceDate);  // Invoice document's issued date
   const invoiceRaisedDate = fmtDateDMY(b.invoiceRaisedDate);       // booking-level raised date
   const invNo   = b.invoiceId?.invoiceNo ?? "";
@@ -835,12 +839,22 @@ async function resolveBookedFromCity(req: any) {
 // phone ENQUIRY logged by staff (ManualBookingForm mode="enquiry", page
 // /admin/manual-bookings/log-enquiry). Identical validation and tenant gate,
 // plus: always PENDING with no sub status, always a plain MANUAL booking (no
-// Book Now link), and the lead passenger needs a phone or an email. The row
-// is tagged metadata.channel = "ADMIN_ENQUIRY" HERE, by the route the
-// request came in on — never from the body: `metadata` is not in
-// CREATE_BODY_FIELDS, so no client can set or spoof the tag on either route.
+// Book Now link). The lead passenger's phone and email are OPTIONAL
+// (2026-11-16 follow-up). The row is tagged metadata.channel =
+// "ADMIN_ENQUIRY" HERE, by the route the request came in on — never from the
+// body: `metadata` is not in CREATE_BODY_FIELDS, so no client can set or
+// spoof the tag on either route.
 export const ADMIN_ENQUIRY_CHANNEL = "ADMIN_ENQUIRY";
-export const ENQUIRY_CONTACT_REQUIRED = "Phone or email is required for the lead passenger";
+export const ENQUIRY_LEAD_NAME_REQUIRED = "Lead passenger name is required";
+//
+// "Client not registered yet": body.clientNotRegistered === true saves the
+// enquiry under the HOUSE customer and REQUIRES body.prospectCompanyName,
+// stored on the booking. prospectCompanyName is read HERE only — it is in
+// neither CREATE_BODY_FIELDS nor UPDATE_BODY_FIELDS, so POST / and PUT /:id
+// can never write it. Moving the booking to the real client later is
+// POST /:id/move-client.
+export const PROSPECT_COMPANY_REQUIRED = "Company name is required when the client is not registered yet";
+export const PROSPECT_COMPANY_MAX = 200;
 
 router.post("/", requirePermission("manualBookings", "WRITE"), (req: any, res: any) => createBooking(req, res, false));
 router.post("/enquiry", requirePermission("manualBookings", "WRITE"), (req: any, res: any) => createBooking(req, res, true));
@@ -851,6 +865,7 @@ async function createBooking(req: any, res: any, enquiry: boolean) {
     if (attErr) return res.status(400).json({ error: attErr });
 
     const body = pickBookingBody(req.body, "create");
+    let prospectCompanyName: string | undefined;
 
     if (enquiry) {
       const asked = String(body.status || "PENDING").toUpperCase();
@@ -864,9 +879,25 @@ async function createBooking(req: any, res: any, enquiry: boolean) {
       body.subStatus = "";
       body.source = "MANUAL";
       delete body.sourceBookingId;
+      // Phone / email are optional; the lead passenger's NAME is not (the
+      // shared validator doesn't check it, and the model accepts "  ").
       const lead = Array.isArray(body.passengers) ? body.passengers[0] : null;
-      if (!String(lead?.phone ?? "").trim() && !String(lead?.email ?? "").trim()) {
-        return res.status(400).json({ error: ENQUIRY_CONTACT_REQUIRED, details: [ENQUIRY_CONTACT_REQUIRED] });
+      if (!String(lead?.name ?? "").trim()) {
+        return res.status(400).json({ error: ENQUIRY_LEAD_NAME_REQUIRED, details: [ENQUIRY_LEAD_NAME_REQUIRED] });
+      }
+      if (req.body?.clientNotRegistered === true) {
+        const company = String(req.body?.prospectCompanyName ?? "").trim();
+        if (!company) {
+          return res.status(400).json({ error: PROSPECT_COMPANY_REQUIRED, details: [PROSPECT_COMPANY_REQUIRED], code: "PROSPECT_COMPANY_REQUIRED" });
+        }
+        if (company.length > PROSPECT_COMPANY_MAX) {
+          return res.status(400).json({ error: `Company name is too long (max ${PROSPECT_COMPANY_MAX})`, code: "PROSPECT_COMPANY_TOO_LONG" });
+        }
+        if (body.workspaceId && String(body.workspaceId) !== HOUSE_CUSTOMER_ID) {
+          return res.status(400).json({ error: "A client that isn't registered yet is saved under Plumtrips (House)", code: "PROSPECT_NOT_HOUSE" });
+        }
+        body.workspaceId = HOUSE_CUSTOMER_ID;
+        prospectCompanyName = company;
       }
     }
 
@@ -879,7 +910,7 @@ async function createBooking(req: any, res: any, enquiry: boolean) {
     if (!body.workspaceId || !mongoose.isValidObjectId(body.workspaceId)) {
       return res.status(400).json({ error: "workspaceId is required" });
     }
-    const accessCtx = bookingAccessContextFromReq(req);
+    const accessCtx = await bookingAccessContextFromReq(req);
     const prospective = {
       workspaceId: String(body.workspaceId),
       createdBy: accessCtx.callerId,
@@ -968,6 +999,8 @@ async function createBooking(req: any, res: any, enquiry: boolean) {
       bookedFromCity,
       // Set by the route, never by the body (metadata isn't whitelisted).
       ...(enquiry ? { metadata: { channel: ADMIN_ENQUIRY_CHANNEL, loggedAt: new Date() } } : {}),
+      // Enquiry route only (see PROSPECT_COMPANY_REQUIRED above).
+      ...(prospectCompanyName ? { prospectCompanyName } : {}),
     });
 
     // Task automation hook for pending bookings
@@ -1002,7 +1035,7 @@ router.get("/by-request/:requestId", requirePermission("manualBookings", "READ")
     const rid = String(req.params.requestId || "");
     if (!mongoose.isValidObjectId(rid)) return res.status(400).json({ error: "Invalid request id" });
     const rows = (await bookingsByRequest([rid], "workspaceId createdBy assignPerson assignmentStatus")).get(rid) || [];
-    const ctx = bookingAccessContextFromReq(req);
+    const ctx = await bookingAccessContextFromReq(req);
     res.json({ ok: true, bookings: rows.filter((b) => canAccessBooking(ctx, b, "READ")).map(requestBookingSummary) });
   } catch (err: any) {
     console.error("[ManualBookings by-request]", err.message);
@@ -1031,7 +1064,7 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
 
     // Tenant + own-scope + soft-delete gates — shared verbatim with GET /export
     // (see applyBookingReadGates above), which previously had none of them.
-    applyBookingReadGates(req, filter);
+    await applyBookingReadGates(req, filter);
 
     // Bug 3 fix: resolve invoice number to booking invoiceId
     if (req.query.invoiceNo) await applyInvoiceFilter(filter, req.query.invoiceNo);
@@ -1093,7 +1126,7 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     // Resolve client names from Customer collection
     // (ManualBooking.workspaceId stores Customer._id, not CustomerWorkspace._id)
     const wsIds = [...new Set(
-      docs.map((b: any) => b.workspaceId?.toString()).filter(Boolean),
+      docs.map((b: any) => String(b.workspaceId?._id ?? b.workspaceId ?? "")).filter(Boolean), // populated → its _id
     )];
     const customers = await Promise.all(
       wsIds.map((id) =>
@@ -1110,7 +1143,7 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     // applyBookingReadGates; this response-shaping concern is separate from
     // access filtering, so it names its own dependency rather than relying on
     // a variable left behind by the gates.
-    const accessCtx = bookingAccessContextFromReq(req);
+    const accessCtx = await bookingAccessContextFromReq(req);
     const seeInternals = canSeeBookingInternals(req);
 
     // "Created by" as a profile name (never an id; the email only as a hover):
@@ -1120,7 +1153,7 @@ router.get("/", requirePermission("manualBookings", "READ"), async (req: any, re
     const enriched = docs.map((b: any) => {
       const row = {
         ...b,
-        clientName: clientNameMap[b.workspaceId?.toString()] || "",
+        clientName: clientLabel(clientNameMap[String(b.workspaceId?._id ?? b.workspaceId ?? "")] || "", b),
         createdByName: nameOrUnknown(
           creatorNames.get(String(b.createdBy || "")),
           creatorNames.get(String(b.createdByEmail || "").toLowerCase()),
@@ -1171,7 +1204,7 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
     // LEAK 2: this handler used to stop here. Same three gates as the list —
     // without them, anything hidden from the list was still downloadable from
     // the export, cost and margin columns included.
-    applyBookingReadGates(req, filter);
+    await applyBookingReadGates(req, filter);
     if (req.query.invoiceNo) await applyInvoiceFilter(filter, req.query.invoiceNo);
     if (req.query.partner) await applyPartnerFilter(filter, req.query.partner);
     const format = req.query.format === "xlsx" ? "xlsx" : "csv";
@@ -1184,7 +1217,7 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
 
     // Build workspace name map via Customer (has legalName / companyName / name)
     const wsIds = [...new Set(
-      docs.map((b: any) => b.workspaceId?.toString()).filter(Boolean),
+      docs.map((b: any) => String(b.workspaceId?._id ?? b.workspaceId ?? "")).filter(Boolean), // populated → its _id
     )];
     const customers = await Promise.all(
       wsIds.map((id) => Customer.findById(id).lean().catch(() => null)),
@@ -1906,17 +1939,21 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
 // shape and same rationale as /creators below: an exact-match id dropdown
 // instead of a free-text box keeps the query on the indexed assignPerson path.
 //
-// assignPersonName is denormalised onto the booking, so the label needs no
-// $lookup — unlike /creators, whose createdBy is a bare string id.
+// Labels: the denormalised assignPersonName is (per the list route's note)
+// written by almost nothing, so the name comes from ONE batched User lookup,
+// projected to `name` only; the stored name is the fallback.
 router.get("/assignees", requirePermission("manualBookings", "READ"), async (_req: any, res: any) => {
   try {
     const raw = await ManualBooking.aggregate([
       { $match: { assignPerson: { $ne: null }, isDemo: { $ne: true } } },
       { $group: { _id: "$assignPerson", name: { $last: "$assignPersonName" } } },
-      { $project: { _id: 1, name: { $ifNull: ["$name", ""] } } },
-      { $sort: { name: 1 } },
     ]);
-    res.json({ ok: true, assignees: raw.map((a: any) => ({ _id: String(a._id), name: a.name })) });
+    const users: any[] = await User.find({ _id: { $in: raw.map((a: any) => a._id) } }).select("name").lean();
+    const nameOf = new Map(users.map((u) => [String(u._id), String(u.name || "")]));
+    const assignees = raw
+      .map((a: any) => ({ _id: String(a._id), name: nameOf.get(String(a._id)) || String(a.name || "") }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    res.json({ ok: true, assignees });
   } catch (err: any) {
     console.error("[ManualBookings assignees]", err.message);
     res.status(500).json({ error: err.message });
@@ -1956,6 +1993,79 @@ router.get("/creators", requirePermission("manualBookings", "READ"), async (req:
     res.json({ ok: true, creators: raw });
   } catch (err: any) {
     console.error("[ManualBookings creators]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Team Summary (2026-11-16) ─────────────────────────────────────────
+ * GET /summary         — cards, status donut, top-5, daily trend, per-person table
+ * GET /summary/export  — the table as XLSX, same filters + person search
+ *
+ * Maths and rules: services/manualBookingTeamSummary.ts. ACCESS: the list's
+ * own gates (applyBookingReadGates = tenant + THE visibility rule + soft
+ * delete), so every count opens a list that shows exactly those cases; plus
+ * HOUSE staff only (the page is HouseOnly; staff names are not a tenant's
+ * business). Only the summary's own filters (type / client / source) are
+ * forwarded to the list filter builder — the date range is applied per bucket.
+ */
+async function teamSummaryForRequest(req: any) {
+  const q: Record<string, any> = {};
+  for (const k of ["type", "workspaceId", "source", "prospect"]) if (req.query[k]) q[k] = req.query[k];
+  const base = buildSearchFilter(q, req.user);
+  await applyBookingReadGates(req, base);
+  const ctx = await bookingAccessContextFromReq(req);
+  const visibility = bookingVisibility(ctx);
+  const summary = await buildTeamSummary({
+    base,
+    groupBy: parseGroupBy(req.query.groupBy),
+    range: resolveSummaryRange(req.query),
+    people: visibility.all ? null : visibility.people,
+    // OWN = "only their own row"; TEAM and wide scopes keep the Unassigned row.
+    includeUnassigned: visibility.all || ctx.permissionScope === "TEAM",
+  });
+  return { summary, everyone: visibility.all };
+}
+
+function summaryHouseOnly(req: any, res: any): boolean {
+  const ctx = bookingAccessBaseContext(req);
+  if (ctx.isSuperAdmin || isHouseCallerContext(ctx)) return true;
+  res.status(403).json({ error: "The team summary is for Plumtrips staff only.", code: "HOUSE_ONLY" });
+  return false;
+}
+
+router.get("/summary", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
+  try {
+    if (!summaryHouseOnly(req, res)) return;
+    const { summary, everyone } = await teamSummaryForRequest(req);
+    res.json({ ok: true, ...summary, scope: { everyone } });
+  } catch (err: any) {
+    console.error("[ManualBookings summary]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/summary/export", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
+  try {
+    if (!summaryHouseOnly(req, res)) return;
+    const { summary } = await teamSummaryForRequest(req);
+    const rows = filterRowsByPerson(summary.rows, req.query.person);
+    let client = "";
+    if (req.query.workspaceId && mongoose.Types.ObjectId.isValid(String(req.query.workspaceId))) {
+      const c: any = await Customer.findById(req.query.workspaceId).select("legalName name companyName").lean();
+      client = c?.legalName || c?.name || c?.companyName || String(req.query.workspaceId);
+    }
+    const filtersLine = [
+      `Filters: type ${req.query.type || "all"}`,
+      `client ${req.query.prospect === "1" ? "Client not registered yet" : client || "all"}`,
+      `source ${req.query.source || "all"}`,
+      req.query.person ? `person "${String(req.query.person)}"` : "",
+    ].filter(Boolean).join(" · ");
+    const buf = await summaryWorkbook(summary, rows, filtersLine);
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="manual-bookings-team-summary-${summary.range.from}_${summary.range.to}.xlsx"`);
+    res.send(buf);
+  } catch (err: any) {
+    console.error("[ManualBookings summary export]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2050,7 +2160,7 @@ router.get("/:id", requirePermission("manualBookings", "READ"), async (req: any,
       .lean();
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-    if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "READ")) {
+    if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "READ")) {
       return res.status(403).json({ success: false, message: "Not found" });
     }
 
@@ -2077,7 +2187,7 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
     const booking = await ManualBooking.findById(req.params.id);
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-    if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+    if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "WRITE")) {
       return res.status(403).json({ success: false, message: "Not found" });
     }
 
@@ -2157,6 +2267,75 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
   }
 });
 
+/* ── POST /:id/move-client (2026-11-16) ─────────────────────────────────
+ * The ONE sanctioned client change: a booking logged under the HOUSE customer
+ * (e.g. "Client not registered yet") moves to the real client once that
+ * client exists. PUT /:id still never accepts workspaceId; every other client
+ * change stays blocked (cancel as Wrong Customer and re-create).
+ *
+ * ALL must hold, else the move is refused:
+ *  - caller: HOUSE staff (or SuperAdmin) with manualBookings WRITE, who can
+ *    see this booking under the shared visibility rule (canAccessBooking);
+ *  - booking: on the HOUSE customer, status PENDING or WIP;
+ *  - target: an existing, ACTIVE Customer that is not HOUSE.
+ * The update is CONDITIONAL on the booking still being HOUSE + PENDING/WIP,
+ * so a concurrent status change can't slip a Done booking through.
+ * Recorded in booking.clientMoves (who, when, from → to, prospect company);
+ * prospectCompanyName is kept for reference.
+ */
+const MOVABLE_STATUSES = ["PENDING", "WIP"];
+router.post("/:id/move-client", requirePermission("manualBookings", "WRITE"), async (req: any, res: any) => {
+  try {
+    const baseCtx = bookingAccessBaseContext(req);
+    if (!baseCtx.isSuperAdmin && !isHouseCallerContext(baseCtx)) {
+      return res.status(403).json({ error: "Only Plumtrips staff can move a booking to a client.", code: "HOUSE_ONLY" });
+    }
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: "Booking not found" });
+    const booking: any = await ManualBooking.findById(req.params.id)
+      .select("workspaceId createdBy assignPerson assignmentStatus status bookingRef prospectCompanyName isActive")
+      .lean();
+    if (!booking || booking.isActive === false) return res.status(404).json({ error: "Booking not found" });
+    if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "WRITE")) {
+      return res.status(403).json({ success: false, message: "Not found" });
+    }
+    if (String(booking.workspaceId) !== HOUSE_CUSTOMER_ID) {
+      return res.status(400).json({ error: "Only a booking under Plumtrips (House) can be moved to a client.", code: "NOT_HOUSE" });
+    }
+    if (!MOVABLE_STATUSES.includes(String(booking.status))) {
+      return res.status(400).json({ error: "Only a Pending or WIP booking can be moved to a client.", code: "MOVE_STATUS" });
+    }
+    const target = String(req.body?.workspaceId ?? "");
+    if (!mongoose.isValidObjectId(target) || target === HOUSE_CUSTOMER_ID) {
+      return res.status(400).json({ error: "Pick the client to move this booking to.", code: "TARGET_INVALID" });
+    }
+    const client: any = await Customer.findById(target).select("legalName name companyName status").lean();
+    if (!client || String(client.status || "ACTIVE").toUpperCase() !== "ACTIVE") {
+      return res.status(400).json({ error: "That client doesn't exist (or isn't active).", code: "TARGET_NOT_FOUND" });
+    }
+    const toName = String(client.legalName || client.companyName || client.name || "");
+    const move = {
+      at: new Date(),
+      by: new mongoose.Types.ObjectId(baseCtx.callerId),
+      byName: personName(req.user) || String(req.user?.email || ""),
+      from: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID),
+      to: new mongoose.Types.ObjectId(target),
+      toName,
+      ...(booking.prospectCompanyName ? { prospectCompanyName: booking.prospectCompanyName } : {}),
+    };
+    const r = await ManualBooking.updateOne(
+      { _id: booking._id, workspaceId: new mongoose.Types.ObjectId(HOUSE_CUSTOMER_ID), status: { $in: MOVABLE_STATUSES } },
+      { $set: { workspaceId: move.to }, $push: { clientMoves: move } },
+    );
+    if (!r.modifiedCount) {
+      return res.status(409).json({ error: "The booking changed meanwhile — reload and try again.", code: "MOVE_CONFLICT" });
+    }
+    res.json({ ok: true, bookingId: String(booking._id), bookingRef: booking.bookingRef, workspaceId: target, clientName: toName, move });
+  } catch (err: any) {
+    console.error("[ManualBookings move-client]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/admin/manual-bookings/:id/cancel
 router.post("/:id/cancel", requirePermission("manualBookings", "FULL"), async (req: any, res: any) => {
   try {
@@ -2173,7 +2352,7 @@ router.post("/:id/cancel", requirePermission("manualBookings", "FULL"), async (r
     const booking: any = await ManualBooking.findById(req.params.id);
     if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-    if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+    if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "WRITE")) {
       return res.status(403).json({ success: false, message: "Not found" });
     }
 
@@ -2234,7 +2413,7 @@ router.delete("/:id", requirePermission("manualBookings", "FULL"), async (req: a
     // always a no-op today (canAccessBooking short-circuits true for
     // ctx.isSuperAdmin), but keeps this route consistent with the others if
     // the SuperAdmin-only requirement above is ever relaxed.
-    if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+    if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "WRITE")) {
       return res.status(403).json({ success: false, message: "Not found" });
     }
 
@@ -2309,7 +2488,7 @@ router.post(
       const booking: any = await ManualBooking.findById(req.params.id);
       if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "READ")) {
+      if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "READ")) {
         return res.status(403).json({ success: false, message: "Not found" });
       }
 
@@ -2387,7 +2566,7 @@ router.get(
         .lean();
       if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "READ")) {
+      if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "READ")) {
         return res.status(403).json({ success: false, message: "Not found" });
       }
 
@@ -2410,7 +2589,7 @@ router.get(
         .lean();
       if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "READ")) {
+      if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "READ")) {
         return res.status(403).json({ success: false, message: "Not found" });
       }
 
@@ -2457,7 +2636,7 @@ router.patch(
       const booking: any = await ManualBooking.findById(req.params.id);
       if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+      if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "WRITE")) {
         return res.status(403).json({ success: false, message: "Not found" });
       }
 
@@ -2495,7 +2674,7 @@ router.delete(
       const booking: any = await ManualBooking.findById(req.params.id);
       if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+      if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "WRITE")) {
         return res.status(403).json({ success: false, message: "Not found" });
       }
 
@@ -2557,7 +2736,7 @@ router.get(
         .lean();
       if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "READ")) {
+      if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "READ")) {
         return res.status(403).json({ success: false, message: "Not found" });
       }
 
@@ -2591,7 +2770,7 @@ router.patch(
         .lean();
       if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+      if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "WRITE")) {
         return res.status(403).json({ success: false, message: "Not found" });
       }
 
@@ -2641,7 +2820,7 @@ router.post(
         .lean();
       if (!booking) return res.status(404).json({ error: "Booking not found" });
 
-      if (!canAccessBooking(bookingAccessContextFromReq(req), booking, "WRITE")) {
+      if (!canAccessBooking(await bookingAccessContextFromReq(req), booking, "WRITE")) {
         return res.status(403).json({ success: false, message: "Not found" });
       }
 
