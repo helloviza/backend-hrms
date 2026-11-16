@@ -318,6 +318,14 @@ export interface IManualBooking extends Document {
    * POST /:id/move-client moves the booking to the real client, for reference.
    */
   prospectCompanyName?: string;
+  /**
+   * When the booking FIRST entered CONFIRMED (2026-11-17) — set by the
+   * pre-save hook below, never by a request body, never moved afterwards
+   * (an invoice cancel that drops it back to CONFIRMED doesn't reset it).
+   * Absent on bookings confirmed before it existed: "time to complete"
+   * shows "—" for those. Feeds the Team Summary's Enquiries tab.
+   */
+  confirmedAt?: Date;
   /** Moves HOUSE → real client (POST /:id/move-client), oldest first. Server-written only. */
   clientMoves?: Array<{
     at: Date;
@@ -563,6 +571,8 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     assignPersonName: { type: String, trim: true },
     // See IManualBooking.prospectCompanyName / clientMoves above.
     prospectCompanyName: { type: String, trim: true, maxlength: 200 },
+    // See IManualBooking.confirmedAt — written only by the pre-save hook.
+    confirmedAt: { type: Date },
     clientMoves: {
       type: [
         new Schema(
@@ -910,6 +920,19 @@ ManualBookingSchema.pre("save", async function (next) {
  * assignPerson cleared → revert to PENDING_TO_ASSIGN, regardless of prior value.
  * Deliberately does not read/write `status` — the two fields stay orthogonal.
  */
+/* ── First confirmation time (2026-11-17) ─────────────────────────────
+ * The first time a booking is saved as CONFIRMED, stamp confirmedAt. Every
+ * route that changes a booking's status to CONFIRMED for the first time goes
+ * through .save() (create, PUT, import); the bulk updateMany paths only move
+ * already-confirmed bookings between CONFIRMED and INVOICED.
+ */
+ManualBookingSchema.pre("save", function (next) {
+  if ((this as any).status === "CONFIRMED" && !(this as any).confirmedAt) {
+    (this as any).confirmedAt = new Date();
+  }
+  next();
+});
+
 ManualBookingSchema.pre("save", function (next) {
   if (this.assignPerson) {
     if (this.assignmentStatus === "PENDING_TO_ASSIGN") {

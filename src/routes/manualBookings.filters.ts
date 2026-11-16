@@ -38,6 +38,11 @@ import { BOOKING_STATUSES, demoClause } from "../utils/bookingMetrics.js";
 
 const BOOKING_SOURCES = ["MANUAL", "SBT", "ADMIN_QUEUE", "SBT_AUTO"] as const;
 const HOUSE_CUSTOMER_ID = "6a4e0d2ea90c293c9e129f48"; // Customer._id (utils/bookingAccess.ts)
+// Enquiry channels (metadata.channel): Log Enquiry (routes/manualBookings.ts
+// ADMIN_ENQUIRY_CHANNEL) and the public website form / Google Form intake
+// (services/travelIntake.create.ts default). The Team Summary's Enquiries tab
+// links here with ?channel=<csv>.
+export const ENQUIRY_CHANNELS = ["ADMIN_ENQUIRY", "TRAVEL_INTAKE_FORM"] as const;
 const ASSIGNMENT_STATUSES = ["PENDING_TO_ASSIGN", "ASSIGNED"] as const;
 
 export function buildSearchFilter(query: Record<string, any>, user?: any) {
@@ -105,6 +110,10 @@ export function buildSearchFilter(query: Record<string, any>, user?: any) {
     if (query.dateFrom) filter.bookingDate.$gte = parseISTStart(query.dateFrom);
     if (query.dateTo)   filter.bookingDate.$lte = parseISTEnd(query.dateTo);
   }
+
+  // channel: enquiry channel(s), CSV, allow-listed; unknown-only → nothing.
+  const channelF = enumFilter(query.channel, ENQUIRY_CHANNELS);
+  if (channelF !== undefined) filter["metadata.channel"] = channelF;
 
   // createdBefore (ISO instant): cases created strictly before it — the Team
   // Summary's "pending > 1 day / > 3 days" counts link here with now − N days.

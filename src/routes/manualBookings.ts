@@ -25,6 +25,8 @@ import User from "../models/User.js";
 import { buildSearchFilter, applyInvoiceFilter, applyPartnerFilter, applyReservedNumberFilter, partnerFilterOptions } from "./manualBookings.filters.js";
 import { canAccessBooking, isHouseCallerContext, bookingAccessContext, bookingAccessBaseContext, bookingScopeClause, bookingVisibility } from "../utils/bookingAccess.js";
 import { buildTeamSummary, parseGroupBy, resolveSummaryRange, filterRowsByPerson, summaryWorkbook } from "../services/manualBookingTeamSummary.js";
+import { assignableUsers, assigneeChangeError, userDisplayName } from "../services/assignableUsers.js";
+import { buildEnquirySummary, parseEnquiryGroupBy, parseEnquirySource, enquiryWorkbook } from "../services/manualBookingEnquirySummary.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { uploadBufferToS3 } from "../utils/s3Upload.js";
 import { presignGetObject } from "../utils/s3Presign.js";
@@ -900,6 +902,10 @@ async function createBooking(req: any, res: any, enquiry: boolean) {
         prospectCompanyName = company;
       }
     }
+
+    // Assign Person must be Manual Bookings staff (services/assignableUsers.ts).
+    const assigneeErr = await assigneeChangeError(body.assignPerson);
+    if (assigneeErr) return res.status(400).json({ error: assigneeErr, code: "ASSIGNEE_NOT_ALLOWED" });
 
     // TENANT GATE ON CREATE — the same predicate every read/update runs,
     // applied to the booking-to-be. A caller may only create for a customer
@@ -1933,26 +1939,62 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
 });
 
 // GET /api/admin/manual-bookings/creators
+// GET /api/admin/manual-bookings/assignable-users[?include=<userId>]
+// Every Assign Person picker (/new, edit, Log Enquiry, Save & log another).
+// The assignable staff (services/assignableUsers.ts), sorted by name. With
+// ?include=<id> (a booking's CURRENT assignee) that person is appended with
+// noAccess: true when they are not assignable, so the edit page can still
+// show who holds the booking — the picker never offers them for a new pick.
+// HOUSE staff only (staff names are not a tenant's business).
+router.get("/assignable-users", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
+  try {
+    const ctx = bookingAccessBaseContext(req);
+    if (!ctx.isSuperAdmin && !isHouseCallerContext(ctx)) {
+      return res.status(403).json({ error: "Plumtrips staff only", code: "HOUSE_ONLY" });
+    }
+    const users: Array<{ _id: string; name: string; email: string; noAccess?: boolean }> = await assignableUsers();
+    const include = String(req.query.include ?? "").trim();
+    if (include && mongoose.isValidObjectId(include) && !users.some((u) => u._id === include)) {
+      const name = await userDisplayName(include);
+      if (name) users.push({ _id: include, name, email: "", noAccess: true });
+    }
+    res.json({ ok: true, users });
+  } catch (err: any) {
+    console.error("[ManualBookings assignable-users]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Returns the distinct set of staff users who have created at least one booking
 // GET /api/admin/manual-bookings/assignees
 // Distinct assignPerson values, for the "Assigned to" filter dropdown. Same
 // shape and same rationale as /creators below: an exact-match id dropdown
 // instead of a free-text box keeps the query on the indexed assignPerson path.
 //
-// Labels: the denormalised assignPersonName is (per the list route's note)
-// written by almost nothing, so the name comes from ONE batched User lookup,
-// projected to `name` only; the stored name is the fallback.
+// 2026-11-17: the options are the ASSIGNABLE staff (services/
+// assignableUsers.ts — Manual Bookings access per /admin/access, plus
+// SUPERADMINs), followed by anyone who still holds bookings but is no longer
+// assignable, flagged noAccess so old assignments stay filterable.
+// Labels: ONE batched User lookup (name only); the stored name is the fallback.
 router.get("/assignees", requirePermission("manualBookings", "READ"), async (_req: any, res: any) => {
   try {
-    const raw = await ManualBooking.aggregate([
-      { $match: { assignPerson: { $ne: null }, isDemo: { $ne: true } } },
-      { $group: { _id: "$assignPerson", name: { $last: "$assignPersonName" } } },
+    const [list, raw] = await Promise.all([
+      assignableUsers(),
+      ManualBooking.aggregate([
+        { $match: { assignPerson: { $ne: null }, isDemo: { $ne: true } } },
+        { $group: { _id: "$assignPerson", name: { $last: "$assignPersonName" } } },
+      ]),
     ]);
-    const users: any[] = await User.find({ _id: { $in: raw.map((a: any) => a._id) } }).select("name").lean();
+    const known = new Set(list.map((u) => u._id));
+    const extra = raw.filter((a: any) => !known.has(String(a._id)));
+    const users: any[] = extra.length ? await User.find({ _id: { $in: extra.map((a: any) => a._id) } }).select("name").lean() : [];
     const nameOf = new Map(users.map((u) => [String(u._id), String(u.name || "")]));
-    const assignees = raw
-      .map((a: any) => ({ _id: String(a._id), name: nameOf.get(String(a._id)) || String(a.name || "") }))
-      .sort((a, b) => a.name.localeCompare(b.name));
+    const assignees = [
+      ...list.map((u) => ({ _id: u._id, name: u.name })),
+      ...extra
+        .map((a: any) => ({ _id: String(a._id), name: nameOf.get(String(a._id)) || String(a.name || ""), noAccess: true }))
+        .sort((a: any, b: any) => a.name.localeCompare(b.name)),
+    ];
     res.json({ ok: true, assignees });
   } catch (err: any) {
     console.error("[ManualBookings assignees]", err.message);
@@ -2066,6 +2108,63 @@ router.get("/summary/export", requirePermission("manualBookings", "READ"), async
     res.send(buf);
   } catch (err: any) {
     console.error("[ManualBookings summary export]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Team Summary → Enquiries tab (2026-11-17) ──────────────────────────
+ * GET /enquiry-summary[?groupBy=assignee|logger&enquirySource=all|admin|website
+ *   &dateFrom&dateTo&type&workspaceId&source&prospect]   (+ /enquiry-summary/export)
+ * Rules: services/manualBookingEnquirySummary.ts. Same gates, HOUSE-only rule
+ * and scope handling as the team summary above.
+ */
+async function enquirySummaryForRequest(req: any) {
+  const q: Record<string, any> = {};
+  for (const k of ["type", "workspaceId", "source", "prospect"]) if (req.query[k]) q[k] = req.query[k];
+  const base = buildSearchFilter(q, req.user);
+  await applyBookingReadGates(req, base);
+  const ctx = await bookingAccessContextFromReq(req);
+  const visibility = bookingVisibility(ctx);
+  const summary = await buildEnquirySummary({
+    base,
+    groupBy: parseEnquiryGroupBy(req.query.groupBy),
+    source: parseEnquirySource(req.query.enquirySource),
+    range: resolveSummaryRange(req.query),
+    people: visibility.all ? null : visibility.people,
+    includeUnassigned: visibility.all || ctx.permissionScope === "TEAM",
+  });
+  return { summary, everyone: visibility.all };
+}
+
+router.get("/enquiry-summary", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
+  try {
+    if (!summaryHouseOnly(req, res)) return;
+    const { summary, everyone } = await enquirySummaryForRequest(req);
+    res.json({ ok: true, ...summary, scope: { everyone } });
+  } catch (err: any) {
+    console.error("[ManualBookings enquiry summary]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/enquiry-summary/export", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
+  try {
+    if (!summaryHouseOnly(req, res)) return;
+    const { summary } = await enquirySummaryForRequest(req);
+    const needle = String(req.query.person ?? "").trim().toLowerCase();
+    const rows = needle ? summary.rows.filter((r) => r.name.toLowerCase().includes(needle) || r.role.toLowerCase().includes(needle)) : summary.rows;
+    const filtersLine = [
+      `Filters: type ${req.query.type || "all"}`,
+      `client ${req.query.prospect === "1" ? "Client not registered yet" : req.query.workspaceId || "all"}`,
+      `booking source ${req.query.source || "all"}`,
+      req.query.person ? `person "${String(req.query.person)}"` : "",
+    ].filter(Boolean).join(" · ");
+    const buf = await enquiryWorkbook(summary, rows, filtersLine);
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="manual-bookings-enquiries-${summary.range.from}_${summary.range.to}.xlsx"`);
+    res.send(buf);
+  } catch (err: any) {
+    console.error("[ManualBookings enquiry summary export]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2208,6 +2307,13 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
         return res.status(400).json({ error: `status must be one of: ${CLIENT_SETTABLE_STATUSES.join(", ")}` });
       }
       body.status = status;
+    }
+
+    // Assign Person: a NEW or CHANGED value must be Manual Bookings staff; an
+    // unchanged one is fine (old bookings stay editable after access changes).
+    if (Object.prototype.hasOwnProperty.call(body, "assignPerson")) {
+      const err = await assigneeChangeError(body.assignPerson, booking.assignPerson);
+      if (err) return res.status(400).json({ error: err, code: "ASSIGNEE_NOT_ALLOWED" });
     }
 
     // The case a booking was made for is fixed at create: an edit can't
