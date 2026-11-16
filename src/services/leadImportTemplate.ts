@@ -20,7 +20,7 @@
 import ExcelJS from "exceljs";
 import { LEAD_SOURCES, LEAD_STAGES } from "../models/Lead.js";
 import { LEAD_STATUSES, LEAD_STATUS_LABEL } from "../models/crmTaxonomy.js";
-import { type DispositionEntry } from "../models/crmDisposition.js";
+import { isActiveEntry, type DispositionEntry } from "../models/crmDisposition.js";
 import { IMPORT_FIELDS, IMPORT_ROW_CAP, type ImportField } from "./leadImport.js";
 
 export interface TemplateInput {
@@ -61,17 +61,45 @@ const FIELD_HELP: Record<ImportField, string> = {
   owner: "Optional. A CRM rep's EMAIL (preferred) or exact full name — see Owners. Unknown or ambiguous → the row is rejected. Blank = the batch owner chosen on the import screen.",
   status: "Optional, legacy-only rows. Ignored when the row has a disposition (derived instead).",
   stage: "Optional, legacy-only rows. Ignored when the row has a disposition (derived instead).",
-  disposition: "Optional. Must be the parent of subDisposition. May stand alone only when it has exactly one sub-disposition (Onboarded).",
+  disposition: "Optional. Must be the parent of subDisposition. May stand alone only when it has exactly one sub-disposition.",
   subDisposition: "Optional. The key: stage, status, opportunity and (for Onboarded) the CRM contact are derived from it exactly as a live disposition.",
   budget: "Optional free text.",
   dealValue: "Optional number (no currency symbol needed; 1,80,000 is fine). Becomes the opportunity value on Interested / Onboarded rows.",
   currency: "Optional. INR (default), USD or AED.",
-  nextFollowUpDate: "dd-mm-yyyy or ISO. REQUIRED for 'Call Back Time Given', 'Follow up Required', 'Switched off' and 'Ringing Only'; kept as the lead's next follow-up otherwise.",
+  nextFollowUpDate: "dd-mm-yyyy or ISO. Kept as the lead's next follow-up.", // + the live next-touch list (fieldHelp)
   followUpNotes: "Optional. Stored as the follow-up note (and as the disposition note when the row has one).",
   createdDate: "dd-mm-yyyy or ISO date-time. PRESERVED as the lead's created date (not the import day). Blank = import time. Not in the future.",
   dispositionDate: "dd-mm-yyyy or ISO date-time. When the disposition happened — stamps dispositionAt / wonDate / opportunity closed date. Blank = import time. Not before createdDate.",
   notes: "Optional. Stored on the lead and echoed into the import note on its timeline.",
+  leadCode: "Optional — leave blank for new leads. A lead code already in the CRM (e.g. a re-imported Leads export row) → the row is skipped: no error, and the existing lead is never changed. An unknown code imports as a new lead with a new code.",
 };
+
+const quoted = (list: string[]) =>
+  list.length <= 1 ? list.map((x) => `'${x}'`).join("") : `${list.slice(0, -1).map((x) => `'${x}'`).join(", ")} and '${list[list.length - 1]}'`;
+
+/** The parts of the help text that name sub-dispositions — generated from the
+ *  live (active) set so they cannot drift from what the importer enforces. */
+function setHelp(set: DispositionEntry[]) {
+  const groups = new Map<string, DispositionEntry[]>();
+  for (const e of set) groups.set(e.disposition, [...(groups.get(e.disposition) ?? []), e]);
+  const standAlone = [...groups].filter(([, subs]) => subs.length === 1).map(([d]) => d);
+  const nextTouch = set.filter((e) => e.nextTouch).map((e) => e.subDisposition);
+  const byOppStage = new Map<string, string[]>();
+  for (const e of set) if (e.opportunityEffect === "open") byOppStage.set(e.opportunityStage!, [...(byOppStage.get(e.opportunityStage!) ?? []), e.subDisposition]);
+  const won = set.filter((e) => e.opportunityEffect === "won").map((e) => e.subDisposition);
+  const lost = set.filter((e) => e.opportunityEffect === "lost").map((e) => e.subDisposition);
+  const opportunity = [
+    ...[...byOppStage].map(([stage, subs]) => `${quoted(subs)} → an open opportunity at ${stage}.`),
+    won.length ? `${quoted(won)} → a closed-won opportunity + the CRM contact/company.` : "",
+    lost.length ? `${quoted(lost)} → lost at the lead grain (a fresh import never had an opportunity to close).` : "",
+    "Every other sub-disposition → none.",
+  ].filter(Boolean).join(" ");
+  return {
+    standAlone: standAlone.length ? `Only ${quoted(standAlone)} may be given without a sub-disposition.` : "Every disposition needs a sub-disposition.",
+    nextTouch: nextTouch.length ? `REQUIRED for ${quoted(nextTouch)} (marked YES under "Needs nextFollowUpDate").` : "",
+    opportunity,
+  };
+}
 
 const ddmmyyyy = (d: Date) => `${String(d.getUTCDate()).padStart(2, "0")}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${d.getUTCFullYear()}`;
 const daysFromNow = (n: number) => new Date(Date.now() + n * 86_400_000);
@@ -84,11 +112,20 @@ function letter(i: number): string {
 export function buildImportTemplate(input: TemplateInput): ExcelJS.Workbook {
   const wb = new ExcelJS.Workbook();
   wb.creator = "Plumtrips CRM";
-  const set = input.dispositionSet ?? [];
+  // Pickable entries only: a retired (inactive) sub is not offered and the importer refuses it.
+  const set = (input.dispositionSet ?? []).filter(isActiveEntry);
   const dispositions = [...new Set(set.map((e) => e.disposition))];
   const subs = set.map((e) => e.subDisposition);
   const ownerEmails = input.reps.map((r) => r.email).filter(Boolean);
   const exampleOwner = input.exampleOwner?.email || input.reps[0]?.email || "";
+  const sh = setHelp(set);
+  const help: Record<ImportField, string> = {
+    ...FIELD_HELP,
+    disposition: `${FIELD_HELP.disposition}${set.length ? ` ${sh.standAlone}` : ""}`,
+    nextFollowUpDate: sh.nextTouch ? `dd-mm-yyyy or ISO. ${sh.nextTouch} Kept as the lead's next follow-up otherwise.` : FIELD_HELP.nextFollowUpDate,
+  };
+  // The example row's disposition: an ACTIVE sub (Interested → Demo Scheduled when the set has it).
+  const exampleEntry = set.find((e) => e.subDisposition === "Demo Scheduled") ?? set.find((e) => e.nextTouch) ?? set[0] ?? null;
 
   // Leads is added FIRST: the importer reads the first sheet.
   const leads = wb.addWorksheet("Leads", { views: [{ state: "frozen", ySplit: 1 }] });
@@ -122,13 +159,13 @@ export function buildImportTemplate(input: TemplateInput): ExcelJS.Workbook {
     const f = IMPORT_FIELDS[i];
     const required = "required" in f && !!f.required;
     const cell = header.getCell(i + 1);
-    cell.note = `${f.label}${required ? " — REQUIRED" : ""}\n${FIELD_HELP[k]}`;
+    cell.note = `${f.label}${required ? " — REQUIRED" : ""}\n${help[k]}`;
     if (required) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFB3261E" } };
   });
 
   const widths: Partial<Record<ImportField, number>> = {
     contactName: 22, contactPhone: 16, contactEmail: 28, contactDesignation: 18, companyName: 24, industry: 16, companySize: 12, location: 14, address: 24, website: 20, gstin: 16,
-    source: 12, owner: 28, status: 12, stage: 14, disposition: 16, subDisposition: 26, budget: 12, dealValue: 12, currency: 9, nextFollowUpDate: 16, followUpNotes: 26, createdDate: 20, dispositionDate: 20, notes: 36,
+    source: 12, owner: 28, status: 12, stage: 14, disposition: 16, subDisposition: 26, budget: 12, dealValue: 12, currency: 9, nextFollowUpDate: 16, followUpNotes: 26, createdDate: 20, dispositionDate: 20, notes: 36, leadCode: 16,
   };
   const TEXT_COLS: ImportField[] = ["contactPhone", "gstin", "nextFollowUpDate", "createdDate", "dispositionDate"];
   keys.forEach((k, i) => {
@@ -138,15 +175,16 @@ export function buildImportTemplate(input: TemplateInput): ExcelJS.Workbook {
   });
 
   // One valid example row (the user replaces or deletes it).
-  const hasDisp = set.length > 0;
+  const hasDisp = !!exampleEntry;
   const example: Record<ImportField, string | number> = {
     contactName: "Kavya Rao", contactPhone: "9811000901", contactEmail: "kavya.rao@onboarded-demo.test", contactDesignation: "HR Head",
     companyName: "Onboarded Demo Co", industry: "IT/Technology", companySize: "51-200", location: "Bengaluru", address: "", website: "onboarded-demo.test", gstin: "",
     source: "LinkedIn", owner: exampleOwner, status: hasDisp ? "" : "CONTACTED", stage: hasDisp ? "" : "contacted",
-    disposition: hasDisp ? "Interested" : "", subDisposition: hasDisp ? "Follow up Required" : "",
-    budget: "", dealValue: 220000, currency: "INR", nextFollowUpDate: ddmmyyyy(daysFromNow(7)), followUpNotes: "Send offsite proposal",
+    disposition: exampleEntry?.disposition ?? "", subDisposition: exampleEntry?.subDisposition ?? "",
+    budget: "", dealValue: 220000, currency: "INR", nextFollowUpDate: ddmmyyyy(daysFromNow(7)), followUpNotes: "Demo for the HR team",
     createdDate: ddmmyyyy(daysFromNow(-30)), dispositionDate: hasDisp ? ddmmyyyy(daysFromNow(-7)) : "",
     notes: "EXAMPLE ROW — replace or delete before importing. Annual offsite for 60.",
+    leadCode: "",
   };
   const ex = leads.addRow(keys.map((k) => example[k]));
   ex.font = { italic: true, color: { argb: "FF6B7280" } };
@@ -178,14 +216,14 @@ export function buildImportTemplate(input: TemplateInput): ExcelJS.Workbook {
       ? "Your import scope is OWN: the owner column may only name you (or stay blank). Any other rep → the row is rejected."
       : "A rep's email (exact, case-insensitive) — or their exact full name. Unknown, not a CRM rep, or ambiguous → the row is REJECTED with the reason (never silently dropped, never self-assigned). Blank → the batch owner picked on the import screen."],
     ["disposition / subDisposition", setEnabled
-      ? "subDisposition is the key (matched case-insensitively). disposition is optional but must be its parent. Only 'Onboarded' may be given without a sub-disposition. From the pair the importer DERIVES dispositionStage, dispositionStatus, the lead status, the legacy stage, the opportunity and (Onboarded) the CRM contact — exactly like the live disposition flow. Never type those derived values."
+      ? `subDisposition is the key (matched case-insensitively). disposition is optional but must be its parent. ${sh.standAlone} From the pair the importer DERIVES dispositionStage, dispositionStatus, the lead status, the legacy stage, the opportunity and (Onboarded) the CRM contact — exactly like the live disposition flow. Never type those derived values.`
       : "Dispositions are OFF on this server (CRM_V2_DISPOSITION). Leave both columns blank or the row is rejected."],
     ["status / stage", "Only for rows WITHOUT a disposition (legacy-only leads). With a disposition they are ignored (a warning shows if they differ from the derived value). Either may be given alone — the other is derived."],
-    ["Opportunity", "Interested → an open opportunity at the sub-disposition's stage. Onboarded → a closed-won opportunity + the CRM contact/company. Not Interested / Number Does not Exist / Temp out of Service → lost at the lead grain (a fresh import never had an opportunity to close). Call Back / Switched off / Ringing Only → none."],
-    ["Dates", "dd-mm-yyyy (read as UTC midnight), yyyy-mm-dd, or a full ISO date-time (2026-03-14T09:30:00.000Z). Keep the cells as TEXT — the template already formats them."],
+    ["Opportunity", setEnabled ? sh.opportunity : "None — dispositions are off on this server."],
+    ["Dates", "dd-mm-yyyy, dd/mm/yyyy or yyyy-mm-dd (read as that day in IST, 00:00 IST), or a full ISO date-time (2026-03-14T09:30:00.000Z). Keep the cells as TEXT — the template already formats them."],
     ["createdDate", "PRESERVED as the lead's created date. Blank = import time. Rejected if in the future or before 2000."],
     ["dispositionDate", "When the disposition happened. Stamps dispositionAt, wonDate and a new opportunity's created/closed date. Blank = import time (the same as a live disposition — so a re-import without it reads as 'dispositioned today'). Rejected if before createdDate."],
-    ["nextFollowUpDate", "REQUIRED for 'Call Back Time Given', 'Follow up Required', 'Switched off' and 'Ringing Only'. Kept on the lead for every row."],
+    ["nextFollowUpDate", `${sh.nextTouch ? `${sh.nextTouch} ` : ""}Kept on the lead for every row.`],
     ["Duplicates", "A row whose company already has an OPEN lead is still imported, tagged as a possible duplicate (advisory)."],
   ].forEach(([k, v]) => { const r = av.addRow([k, v]); r.getCell(1).font = { bold: true }; r.getCell(2).alignment = { wrapText: true, vertical: "top" }; av.mergeCells(r.number, 2, r.number, 8); });
   gap();

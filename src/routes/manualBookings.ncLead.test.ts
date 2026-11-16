@@ -6,10 +6,11 @@
 //     partner booking and an ordinary one, on create and on update;
 //   - the basics are still required (type, client, booking date, travel date,
 //     a passenger name);
-//   - moving OFF an NC sub status re-applies the full create rules: to
-//     Pending for Customer Confirmation / WIP / Confirmed with missing fields
-//     is refused (partner bookings keep their own supplier rule while open);
-//   - every other Status / Sub Status is validated exactly as before;
+//   - moving OFF an NC sub status re-applies the full create rules, with
+//     supplier / given by / hotel check-out gated on status for EVERY booking
+//     (utils/bookingStatusGate.ts, 2026-11-16): open (Pending / WIP) without
+//     them is fine, Confirmed without them is refused;
+//   - every other Status / Sub Status: the full rule set, status-gated;
 //   - partner bookings still write a case history row for each NC change.
 //
 // Real: manual-bookings router, booking → request sync, models, in-memory
@@ -156,17 +157,22 @@ describe("an NC lead saves with only the basics", () => {
 });
 
 describe("leaving NC re-applies the full rules", () => {
-  it("ordinary: to Pending for Customer Confirmation, WIP or Confirmed with missing fields is refused", async () => {
+  // CHANGED ON PURPOSE (2026-11-16, utils/bookingStatusGate.ts): this used to
+  // assert that leaving NC for an OPEN status without supplier / given by was
+  // refused. Supplier and given by are now optional for every booking while
+  // Pending / WIP and required only at Confirmed, so the open moves pass and
+  // the refusal moves to Confirmed.
+  it("ordinary: to Pending for Customer Confirmation or WIP passes without supplier; Confirmed needs it", async () => {
     const id = String((await create(minimal("ordinary", "PENDING", "Lead Not Contactable"))).body.booking._id);
     for (const change of [{ subStatus: "Pending for Customer Confirmation" }, { status: "WIP", subStatus: "" }]) {
       const r = await put(id, change);
-      expect(r.status, JSON.stringify(change)).toBe(400);
-      expect(r.body.details).toEqual(["Supplier Name is required", "Given By is required"]);
+      expect(r.status, JSON.stringify([change, r.body])).toBe(200);
     }
+    const bare = await put(id, { status: "CONFIRMED", subStatus: "" });
+    expect(bare.status).toBe(400);
+    expect(bare.body.details).toEqual(["Supplier Name is required", "Given By is required"]);
     const confirm = await put(id, { status: "CONFIRMED", subStatus: "", supplierName: "IndiGo", givenBy: "Rita" });
     expect([confirm.status, confirm.body.code]).toEqual([400, "ATTACHMENT_REQUIRED"]);
-    // With everything it goes through to WIP.
-    expect((await put(id, { status: "WIP", subStatus: "", supplierName: "IndiGo", givenBy: "Rita" })).status).toBe(200);
   });
 
   it("partner: still open (WIP) keeps the partner relaxation; Confirmed needs supplier, given by and the attachment", async () => {
@@ -177,36 +183,54 @@ describe("leaving NC re-applies the full rules", () => {
     expect(confirm.body.details).toEqual(["Supplier Name is required", "Given By is required"]);
   });
 
-  it("a hotel NC lead moved to Pending for Supplier Confirmation needs its city and check-out back", async () => {
+  // CHANGED ON PURPOSE (2026-11-16): check-out is now status-gated like the
+  // supplier (optional while Pending / WIP), so only the city comes back here;
+  // check-out is demanded at Confirmed.
+  it("a hotel NC lead moved to Pending for Supplier Confirmation needs its city back (check-out waits for Confirmed)", async () => {
     const id = String((await create(minimal("ordinary", "PENDING", "Lead Not Contactable", { type: "HOTEL", supplierName: "Taj", givenBy: "Rita" }))).body.booking._id);
     const r = await put(id, { subStatus: "Pending for Supplier Confirmation" });
     expect(r.status).toBe(400);
-    expect(r.body.details).toEqual(["City is required for hotel bookings", "Check-out (return) date is required for hotel bookings"]);
+    expect(r.body.details).toEqual(["City is required for hotel bookings"]);
+    const confirm = await put(id, { status: "CONFIRMED", subStatus: "", sector: "Goa" });
+    expect(confirm.status).toBe(400);
+    expect(confirm.body.details).toEqual(["Check-out (return) date is required for hotel bookings"]);
   });
 });
 
-describe("every other Status / Sub Status: exactly as before", () => {
-  // The required-field answer per status for a create with no supplier / given by (today's rule set).
+describe("every other Status / Sub Status: full rules, status-gated", () => {
+  // The required-field answer per status for a create with no supplier / given by.
+  // CHANGED ON PURPOSE (2026-11-16, utils/bookingStatusGate.ts): Pending and
+  // WIP used to answer "Supplier Name / Given By required" like every other
+  // status. They are now optional while the booking is open, for every
+  // booking; Confirmed still demands both. Cancelled never requires them
+  // (second pass, same day).
   const SNAPSHOT: Array<[string, string, string[]]> = [
-    ["PENDING", "", ["Supplier Name is required", "Given By is required"]],
-    ["PENDING", "Pending for Customer Confirmation", ["Supplier Name is required", "Given By is required"]],
-    ["PENDING", "Pending for Supplier Confirmation", ["Supplier Name is required", "Given By is required"]],
-    ["WIP", "", ["Supplier Name is required", "Given By is required"]],
+    ["PENDING", "", []],
+    ["PENDING", "Pending for Customer Confirmation", []],
+    ["PENDING", "Pending for Supplier Confirmation", []],
+    ["WIP", "", []],
     ["CONFIRMED", "", ["Supplier Name is required", "Given By is required"]],
-    ["CANCELLED", "Plan changed", ["Supplier Name is required", "Given By is required"]],
-    ["CANCELLED", "Travel cancelled", ["Supplier Name is required", "Given By is required"]],
+    ["CANCELLED", "Plan changed", []],
+    ["CANCELLED", "Travel cancelled", []],
   ];
   for (const [status, sub, expected] of SNAPSHOT) {
     it(`ordinary · ${status} · ${sub || "(none)"}`, async () => {
       const res = await create(minimal("ordinary", status, sub, { type: "VISA" }));
-      expect(res.status).toBe(400);
-      expect(res.body.details).toEqual(expected);
+      if (expected.length) {
+        expect(res.status).toBe(400);
+        expect(res.body.details).toEqual(expected);
+      } else {
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+      }
     });
   }
 
-  it("an ordinary non-NC hotel still needs city and check-out", async () => {
+  // CHANGED ON PURPOSE (2026-11-16): check-out is status-gated; city is not.
+  it("an ordinary open hotel still needs a city; check-out only at Confirmed", async () => {
     const res = await create(minimal("ordinary", "PENDING", "", { type: "HOTEL", supplierName: "Taj", givenBy: "Rita" }));
-    expect(res.body.details).toEqual(["City is required for hotel bookings", "Check-out (return) date is required for hotel bookings"]);
+    expect(res.body.details).toEqual(["City is required for hotel bookings"]);
+    const born = await create(minimal("ordinary", "CONFIRMED", "", { type: "HOTEL", supplierName: "Taj", givenBy: "Rita" }));
+    expect(born.body.details).toEqual(["City is required for hotel bookings", "Check-out (return) date is required for hotel bookings"]);
   });
 
   it("the partner relaxation is unchanged: open without supplier OK, Confirmed refused", async () => {

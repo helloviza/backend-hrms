@@ -11,7 +11,7 @@ import { isCrmV2OpportunityEnabled } from "../config/crmV2.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireHouse } from "../middleware/requireHouse.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
-import { crmScope, moduleScope, contactMatch, leadMatch, opportunityMatch } from "../services/crmScope.js";
+import { crmScope, moduleScope, contactMatch, leadMatch, opportunityMatch, canManageOthers } from "../services/crmScope.js";
 import { triggerTaskAutomation } from "../services/taskAutomation.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
 import logger from "../utils/logger.js";
@@ -25,6 +25,78 @@ function userId(user: AnyObj): string {
 
 function canWrite(access: string): boolean {
   return access === "WRITE" || access === "FULL";
+}
+
+// ── Write ALLOW-list (audit P1-5) ───────────────────────────────────
+// POST and PUT copy exactly the fields the two contact forms offer —
+// pages/crm/ContactForm.tsx (create) and the edit panel in
+// pages/crm/ContactDetail.tsx. Every other key is ignored and echoed back as
+// `ignored`, never written; ContactDetail posts the whole contact back, so
+// unknown keys are not rejected. Never client-writable: leadId (set by lead
+// conversion), createdBy, contactCode, visibleTo, timestamps and the
+// computed assignedToName.
+const CONTACT_EDITABLE = [
+  "firstName", "lastName", "jobTitle", "companyName",
+  "email", "phone", "phone2", "whatsapp",
+  "source", "status", "tags", "notes",
+  "address", "country", "state", "city", "pincode",
+  "linkedin", "facebook", "instagram", "twitter", "avatarUrl",
+] as const;
+// Handled with a rule below: companyId, isPrivate, assignedTo.
+const CONTACT_RULED = ["companyId", "isPrivate", "assignedTo"] as const;
+
+type Picked = { data: AnyObj; ignored: string[] };
+
+/** "" / null → null, a valid id → ObjectId, anything else → undefined (ignore). */
+function idOrNull(v: unknown): mongoose.Types.ObjectId | null | undefined {
+  if (v === null || v === "") return null;
+  if (mongoose.isValidObjectId(String(v))) return new mongoose.Types.ObjectId(String(v));
+  return undefined;
+}
+
+/**
+ * Owner (assignedTo): only a caller who may manage other people's rows
+ * (crmScope canManageOthers — FULL + ALL; admins are FULL + ALL) sets it
+ * freely. Anyone else may, on create, leave it empty or name themselves;
+ * on edit they cannot change it (a value equal to the current owner is a
+ * no-op, not "ignored" — the edit form always echoes it). Admins also have
+ * POST /:id/assign.
+ *
+ * isPrivate: anyone who reaches the write — the creator on POST, the creator
+ * or an admin on PUT (the existing PUT gate). It only narrows who ELSE sees
+ * the creator's own record (every scope rule keeps createdBy-me visible), so
+ * it can never widen the caller's own access. Booleans only.
+ */
+function pickContactFields(
+  body: AnyObj,
+  o: { canAssign: boolean; me: mongoose.Types.ObjectId | null; currentOwner?: unknown; isCreate: boolean },
+): Picked {
+  const data: AnyObj = {};
+  const allowed = new Set<string>([...CONTACT_EDITABLE, ...CONTACT_RULED]);
+  const ignored = Object.keys(body).filter((k) => !allowed.has(k));
+  for (const k of CONTACT_EDITABLE) {
+    if (k in body) data[k] = body[k];
+  }
+  if ("companyId" in body) {
+    const v = idOrNull(body.companyId);
+    if (v === undefined) ignored.push("companyId");
+    else data.companyId = v;
+  }
+  if ("isPrivate" in body) {
+    if (typeof body.isPrivate === "boolean") data.isPrivate = body.isPrivate;
+    else ignored.push("isPrivate");
+  }
+  if ("assignedTo" in body) {
+    const v = idOrNull(body.assignedTo);
+    const current = o.currentOwner ? String(o.currentOwner) : "";
+    if (v === undefined) ignored.push("assignedTo");
+    else if (o.canAssign) data.assignedTo = v;
+    else if (o.isCreate) {
+      if (v === null || (o.me && v.equals(o.me))) data.assignedTo = v;
+      else ignored.push("assignedTo");
+    } else if ((v ? String(v) : "") !== current) ignored.push("assignedTo");
+  }
+  return { data, ignored };
 }
 
 function fmtDate(d: Date | null | undefined): string {
@@ -55,18 +127,19 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: "firstName, jobTitle and phone are required." });
     }
 
-    let companyName = body.companyName || "";
-    if (body.companyId && mongoose.isValidObjectId(String(body.companyId))) {
-      const co = (await CRMCompany.findById(body.companyId).select("name").lean()) as any;
+    const scope = crmScope(req);
+    const picked = pickContactFields(body, { canAssign: canManageOthers(scope), me: scope.userId, isCreate: true });
+
+    let companyName = picked.data.companyName || "";
+    if (picked.data.companyId) {
+      const co = (await CRMCompany.findById(picked.data.companyId).select("name").lean()) as any;
       if (co) companyName = co.name || companyName;
     }
 
     const contact = await CRMContact.create({
-      ...body,
+      ...picked.data,
       companyName,
-      createdBy: mongoose.isValidObjectId(userId(user))
-        ? new mongoose.Types.ObjectId(userId(user))
-        : undefined,
+      createdBy: scope.userId ?? undefined,
     });
 
     // Task automation hook
@@ -83,7 +156,7 @@ router.post("/", async (req, res) => {
       },
     }).catch(() => {});
 
-    return res.status(201).json({ contact });
+    return res.status(201).json({ contact, ...(picked.ignored.length ? { ignored: picked.ignored } : {}) });
   } catch (err) {
     logger.error("crm.contacts POST / error", { err });
     return res.status(500).json({ error: "Failed to create contact." });
@@ -96,23 +169,8 @@ router.post("/", async (req, res) => {
 
 router.get("/export", async (req, res) => {
   try {
-    const user = (req as any).user as AnyObj;
-    const crmScope = (req as any).crmScope as string;
-    const crmAccess = (req as any).crmAccess as string;
-    const conditions: AnyObj[] = [];
-    const uid = userId(user);
-    const uidObjId = mongoose.isValidObjectId(uid) ? new mongoose.Types.ObjectId(uid) : null;
-    const isFullAdmin = crmAccess === "FULL" && crmScope === "ALL";
-
-    if (crmScope === "OWN" && uidObjId) {
-      conditions.push({ $or: [{ assignedTo: uidObjId }, { createdBy: uidObjId }] });
-    } else if (!isFullAdmin) {
-      const visOr: AnyObj[] = [{ isPrivate: false }];
-      if (uidObjId) visOr.push({ createdBy: uidObjId });
-      conditions.push({ $or: visOr });
-    }
-
-    const filter = conditions.length > 0 ? { $and: conditions } : {};
+    // Same rule as the list and GET /:id (services/crmScope contactMatch).
+    const filter = contactMatch(crmScope(req));
     const contacts = await CRMContact.find(filter).sort({ createdAt: -1 }).limit(5000).lean();
 
     const exportAssignedIds = contacts
@@ -190,22 +248,10 @@ router.get("/export", async (req, res) => {
 
 router.get("/", async (req, res) => {
   try {
-    const user = (req as any).user as AnyObj;
-    const crmScope = (req as any).crmScope as string;
-    const crmAccess = (req as any).crmAccess as string;
     const q = req.query as AnyObj;
-    const conditions: AnyObj[] = [];
-    const uid = userId(user);
-    const uidObjId = mongoose.isValidObjectId(uid) ? new mongoose.Types.ObjectId(uid) : null;
-    const isFullAdmin = crmAccess === "FULL" && crmScope === "ALL";
-
-    if (crmScope === "OWN" && uidObjId) {
-      conditions.push({ $or: [{ assignedTo: uidObjId }, { createdBy: uidObjId }] });
-    } else if (!isFullAdmin) {
-      const visOr: AnyObj[] = [{ isPrivate: false }];
-      if (uidObjId) visOr.push({ createdBy: uidObjId });
-      conditions.push({ $or: visOr });
-    }
+    // Scope goes through services/crmScope (normalizeScope): NONE / TEAM /
+    // unknown narrow to OWN; only ALL / WORKSPACE get the wider view.
+    const conditions: AnyObj[] = [contactMatch(crmScope(req))];
 
     if (q.search) {
       const re = new RegExp(String(q.search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
@@ -359,23 +405,26 @@ router.put("/:id", async (req, res) => {
       return res.status(403).json({ error: "Only the creator or admin can edit this contact." });
     }
 
-    const PROTECTED = new Set(["_id", "contactCode", "createdBy", "createdAt", "leadId"]);
-    const body = req.body as AnyObj;
-
-    for (const key of Object.keys(body)) {
-      if (!PROTECTED.has(key)) {
-        (contact as any)[key] = body[key];
-      }
+    const body = (req.body || {}) as AnyObj;
+    const scope = crmScope(req);
+    const picked = pickContactFields(body, {
+      canAssign: canManageOthers(scope),
+      me: scope.userId,
+      currentOwner: contact.assignedTo,
+      isCreate: false,
+    });
+    for (const [k, v] of Object.entries(picked.data)) {
+      (contact as any)[k] = v;
     }
 
     // Re-fetch companyName if companyId changed
-    if (body.companyId && mongoose.isValidObjectId(String(body.companyId))) {
-      const co = (await CRMCompany.findById(body.companyId).select("name").lean()) as any;
+    if (picked.data.companyId) {
+      const co = (await CRMCompany.findById(picked.data.companyId).select("name").lean()) as any;
       if (co) contact.companyName = co.name || contact.companyName;
     }
 
     await contact.save();
-    return res.json({ contact });
+    return res.json({ contact, ...(picked.ignored.length ? { ignored: picked.ignored } : {}) });
   } catch (err) {
     logger.error("crm.contacts PUT /:id error", { err });
     return res.status(500).json({ error: "Failed to update contact." });

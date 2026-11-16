@@ -52,6 +52,7 @@ const { default: Task } = await import("../models/Task.js");
 const { default: User } = await import("../models/User.js");
 const { UserPermission } = await import("../models/UserPermission.js");
 const { default: router } = await import("./leads.js");
+const { ensureDefaultPipeline } = await import("../services/crmPipelines.js");
 const { CRM_V2_DISPOSITION_ENV, CRM_V2_OPPORTUNITY_ENV } = await import("../config/crmV2.js");
 const { BULK_CAP } = await import("../services/leadBulk.js");
 
@@ -80,8 +81,6 @@ beforeAll(async () => {
     modules: { leads: { access, scope } }, grantedBy: ids.ADMIN,
   });
   await UserPermission.create([perm(ids.WRITER, "writer@plumtrips.com", "WRITE", "OWN"), perm(ids.FULLOWN, "fullown@plumtrips.com", "FULL", "OWN")] as any);
-  process.env[CRM_V2_DISPOSITION_ENV] = "true";
-  process.env[CRM_V2_OPPORTUNITY_ENV] = "true";
 }, 120_000);
 afterAll(async () => {
   delete process.env[CRM_V2_DISPOSITION_ENV];
@@ -90,8 +89,13 @@ afterAll(async () => {
   await mongod.stop();
 });
 beforeEach(async () => {
+  // Per test, so a test that turns dispositions off cannot leak that state.
+  process.env[CRM_V2_DISPOSITION_ENV] = "true";
+  process.env[CRM_V2_OPPORTUNITY_ENV] = "true";
   caller.current = "ADMIN";
   await Promise.all([Lead.deleteMany({}), LeadActivity.deleteMany({}), Opportunity.deleteMany({}), CRMContact.deleteMany({}), CRMCompany.deleteMany({}), Task.deleteMany({})]);
+  // The pipeline row is seeded at startup in prod (server.ts); requests never seed it.
+  await ensureDefaultPipeline();
 });
 
 async function seed(n: number, owner = ids.REP_A, extra: Record<string, unknown> = {}) {
@@ -164,6 +168,9 @@ describe("POST /leads/bulk — target resolution", () => {
 
 describe("POST /leads/bulk — actions", () => {
   it("stage: every lead moves, one stage_change each (both vocabularies), proposal_sent builds the opportunity; unchanged leads are not rewritten", async () => {
+    // Legacy stage / status moves exist only with dispositions OFF — on, they
+    // answer 409 (stage follows the disposition; leads.foundation.test.ts).
+    delete process.env[CRM_V2_DISPOSITION_ENV];
     const leads = await seed(3);
     await Lead.updateOne({ _id: leads[2]._id }, { $set: { stage: "proposal_sent", status: "CONVERTED" } });
     const r = await bulk({ action: "stage", target: { leadIds: leads.map((l) => l._id) }, params: { stage: "proposal_sent", note: "Proposal batch sent" } });
@@ -183,6 +190,9 @@ describe("POST /leads/bulk — actions", () => {
   });
 
   it("stage: follow_up requires a date and a note — refused before any write", async () => {
+    // Legacy stage / status moves exist only with dispositions OFF — on, they
+    // answer 409 (stage follows the disposition; leads.foundation.test.ts).
+    delete process.env[CRM_V2_DISPOSITION_ENV];
     const leads = await seed(2);
     const r = await bulk({ action: "stage", target: { leadIds: leads.map((l) => l._id) }, params: { stage: "follow_up" } });
     expect(r.status).toBe(400);
@@ -196,6 +206,9 @@ describe("POST /leads/bulk — actions", () => {
   });
 
   it("status: sets the Slice-2 status, the model derives the legacy stage, one stage_change each", async () => {
+    // Legacy stage / status moves exist only with dispositions OFF — on, they
+    // answer 409 (stage follows the disposition; leads.foundation.test.ts).
+    delete process.env[CRM_V2_DISPOSITION_ENV];
     const leads = await seed(2);
     const r = await bulk({ action: "status", target: { leadIds: leads.map((l) => l._id) }, params: { status: "contacted" } });
     expect(r.status).toBe(200);
@@ -235,17 +248,19 @@ describe("POST /leads/bulk — actions", () => {
   it("disposition: the pair is validated up front — wrong parent, unknown sub, missing follow-up date — nothing written", async () => {
     const leads = await seed(2);
     const idsOnly = leads.map((l) => l._id);
-    expect((await bulk({ action: "disposition", target: { leadIds: idsOnly }, params: { disposition: "Interested", subDisposition: "Trust Issue" } })).body.error).toBe('Sub-disposition "Trust Issue" belongs to "Not Interested", not "Interested"');
+    expect((await bulk({ action: "disposition", target: { leadIds: idsOnly }, params: { disposition: "Interested", subDisposition: "Repeated RNR" } })).body.error).toBe('Sub-disposition "Repeated RNR" belongs to "Not Interested", not "Interested"');
     expect((await bulk({ action: "disposition", target: { leadIds: idsOnly }, params: { subDisposition: "Nope" } })).body.error).toMatch(/is not a sub-disposition/);
     expect((await bulk({ action: "disposition", target: { leadIds: idsOnly }, params: { disposition: "Interested" } })).body.error).toMatch(/needs a subDisposition/);
-    expect((await bulk({ action: "disposition", target: { leadIds: idsOnly }, params: { subDisposition: "Follow up Required" } })).body.error).toBe('"Follow up Required" needs a next follow-up date.');
+    expect((await bulk({ action: "disposition", target: { leadIds: idsOnly }, params: { subDisposition: "Proposal Mail Sent" } })).body.error).toBe('"Proposal Mail Sent" needs a next follow-up date.');
+    // Nurture is a one-sub group: the disposition alone resolves to it (and it needs a date too)
+    expect((await bulk({ action: "disposition", target: { leadIds: idsOnly }, params: { disposition: "Nurture" } })).body.error).toBe('"Nurture" needs a next follow-up date.');
     expect(await LeadActivity.countDocuments({ type: "disposition" })).toBe(0);
     expect(await Opportunity.countDocuments({})).toBe(0);
 
-    const ok = await bulk({ action: "disposition", target: { leadIds: idsOnly }, params: { subDisposition: "Follow up Required", nextFollowUpDate: "2026-09-22", note: "Send the deck" } });
+    const ok = await bulk({ action: "disposition", target: { leadIds: idsOnly }, params: { subDisposition: "Proposal Mail Sent", nextFollowUpDate: "2026-09-22", note: "Send the deck" } });
     expect(ok.body.summary.updated).toBe(2);
-    expect(await Opportunity.countDocuments({ stage: "qualified" })).toBe(2);
-    expect(await Lead.countDocuments({ subDisposition: "Follow up Required", followUpNotes: "Send the deck", nextFollowUpDate: new Date("2026-09-22") })).toBe(2);
+    expect(await Opportunity.countDocuments({ stage: "proposal" })).toBe(2);
+    expect(await Lead.countDocuments({ subDisposition: "Proposal Mail Sent", followUpNotes: "Send the deck", nextFollowUpDate: new Date("2026-09-22") })).toBe(2);
   });
 });
 
@@ -259,6 +274,9 @@ describe("POST /leads/bulk — access + scope", () => {
   });
 
   it("FULL + OWN: a filter target is narrowed to the caller's own leads; a foreign id fails per lead", async () => {
+    // Legacy stage / status moves exist only with dispositions OFF — on, they
+    // answer 409 (stage follows the disposition; leads.foundation.test.ts).
+    delete process.env[CRM_V2_DISPOSITION_ENV];
     const mine = await seed(2, ids.FULLOWN);
     const theirs = await seed(2, ids.REP_A);
     caller.current = "FULLOWN";
@@ -283,7 +301,9 @@ describe("GET /leads/dispositions", () => {
     expect(r.status).toBe(200);
     expect(r.body.pipeline.key).toBe("corporate_calling");
     expect(r.body.canWork).toBe(true);
-    expect(r.body.groups.map((g: any) => g.disposition)).toEqual(["Call Back", "Interested", "Not Interested", "Not Connected", "Onboarded"]);
-    expect(r.body.groups[1].subs[0]).toMatchObject({ subDisposition: "Follow up Required", nextTouch: true, opportunityEffect: "open", opportunityStage: "qualified" });
+    expect(r.body.groups.map((g: any) => g.disposition)).toEqual(["Contacted", "Call Back", "Interested", "Nurture", "Not Interested", "Not Connected", "Onboarded"]);
+    expect(r.body.groups.flatMap((g: any) => g.subs)).toHaveLength(21);
+    expect(r.body.groups[2].subs[0]).toMatchObject({ subDisposition: "Demo Scheduled", nextTouch: true, opportunityEffect: "none" });
+    expect(r.body.groups[2].subs[2]).toMatchObject({ subDisposition: "Proposal Mail Sent", nextTouch: true, opportunityEffect: "open", opportunityStage: "proposal" });
   });
 });

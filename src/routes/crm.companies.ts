@@ -9,11 +9,11 @@ import CRMCompany, {
 import CRMContact from "../models/CRMContact.js";
 import Lead from "../models/Lead.js";
 import Opportunity from "../models/Opportunity.js";
-import { isClosedLeadStatus, isClosedOpportunityStage, legacyStageToStatus } from "../models/crmTaxonomy.js";
+import { isClosedOpportunityStage, isOpenLead } from "../models/crmTaxonomy.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireHouse } from "../middleware/requireHouse.js";
 import { requireCRMAccess } from "../utils/crmAccess.js";
-import { moduleScope, leadMatch, opportunityMatch, contactMatch } from "../services/crmScope.js";
+import { moduleScope, leadMatch, opportunityMatch, contactMatch, companyMatchFor } from "../services/crmScope.js";
 import { normalizeCompanyName } from "../utils/companyName.js";
 import { isCrmV2FoundationEnabled, isCrmV2OpportunityEnabled } from "../config/crmV2.js";
 import logger from "../utils/logger.js";
@@ -21,34 +21,51 @@ import logger from "../utils/logger.js";
 const router = express.Router();
 type AnyObj = Record<string, any>;
 
-// ── CRM_V2_FOUNDATION write path (Slice 1) ──────────────────────────
-// Under the flag, POST / PUT stop spreading req.body into the document and
-// go through this allow-list instead. Legacy fields keep their loose typing
-// (the schema trims/casts them); the Company Account fields are validated
-// against the model enums so a bad value is a 400, not a Mongoose 500.
+// ── Write ALLOW-list (Slice 1; both flag paths since audit P1-5) ─────
+// POST / PUT never spread req.body into the document — flag on or off. They
+// copy exactly the fields pages/crm/CompanyForm.tsx and the CompanyDetail.tsx
+// edit panel offer, plus the validated Company Account fields. Legacy fields
+// keep their loose typing (the schema trims/casts them); the Account fields
+// are validated against the model enums so a bad value is a 400, not a
+// Mongoose 500. Every other key is ignored and echoed back as `ignored`
+// (CompanyDetail posts the whole company back, so unknown keys are not
+// rejected). Never client-writable: nameNormalized (derived from name by the
+// model hook), customerId / customerWorkspaceId (set by customer onboarding,
+// server-side), createdBy, companyCode, leadId, contactCount, timestamps.
+//
+// isPrivate: anyone who reaches the write — the creator on POST, the creator
+// or an admin on PUT (the existing PUT gate). It only narrows who ELSE sees
+// the creator's own company (companyMatch keeps createdBy-me visible), so it
+// cannot widen the caller's access. Booleans only.
 const WRITABLE_LEGACY_FIELDS = [
   "name", "industry", "companySize", "website", "phone", "email",
-  "city", "state", "country", "address", "notes", "isPrivate",
+  "city", "state", "country", "address", "notes",
 ] as const;
-// Account fields (accountType, lifecycleStatus, accountTier, accountManagerId,
-// customerId, customerWorkspaceId) are handled explicitly below with validation.
+// Handled explicitly below with validation.
+const RULED_FIELDS = ["isPrivate", "accountType", "lifecycleStatus", "accountTier", "accountManagerId"] as const;
 
-type PickResult = { ok: boolean; data: AnyObj; error?: string };
+type PickResult = { ok: boolean; data: AnyObj; ignored: string[]; error?: string };
 
 function pickWritableFields(body: AnyObj): PickResult {
   const data: AnyObj = {};
+  const allowed = new Set<string>([...WRITABLE_LEGACY_FIELDS, ...RULED_FIELDS]);
+  const ignored = Object.keys(body).filter((k) => !allowed.has(k));
   for (const k of WRITABLE_LEGACY_FIELDS) {
     if (k in body) data[k] = body[k];
   }
+  if ("isPrivate" in body) {
+    if (typeof body.isPrivate === "boolean") data.isPrivate = body.isPrivate;
+    else ignored.push("isPrivate");
+  }
   if ("accountType" in body) {
     if (!(ACCOUNT_TYPES as readonly string[]).includes(body.accountType)) {
-      return { ok: false, data, error: `accountType must be one of: ${ACCOUNT_TYPES.join(", ")}` };
+      return { ok: false, data, ignored, error: `accountType must be one of: ${ACCOUNT_TYPES.join(", ")}` };
     }
     data.accountType = body.accountType;
   }
   if ("lifecycleStatus" in body) {
     if (!(LIFECYCLE_STATUSES as readonly string[]).includes(body.lifecycleStatus)) {
-      return { ok: false, data, error: `lifecycleStatus must be one of: ${LIFECYCLE_STATUSES.join(", ")}` };
+      return { ok: false, data, ignored, error: `lifecycleStatus must be one of: ${LIFECYCLE_STATUSES.join(", ")}` };
     }
     data.lifecycleStatus = body.lifecycleStatus;
   }
@@ -56,26 +73,21 @@ function pickWritableFields(body: AnyObj): PickResult {
     if (body.accountTier === null || body.accountTier === "") {
       data.accountTier = null;
     } else if (!(ACCOUNT_TIERS as readonly string[]).includes(body.accountTier)) {
-      return { ok: false, data, error: `accountTier must be one of: ${ACCOUNT_TIERS.join(", ")} (or null)` };
+      return { ok: false, data, ignored, error: `accountTier must be one of: ${ACCOUNT_TIERS.join(", ")} (or null)` };
     } else {
       data.accountTier = body.accountTier;
     }
   }
-  for (const k of ["accountManagerId", "customerId"] as const) {
-    if (k in body) {
-      if (body[k] === null || body[k] === "") data[k] = null;
-      else if (!mongoose.isValidObjectId(String(body[k]))) return { ok: false, data, error: `${k} must be a valid id or null` };
-      else data[k] = new mongoose.Types.ObjectId(String(body[k]));
-    }
+  if ("accountManagerId" in body) {
+    const v = body.accountManagerId;
+    if (v === null || v === "") data.accountManagerId = null;
+    else if (!mongoose.isValidObjectId(String(v))) return { ok: false, data, ignored, error: "accountManagerId must be a valid id or null" };
+    else data.accountManagerId = new mongoose.Types.ObjectId(String(v));
   }
-  if ("customerWorkspaceId" in body) {
-    data.customerWorkspaceId =
-      body.customerWorkspaceId === null || body.customerWorkspaceId === ""
-        ? null
-        : String(body.customerWorkspaceId).trim();
-  }
-  return { ok: true, data };
+  return { ok: true, data, ignored };
 }
+
+const withIgnored = (ignored: string[]) => (ignored.length ? { ignored } : {});
 
 function userId(user: AnyObj): string {
   return String(user.id || user.sub || "");
@@ -117,15 +129,18 @@ router.post("/", async (req, res) => {
       ? new mongoose.Types.ObjectId(userId(user))
       : undefined;
 
-    // ── Legacy path (CRM_V2_FOUNDATION off): body spread, no dedupe ──
+    const picked = pickWritableFields(body);
+    if (!picked.ok) return res.status(400).json({ error: picked.error });
+
+    // ── Legacy path (CRM_V2_FOUNDATION off): allow-list, no dedupe ──
     // The model now keys nameNormalized on every save (Slice 2, un-gated), so
     // a duplicate name meets the prod unique+partial index here. That is a
     // 409 with the existing row's id, not a silent second company and not an
     // opaque 500 — the collapse-and-return behaviour stays behind the flag.
     if (!isCrmV2FoundationEnabled()) {
       try {
-        const company = await CRMCompany.create({ ...body, createdBy });
-        return res.status(201).json({ company });
+        const company = await CRMCompany.create({ ...picked.data, createdBy });
+        return res.status(201).json({ company, ...withIgnored(picked.ignored) });
       } catch (e: any) {
         if (e?.code === 11000) {
           const existing = await CRMCompany.findOne({ nameNormalized: normalizeCompanyName(body.name) })
@@ -148,9 +163,6 @@ router.post("/", async (req, res) => {
     // outcomes — 201 for a fresh row, 200 + deduped:true for a collapse — and
     // never applies the submitted attributes to the existing row ($setOnInsert
     // semantics, mirrored here with a find-then-create).
-    const picked = pickWritableFields(body);
-    if (!picked.ok) return res.status(400).json({ error: picked.error });
-
     const nameNormalized = normalizeCompanyName(picked.data.name);
     if (!nameNormalized) {
       return res.status(400).json({ error: "name is required." });
@@ -158,19 +170,19 @@ router.post("/", async (req, res) => {
 
     const existing = await CRMCompany.findOne({ nameNormalized }).lean();
     if (existing) {
-      return res.status(200).json({ company: existing, deduped: true });
+      return res.status(200).json({ company: existing, deduped: true, ...withIgnored(picked.ignored) });
     }
 
     try {
       const company = await CRMCompany.create({ ...picked.data, nameNormalized, createdBy });
-      return res.status(201).json({ company });
+      return res.status(201).json({ company, ...withIgnored(picked.ignored) });
     } catch (e: any) {
       // Lost the race against a concurrent create / lead resolve; the prod
       // unique+partial index on nameNormalized rejected the second insert.
       // Return the winner — same outcome as the findOne hit above.
       if (e?.code === 11000) {
         const winner = await CRMCompany.findOne({ nameNormalized }).lean();
-        if (winner) return res.status(200).json({ company: winner, deduped: true });
+        if (winner) return res.status(200).json({ company: winner, deduped: true, ...withIgnored(picked.ignored) });
       }
       throw e;
     }
@@ -186,18 +198,9 @@ router.post("/", async (req, res) => {
 
 router.get("/export", async (req, res) => {
   try {
-    const user = (req as any).user as AnyObj;
-    const crmScope = (req as any).crmScope as string;
-    const conditions: AnyObj[] = [];
-
-    if (crmScope === "OWN") {
-      const uid = userId(user);
-      if (mongoose.isValidObjectId(uid)) {
-        conditions.push({ createdBy: new mongoose.Types.ObjectId(uid) });
-      }
-    }
-
-    const filter = conditions.length > 0 ? { $and: conditions } : {};
+    // Same rule as the list and GET /:id — scope AND isPrivate
+    // (services/crmScope companyMatch). The export used to skip isPrivate.
+    const filter = await companyMatchFor(req);
     const companies = await CRMCompany.find(filter).sort({ createdAt: -1 }).limit(5000).lean();
 
     const workbook = new ExcelJS.Workbook();
@@ -251,21 +254,10 @@ router.get("/export", async (req, res) => {
 
 router.get("/", async (req, res) => {
   try {
-    const user = (req as any).user as AnyObj;
-    const crmScope = (req as any).crmScope as string;
     const q = req.query as AnyObj;
-    const conditions: AnyObj[] = [];
-    const uid = userId(user);
-
-    if (crmScope === "OWN") {
-      if (mongoose.isValidObjectId(uid)) {
-        conditions.push({ createdBy: new mongoose.Types.ObjectId(uid) });
-      }
-    } else {
-      const scopeOr: AnyObj[] = [{ isPrivate: false }];
-      if (mongoose.isValidObjectId(uid)) scopeOr.push({ createdBy: new mongoose.Types.ObjectId(uid) });
-      conditions.push({ $or: scopeOr });
-    }
+    // Scope goes through services/crmScope (normalizeScope): NONE / TEAM /
+    // unknown narrow to OWN; only ALL / WORKSPACE get the shared view.
+    const conditions: AnyObj[] = [await companyMatchFor(req)];
 
     if (q.search) {
       const re = new RegExp(String(q.search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
@@ -299,7 +291,10 @@ router.get("/", async (req, res) => {
     );
     // Lead / opportunity rollups for the page — same computed-on-read posture.
     // Leads anchor on Lead.companyId (backfill-lead-companyId); "open" is the
-    // canonical status (status ?? legacy stage) not in CONVERTED / LOST.
+    // Leads page / Inbox rule (crmTaxonomy isOpenLead): disposition status
+    // Open / In-progress — so Proposal / Negotiation leads count — else, for a
+    // never-dispositioned lead, open unless stage won / lost, status LOST or
+    // won (wonDate) — legacy proposal_sent / negotiation leads count as open.
     // Opportunities are read only under CRM_V2_OPPORTUNITY, matching
     // GET /leads/:id; off, the counts are 0 and the UI hides them.
     // Rollups follow the VIEWER's leads scope (services/crmScope): an OWN rep
@@ -307,14 +302,14 @@ router.get("/", async (req, res) => {
     // leads access at all → zeros.
     const leadsScope = moduleScope(req, "leads");
     const leadRows = companyIds.length && leadsScope
-      ? await Lead.find({ ...leadMatch(leadsScope), companyId: { $in: companyIds } }).select("companyId stage status").lean()
+      ? await Lead.find({ ...leadMatch(leadsScope), companyId: { $in: companyIds } }).select("companyId stage status dispositionStatus wonDate").lean()
       : [];
     const leadCounts = new Map<string, { total: number; open: number }>();
     for (const l of leadRows as any[]) {
       const k = String(l.companyId);
       const e = leadCounts.get(k) || { total: 0, open: 0 };
       e.total += 1;
-      if (!isClosedLeadStatus(l.status || legacyStageToStatus(l.stage))) e.open += 1;
+      if (isOpenLead(l)) e.open += 1;
       leadCounts.set(k, e);
     }
     const oppRows =
@@ -357,13 +352,15 @@ router.get("/:id", async (req, res) => {
       return res.status(400).json({ error: "Invalid company ID." });
     }
 
-    const company = await CRMCompany.findById(req.params.id).lean();
+    // Same rule as the list and export (services/crmScope companyMatch, audit
+    // P1-4): scope AND isPrivate. Outside it reads as "not found" — never
+    // confirm existence, same as GET /leads/:id.
+    const company = await CRMCompany.findOne({ _id: req.params.id, ...(await companyMatchFor(req)) }).lean();
     if (!company) return res.status(404).json({ error: "Company not found." });
 
-    // The company itself is a shared entity (a rep's own lead may sit at a
-    // company someone else created), but every rollup on it follows the
-    // viewer's scope for THAT module (services/crmScope): contacts by the
-    // crmContacts scope, deals by the leads scope; no access → empty.
+    // Every rollup on the company follows the viewer's scope for THAT module
+    // (services/crmScope): contacts by the crmContacts scope, deals by the
+    // leads scope; no access → empty.
     const contactsScope = moduleScope(req, "crmContacts");
     const leadsScope = moduleScope(req, "leads");
     const contactFilter = contactsScope ? { ...contactMatch(contactsScope), companyId: company._id } : null;
@@ -414,17 +411,16 @@ router.put("/:id", async (req, res) => {
       return res.status(403).json({ error: "Only the creator or admin can edit this company." });
     }
 
-    const body = req.body as AnyObj;
+    const body = (req.body || {}) as AnyObj;
+    const picked = pickWritableFields(body);
+    if (!picked.ok) return res.status(400).json({ error: picked.error });
 
-    // ── Legacy path (CRM_V2_FOUNDATION off): body spread ──
+    // ── Legacy path (CRM_V2_FOUNDATION off): allow-list, no pre-check ──
     // Same E11000 → 409 translation as POST: the un-gated key hook means a
     // rename onto another company's name is refused by the index.
     if (!isCrmV2FoundationEnabled()) {
-      const PROTECTED = new Set(["_id", "companyCode", "createdBy", "createdAt"]);
-      for (const key of Object.keys(body)) {
-        if (!PROTECTED.has(key)) {
-          (company as any)[key] = body[key];
-        }
+      for (const [k, v] of Object.entries(picked.data)) {
+        (company as any)[k] = v;
       }
       try {
         await company.save();
@@ -444,12 +440,10 @@ router.put("/:id", async (req, res) => {
         }
         throw e;
       }
-      return res.json({ company });
+      return res.json({ company, ...withIgnored(picked.ignored) });
     }
 
     // ── CRM_V2_FOUNDATION path: allow-list; rename re-keys nameNormalized ──
-    const picked = pickWritableFields(body);
-    if (!picked.ok) return res.status(400).json({ error: picked.error });
 
     // Key the row will carry after this save: the new name if renamed, else the
     // current name (which re-keys a legacy row whose nameNormalized is still "").
@@ -476,7 +470,7 @@ router.put("/:id", async (req, res) => {
     }
     // nameNormalized is derived by the model's pre-validate hook from `name`.
     await company.save();
-    return res.json({ company });
+    return res.json({ company, ...withIgnored(picked.ignored) });
   } catch (err) {
     logger.error("crm.companies PUT /:id error", { err });
     return res.status(500).json({ error: "Failed to update company." });

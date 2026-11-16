@@ -11,7 +11,9 @@
 //      dispositionStage, dispositionStatus) plus the coherent Slice-2 status
 //      and legacy stage the kanban/reports read — the rep never sets these;
 //   3. capture nextFollowUpDate when the entry implies a next touch (required
-//      then, ignored otherwise); lostReason ← sub-disposition on a Lost status;
+//      then, ignored otherwise); a Won / Lost status CLEARS nextFollowUpDate +
+//      followUpNotes (a closed lead is never due); lostReason ← sub-disposition
+//      on a Lost status;
 //   4. append ONE `disposition` activity carrying from → to (explainable, never
 //      rewrites history);
 //   4a/4b. status Won (Onboarded) → the CRM CONTACT + company the legacy /win
@@ -47,7 +49,7 @@ import CRMContact from "../models/CRMContact.js";
 import CRMCompany from "../models/CRMCompany.js";
 import { resolveOrCreateCompany } from "../utils/crmCompany.js";
 import { closedStage, isClosedOpportunityStage, MILESTONES } from "../models/crmTaxonomy.js";
-import { FRESH_DISPOSITION, type DispositionEntry } from "../models/crmDisposition.js";
+import { FRESH_DISPOSITION, isActiveEntry, type DispositionEntry } from "../models/crmDisposition.js";
 import { triggerTaskAutomation, runTaskAutomation, type TaskAutomationOutcome } from "./taskAutomation.js";
 import logger from "../utils/logger.js";
 import { SYSTEM_WORKSPACE_ID } from "../config/defaultTaskAutomations.js";
@@ -165,6 +167,9 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
   if (!canWorkPipeline(input.actor, pipeline)) throw new DispositionError("You are not on a team that works this pipeline.", 403);
   const entry = findEntry(pipeline, input.subDisposition);
   if (!entry) throw new DispositionError(`"${input.subDisposition}" is not a sub-disposition of ${pipeline.name}.`, 400);
+  // Retired subs stay valid for the leads already on them (display only) —
+  // they are never a NEW pick, whatever the caller (route, bulk, import).
+  if (!isActiveEntry(entry)) throw new DispositionError(`"${entry.subDisposition}" is no longer in use — pick another sub-disposition.`, 400);
 
   let followUp: Date | null = null;
   if (entry.nextTouch) {
@@ -194,6 +199,12 @@ export async function applyDisposition(lead: LeadDoc, input: ApplyDispositionInp
   if (followUp) {
     lead.nextFollowUpDate = followUp;
     if (note) lead.followUpNotes = note;
+  }
+  // A closed lead (Won / Lost) has no next touch — clear the follow-up so it
+  // never reads as due or overdue anywhere (Today, Inbox, health, KPIs).
+  if (entry.status === "Won" || entry.status === "Lost") {
+    lead.nextFollowUpDate = undefined;
+    lead.followUpNotes = "";
   }
   if (entry.status === "Lost") lead.lostReason = entry.subDisposition;
   if (entry.status === "Won" && !lead.wonDate) lead.wonDate = at ?? new Date();

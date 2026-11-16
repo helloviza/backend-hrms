@@ -186,16 +186,15 @@ describe("POST /crm/companies — flag OFF (legacy)", () => {
     expect(await CRMCompany.countDocuments({})).toBe(2);
   });
 
-  it("still spreads the body (legacy behaviour preserved, warts included)", async () => {
+  it("no longer spreads the body: allow-list, ignored keys echoed back (audit P1-5)", async () => {
     flag(false);
     const r = await request(app())
       .post("/api/crm/companies")
       .send({ name: "Legacy Co", contactCount: 7, accountType: "agency" });
     expect(r.status).toBe(201);
-    expect(r.body.company.contactCount).toBe(7);
-    // The schema now has the field, so a legacy spread would persist it — the
-    // flag does not (and cannot) hide schema paths; it only governs the route.
-    expect(r.body.company.accountType).toBe("agency");
+    expect(r.body.company.contactCount).toBe(0);
+    expect(r.body.company.accountType).toBe("agency"); // an allow-listed, validated field
+    expect(r.body.ignored).toEqual(["contactCount"]);
   });
 });
 
@@ -256,7 +255,7 @@ describe("POST /crm/companies — flag ON (dedupe on nameNormalized)", () => {
     expect(await CRMCompany.countDocuments({})).toBe(2);
   });
 
-  it("accepts and stores the Company Account fields", async () => {
+  it("accepts and stores the Company Account fields; customer links are server-only", async () => {
     const mgr = new mongoose.Types.ObjectId().toHexString();
     const cust = new mongoose.Types.ObjectId().toHexString();
     const r = await request(app()).post("/api/crm/companies").send({
@@ -273,8 +272,11 @@ describe("POST /crm/companies — flag ON (dedupe on nameNormalized)", () => {
     expect(r.body.company.lifecycleStatus).toBe("active");
     expect(r.body.company.accountTier).toBe("growth");
     expect(r.body.company.accountManagerId).toBe(mgr);
-    expect(r.body.company.customerId).toBe(cust);
-    expect(r.body.company.customerWorkspaceId).toBe("69679a7628330a58d29f2254");
+    // customerId / customerWorkspaceId are set by customer onboarding, never
+    // by the client (audit P1-5).
+    expect(r.body.company.customerId).toBeNull();
+    expect(r.body.company.customerWorkspaceId).toBeNull();
+    expect(r.body.ignored).toEqual(["customerId", "customerWorkspaceId"]);
   });
 
   it.each([
@@ -282,7 +284,6 @@ describe("POST /crm/companies — flag ON (dedupe on nameNormalized)", () => {
     [{ lifecycleStatus: "won" }, /lifecycleStatus/],
     [{ accountTier: "platinum" }, /accountTier/],
     [{ accountManagerId: "not-an-id" }, /accountManagerId/],
-    [{ customerId: "nope" }, /customerId/],
   ])("400s on invalid account value %j", async (bad, re) => {
     const r = await request(app()).post("/api/crm/companies").send({ name: "Bad Co", ...bad });
     expect(r.status).toBe(400);

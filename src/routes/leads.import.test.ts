@@ -37,6 +37,7 @@ const { default: CRMCompany } = await import("../models/CRMCompany.js");
 const { default: Counter } = await import("../models/Counter.js");
 const { default: User } = await import("../models/User.js");
 const { default: router } = await import("./leads.js");
+const { ensureDefaultPipeline } = await import("../services/crmPipelines.js");
 const { CRM_V2_DISPOSITION_ENV, CRM_V2_OPPORTUNITY_ENV } = await import("../config/crmV2.js");
 
 let mongod: MongoMemoryServer;
@@ -79,6 +80,8 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await Promise.all([Lead.deleteMany({}), LeadActivity.deleteMany({}), CRMCompany.deleteMany({}), Counter.deleteMany({})]);
+  // The pipeline row is seeded at startup in prod (server.ts); requests never seed it.
+  await ensureDefaultPipeline();
 });
 afterEach(() => {
   delete process.env[CRM_V2_DISPOSITION_ENV];
@@ -101,7 +104,7 @@ describe("POST /leads/import/preview", () => {
       Source: "source", "Deal Value": "dealValue", "Next Follow-up": "nextFollowUpDate",
     });
     expect(r.body.rowCount).toBe(5);
-    expect(r.body.summary).toEqual({ total: 5, valid: 3, invalid: 2, flagged: 0 });
+    expect(r.body.summary).toEqual({ total: 5, valid: 3, invalid: 2, existing: 0, flagged: 0 });
 
     const byRow = Object.fromEntries(r.body.rows.map((x: any) => [x.row, x]));
     expect(byRow[3].valid).toBe(false);
@@ -126,7 +129,7 @@ describe("POST /leads/import/preview", () => {
     const r = await preview(buf, "leads.xlsx");
     expect(r.status).toBe(200);
     expect(r.body.suggestedMapping).toEqual({ "Full Name": "contactName", Mobile: "contactPhone", Organisation: "companyName" });
-    expect(r.body.summary).toEqual({ total: 2, valid: 2, invalid: 0, flagged: 1 });
+    expect(r.body.summary).toEqual({ total: 2, valid: 2, invalid: 0, existing: 0, flagged: 1 });
     expect(r.body.rows[0].duplicate).toMatchObject({ contactName: "Existing Person", ownerName: "Imran" });
     expect(r.body.rows[0].duplicate.leadCode).toMatch(/^LEAD-/);
     expect(r.body.rows[1].duplicate).toBeNull();
@@ -140,7 +143,7 @@ describe("POST /leads/import/preview", () => {
     });
     expect(r.status).toBe(200);
     expect(r.body.defaults).toMatchObject({ source: "linkedin", owner: { id: ADMIN_ID, name: "Ops Admin" }, dispositionsEnabled: false });
-    expect(r.body.summary).toEqual({ total: 2, valid: 1, invalid: 1, flagged: 0 });
+    expect(r.body.summary).toEqual({ total: 2, valid: 1, invalid: 1, existing: 0, flagged: 0 });
     expect(r.body.rows[1].errors).toEqual(["Contact name is required"]);
   });
 
@@ -166,7 +169,7 @@ describe("POST /leads/import/commit", () => {
 
     const r = await request(app()).post("/api/leads/import/commit").send({ rows: rows(), mapping, defaults: { source: "referral" } });
     expect(r.status).toBe(201);
-    expect(r.body.summary).toEqual({ total: 5, created: 3, flagged: 2, invalid: 2, failed: 0, dispositioned: 0 });
+    expect(r.body.summary).toEqual({ total: 5, created: 3, flagged: 2, invalid: 2, failed: 0, dispositioned: 0, existing: 0 });
     expect(r.body.invalid.map((x: any) => x.row)).toEqual([3, 4]);
     expect(r.body.batchId).toMatch(/^IMP-\d{4}-\d{2}-\d{2}-[0-9a-f]{6}$/);
 
@@ -196,7 +199,7 @@ describe("POST /leads/import/commit", () => {
     const arjun = imported[0];
     expect(arjun).toMatchObject({ contactName: "Arjun Sethi", contactEmail: "arjun@onboarded.test", contactDesignation: "Procurement Manager", source: "linkedin", dealValue: 180000, currency: "INR", stage: "new", status: "NEW", disposition: "", dispositionStatus: "", assignedToName: "Ops Admin" });
     expect(String(arjun.assignedTo)).toBe(ADMIN_ID);
-    expect(new Date(arjun.nextFollowUpDate).toISOString()).toBe("2026-09-20T00:00:00.000Z");
+    expect(new Date(arjun.nextFollowUpDate).toISOString()).toBe("2026-09-19T18:30:00.000Z");
     expect(imported[1]).toMatchObject({ contactName: "Priya Nair", source: "referral", type: "company" }); // blank source → batch default
     expect(imported[2]).toMatchObject({ contactName: "Meera Iyer", type: "company", companyName: "onboarded demo co" });
     expect(imported[2].opportunityId ?? null).toBeNull();

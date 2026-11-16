@@ -3,6 +3,7 @@
 // explainable activity, and the shadow opportunity fires/syncs/closes without
 // the rep ever touching it. Real collections on mongodb-memory-server.
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
 import mongoose from "mongoose";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import express from "express";
@@ -55,6 +56,8 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await Promise.all([Lead.deleteMany({}), LeadActivity.deleteMany({}), Opportunity.deleteMany({}), CrmPipeline.deleteMany({}), CRMContact.deleteMany({}), CRMCompany.deleteMany({})]);
+  // The pipeline row is seeded at startup in prod (server.ts); requests never seed it.
+  await ensureDefaultPipeline();
   process.env[CRM_V2_DISPOSITION_ENV] = "true";
   process.env[CRM_V2_OPPORTUNITY_ENV] = "true";
 });
@@ -76,40 +79,69 @@ const app = () => {
 
 /* ───────────────────────── the set ───────────────────────── */
 
-describe("Corporate Calling disposition set (from the sheet)", () => {
-  it("is structurally valid and matches the sheet exactly", () => {
-    expect(validateDispositionSet(CORPORATE_CALLING_SET)).toEqual([]);
-    const by = (d: string) => CORPORATE_CALLING_SET.filter((e) => e.disposition === d);
-    expect(by("Call Back").map((e) => e.subDisposition)).toEqual(["Call Back Time Given", "Call Back Time Not Given"]);
-    expect(by("Interested").map((e) => e.subDisposition)).toEqual([
-      "Follow up Required", "Introduction Email Sent", "Proposal Mail Required", "Proposal Mail Sent",
-      "Demo Scheduled", "Negotiation in Progress", "Agreement in Progress", "NDA in Progress",
+describe("Corporate Calling disposition set (v2, Imran's set of 2026-11-12)", () => {
+  it("is structurally valid and matches the set exactly", () => {
+    expect(validateDispositionSet(CORPORATE_CALLING_SET, "corporate")).toEqual([]);
+    const active = CORPORATE_CALLING_SET.filter((e) => e.active !== false);
+    const by = (d: string) => active.filter((e) => e.disposition === d);
+    expect(CORPORATE_CALLING_SET).toHaveLength(32);
+    expect(active).toHaveLength(21);
+    expect([...new Set(active.map((e) => e.disposition))]).toEqual(["Contacted", "Call Back", "Interested", "Nurture", "Not Interested", "Not Connected", "Onboarded"]);
+    const row = (e: (typeof active)[number]) =>
+      [e.disposition, e.subDisposition, e.stage, e.status, e.leadStatus, e.legacyStage, e.nextTouch, e.opportunityEffect === "open" ? `open @ ${e.opportunityStage}` : e.opportunityEffect].join(" | ");
+    expect(active.map(row)).toEqual([
+      "Contacted | Introduction Email Sent | In-progress | Open | CONTACTED | contacted | true | none",
+      "Contacted | Asked to follow up | In-progress | Open | CONTACTED | contacted | true | none",
+      "Call Back | Call Back Time Given | In-progress | Open | CONTACTED | follow_up | true | none",
+      "Call Back | Call Back Time Not Given | In-progress | Open | CONTACTED | follow_up | true | none",
+      "Interested | Demo Scheduled | In-progress | Open | CONTACTED | contacted | true | none",
+      "Interested | Demo Done | In-progress | Open | CONTACTED | contacted | true | none",
+      "Interested | Proposal Mail Sent | In-progress | Open | CONVERTED | proposal_sent | true | open @ proposal",
+      "Interested | Negotiation in Progress | In-progress | Open | CONVERTED | negotiation | true | open @ negotiation",
+      "Interested | Onboarding link sent | In-progress | Open | CONVERTED | negotiation | true | open @ negotiation",
+      "Interested | Agreement in Progress | In-progress | Open | CONVERTED | negotiation | true | open @ negotiation",
+      "Interested | NDA in Progress | In-progress | Open | CONVERTED | negotiation | true | open @ negotiation",
+      "Nurture | Nurture | In-progress | Open | CONTACTED | follow_up | true | none",
+      "Not Interested | Repeated RNR | Lost | Lost | LOST | lost | false | lost",
+      "Not Interested | Competitor onboarded | Lost | Lost | LOST | lost | false | lost",
+      "Not Interested | Global tie up mandate | Lost | Lost | LOST | lost | false | lost",
+      "Not Interested | Proposal rejected | Lost | Lost | LOST | lost | false | lost",
+      "Not Connected | Number Does not Exist | Lost | Lost | LOST | lost | false | lost",
+      "Not Connected | Switched off | NC | Open | CONTACTED | contacted | true | none",
+      "Not Connected | Ringing Only | NC | Open | CONTACTED | contacted | true | none",
+      "Not Connected | Temp out of Service | Lost | Lost | LOST | lost | false | lost",
+      "Onboarded | Onboarded | Onboarded | Won | CONVERTED | won | false | won",
     ]);
-    expect(by("Not Interested").map((e) => e.subDisposition)).toEqual([
-      "Stopped Answering Call", "Not Interested for Services", "Other Vendor onboarded", "Working with other vendors",
-      "Trust Issue", "Not A right party contact", "Travel Desk Not Required", "Visa Services Not Required", "No Use Case Available",
-    ]);
-    expect(by("Not Connected").map((e) => [e.subDisposition, e.stage, e.status])).toEqual([
-      ["Number Does not Exist", "Lost", "Lost"], ["Switched off", "NC", "Open"], ["Ringing Only", "NC", "Open"], ["Temp out of Service", "Lost", "Lost"],
-    ]);
-    // a reachable number that didn't answer → schedule the callback
-    expect(CORPORATE_CALLING_SET.filter((e) => e.nextTouch).map((e) => e.subDisposition)).toEqual([
-      "Call Back Time Given", "Follow up Required", "Switched off", "Ringing Only",
-    ]);
+    // the rule: every sub that is not Lost / Won needs a next follow-up date
+    for (const e of active) expect(e.nextTouch, e.subDisposition).toBe(e.status !== "Lost" && e.status !== "Won");
+    expect(by("Nurture")).toHaveLength(1);
     expect(by("Onboarded")).toHaveLength(1);
-    expect(by("Onboarded")[0]).toMatchObject({ stage: "Onboarded", status: "Won", opportunityEffect: "won" });
-    // derived pairs
-    for (const e of by("Call Back")) expect([e.stage, e.status]).toEqual(["In-progress", "Open"]);
-    for (const e of by("Interested")) expect([e.stage, e.status, e.opportunityEffect]).toEqual(["In-progress", "Open", "open"]);
-    for (const e of by("Not Interested")) expect([e.stage, e.status]).toEqual(["Lost", "Lost"]);
-    expect(CORPORATE_CALLING_SET).toHaveLength(24);
+
+    // retired v1 subs: kept (leads still sit on them), hidden, v1 settings unchanged
+    const retired = CORPORATE_CALLING_SET.filter((e) => e.active === false);
+    expect(retired.map((e) => `${e.disposition} | ${e.subDisposition}`)).toEqual([
+      "Interested | Follow up Required", "Interested | Proposal Mail Required",
+      "Not Interested | Stopped Answering Call", "Not Interested | Not Interested for Services", "Not Interested | Other Vendor onboarded",
+      "Not Interested | Working with other vendors", "Not Interested | Trust Issue", "Not Interested | Not A right party contact",
+      "Not Interested | Travel Desk Not Required", "Not Interested | Visa Services Not Required", "Not Interested | No Use Case Available",
+    ]);
+    expect(retired[0]).toMatchObject({ stage: "In-progress", status: "Open", nextTouch: true, opportunityEffect: "open", opportunityStage: "qualified", leadStatus: "CONVERTED", legacyStage: "follow_up" });
+    expect(retired[1]).toMatchObject({ stage: "In-progress", status: "Open", nextTouch: false, opportunityEffect: "open", opportunityStage: "discovery", leadStatus: "CONVERTED", legacyStage: "contacted" });
+    for (const e of retired.slice(2)) expect(e).toMatchObject({ stage: "Lost", status: "Lost", nextTouch: false, opportunityEffect: "lost", leadStatus: "LOST", legacyStage: "lost" });
     expect(DISPOSITION_STAGES).toEqual(["Prospect", "In-progress", "Lost", "Onboarded", "NC"]);
     expect(DISPOSITION_STATUSES).toEqual(["Open", "In-progress", "Lost", "Won"]);
   });
 
+  it("the live spec file carries exactly the seed", () => {
+    const spec = JSON.parse(readFileSync(new URL("../scripts/disposition-sets/corporate-calling-v2.json", import.meta.url), "utf8"));
+    expect(spec).toMatchObject({ pipeline: "corporate_calling", opportunityPipeline: "corporate" });
+    expect(spec.dispositionSet).toEqual(CORPORATE_CALLING_SET.map((e) => ({ ...e, active: e.active !== false })));
+  });
+
   it("rejects a malformed set", () => {
-    expect(validateDispositionSet([{ ...CORPORATE_CALLING_SET[0] }, { ...CORPORATE_CALLING_SET[0] }])).toContain('duplicate sub-disposition "Call Back Time Given"');
-    expect(validateDispositionSet([{ ...CORPORATE_CALLING_SET[2], opportunityStage: undefined }])[0]).toMatch(/needs opportunityStage/);
+    expect(validateDispositionSet([{ ...CORPORATE_CALLING_SET[0] }, { ...CORPORATE_CALLING_SET[0] }])).toContain('duplicate sub-disposition "Introduction Email Sent" (sub-dispositions are matched case-insensitively)');
+    const proposal = CORPORATE_CALLING_SET.find((e) => e.subDisposition === "Proposal Mail Sent")!;
+    expect(validateDispositionSet([{ ...proposal, opportunityStage: undefined }])[0]).toMatch(/needs opportunityStage/);
   });
 });
 
@@ -122,8 +154,9 @@ describe("CrmPipeline — the set lives on the pipeline row", () => {
     expect(String(a._id)).toBe(String(b._id));
     expect(await CrmPipeline.countDocuments({})).toBe(1);
     expect(a).toMatchObject({ key: "corporate_calling", name: "Corporate Calling", opportunityPipeline: "corporate", isDefault: true });
-    expect(a.dispositionSet).toHaveLength(24);
-    expect(groupedSet(a).map((g) => g.disposition)).toEqual(["Call Back", "Interested", "Not Interested", "Not Connected", "Onboarded"]);
+    expect(a.dispositionSet).toHaveLength(32);
+    expect(groupedSet(a).map((g) => g.disposition)).toEqual(["Contacted", "Call Back", "Interested", "Nurture", "Not Interested", "Not Connected", "Onboarded"]);
+    expect(groupedSet(a).flatMap((g) => g.subs)).toHaveLength(21);
     expect(findEntry(a, "  proposal mail sent ")!.opportunityStage).toBe("proposal");
     expect(findEntry(a, "nope")).toBeNull();
 
@@ -152,7 +185,7 @@ describe("CrmPipeline — the set lives on the pipeline row", () => {
 /* ───────────────────────── the cascade ───────────────────────── */
 
 describe("applyDisposition — derivation, activity, shadow opportunity", () => {
-  it("Fresh → Call Back Time Given → Interested (fires) → Proposal Mail Sent (syncs) → Onboarded (won)", async () => {
+  it("Fresh → Call Back Time Given → Demo Scheduled (no deal) → Proposal Mail Sent (fires) → Negotiation in Progress (syncs) → Onboarded (won)", async () => {
     const lead = await freshLead();
     expect(snapshotOf(lead)).toEqual({ disposition: "", subDisposition: "", stage: "Prospect", status: "Open" });
 
@@ -167,27 +200,35 @@ describe("applyDisposition — derivation, activity, shadow opportunity", () => 
     expect(raw!.pipelineId).toBeTruthy();
     expect(await Opportunity.countDocuments({})).toBe(0);
 
-    // Interested / Follow up Required: shadow opportunity fires at "qualified"
-    const r2 = await applyDisposition(lead, { subDisposition: "Follow up Required", nextFollowUpDate: new Date(Date.now() + 2 * 86400000), actor: ACTOR });
-    expect(r2.opportunity).toMatchObject({ created: true, stage: "qualified", effect: "open" });
+    // Interested / Demo Scheduled: needs a date; still CONTACTED; NO deal yet
+    await expect(applyDisposition(lead, { subDisposition: "Demo Scheduled", actor: ACTOR })).rejects.toThrow(/"Demo Scheduled" needs a next follow-up date/);
+    const rd = await applyDisposition(lead, { subDisposition: "Demo Scheduled", nextFollowUpDate: new Date(Date.now() + 2 * 86400000), actor: ACTOR });
+    expect(rd.opportunity).toBeNull();
+    expect(await Lead.collection.findOne({ _id: lead._id })).toMatchObject({ disposition: "Interested", stage: "contacted", status: "CONTACTED" });
+    expect(await Opportunity.countDocuments({})).toBe(0);
+
+    // Proposal Mail Sent: shadow opportunity fires at "proposal"
+    await expect(applyDisposition(lead, { subDisposition: "Proposal Mail Sent", actor: ACTOR })).rejects.toThrow(/needs a next follow-up date/);
+    const r2 = await applyDisposition(lead, { subDisposition: "Proposal Mail Sent", nextFollowUpDate: new Date(Date.now() + 2 * 86400000), actor: ACTOR });
+    expect(r2.opportunity).toMatchObject({ created: true, stage: "proposal", effect: "open" });
     const opp = await Opportunity.findOne({ leadId: lead._id }).lean();
-    expect(opp).toMatchObject({ pipeline: "corporate", stage: "qualified", probability: 25, dealValue: 450000, name: "Zepto", automatedByRule: "", legacyLeadStage: "follow_up" });
+    expect(opp).toMatchObject({ pipeline: "corporate", stage: "proposal", probability: 65, dealValue: 450000, name: "Zepto", automatedByRule: "", legacyLeadStage: "proposal_sent" });
     expect(String(opp!.ownerUserId)).toBe(ADMIN_ID);
     raw = await Lead.collection.findOne({ _id: lead._id });
     expect(raw!.status).toBe("CONVERTED");
     expect(String(raw!.opportunityId)).toBe(String(opp!._id));
 
-    // Proposal Mail Sent: same opportunity, synced to "proposal"; dealValue synced
+    // Negotiation in Progress: same opportunity, synced to "negotiation"; dealValue synced
     lead.dealValue = 500000;
-    const r3 = await applyDisposition(lead, { subDisposition: "Proposal Mail Sent", actor: ACTOR });
-    expect(r3.opportunity).toMatchObject({ created: false, fromStage: "qualified", stage: "proposal" });
+    const r3 = await applyDisposition(lead, { subDisposition: "Negotiation in Progress", nextFollowUpDate: new Date(Date.now() + 3 * 86400000), actor: ACTOR });
+    expect(r3.opportunity).toMatchObject({ created: false, fromStage: "proposal", stage: "negotiation" });
     expect(await Opportunity.countDocuments({ leadId: lead._id })).toBe(1);
     expect((await Opportunity.findOne({ leadId: lead._id }).lean())!.dealValue).toBe(500000);
 
     // Onboarded: won
     const r4 = await applyDisposition(lead, { subDisposition: "Onboarded", actor: ACTOR });
     expect(r4.to).toEqual({ disposition: "Onboarded", subDisposition: "Onboarded", stage: "Onboarded", status: "Won" });
-    expect(r4.opportunity).toMatchObject({ created: false, fromStage: "proposal", stage: "closed_won", effect: "won" });
+    expect(r4.opportunity).toMatchObject({ created: false, fromStage: "negotiation", stage: "closed_won", effect: "won" });
     const won = await Opportunity.findOne({ leadId: lead._id }).lean();
     expect(won!.probability).toBe(100);
     expect(won!.closedAt).toBeInstanceOf(Date);
@@ -195,38 +236,38 @@ describe("applyDisposition — derivation, activity, shadow opportunity", () => 
     expect(raw).toMatchObject({ stage: "won", status: "CONVERTED", dispositionStatus: "Won" });
     expect(raw!.wonDate).toBeInstanceOf(Date);
 
-    // one disposition activity per write (4) + opportunity rows for open/sync/won (3), all explainable
+    // one disposition activity per write (5) + opportunity rows for open/sync/won (3), all explainable
     const acts = await LeadActivity.find({ leadId: lead._id }).sort({ createdAt: 1 }).lean();
     const disp = acts.filter((a: any) => a.type === "disposition");
-    expect(disp).toHaveLength(4);
+    expect(disp).toHaveLength(5);
     expect((disp[0] as any).disposition).toEqual({ from: { disposition: "", subDisposition: "", stage: "Prospect", status: "Open" }, to: { disposition: "Call Back", subDisposition: "Call Back Time Given", stage: "In-progress", status: "Open" } });
-    expect((disp[3] as any).disposition.to.status).toBe("Won");
+    expect((disp[4] as any).disposition.to.status).toBe("Won");
     const oppRows = acts.filter((a: any) => a.subject?.type === "OPPORTUNITY");
-    expect(oppRows.map((a: any) => a.toStage)).toEqual(["qualified", "proposal", "closed_won"]);
+    expect(oppRows.map((a: any) => a.toStage)).toEqual(["proposal", "negotiation", "closed_won"]);
   });
 
   it("Fresh → Not Interested → Lost at the lead grain, NO opportunity", async () => {
     const lead = await freshLead();
-    const r = await applyDisposition(lead, { subDisposition: "Not Interested for Services", actor: ACTOR });
+    const r = await applyDisposition(lead, { subDisposition: "Repeated RNR", actor: ACTOR });
     expect(r.to).toMatchObject({ stage: "Lost", status: "Lost" });
     expect(r.opportunity).toBeNull();
     expect(await Opportunity.countDocuments({})).toBe(0);
     const raw = await Lead.collection.findOne({ _id: lead._id });
-    expect(raw).toMatchObject({ stage: "lost", status: "LOST", lostReason: "Not Interested for Services", dispositionStatus: "Lost" });
+    expect(raw).toMatchObject({ stage: "lost", status: "LOST", lostReason: "Repeated RNR", dispositionStatus: "Lost" });
   });
 
   it("Lost AFTER Interested → the opportunity is closed-lost (feeds win/loss)", async () => {
     const lead = await freshLead();
-    await applyDisposition(lead, { subDisposition: "Introduction Email Sent", actor: ACTOR });
-    const r = await applyDisposition(lead, { subDisposition: "Working with other vendors", actor: ACTOR });
+    await applyDisposition(lead, { subDisposition: "Proposal Mail Sent", nextFollowUpDate: new Date(Date.now() + 86400000), actor: ACTOR });
+    const r = await applyDisposition(lead, { subDisposition: "Competitor onboarded", actor: ACTOR });
     expect(r.opportunity).toMatchObject({ created: false, stage: "closed_lost", effect: "lost" });
     const opp = await Opportunity.findOne({ leadId: lead._id }).lean();
-    expect(opp).toMatchObject({ stage: "closed_lost", lostReason: "Working with other vendors", probability: 0 });
+    expect(opp).toMatchObject({ stage: "closed_lost", lostReason: "Competitor onboarded", probability: 0 });
     expect(opp!.closedAt).toBeInstanceOf(Date);
     expect(await Opportunity.countDocuments({})).toBe(1);
 
     // and Interested again reopens the same deal
-    const r2 = await applyDisposition(lead, { subDisposition: "Negotiation in Progress", actor: ACTOR });
+    const r2 = await applyDisposition(lead, { subDisposition: "Negotiation in Progress", nextFollowUpDate: new Date(Date.now() + 86400000), actor: ACTOR });
     expect(r2.opportunity).toMatchObject({ created: false, fromStage: "closed_lost", stage: "negotiation" });
     const re = await Opportunity.findOne({ leadId: lead._id }).lean();
     expect(re!.closedAt).toBeNull();
@@ -253,9 +294,9 @@ describe("applyDisposition — derivation, activity, shadow opportunity", () => 
   it("idempotent against a pre-existing opportunity (e.g. from the Slice-2 migration)", async () => {
     const lead = await freshLead({ stage: "proposal_sent" });
     const existing = await Opportunity.create({ leadId: lead._id, pipeline: "corporate", stage: "proposal", dealValue: 1 });
-    const r = await applyDisposition(lead, { subDisposition: "Demo Scheduled", actor: ACTOR });
+    const r = await applyDisposition(lead, { subDisposition: "Negotiation in Progress", nextFollowUpDate: new Date(Date.now() + 86400000), actor: ACTOR });
     expect(r.opportunity!.id).toBe(String(existing._id));
-    expect(r.opportunity).toMatchObject({ created: false, fromStage: "proposal", stage: "discovery" });
+    expect(r.opportunity).toMatchObject({ created: false, fromStage: "proposal", stage: "negotiation" });
     expect(await Opportunity.countDocuments({ leadId: lead._id })).toBe(1);
   });
 
@@ -264,6 +305,44 @@ describe("applyDisposition — derivation, activity, shadow opportunity", () => 
     await expect(applyDisposition(lead, { subDisposition: "Ghosted", actor: ACTOR })).rejects.toBeInstanceOf(DispositionError);
     expect(await LeadActivity.countDocuments({})).toBe(0);
     expect((await Lead.collection.findOne({ _id: lead._id }))!.disposition).toBe("");
+  });
+});
+
+/* ─────────────────── closed leads drop their follow-up ─────────────────── */
+
+describe("applyDisposition — Won / Lost clear the follow-up", () => {
+  const due = new Date(Date.now() - 86400000); // overdue, the case that showed on Today
+
+  it("Lost clears nextFollowUpDate and followUpNotes", async () => {
+    const lead = await freshLead({ nextFollowUpDate: due, followUpNotes: "Ring Monday" });
+    await applyDisposition(lead, { subDisposition: "Repeated RNR", actor: ACTOR });
+    const raw = await Lead.collection.findOne({ _id: lead._id });
+    expect(raw).toMatchObject({ dispositionStatus: "Lost", followUpNotes: "" });
+    expect(raw!.nextFollowUpDate ?? null).toBeNull();
+    expect(lead.nextFollowUpDate).toBeUndefined();
+  });
+
+  it("Won (Onboarded) clears them too — after an open disposition had set them", async () => {
+    const lead = await freshLead();
+    await applyDisposition(lead, { subDisposition: "Proposal Mail Sent", note: "Chase the CFO", nextFollowUpDate: due, actor: ACTOR });
+    let raw = await Lead.collection.findOne({ _id: lead._id });
+    expect(raw).toMatchObject({ dispositionStatus: "Open", followUpNotes: "Chase the CFO" });
+    expect(raw!.nextFollowUpDate).toEqual(due);
+
+    await applyDisposition(lead, { subDisposition: "Onboarded", actor: ACTOR });
+    raw = await Lead.collection.findOne({ _id: lead._id });
+    expect(raw).toMatchObject({ dispositionStatus: "Won", followUpNotes: "" });
+    expect(raw!.nextFollowUpDate ?? null).toBeNull();
+  });
+
+  it("an open disposition keeps (and replaces) the follow-up — only closed statuses clear it", async () => {
+    const lead = await freshLead({ nextFollowUpDate: due, followUpNotes: "old" });
+    const next = new Date(Date.now() + 2 * 86400000);
+    const r = await applyDisposition(lead, { subDisposition: "Demo Scheduled", note: "Demo Thu", nextFollowUpDate: next, actor: ACTOR });
+    expect(r.to.status).toBe("Open");
+    const raw = await Lead.collection.findOne({ _id: lead._id });
+    expect(raw).toMatchObject({ followUpNotes: "Demo Thu" });
+    expect(raw!.nextFollowUpDate).toEqual(next);
   });
 });
 
@@ -365,7 +444,7 @@ describe("Onboarded → CRMContact (what /win materialised, with the guards it l
 
   it("no contact on a non-Won disposition; Won reached via the route returns the contact in the cascade", async () => {
     const lead = await freshLead({ contactEmail: "a@b.com" });
-    const r = await applyDisposition(lead, { subDisposition: "Introduction Email Sent", actor: ACTOR });
+    const r = await applyDisposition(lead, { subDisposition: "Introduction Email Sent", nextFollowUpDate: new Date(Date.now() + 86400000), actor: ACTOR });
     expect(r.contact).toBeNull();
     expect(await CRMContact.countDocuments({})).toBe(0);
 
@@ -382,6 +461,7 @@ describe("Onboarded → CRMContact (what /win materialised, with the guards it l
 describe("routes", () => {
   it("flag OFF: both routes are 404", async () => {
     delete process.env[CRM_V2_DISPOSITION_ENV];
+    await CrmPipeline.deleteMany({}); // prove the flag-off routes never create the row
     const lead = await freshLead();
     expect((await request(app()).get(`/api/leads/${lead._id}/dispositions`)).status).toBe(404);
     expect((await request(app()).post(`/api/leads/${lead._id}/disposition`).send({ subDisposition: "Onboarded" })).status).toBe(404);
@@ -393,7 +473,8 @@ describe("routes", () => {
     const g = await request(app()).get(`/api/leads/${lead._id}/dispositions`);
     expect(g.status).toBe(200);
     expect(g.body.pipeline.name).toBe("Corporate Calling");
-    expect(g.body.groups.map((x: any) => x.disposition)).toEqual(["Call Back", "Interested", "Not Interested", "Not Connected", "Onboarded"]);
+    expect(g.body.groups.map((x: any) => x.disposition)).toEqual(["Contacted", "Call Back", "Interested", "Nurture", "Not Interested", "Not Connected", "Onboarded"]);
+    expect(g.body.groups.flatMap((x: any) => x.subs)).toHaveLength(21);
     expect(g.body.current).toEqual({ disposition: "", subDisposition: "", stage: "Prospect", status: "Open" });
     expect(g.body.canWork).toBe(true);
 
@@ -401,12 +482,12 @@ describe("routes", () => {
     expect(bad.status).toBe(400);
     expect(bad.body.error).toMatch(/follow-up date/);
 
-    const p = await request(app()).post(`/api/leads/${lead._id}/disposition`).send({ subDisposition: "Demo Scheduled", note: "Demo Thursday" });
+    const p = await request(app()).post(`/api/leads/${lead._id}/disposition`).send({ subDisposition: "Proposal Mail Sent", note: "Sent Thursday", nextFollowUpDate: new Date(Date.now() + 86400000).toISOString() });
     expect(p.status).toBe(200);
-    expect(p.body.to).toEqual({ disposition: "Interested", subDisposition: "Demo Scheduled", stage: "In-progress", status: "Open" });
-    expect(p.body.opportunity).toMatchObject({ created: true, stage: "discovery" });
+    expect(p.body.to).toEqual({ disposition: "Interested", subDisposition: "Proposal Mail Sent", stage: "In-progress", status: "Open" });
+    expect(p.body.opportunity).toMatchObject({ created: true, stage: "proposal" });
     expect(p.body.lead.dispositionStatus).toBe("Open");
-    expect(p.body.lead.stage).toBe("demo_scheduled");
+    expect(p.body.lead.stage).toBe("proposal_sent");
 
     // derived fields cannot be set by hand through the edit route
     const e = await request(app()).put(`/api/leads/${lead._id}`).send({ dispositionStatus: "Won", disposition: "Onboarded", notes: "x" });
@@ -464,7 +545,7 @@ describe("follow-up task outcome (lead.next_followup)", () => {
   });
 
   it("no follow-up date → nothing attempted, followUpTask null", async () => {
-    const r = await applyDisposition(await freshLead(), { subDisposition: "Introduction Email Sent", actor: ACTOR });
+    const r = await applyDisposition(await freshLead(), { subDisposition: "Repeated RNR", actor: ACTOR });
     expect(r.followUpTask).toBeNull();
   });
 

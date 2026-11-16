@@ -8,9 +8,9 @@
 //   - case history: each change of a partner booking's Status or Sub Status
 //     writes one "booking_status" row on the case (status, sub status, who,
 //     when) — the steps the partner tracker shows;
-//   - supplier name and "given by" are optional while the booking is Pending
-//     or WIP (the RM has talked to the student, not to a supplier yet) and
-//     required at Confirmed;
+//   - (supplier name and "given by" optional while Pending / WIP, required
+//     at Confirmed — born here, now the rule for every booking:
+//     utils/bookingStatusGate.ts);
 //   - it can't be invoiced unless it is CONFIRMED;
 //   - the case's rollup over its bookings (bookingRollup) for the tracker.
 import mongoose from "mongoose";
@@ -72,28 +72,13 @@ export function bookingStepLabel(status: any, subStatus: any): string {
   return sub ? `${s} – ${sub}` : s;
 }
 
-/* ───────────────────────── supplier / given-by ───────────────────────── */
+/* ───────────────────────── supplier / given-by ─────────────────────────
+ * The partner rule (optional while Pending / WIP, required at Confirmed) now
+ * applies to EVERY manual booking — see utils/bookingStatusGate.ts
+ * (2026-11-16). Nothing partner-specific is left here.
+ */
 
 const OPEN = new Set(["PENDING", "WIP"]);
-const SUPPLIER_ERRORS = new Set(["Supplier Name is required", "Given By is required"]);
-
-/**
- * The route's required-field errors, adjusted for a partner booking: supplier
- * name and given-by are dropped while it is Pending / WIP, and demanded when
- * it is Confirmed. Non-partner bookings: `errors` unchanged.
- */
-export function partnerRequiredErrors(errors: string[], booking: AnyObj, isPartner: boolean): string[] {
-  if (!isPartner) return errors;
-  const status = str(booking?.status || "PENDING").toUpperCase();
-  if (OPEN.has(status)) return errors.filter((e) => !SUPPLIER_ERRORS.has(e));
-  if (status === "CONFIRMED") {
-    const out = [...errors];
-    if (!str(booking?.supplierName) && !out.includes("Supplier Name is required")) out.push("Supplier Name is required");
-    if (!str(booking?.givenBy) && !out.includes("Given By is required")) out.push("Given By is required");
-    return out;
-  }
-  return errors;
-}
 
 /* ───────────────────────── case history ───────────────────────── */
 

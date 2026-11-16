@@ -89,3 +89,9 @@ export const CRM_V2_DISPOSITION_ENV = "CRM_V2_DISPOSITION";
 export function isCrmV2DispositionEnabled(): boolean {
   return String(process.env[CRM_V2_DISPOSITION_ENV] || "").trim().toLowerCase() === "true";
 }
+
+/** With CRM_V2_DISPOSITION on, stage / status are derived from the
+ *  disposition, so every legacy stage writer (PUT /leads/:id/stage, /win,
+ *  /lose, /convert, bulk stage / status) answers 409 with this. */
+export const STAGE_FOLLOWS_DISPOSITION =
+  "Stage follows the lead's disposition on this CRM — set a disposition instead (Won = Onboarded, Lost = a Not Interested / Not Connected sub-disposition).";

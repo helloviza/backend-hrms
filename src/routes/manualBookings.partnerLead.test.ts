@@ -209,10 +209,15 @@ describe("supplier name and given-by on partner bookings", () => {
     expect(born.body.details).toEqual(["Supplier Name is required", "Given By is required"]);
   });
 
-  it("an ordinary booking keeps the old rule: required at create, whatever the status", async () => {
+  // CHANGED ON PURPOSE (2026-11-16, utils/bookingStatusGate.ts): this used to
+  // pin "an ordinary booking keeps the old rule: required at create, whatever
+  // the status". The partner rule is now every booking's rule.
+  it("an ordinary booking now follows the same rule: optional while open, required at Confirmed", async () => {
     const res = await create(ordinaryBody({ supplierName: "", givenBy: "" }));
-    expect(res.status).toBe(400);
-    expect(res.body.details).toEqual(["Supplier Name is required", "Given By is required"]);
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const confirm = await put(String(res.body.booking._id), { status: "CONFIRMED" });
+    expect(confirm.status).toBe(400);
+    expect(confirm.body.details).toEqual(["Supplier Name is required", "Given By is required"]);
   });
 });
 

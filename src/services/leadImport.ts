@@ -37,12 +37,20 @@
 //   subDisposition   status + opportunity + contact are DERIVED by
 //                    services/disposition.ts exactly as a live disposition —
 //                    the row never sets them. A disposition with exactly one
-//                    sub (Onboarded) may omit subDisposition.
+//                    sub (Onboarded, Nurture) may omit subDisposition.
 //   status / stage   honoured ONLY on rows without a disposition (legacy-
 //                    only rows); the model hook keeps the pair coherent.
 //   createdDate      → Lead.createdAt (Mongoose keeps an explicit value).
 //   dispositionDate  → dispositionAt / wonDate / opportunity closedAt; blank
 //                    = import time, same as a live disposition.
+//   leadCode         a code that is ALREADY a lead (e.g. a re-imported
+//                    export row) → the row is SKIPPED: no error, no write,
+//                    no duplicate. Import never changes an existing lead; a
+//                    row whose disposition differs from the lead's carries a
+//                    warning saying so. An unknown code creates a new lead
+//                    (the code is drawn fresh) with a warning.
+// Dates: dd-mm-yyyy / dd/mm/yyyy and a bare yyyy-mm-dd are that IST calendar
+// day (00:00 IST) — the export writes IST days, so a round trip is exact.
 import mongoose from "mongoose";
 import XLSX from "xlsx";
 import Lead, { LEAD_SOURCES, LEAD_STAGES, effectiveLeadStatus } from "../models/Lead.js";
@@ -50,7 +58,7 @@ import LeadActivity from "../models/LeadActivity.js";
 import CRMCompany from "../models/CRMCompany.js";
 import User from "../models/User.js";
 import { isClosedLeadStatus, LEAD_STATUSES } from "../models/crmTaxonomy.js";
-import { type DispositionEntry } from "../models/crmDisposition.js";
+import { isActiveEntry, type DispositionEntry } from "../models/crmDisposition.js";
 import { applyDisposition, type ApplyDispositionResult } from "./disposition.js";
 import { normalizeCompanyName, resolveOrCreateCompany } from "../utils/crmCompany.js";
 
@@ -173,6 +181,7 @@ export const IMPORT_FIELDS = [
   { key: "createdDate", label: "Created date (original)" },
   { key: "dispositionDate", label: "Disposition date (original)" },
   { key: "notes", label: "Notes" },
+  { key: "leadCode", label: "Lead code (a lead already in the CRM is skipped)" },
 ] as const;
 export type ImportField = (typeof IMPORT_FIELDS)[number]["key"];
 const FIELD_KEYS = new Set<string>(IMPORT_FIELDS.map((f) => f.key));
@@ -204,6 +213,7 @@ const ALIASES: Record<ImportField, string[]> = {
   followUpNotes: ["followupnotes", "followupnote", "nextsteps", "nextstep"],
   createdDate: ["createddate", "createdat", "created", "createdon", "dateadded", "leaddate", "datecreated"],
   dispositionDate: ["dispositiondate", "dispositionat", "dispositionedon", "dispositionedat", "lastdispositiondate"],
+  leadCode: ["leadcode", "leadno", "leadnumber", "leadref"],
 };
 
 export const normHeader = (h: string) => String(h || "").toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -284,7 +294,18 @@ export interface ImportDefaults {
   /** The disposition set of the pipeline the rows will be worked in; null when
    *  CRM_V2_DISPOSITION is off (then a disposition cell is an error). */
   dispositionSet: DispositionEntry[] | null;
+  /** Lead codes in the file that are already leads (UPPERCASE code → lead) —
+   *  findExistingLeads. Absent = no row matches an existing lead. */
+  existingLeads?: Map<string, ExistingLead>;
   now?: Date;
+}
+
+/** A lead a row's leadCode cell already names. */
+export interface ExistingLead {
+  leadId: string;
+  leadCode: string;
+  disposition: string;
+  subDisposition: string;
 }
 
 export interface ValidatedRow {
@@ -295,6 +316,8 @@ export interface ValidatedRow {
   owner: { id: string; name: string } | null;
   /** The set entry to apply after create, when the row carries a disposition. */
   disposition: { entry: DispositionEntry; at: Date | null } | null;
+  /** The row names a lead that already exists → skipped (never written, never an error). */
+  existing: ExistingLead | null;
   errors: string[];
   warnings: string[];
 }
@@ -312,15 +335,27 @@ export function normaliseSource(v: string): string {
 const normKey = (v: string) => String(v || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
 const normName = (v: string) => String(v || "").trim().toLowerCase().replace(/\s+/g, " ");
 
-/** dd-mm-yyyy (UTC midnight), yyyy-mm-dd, or any ISO date-time. */
+/** An IST calendar day → its 00:00 IST instant; null for an impossible date (31-02). */
+function istMidnight(y: string, m: string, d: string): Date | null {
+  const mm = m.padStart(2, "0");
+  const dd = d.padStart(2, "0");
+  const t = new Date(`${y}-${mm}-${dd}T00:00:00.000+05:30`);
+  if (isNaN(t.getTime())) return null;
+  // Date rolls 31-02 over to 03-03 — reject instead of moving the day.
+  const back = new Date(t.getTime() + 5.5 * 3600e3);
+  return back.getUTCDate() === Number(dd) && back.getUTCMonth() + 1 === Number(mm) ? t : null;
+}
+
+/** dd-mm-yyyy / dd/mm/yyyy / dd.mm.yyyy and a bare yyyy-mm-dd → 00:00 IST of
+ *  that day (the export's IST day reads back as the same day); any other ISO
+ *  date-time as given. */
 export function parseDate(v: string): Date | null {
   const s = String(v || "").trim();
   if (!s) return null;
   const m = s.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})$/);
-  if (m) {
-    const d = new Date(`${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}T00:00:00.000Z`);
-    return isNaN(d.getTime()) ? null : d;
-  }
+  if (m) return istMidnight(m[3], m[2], m[1]);
+  const iso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (iso) return istMidnight(iso[1], iso[2], iso[3]);
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
 }
@@ -355,7 +390,8 @@ export function resolveOwnerCell(cell: string, reps: ImportRep[]): { rep: Import
  * disposition + subDisposition cells → the set entry. subDisposition is the
  * key (matched case-insensitively, like POST /:id/disposition); disposition,
  * when given, must be the sub's parent. A disposition whose set has exactly
- * one sub (Onboarded) may omit subDisposition.
+ * one ACTIVE sub (Onboarded, Nurture) may omit subDisposition. An inactive (retired)
+ * sub is refused — import and bulk are new picks. Shared by bulk.
  */
 export function resolveDispositionCells(disposition: string, subDisposition: string, set: DispositionEntry[]): { entry: DispositionEntry } | { error: string } {
   const d = String(disposition || "").trim();
@@ -363,13 +399,16 @@ export function resolveDispositionCells(disposition: string, subDisposition: str
   if (sub) {
     const entry = set.find((e) => e.subDisposition.toLowerCase() === sub.toLowerCase());
     if (!entry) return { error: `"${sub}" is not a sub-disposition — see the Allowed values sheet` };
+    if (!isActiveEntry(entry)) return { error: `"${entry.subDisposition}" is no longer in use — pick another sub-disposition` };
     if (d && entry.disposition.toLowerCase() !== d.toLowerCase()) {
       return { error: `Sub-disposition "${entry.subDisposition}" belongs to "${entry.disposition}", not "${d}"` };
     }
     return { entry };
   }
-  const subs = set.filter((e) => e.disposition.toLowerCase() === d.toLowerCase());
-  if (!subs.length) return { error: `"${d}" is not a disposition — see the Allowed values sheet` };
+  const all = set.filter((e) => e.disposition.toLowerCase() === d.toLowerCase());
+  if (!all.length) return { error: `"${d}" is not a disposition — see the Allowed values sheet` };
+  const subs = all.filter(isActiveEntry);
+  if (!subs.length) return { error: `"${all[0].disposition}" is no longer in use — pick another disposition` };
   if (subs.length === 1) return { entry: subs[0] };
   return { error: `Disposition "${subs[0].disposition}" needs a subDisposition (one of: ${subs.map((e) => e.subDisposition).join(", ")})` };
 }
@@ -386,6 +425,22 @@ export function validateRows(rows: Record<string, string>[], mapping: Record<str
   return rows.map((values, i) => {
     const errors: string[] = [];
     const warnings: string[] = [];
+
+    // ── a lead that already exists: skipped, never validated, never written ──
+    const codeCell = get(values, "leadCode");
+    const existing = codeCell ? defaults.existingLeads?.get(codeCell.toUpperCase()) ?? null : null;
+    if (existing) {
+      const d = get(values, "disposition");
+      const sd = get(values, "subDisposition");
+      const same = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
+      if ((d || sd) && !(same(d, existing.disposition) && same(sd, existing.subDisposition))) {
+        const current = [existing.disposition, existing.subDisposition].filter(Boolean).join(" / ") || "none";
+        warnings.push(`Disposition differs from ${existing.leadCode} (${current}) — import never changes an existing lead; set it on the lead`);
+      }
+      return { row: i + 1, values, lead: null, owner: null, disposition: null, existing, errors, warnings };
+    }
+    if (codeCell) warnings.push(`Lead code "${codeCell}" is not in the CRM — the row is created as a new lead with a new code`);
+
     const contactName = get(values, "contactName");
     const contactPhone = get(values, "contactPhone");
     if (!contactName) errors.push("Contact name is required");
@@ -497,8 +552,24 @@ export function validateRows(rows: Record<string, string>[], mapping: Record<str
           ...(status ? { status } : {}),
           ...(createdAt ? { createdAt } : {}),
         };
-    return { row: i + 1, values, lead, owner: errors.length ? null : owner, disposition: errors.length ? null : disposition, errors, warnings };
+    return { row: i + 1, values, lead, owner: errors.length ? null : owner, disposition: errors.length ? null : disposition, existing: null, errors, warnings };
   });
+}
+
+/** The rows' leadCode cells that are already leads (UPPERCASE code → lead).
+ *  Not narrowed to the importer's scope: a code that exists is skipped
+ *  whoever owns it — the importer never writes it either way. */
+export async function findExistingLeads(rows: Record<string, string>[], mapping: Record<string, string>): Promise<Map<string, ExistingLead>> {
+  const col = Object.entries(mapping || {}).find(([, f]) => f === "leadCode")?.[0];
+  const out = new Map<string, ExistingLead>();
+  if (!col) return out;
+  const codes = [...new Set(rows.map((r) => String(r[col] ?? "").trim().toUpperCase()).filter(Boolean))];
+  if (!codes.length) return out;
+  const found = (await Lead.find({ leadCode: { $in: codes } }).select("leadCode disposition subDisposition").lean()) as any[];
+  for (const l of found) {
+    out.set(String(l.leadCode).toUpperCase(), { leadId: String(l._id), leadCode: l.leadCode, disposition: l.disposition || "", subDisposition: l.subDisposition || "" });
+  }
+  return out;
 }
 
 /* ───────────────────────────── dedupe snapshot ───────────────────────────── */
@@ -560,7 +631,7 @@ export interface CreatedDisposition {
 }
 export interface CommitReport {
   batchId: string;
-  summary: { total: number; created: number; flagged: number; invalid: number; failed: number; dispositioned: number };
+  summary: { total: number; created: number; flagged: number; invalid: number; failed: number; dispositioned: number; existing: number };
   created: Array<{
     row: number; leadId: string; leadCode: string; contactName: string; companyName: string;
     ownerId: string; ownerName: string; createdAt: string;
@@ -569,18 +640,25 @@ export interface CommitReport {
   }>;
   invalid: Array<{ row: number; errors: string[] }>;
   failed: Array<{ row: number; reason: string }>;
+  /** Rows naming a lead already in the CRM — skipped, the lead untouched. */
+  existing: Array<{ row: number; leadCode: string; warnings: string[] }>;
 }
 
 export async function commitImport(input: CommitInput): Promise<CommitReport> {
   const batchId = input.batchId || `IMP-${new Date().toISOString().slice(0, 10)}-${new mongoose.Types.ObjectId().toHexString().slice(-6)}`;
-  const validated = validateRows(input.rows, input.mapping, input.defaults);
+  const defaults = input.defaults.existingLeads ? input.defaults : { ...input.defaults, existingLeads: await findExistingLeads(input.rows, input.mapping) };
+  const validated = validateRows(input.rows, input.mapping, defaults);
   const snapshot = await dedupeSnapshot(validated.filter((r) => r.lead));
   const importerId = mongoose.isValidObjectId(input.importer.id) ? new mongoose.Types.ObjectId(input.importer.id) : undefined;
   const oid = (v: string) => (mongoose.isValidObjectId(v) ? new mongoose.Types.ObjectId(v) : undefined);
 
-  const report: CommitReport = { batchId, summary: { total: validated.length, created: 0, flagged: 0, invalid: 0, failed: 0, dispositioned: 0 }, created: [], invalid: [], failed: [] };
+  const report: CommitReport = { batchId, summary: { total: validated.length, created: 0, flagged: 0, invalid: 0, failed: 0, dispositioned: 0, existing: 0 }, created: [], invalid: [], failed: [], existing: [] };
 
   for (const r of validated) {
+    if (r.existing) {
+      report.existing.push({ row: r.row, leadCode: r.existing.leadCode, warnings: r.warnings });
+      continue;
+    }
     if (!r.lead) {
       report.invalid.push({ row: r.row, errors: r.errors });
       continue;
@@ -661,5 +739,6 @@ export async function commitImport(input: CommitInput): Promise<CommitReport> {
   }
   report.summary.invalid = report.invalid.length;
   report.summary.failed = report.failed.length;
+  report.summary.existing = report.existing.length;
   return report;
 }

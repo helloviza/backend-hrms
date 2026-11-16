@@ -20,7 +20,7 @@
 // Nothing hardcodes "the single global set" or "the single team".
 
 import mongoose, { Document, Schema } from "mongoose";
-import { OPPORTUNITY_PIPELINES, pipelineStage, type OpportunityPipeline } from "./crmTaxonomy.js";
+import { OPPORTUNITY_PIPELINES, type OpportunityPipeline } from "./crmTaxonomy.js";
 import {
   DISPOSITION_STAGES,
   DISPOSITION_STATUSES,
@@ -58,6 +58,9 @@ const DispositionEntrySchema = new Schema<DispositionEntry>(
     opportunityStage: { type: String, trim: true },
     leadStatus: { type: String, required: true, trim: true },
     legacyStage: { type: String, required: true, trim: true },
+    // false = retired: hidden from pickers, refused as a new pick, still valid
+    // for leads already on it. Rows stored before the field read as true.
+    active: { type: Boolean, default: true },
   },
   { _id: false },
 );
@@ -82,14 +85,11 @@ CrmPipelineSchema.index({ key: 1 }, { unique: true });
 CrmPipelineSchema.index({ isDefault: 1, active: 1 });
 
 // A set must be structurally sound AND every "open" stage must exist in the
-// deal pipeline the shadow opportunity is created in.
+// deal pipeline the shadow opportunity is created in (both in
+// validateDispositionSet). Runs on every save — which is why the set-apply
+// script writes through the model, never a raw updateOne.
 CrmPipelineSchema.pre("validate", function (next) {
-  const problems = validateDispositionSet(this.dispositionSet || []);
-  for (const e of this.dispositionSet || []) {
-    if (e.opportunityEffect === "open" && e.opportunityStage && !pipelineStage(this.opportunityPipeline, e.opportunityStage)) {
-      problems.push(`"${e.subDisposition}": opportunityStage "${e.opportunityStage}" is not a stage of ${this.opportunityPipeline}`);
-    }
-  }
+  const problems = validateDispositionSet(this.dispositionSet || [], this.opportunityPipeline);
   if (problems.length) return next(new Error(`dispositionSet invalid: ${problems.join("; ")}`));
   next();
 });

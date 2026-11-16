@@ -8,7 +8,7 @@ import User from '../models/User.js'
 import logger from '../utils/logger.js'
 import { notifyUser } from '../services/notificationDispatch.js'
 import { UserPermission } from '../models/UserPermission.js'
-import { normalizeScope, findVisibleLead, ownsOpportunity, contactMatch, type ScopeCtx } from '../services/crmScope.js'
+import { normalizeScope, findVisibleLead, ownsOpportunity, contactMatch, companyMatch, type ScopeCtx } from '../services/crmScope.js'
 
 const router = express.Router()
 
@@ -46,8 +46,9 @@ const CRM_LINKED_TYPES = ['LEAD', 'OPPORTUNITY', 'CONTACT', 'COMPANY']
  * May the caller open this CRM record? Mirrors each module's own GET /:id
  * (services/crmScope): lead → findVisibleLead on the leads scope, opportunity
  * → ownsOpportunity on the leads scope, contact → contactMatch on the
- * crmContacts scope, company → any crmCompanies access (a company is a shared
- * entity). ADMIN / SUPERADMIN are ALL, exactly as the CRM gates set them.
+ * crmContacts scope, company → companyMatch on the crmCompanies scope (scope
+ * + isPrivate + links to leads, deals and contacts the caller may see).
+ * ADMIN / SUPERADMIN are ALL, exactly as the CRM gates set them.
  */
 async function canSeeCrmRecord(user: AnyObj, linkedType: string, linkedId: string): Promise<boolean> {
   const roles = ((user.roles || []) as string[]).map((r) => String(r).toUpperCase())
@@ -82,9 +83,10 @@ async function canSeeCrmRecord(user: AnyObj, linkedType: string, linkedId: strin
     return !!(await CRMContact.exists({ _id: linkedId, ...contactMatch(ctx) }))
   }
   if (linkedType === 'COMPANY') {
-    if (!ctxFor('crmCompanies')) return false
+    const ctx = ctxFor('crmCompanies')
+    if (!ctx) return false
     const { default: CRMCompany } = await import('../models/CRMCompany.js')
-    return !!(await CRMCompany.exists({ _id: linkedId }))
+    return !!(await CRMCompany.exists({ _id: linkedId, ...(await companyMatch(ctx, { leads: ctxFor('leads'), contacts: ctxFor('crmContacts') })) }))
   }
   return false
 }

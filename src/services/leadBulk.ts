@@ -21,6 +21,9 @@
 //                         status       → the Slice-2 status; the model hook
 //                                        derives the legacy stage, then the
 //                                        same activity + split as a stage move
+//                                        (stage and status answer 409 with
+//                                        CRM_V2_DISPOSITION on — stage follows
+//                                        the disposition there)
 //                         disposition  → services/disposition.ts
 //                                        applyDisposition — derives stage /
 //                                        status, writes the disposition
@@ -46,11 +49,11 @@ import Opportunity from "../models/Opportunity.js";
 import Task from "../models/Task.js";
 import { LEAD_STATUSES, type LeadStatus } from "../models/crmTaxonomy.js";
 import { type DispositionEntry } from "../models/crmDisposition.js";
-import { isCrmV2DispositionEnabled, isCrmV2OpportunityEnabled } from "../config/crmV2.js";
+import { isCrmV2DispositionEnabled, isCrmV2OpportunityEnabled, STAGE_FOLLOWS_DISPOSITION } from "../config/crmV2.js";
 import { applyDisposition } from "./disposition.js";
 import { resolveDispositionCells } from "./leadImport.js";
 import { runOpportunitySplit } from "./leadSplit.js";
-import { resolvePipelineForLead, type PipelineActor } from "./crmPipelines.js";
+import { resolvePipelineForLead, PipelineNotConfiguredError, type PipelineActor } from "./crmPipelines.js";
 import { canManageOthers, ownsLead, type ScopeCtx } from "./crmScope.js";
 import logger from "../utils/logger.js";
 
@@ -140,6 +143,7 @@ export async function validateBulkParams(
       return { action: "reassign", assignedTo, assignedToName };
     }
     case "stage": {
+      if (isCrmV2DispositionEnabled()) throw new BulkError(STAGE_FOLLOWS_DISPOSITION, 409);
       const stage = String(p.stage || "");
       if (!(LEAD_STAGES as readonly string[]).includes(stage)) throw new BulkError(`Invalid stage. Must be one of: ${LEAD_STAGES.join(", ")}`);
       const nextFollowUpDate = parseDate(p.nextFollowUpDate);
@@ -149,6 +153,7 @@ export async function validateBulkParams(
       return { action: "stage", stage: stage as LeadStage, note, nextFollowUpDate };
     }
     case "status": {
+      if (isCrmV2DispositionEnabled()) throw new BulkError(STAGE_FOLLOWS_DISPOSITION, 409);
       if (!isCrmV2OpportunityEnabled()) throw new BulkError("Status changes need CRM_V2_OPPORTUNITY.", 404);
       const status = String(p.status || "").toUpperCase();
       if (!(LEAD_STATUSES as readonly string[]).includes(status)) throw new BulkError(`Invalid status. Must be one of: ${LEAD_STATUSES.join(", ")}`);
@@ -156,7 +161,10 @@ export async function validateBulkParams(
     }
     case "disposition": {
       if (!isCrmV2DispositionEnabled()) throw new BulkError("Dispositions need CRM_V2_DISPOSITION.", 404);
-      const pipeline = await resolvePipelineForLead({});
+      const pipeline = await resolvePipelineForLead({}).catch((e) => {
+        if (e instanceof PipelineNotConfiguredError) throw new BulkError(e.message, e.status);
+        throw e;
+      });
       const r = resolveDispositionCells(String(p.disposition || ""), String(p.subDisposition || ""), pipeline.dispositionSet);
       if ("error" in r) throw new BulkError(r.error);
       const nextFollowUpDate = parseDate(p.nextFollowUpDate);

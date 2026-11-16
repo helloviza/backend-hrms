@@ -217,6 +217,42 @@ export function legacyStageToStatus(stage: string | null | undefined): LeadStatu
   return t ? t.leadStatus : "NEW";
 }
 
+/* ───────────────────────── open / closed lead ─────────────────────────
+ * THE open-lead rule — the Leads page Today pill, follow-up health, overdue
+ * counts, Companies "Open leads" and the Inbox queue all read it (frontend
+ * twin: types/leads isOpenLead):
+ *   • a dispositioned lead is open while its disposition status is Open or
+ *     In-progress (Proposal Mail Sent / Negotiation — lead status CONVERTED,
+ *     disposition Open — is OPEN);
+ *   • a lead WITHOUT a disposition is closed only when it was closed: legacy
+ *     stage won / lost, lead status LOST, or won / onboarded (wonDate — both
+ *     /win paths stamp it). So a legacy lead parked on proposal_sent /
+ *     negotiation (status CONVERTED) is OPEN.
+ * `OPEN_LEAD_MATCH` is the same rule as a Mongo filter; combine it under
+ * `$and` (it carries its own `$or`). */
+export const OPEN_DISPOSITION_STATUSES = ["Open", "In-progress"] as const;
+export const CLOSED_LEGACY_STAGES = ["won", "lost"] as const;
+
+export function isOpenLead(l: { dispositionStatus?: string | null; status?: string | null; stage?: string | null; wonDate?: unknown }): boolean {
+  if (l.dispositionStatus) return (OPEN_DISPOSITION_STATUSES as readonly string[]).includes(l.dispositionStatus);
+  if ((CLOSED_LEGACY_STAGES as readonly string[]).includes(String(l.stage || ""))) return false;
+  if (l.status === "LOST") return false;
+  return !l.wonDate;
+}
+
+export const OPEN_LEAD_MATCH = {
+  $or: [
+    { dispositionStatus: { $in: [...OPEN_DISPOSITION_STATUSES] } },
+    {
+      // `$in: [null, ""]` / `null` also match an ABSENT field (prod rows predate it).
+      dispositionStatus: { $in: [null, ""] },
+      stage: { $nin: [...CLOSED_LEGACY_STAGES] },
+      status: { $ne: "LOST" },
+      wonDate: null,
+    },
+  ],
+};
+
 /** Reverse map so the legacy `Lead.stage` column stays readable for the
  *  unchanged frontend while a flagged write sets `status`. Lossy on purpose
  *  (several legacy stages collapse into one status) — pick the mildest. */

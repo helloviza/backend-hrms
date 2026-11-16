@@ -1380,6 +1380,18 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       const { ensureInvoiceReissueIndexes } = await import("./bootstrap/ensureInvoiceReissueIndexes.js");
       await ensureInvoiceReissueIndexes().catch((e: unknown) => logger.error("[INVOICE INDEXES] ensure failed", { e }));
 
+      // CRM dispositions: seed the default calling pipeline ("Corporate
+      // Calling") when the DB has none. The ONLY automatic seed — requests
+      // never write it (a missing row answers 503); an existing row is left
+      // exactly as stored. Log-and-continue — never crashes boot.
+      const { isCrmV2DispositionEnabled } = await import("./config/crmV2.js");
+      if (isCrmV2DispositionEnabled()) {
+        const { ensureDefaultPipeline } = await import("./services/crmPipelines.js");
+        await ensureDefaultPipeline()
+          .then((p) => logger.info("[CRM PIPELINE] default disposition pipeline ready", { key: p.key, entries: p.dispositionSet.length }))
+          .catch((e: unknown) => logger.error("[CRM PIPELINE] seed failed — disposition routes will answer 503", { e }));
+      }
+
       // WA_HOST=true designates the dedicated WhatsApp host — the always-on
       // Fargate service that owns the single whatsapp-web.js client
       // (clientId "plumtrips-eod"). That host runs ONLY the EOD + Sales Pulse

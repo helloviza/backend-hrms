@@ -52,6 +52,7 @@ const { default: CRMCompany } = await import("../models/CRMCompany.js");
 const { default: User } = await import("../models/User.js");
 const { UserPermission } = await import("../models/UserPermission.js");
 const { default: leadsRouter } = await import("./leads.js");
+const { ensureDefaultPipeline } = await import("../services/crmPipelines.js");
 const { default: oppsRouter } = await import("./opportunities.js");
 const { default: companiesRouter } = await import("./crm.companies.js");
 const { default: contactsRouter } = await import("./crm.contacts.js");
@@ -116,6 +117,8 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await Promise.all([Lead.deleteMany({}), LeadActivity.deleteMany({}), Opportunity.deleteMany({}), CRMContact.deleteMany({}), CRMCompany.deleteMany({})]);
+  // The pipeline row is seeded at startup in prod (server.ts); requests never seed it.
+  await ensureDefaultPipeline();
 });
 
 describe("services/crmScope — the switch", () => {
@@ -367,7 +370,12 @@ describe("aggregates — an OWN rep sees only their own numbers; ALL sees the te
 
 describe("companies / contacts — detail and rollups follow the viewer's scope", () => {
   it("company :id: contacts by the crmContacts scope, deals by the leads scope; list rollups count the viewer's rows", async () => {
-    const co = await CRMCompany.create({ name: "Shared Co", nameNormalized: "shared co", createdBy: OTHER, isPrivate: false } as any);
+    // REP created the company, so REP may open it (GET /:id follows the list
+    // rule — audit P1-4); everything else on it — leads, deals, contacts — is
+    // a mix of REP's and OTHER's rows, which is what the rollups must split.
+    const co = await CRMCompany.create({ name: "Shared Co", nameNormalized: "shared co", createdBy: REP, isPrivate: false } as any);
+    const theirsCo = await CRMCompany.create({ name: "Their Co", nameNormalized: "their co", createdBy: OTHER, isPrivate: false } as any);
+    expect((await get("rep", `/crm/companies/${theirsCo._id}`)).status).toBe(404); // outside OWN scope
     const mineLead = await lead({ assignedTo: REP, assignedToName: "Rep", companyId: co._id });
     const theirLead = await lead({ assignedTo: OTHER, assignedToName: "Other", companyId: co._id });
     await lead({ assignedTo: OTHER, assignedToName: "Other", companyId: co._id, stage: "won", status: "CONVERTED" });
@@ -379,7 +387,7 @@ describe("companies / contacts — detail and rollups follow the viewer's scope"
     ] as any);
 
     const r = await get("rep", `/crm/companies/${co._id}`);
-    expect(r.status).toBe(200); // the company itself is a shared entity
+    expect(r.status).toBe(200);
     expect(r.body.contacts.map((c: any) => c.firstName)).toEqual(["Mine"]);
     expect(r.body.company.contactCount).toBe(1);
     expect(r.body.opportunities.map((o: any) => o.name)).toEqual(["mine"]);

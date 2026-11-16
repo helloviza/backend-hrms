@@ -47,8 +47,9 @@ import ApprovalRequest from "../models/ApprovalRequest.js";
 import { syncRequestFromManualBooking } from "../services/bookingDocuments.js";
 import { bookingsByRequest, requestBookingSummaries, requestBookingSummary } from "../services/requestBookings.js";
 import { isPartnerLeadCase } from "../services/partnerLeadCase.js";
-import { partnerCaseForBooking, partnerRequiredErrors, recordPartnerBookingStatus } from "../services/partnerLeadBooking.js";
+import { partnerCaseForBooking, recordPartnerBookingStatus } from "../services/partnerLeadBooking.js";
 import { isNcLead, ncLeadRequiredErrors } from "../utils/ncLead.js";
+import { HOTEL_TYPES, SUPPLIER_NAME_REQUIRED, GIVEN_BY_REQUIRED, CHECKOUT_REQUIRED, statusGatedRequiredErrors } from "../utils/bookingStatusGate.js";
 import { countedBookingMatch, countedStatusClause, countsInMetrics } from "../utils/bookingMetrics.js";
 import { cancelLinksAfterBookingCancelled } from "../services/paymentRequests.js";
 
@@ -228,16 +229,19 @@ export function invoicePendingDays(b: any): number {
 /* ── Required-field validation ───────────────────────────────────────
  * Mirrors the ManualBookingForm front-end rules so bookings created
  * outside the form (API, imports) can't bypass them. Booking-type matrix:
- *   - supplierName : required for every type
- *   - givenBy      : required for every type (form + create/update API only)
+ *   - supplierName : required for every type  ┐ STATUS-GATED for the form-
+ *   - givenBy      : required for every type  │ driven create/update API:
+ *   - returnDate   : required for HOTEL/      │ optional at PENDING / WIP /
+ *                    DUMMY_HOTEL (check-out)  ┘ CANCELLED, required INTO CONFIRMED —
+ *                    see utils/bookingStatusGate.ts (2026-11-16)
  *   - City         : required for HOTEL/DUMMY_HOTEL (sector OR itinerary.destination)
- *   - returnDate   : required for HOTEL/DUMMY_HOTEL (check-out)
  *   - attachments  : >=1 for ATTACHMENT_REQUIRED_TYPES, CREATE only, and only
  *                    when the payload carries the array (see the rule itself)
- * Import paths (Excel /import, SBT import) carry no givenBy and SBT flights
- * carry no return date, so imports enforce the reduced set (supplier + city).
+ * The base validators below still LIST every rule; statusGatedRequiredErrors
+ * then drops or adds the gated three by status. Import paths (Excel /import,
+ * SBT import) carry no givenBy and SBT flights carry no return date, so
+ * imports enforce the reduced set (supplier + city), unchanged and ungated.
  */
-const HOTEL_TYPES = ["HOTEL", "DUMMY_HOTEL"];
 
 function hotelCityPresent(b: any): boolean {
   return Boolean(
@@ -251,11 +255,11 @@ function hotelCityPresent(b: any): boolean {
 function validateBookingRequired(b: any): string[] {
   const errors: string[] = [];
   const type = String(b?.type ?? "").toUpperCase();
-  if (!String(b?.supplierName ?? "").trim()) errors.push("Supplier Name is required");
-  if (!String(b?.givenBy ?? "").trim()) errors.push("Given By is required");
+  if (!String(b?.supplierName ?? "").trim()) errors.push(SUPPLIER_NAME_REQUIRED);
+  if (!String(b?.givenBy ?? "").trim()) errors.push(GIVEN_BY_REQUIRED);
   if (HOTEL_TYPES.includes(type)) {
     if (!hotelCityPresent(b)) errors.push("City is required for hotel bookings");
-    if (!b?.returnDate) errors.push("Check-out (return) date is required for hotel bookings");
+    if (!b?.returnDate) errors.push(CHECKOUT_REQUIRED);
   }
   // No attachment rule here any more. attachments[] is never part of a
   // create/update body (see rejectClientAttachments), so a payload-shaped
@@ -448,16 +452,16 @@ function validateBookingRequiredForUpdate(merged: any, before: any): string[] {
   const type = String(merged?.type ?? "").toUpperCase();
 
   if (String(before?.supplierName ?? "").trim() && !String(merged?.supplierName ?? "").trim())
-    errors.push("Supplier Name is required");
+    errors.push(SUPPLIER_NAME_REQUIRED);
 
   if (String(before?.givenBy ?? "").trim() && !String(merged?.givenBy ?? "").trim())
-    errors.push("Given By is required");
+    errors.push(GIVEN_BY_REQUIRED);
 
   if (HOTEL_TYPES.includes(type)) {
     if (hotelCityPresent(before) && !hotelCityPresent(merged))
       errors.push("City is required for hotel bookings");
     if (before?.returnDate && !merged?.returnDate)
-      errors.push("Check-out (return) date is required for hotel bookings");
+      errors.push(CHECKOUT_REQUIRED);
   }
 
   return errors;
@@ -826,12 +830,45 @@ async function resolveBookedFromCity(req: any) {
 // a STATUS gate (attachmentGateError above): this route refuses to create a
 // gated type directly in a final status, because nothing can be attached
 // yet — and PUT refuses the transition until something is.
-router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, res: any) => {
+//
+// POST /api/admin/manual-bookings/enquiry — the same create, for a walk-in /
+// phone ENQUIRY logged by staff (ManualBookingForm mode="enquiry", page
+// /admin/manual-bookings/log-enquiry). Identical validation and tenant gate,
+// plus: always PENDING with no sub status, always a plain MANUAL booking (no
+// Book Now link), and the lead passenger needs a phone or an email. The row
+// is tagged metadata.channel = "ADMIN_ENQUIRY" HERE, by the route the
+// request came in on — never from the body: `metadata` is not in
+// CREATE_BODY_FIELDS, so no client can set or spoof the tag on either route.
+export const ADMIN_ENQUIRY_CHANNEL = "ADMIN_ENQUIRY";
+export const ENQUIRY_CONTACT_REQUIRED = "Phone or email is required for the lead passenger";
+
+router.post("/", requirePermission("manualBookings", "WRITE"), (req: any, res: any) => createBooking(req, res, false));
+router.post("/enquiry", requirePermission("manualBookings", "WRITE"), (req: any, res: any) => createBooking(req, res, true));
+
+async function createBooking(req: any, res: any, enquiry: boolean) {
   try {
     const attErr = rejectClientAttachments(req.body);
     if (attErr) return res.status(400).json({ error: attErr });
 
     const body = pickBookingBody(req.body, "create");
+
+    if (enquiry) {
+      const asked = String(body.status || "PENDING").toUpperCase();
+      if (asked !== "PENDING") {
+        return res.status(400).json({ error: "An enquiry is always logged as Pending", code: "ENQUIRY_STATUS" });
+      }
+      if (String(body.source || "MANUAL").toUpperCase() !== "MANUAL" || String(body.sourceBookingId ?? "").trim()) {
+        return res.status(400).json({ error: "An enquiry can't be linked to a request — use Book Now for that", code: "ENQUIRY_SOURCE" });
+      }
+      body.status = "PENDING";
+      body.subStatus = "";
+      body.source = "MANUAL";
+      delete body.sourceBookingId;
+      const lead = Array.isArray(body.passengers) ? body.passengers[0] : null;
+      if (!String(lead?.phone ?? "").trim() && !String(lead?.email ?? "").trim()) {
+        return res.status(400).json({ error: ENQUIRY_CONTACT_REQUIRED, details: [ENQUIRY_CONTACT_REQUIRED] });
+      }
+    }
 
     // TENANT GATE ON CREATE — the same predicate every read/update runs,
     // applied to the booking-to-be. A caller may only create for a customer
@@ -867,14 +904,16 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
     const linked: any = linkedRid && mongoose.isValidObjectId(linkedRid)
       ? await ApprovalRequest.findById(linkedRid).select("customerId meta.source stage adminState").lean()
       : null;
-    // A partner lead case's booking: supplier / given-by optional until Confirmed (services/partnerLeadBooking.ts).
+    // A partner lead case's booking (writes case history rows below).
     const isPartnerBooking = !!linked && isPartnerLeadCase(linked) && String(linked.customerId || "") === String(body.workspaceId);
 
     // A Not Contactable lead needs only the basics (utils/ncLead.ts); every
-    // other status keeps the full rule set (and the partner relaxation).
+    // other status gets the full rule set with supplier / given by / hotel
+    // check-out gated on status — optional at Pending / WIP, required at
+    // Confirmed (utils/bookingStatusGate.ts; every booking, not only partner).
     const vErrors = isNcLead(status, body.subStatus)
       ? ncLeadRequiredErrors({ ...body, status })
-      : partnerRequiredErrors(validateBookingRequired(body), { ...body, status }, isPartnerBooking);
+      : statusGatedRequiredErrors(validateBookingRequired(body), { ...body, status });
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
@@ -927,6 +966,8 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
       // AFTER the spread on purpose: this is derived from the connection, and
       // a client-supplied bookedFromCity must never be able to win.
       bookedFromCity,
+      // Set by the route, never by the body (metadata isn't whitelisted).
+      ...(enquiry ? { metadata: { channel: ADMIN_ENQUIRY_CHANNEL, loggedAt: new Date() } } : {}),
     });
 
     // Task automation hook for pending bookings
@@ -947,10 +988,10 @@ router.post("/", requirePermission("manualBookings", "WRITE"), async (req: any, 
 
     res.status(201).json({ ok: true, booking, requestSync });
   } catch (err: any) {
-    console.error("[ManualBookings POST]", err.message);
+    console.error(enquiry ? "[ManualBookings POST /enquiry]" : "[ManualBookings POST]", err.message);
     res.status(500).json({ error: err.message });
   }
-});
+}
 
 // GET /api/admin/manual-bookings/by-request/:requestId — the live Book Now
 // bookings of one approval request (summary: id, ref, type, status), oldest
@@ -2078,12 +2119,17 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
     // Not Contactable lead: the basics only. Moving OFF an NC sub status: the
     // full create rules, not Option B — an NC lead was allowed to skip fields
     // that Option B would then never ask for again (utils/ncLead.ts).
+    // Either way supplier / given by / hotel check-out are then gated on
+    // status: dropped at Pending / WIP / Cancelled, demanded on the move INTO
+    // Confirmed even when Option B would not ask (a row born without them —
+    // public intake, an admin enquiry — must not reach Done without them),
+    // and Option B again on a row that was already Confirmed. utils/bookingStatusGate.ts.
     const vErrors = isNcLead(booking.status, booking.subStatus)
       ? ncLeadRequiredErrors(booking)
-      : partnerRequiredErrors(
+      : statusGatedRequiredErrors(
           isNcLead(before.status, before.subStatus) ? validateBookingRequired(booking) : validateBookingRequiredForUpdate(booking, before),
           booking,
-          !!partnerCase,
+          before.status,
         );
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });

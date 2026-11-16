@@ -27,6 +27,9 @@
 
 import mongoose from "mongoose";
 import Lead from "../models/Lead.js";
+import Opportunity from "../models/Opportunity.js";
+import CRMContact from "../models/CRMContact.js";
+import { isCrmV2OpportunityEnabled } from "../config/crmV2.js";
 import type express from "express";
 
 type AnyObj = Record<string, any>;
@@ -121,11 +124,93 @@ export function leadMatch(ctx: ScopeCtx): AnyObj {
 export function opportunityMatch(ctx: ScopeCtx): AnyObj {
   return rowsFor(ctx, "ownerUserId");
 }
-/** Contacts: the list's existing rule — assigned to me OR created by me. */
+/**
+ * Contacts — THE rule for list, export, GET /:id, a company page's contacts
+ * and task links (audit P1-3):
+ *   OWN / TEAM / NONE → assigned to me OR created by me;
+ *   ALL + FULL        → every contact;
+ *   ALL otherwise     → the shared view: not private, or created by me.
+ */
 export function contactMatch(ctx: ScopeCtx): AnyObj {
-  if (isAll(ctx)) return {};
+  if (isAll(ctx)) {
+    if (ctx.access === "FULL") return {};
+    return { $or: sharedOrMine(ctx) };
+  }
   if (!ctx.userId) return NOTHING;
   return { $or: [{ assignedTo: ctx.userId }, { createdBy: ctx.userId }] };
+}
+/** The caller's scopes on the modules that link to companies. `null` = no
+ *  access to that module, so it contributes no links. */
+export interface CompanyLinkScopes {
+  /** leads module scope — governs leads AND opportunities (as everywhere). */
+  leads: ScopeCtx | null;
+  /** crmContacts module scope. */
+  contacts: ScopeCtx | null;
+}
+
+/**
+ * Companies linked to work the caller may see, under each module's own rule:
+ * leads (companyId / convertedToCompanyId) by leadMatch, opportunities
+ * (companyId, only under CRM_V2_OPPORTUNITY — the flag that makes them
+ * visible at all) by opportunityMatch, contacts (companyId) by contactMatch.
+ * One query per source, run in parallel; never per row.
+ */
+export async function linkedCompanyIds(links: CompanyLinkScopes): Promise<mongoose.Types.ObjectId[]> {
+  const notNull = { $ne: null };
+  const [leadRows, oppIds, contactIds] = await Promise.all([
+    links.leads
+      ? Lead.aggregate([
+          { $match: leadMatch(links.leads) },
+          { $project: { ids: ["$companyId", "$convertedToCompanyId"] } },
+          { $unwind: "$ids" },
+          { $match: { ids: notNull } },
+          { $group: { _id: "$ids" } },
+        ])
+      : Promise.resolve([] as AnyObj[]),
+    links.leads && isCrmV2OpportunityEnabled()
+      ? Opportunity.distinct("companyId", { ...opportunityMatch(links.leads), companyId: notNull })
+      : Promise.resolve([] as unknown[]),
+    links.contacts
+      ? CRMContact.distinct("companyId", { ...contactMatch(links.contacts), companyId: notNull })
+      : Promise.resolve([] as unknown[]),
+  ]);
+  const seen = new Map<string, mongoose.Types.ObjectId>();
+  for (const raw of [...leadRows.map((r: AnyObj) => r._id), ...oppIds, ...contactIds]) {
+    const s = String(raw || "");
+    if (mongoose.isValidObjectId(s) && !seen.has(s)) seen.set(s, new mongoose.Types.ObjectId(s));
+  }
+  return [...seen.values()];
+}
+
+/**
+ * Companies — THE rule for list, export, GET /:id and task links (audit
+ * P1-3 / P1-4):
+ *   OWN / TEAM / NONE → created by me, OR not private AND linked to a lead,
+ *                       opportunity or contact I may see (linkedCompanyIds);
+ *   ALL               → not private, or created by me. There is no FULL
+ *                       bypass: the company list never had one, so admins
+ *                       do not see another user's private company either.
+ * A private company is visible to its creator only — a link never opens it.
+ * `isPrivate: false` (not `$ne: true`) on purpose — it is the list's
+ * existing match, kept byte-for-byte so no list widens.
+ */
+export async function companyMatch(ctx: ScopeCtx, links: CompanyLinkScopes): Promise<AnyObj> {
+  if (isAll(ctx)) return { $or: sharedOrMine(ctx) };
+  const or: AnyObj[] = [];
+  if (ctx.userId) or.push({ createdBy: ctx.userId });
+  const linked = await linkedCompanyIds(links);
+  if (linked.length) or.push({ _id: { $in: linked }, isPrivate: false });
+  return or.length ? { $or: or } : NOTHING;
+}
+
+/** companyMatch for a route behind requireCRMAccess("crmCompanies"). */
+export function companyMatchFor(req: express.Request): Promise<AnyObj> {
+  return companyMatch(crmScope(req), { leads: moduleScope(req, "leads"), contacts: moduleScope(req, "crmContacts") });
+}
+function sharedOrMine(ctx: ScopeCtx): AnyObj[] {
+  const or: AnyObj[] = [{ isPrivate: false }];
+  if (ctx.userId) or.push({ createdBy: ctx.userId });
+  return or;
 }
 /** Lead activities: rows on the leads the caller may see (a `$in` on lead ids). */
 export async function activityMatch(ctx: ScopeCtx): Promise<AnyObj> {
@@ -145,11 +230,14 @@ export function ownsOpportunity(ctx: ScopeCtx, opp: { ownerUserId?: unknown } | 
   if (isAll(ctx)) return true;
   return !!ctx.userId && String(opp.ownerUserId || "") === String(ctx.userId);
 }
-export function ownsContact(ctx: ScopeCtx, contact: { assignedTo?: unknown; createdBy?: unknown } | null | undefined): boolean {
+export function ownsContact(ctx: ScopeCtx, contact: { assignedTo?: unknown; createdBy?: unknown; isPrivate?: unknown } | null | undefined): boolean {
   if (!contact) return false;
-  if (isAll(ctx)) return true;
-  if (!ctx.userId) return false;
-  const me = String(ctx.userId);
+  const me = ctx.userId ? String(ctx.userId) : "";
+  if (isAll(ctx)) {
+    if (ctx.access === "FULL") return true;
+    return contact.isPrivate === false || (!!me && String(contact.createdBy || "") === me);
+  }
+  if (!me) return false;
   return String(contact.assignedTo || "") === me || String(contact.createdBy || "") === me;
 }
 

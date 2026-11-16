@@ -5,15 +5,17 @@ import ExcelJS from "exceljs";
 import Lead, { LEAD_STAGES, LEAD_SOURCES, effectiveLeadStatus } from "../models/Lead.js";
 import LeadActivity, { ACTIVITY_TYPES } from "../models/LeadActivity.js";
 import Opportunity from "../models/Opportunity.js";
-import { isCrmV2OpportunityEnabled, isCrmV2DispositionEnabled } from "../config/crmV2.js";
+import { isCrmV2OpportunityEnabled, isCrmV2DispositionEnabled, STAGE_FOLLOWS_DISPOSITION } from "../config/crmV2.js";
 import { runOpportunitySplit as runSplit } from "../services/leadSplit.js";
 import { applyDisposition, snapshotOf, DispositionError } from "../services/disposition.js";
-import { resolvePipelineForLead, groupedSet, canWorkPipeline } from "../services/crmPipelines.js";
+import { resolvePipelineForLead, groupedSet, canWorkPipeline, PipelineNotConfiguredError } from "../services/crmPipelines.js";
+import { isActiveEntry } from "../models/crmDisposition.js";
+import { OPEN_LEAD_MATCH } from "../models/crmTaxonomy.js";
 import CRMCompany from "../models/CRMCompany.js";
 import CRMContact from "../models/CRMContact.js";
 import { resolveOrCreateCompany, normalizeCompanyName } from "../utils/crmCompany.js";
 import multer from "multer";
-import { companyCheck, commitImport, dedupeSnapshot, normaliseSource, parseSpreadsheet, suggestMapping, validateRows, IMPORT_FIELDS, IMPORT_FILE_CAP_BYTES, IMPORT_ROW_CAP, type ImportDefaults } from "../services/leadImport.js";
+import { companyCheck, commitImport, dedupeSnapshot, findExistingLeads, normaliseSource, parseSpreadsheet, suggestMapping, validateRows, IMPORT_FIELDS, IMPORT_FILE_CAP_BYTES, IMPORT_ROW_CAP, type ImportDefaults } from "../services/leadImport.js";
 import { buildImportTemplate } from "../services/leadImportTemplate.js";
 import { BulkError, BULK_CAP, resolveBulkTarget, runBulk, validateBulkParams } from "../services/leadBulk.js";
 import type { LeadStage } from "../models/Lead.js";
@@ -79,6 +81,16 @@ async function runOpportunitySplit(lead: any, user: AnyObj): Promise<{ triggered
   const actorName = user.name || `${user.firstName || ""} ${user.lastName || ""}`.trim() || user.email || "System";
   return runSplit(lead, { id: userId(user), name: actorName });
 }
+
+// ── Dispositions drive stage (audit P1-2) ──────────────────────
+// With CRM_V2_DISPOSITION on, Lead.stage / Lead.status are derived from the
+// lead's disposition (services/disposition.ts). The legacy stage writers —
+// PUT /:id/stage, /win, /lose, /convert and bulk stage / status
+// (services/leadBulk.ts) — used to move stage without touching the
+// disposition fields, so the command center (which reads dispositionStatus
+// first) and the Leads tabs (which read stage) disagreed. On, they answer 409
+// after the ownership check; off, they behave exactly as before. The message
+// is STAGE_FOLLOWS_DISPOSITION (config/crmV2.ts), shared with bulk.
 
 // ── requireLeadsAccess ──────────────────────────────────────────
 // Exported: routes/opportunities.ts sits behind the same gate (an opportunity
@@ -159,6 +171,12 @@ function fmtDate(d: Date | null | undefined): string {
   return `${day}/${m}/${y}`;
 }
 
+/** An activity's disposition snapshot as "Disposition / Sub" ("—" when empty). */
+function dispoText(snap: { disposition?: string; subDisposition?: string } | null | undefined): string {
+  if (!snap || (!snap.disposition && !snap.subDisposition)) return "—";
+  return [snap.disposition, snap.subDisposition].filter(Boolean).join(" / ");
+}
+
 // ── Shared export filter resolver ───────────────────────────────
 // Lets the XLSX exports match the Owner-Status report's on-screen slice.
 // ADDITIVE + backward-compatible:
@@ -201,6 +219,21 @@ async function resolveExportLeads(
   if (stageF.length) exportMatch.stage = { $in: stageF };
   if (sourceF.length) exportMatch.source = { $in: sourceF };
   if (typeF.length) exportMatch.type = { $in: typeF };
+  // The Leads page's own filters, read exactly as GET / reads them, so the
+  // export's rows are the list's rows: disposition / subDisposition, the
+  // Today cutoff (dueBefore) and the search box.
+  Object.assign(exportMatch, dispositionFilter(q));
+  if (q.dueBefore) {
+    const cutoff = new Date(String(q.dueBefore));
+    if (!isNaN(cutoff.getTime())) {
+      exportMatch.nextFollowUpDate = { $lt: cutoff };
+      exportMatch.$and = [...(exportMatch.$and || []), OPEN_LEAD_MATCH];
+    }
+  }
+  if (q.search) {
+    const re = new RegExp(String(q.search).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    exportMatch.$and = [...(exportMatch.$and || []), { $or: [{ contactName: re }, { companyName: re }, { contactPhone: re }, { contactEmail: re }] }];
+  }
 
   // Legacy date basis (createdAt) — unchanged for existing callers.
   // ignoreDateFilter ⇒ owner/status/source/type + OWN scope only (the activities
@@ -410,8 +443,14 @@ router.get("/dispositions", async (req, res) => {
           nextTouch: e.nextTouch, opportunityEffect: e.opportunityEffect, opportunityStage: e.opportunityStage ?? null,
         })),
       })),
+      // ?includeInactive=1 — the retired subs too, for FILTERING old leads only
+      // (never offered as a pick). In set order, with their group name.
+      ...(String((req.query as AnyObj).includeInactive || "") === "1"
+        ? { inactive: pipeline.dispositionSet.filter((e) => !isActiveEntry(e)).map((e) => ({ disposition: e.disposition, subDisposition: e.subDisposition })) }
+        : {}),
     });
   } catch (err) {
+    if (err instanceof PipelineNotConfiguredError) return res.status(err.status).json({ error: err.message });
     logger.error("leads GET /dispositions error", { err });
     return res.status(500).json({ error: "Failed to load dispositions." });
   }
@@ -495,7 +534,15 @@ async function loadImportDefaults(req: express.Request, raw: AnyObj, assignedTo:
   if (ownerId !== importerId && !ownerName) return { error: "assignedTo is not a known user." };
 
   const reps = (await listCrmReps()).map((r) => ({ id: r._id, name: r.name, email: r.email }));
-  const dispositionSet = isCrmV2DispositionEnabled() ? (await resolvePipelineForLead({})).dispositionSet : null;
+  let dispositionSet: ImportDefaults["dispositionSet"] = null;
+  if (isCrmV2DispositionEnabled()) {
+    try {
+      dispositionSet = (await resolvePipelineForLead({})).dispositionSet;
+    } catch (e) {
+      if (e instanceof PipelineNotConfiguredError) return { error: e.message };
+      throw e;
+    }
+  }
   return { source: src, owner: { id: ownerId, name: ownerName }, reps, lockOwnerTo: all ? null : importerId, dispositionSet };
 }
 
@@ -517,6 +564,7 @@ router.get("/import/template", async (req, res) => {
     await workbook.xlsx.write(res as any);
     res.end();
   } catch (err) {
+    if (err instanceof PipelineNotConfiguredError) return res.status(err.status).json({ error: err.message });
     logger.error("leads GET /import/template error", { err });
     return res.status(500).json({ error: "Could not build the template." });
   }
@@ -555,6 +603,7 @@ router.post("/import/preview", importUpload.single("file"), async (req, res) => 
     const defaults = await loadImportDefaults(req, parseJson(body.defaults) || {}, body.assignedTo);
     if ("error" in defaults) return res.status(400).json({ error: defaults.error });
 
+    defaults.existingLeads = await findExistingLeads(rows, mapping);
     const validated = validateRows(rows, mapping, defaults);
     const snapshot = await dedupeSnapshot(validated.filter((r) => r.lead));
     const seeAll = isAll(leadScope(req));
@@ -565,6 +614,8 @@ router.post("/import/preview", importUpload.single("file"), async (req, res) => 
         row: r.row,
         values: r.values,
         valid: !!r.lead,
+        // A lead already in the CRM (its leadCode) — skipped, not an error.
+        existing: r.existing ? { leadCode: r.existing.leadCode } : null,
         errors: r.errors,
         warnings: r.warnings,
         // What the row will land as — so the preview can show it before anything is written.
@@ -596,7 +647,8 @@ router.post("/import/preview", importUpload.single("file"), async (req, res) => 
       summary: {
         total: out.length,
         valid: out.filter((r) => r.valid).length,
-        invalid: out.filter((r) => !r.valid).length,
+        invalid: out.filter((r) => !r.valid && !r.existing).length,
+        existing: out.filter((r) => r.existing).length,
         flagged: out.filter((r) => r.valid && r.duplicate).length,
       },
     });
@@ -622,6 +674,7 @@ router.post("/import/commit", async (req, res) => {
     if ("error" in defaults) return res.status(400).json({ error: defaults.error });
 
     // Every row must be valid up front — the batch never starts half-baked.
+    defaults.existingLeads = await findExistingLeads(rows, body.mapping);
     const validated = validateRows(rows, body.mapping, defaults);
     if (!validated.some((r) => r.lead)) {
       return res.status(400).json({ error: "No valid rows to import.", invalid: validated.map((r) => ({ row: r.row, errors: r.errors })) });
@@ -784,6 +837,27 @@ async function enrichLeads(leads: any[]): Promise<any[]> {
   });
 }
 
+/** Case-insensitive EXACT match of one value ("" / absent → no filter). */
+function exactCi(v: unknown): RegExp | null {
+  const t = String(v ?? "").trim();
+  if (!t) return null;
+  return new RegExp("^" + t.replace(/[.*+?^$(){}|[\]\\]/g, "\\$&") + "$", "i");
+}
+/**
+ * The Leads page's disposition filters: ?disposition= (the group) and
+ * ?subDisposition=, each a case-insensitive exact match on the stored lead
+ * field. Retired subs match too — a filter finds old leads, it is not a pick.
+ * Legacy leads (no disposition) never match a non-empty filter.
+ */
+export function dispositionFilter(q: AnyObj): AnyObj {
+  const f: AnyObj = {};
+  const d = exactCi(q.disposition);
+  const sd = exactCi(q.subDisposition);
+  if (d) f.disposition = d;
+  if (sd) f.subDisposition = sd;
+  return f;
+}
+
 /**
  * The Full Table's filter contract, as ONE Mongo filter: the caller's scope
  * (OWN pins assignedTo, ALL honours the param) + stage / source / companyId /
@@ -807,6 +881,7 @@ export function leadListFilter(req: express.Request, q: AnyObj): AnyObj {
     filter.stage = { $in: stages };
   }
   if (q.source) filter.source = q.source;
+  Object.assign(filter, dispositionFilter(q));
 
   // Additive read filter — used by the lead form's CompanyPicker to count how
   // many leads already exist for a picked canonical company (dedup context).
@@ -817,10 +892,15 @@ export function leadListFilter(req: express.Request, q: AnyObj): AnyObj {
   // Additive read filter — the Leads page's Today view (ask #11): follow-up
   // overdue or due today. The client sends its own end-of-day cutoff (its
   // timezone), so "today" here is exactly the Inbox's derivation:
-  // nextFollowUpDate < startOfTomorrow.
+  // nextFollowUpDate < startOfTomorrow. OPEN leads only (crmTaxonomy
+  // OPEN_LEAD_MATCH) — a Won / Lost lead is never "today" work, even when a
+  // pre-fix row still carries a follow-up date.
   if (q.dueBefore) {
     const cutoff = new Date(String(q.dueBefore));
-    if (!isNaN(cutoff.getTime())) filter.nextFollowUpDate = { $lt: cutoff };
+    if (!isNaN(cutoff.getTime())) {
+      filter.nextFollowUpDate = { $lt: cutoff };
+      filter.$and = [...(filter.$and || []), OPEN_LEAD_MATCH];
+    }
   }
 
   if (q.dateFrom || q.dateTo) {
@@ -1289,8 +1369,9 @@ router.get("/reports/activity", async (req, res) => {
 });
 
 // ── GET /reports/follow-up-health?todayStart=&dueBefore=&owner=&source= ──
-// The Inbox's definitions, counted server-side over OPEN leads (effective
-// disposition Open / In-progress):
+// The Inbox's definitions, counted server-side over OPEN leads — the Leads
+// page / Inbox rule (crmTaxonomy OPEN_LEAD_MATCH), so this card, the Leads
+// page Today pill and its Overdue Follow-ups KPI agree on the same data:
 //   dueToday    nextFollowUpDate in [todayStart, dueBefore)
 //   overdue     nextFollowUpDate < now                (Inbox isOverdue)
 //   noNextAction no nextFollowUpDate at all
@@ -1309,9 +1390,7 @@ router.get("/reports/follow-up-health", async (req, res) => {
     const mine = ownerSourceScope(req);
     const [agg, untouched] = await Promise.all([
       Lead.aggregate([
-        { $match: mine },
-        { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR } },
-        { $match: { $expr: IS_OPEN } },
+        { $match: { $and: [mine, OPEN_LEAD_MATCH] } },
         {
           $group: {
             _id: null,
@@ -1324,9 +1403,9 @@ router.get("/reports/follow-up-health", async (req, res) => {
       ]),
       // NEW leads older than a day with no activity at all — the Inbox's second SLA fact.
       Lead.aggregate([
-        { $match: mine },
-        { $addFields: { effStatus: EFFECTIVE_STATUS_EXPR, effLead: EFFECTIVE_LEAD_STATUS_EXPR } },
-        { $match: { $expr: { $and: [IS_OPEN, { $eq: ["$effLead", "NEW"] }, { $lt: ["$createdAt", dayAgo] }, { $or: [{ $eq: [{ $ifNull: ["$nextFollowUpDate", null] }, null] }, { $gte: ["$nextFollowUpDate", now] }] }] } } },
+        { $match: { $and: [mine, OPEN_LEAD_MATCH] } },
+        { $addFields: { effLead: EFFECTIVE_LEAD_STATUS_EXPR } },
+        { $match: { $expr: { $and: [{ $eq: ["$effLead", "NEW"] }, { $lt: ["$createdAt", dayAgo] }, { $or: [{ $eq: [{ $ifNull: ["$nextFollowUpDate", null] }, null] }, { $gte: ["$nextFollowUpDate", now] }] }] } } },
         { $lookup: { from: LeadActivity.collection.name, localField: "_id", foreignField: "leadId", as: "acts", pipeline: [{ $limit: 1 }, { $project: { _id: 1 } }] } },
         { $match: { acts: { $size: 0 } } },
         { $count: "n" },
@@ -1601,6 +1680,10 @@ router.get("/export", async (req, res) => {
       "Designation", "Source", "Stage", "Budget", "Deal Value", "Currency",
       "Assigned To", "Next Follow Up", "Lost Reason", "Won Date",
       "Created At", "Notes",
+      // Disposition slice. Headers are the importer's aliases (Disposition /
+      // Sub-disposition / Disposition date), so an export re-imports; the
+      // status is derived from the sub on import and has no import column.
+      "Disposition", "Sub-disposition", "Disposition Status", "Disposition Date",
     ];
 
     const headerRow = sheet.addRow(columns);
@@ -1608,7 +1691,7 @@ router.get("/export", async (req, res) => {
     headerRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF00477F" } };
     headerRow.alignment = { vertical: "middle" };
 
-    const colWidths = [14, 10, 22, 18, 12, 16, 20, 16, 24, 16, 12, 14, 12, 12, 10, 18, 16, 20, 14, 18, 30];
+    const colWidths = [14, 10, 22, 18, 12, 16, 20, 16, 24, 16, 12, 14, 12, 12, 10, 18, 16, 20, 14, 18, 30, 16, 26, 16, 16];
     colWidths.forEach((w, i) => { sheet.getColumn(i + 1).width = w; });
 
     for (const l of leads as any[]) {
@@ -1634,6 +1717,10 @@ router.get("/export", async (req, res) => {
         fmtDate(l.wonDate),
         fmtDate(l.createdAt),
         l.notes || "",
+        l.disposition || "",
+        l.subDisposition || "",
+        l.dispositionStatus || "",
+        fmtDate(l.dispositionAt),
       ]);
     }
 
@@ -1731,6 +1818,8 @@ router.get("/export/activities", async (req, res) => {
       { header: "Note / Description", key: "note", width: 45 },
       { header: "From Stage", key: "fromStage", width: 18 },
       { header: "To Stage", key: "toStage", width: 18 },
+      { header: "Disposition From", key: "dispoFrom", width: 34 },
+      { header: "Disposition To", key: "dispoTo", width: 34 },
       { header: "Done By", key: "createdByName", width: 22 },
       { header: "Date & Time", key: "createdAt", width: 22 },
     ];
@@ -1750,6 +1839,9 @@ router.get("/export/activities", async (req, res) => {
         note: activity.note ? namedNote(activity.note) : "—",
         fromStage: activity.fromStage || "—",
         toStage: activity.toStage || "—",
+        // disposition rows only: "Disposition / Sub" each side ("—" for a fresh lead's from)
+        dispoFrom: activity.type === "disposition" ? dispoText(activity.disposition?.from) : "",
+        dispoTo: activity.type === "disposition" ? dispoText(activity.disposition?.to) : "",
         createdByName: activity.createdByName ||
           userMap.get(activity.createdBy?.toString()) ||
           "—",
@@ -1787,7 +1879,8 @@ router.get("/export/activities", async (req, res) => {
 router.get("/counts-by-stage", async (req, res) => {
   try {
     const agg = await Lead.aggregate([
-      { $match: leadMatch(leadScope(req)) },
+      // caller scope + the Leads page's disposition filter (none → whole scope)
+      { $match: { ...leadMatch(leadScope(req)), ...dispositionFilter(req.query as AnyObj) } },
       { $group: { _id: "$stage", count: { $sum: 1 } } },
     ]);
     const counts: Record<string, number> = {};
@@ -1816,8 +1909,13 @@ router.get("/pipeline-summary", async (req, res) => {
   try {
     // Caller scope + the command center's owner / source (no params → the
     // caller's whole scope, which is what the Leads page header asks for).
-    const mine = ownerSourceScope(req);
-    const mineActs = await ownerSourceActivityMatch(req);
+    // + the Leads page's disposition filter, so the kanban headers and KPIs
+    // count the same leads the columns show.
+    const dispoF = dispositionFilter(req.query as AnyObj);
+    const mine = { ...ownerSourceScope(req), ...dispoF };
+    const mineActs = Object.keys(dispoF).length
+      ? { leadId: { $in: await Lead.distinct("_id", mine) } }
+      : await ownerSourceActivityMatch(req);
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
@@ -1842,9 +1940,10 @@ router.get("/pipeline-summary", async (req, res) => {
           { $match: mine },
           { $group: { _id: "$stage", count: { $sum: 1 }, sumValue: { $sum: "$dealValue" } } },
         ]),
-        // per-stage follow-ups due (date set and not in the future)
+        // per-stage follow-ups due (date set and not in the future) — OPEN
+        // leads only, the Leads page / Inbox rule (OPEN_LEAD_MATCH)
         Lead.aggregate([
-          { $match: { ...mine, nextFollowUpDate: { $ne: null, $lte: now } } },
+          { $match: { $and: [mine, { nextFollowUpDate: { $ne: null, $lte: now } }, OPEN_LEAD_MATCH] } },
           { $group: { _id: "$stage", due: { $sum: 1 } } },
         ]),
         // open pipeline: summed value + active count (everything except won/lost)
@@ -1857,8 +1956,9 @@ router.get("/pipeline-summary", async (req, res) => {
           { $match: { ...mine, stage: "won", wonDate: { $gte: startOfMonth } } },
           { $group: { _id: null, value: { $sum: "$dealValue" } } },
         ]),
-        // overdue follow-ups across open stages (strictly past due)
-        Lead.countDocuments({ ...mine, stage: { $nin: CLOSED }, nextFollowUpDate: { $lt: now } }),
+        // overdue follow-ups across OPEN leads (strictly past due) — the same
+        // open rule as the Today pill and the Inbox, not just "stage not won/lost"
+        Lead.countDocuments({ $and: [mine, { nextFollowUpDate: { $lt: now } }, OPEN_LEAD_MATCH] }),
         // trend inputs
         Lead.countDocuments({ ...mine, stage: { $nin: CLOSED }, createdAt: { $gte: weekAgo } }),
         LeadActivity.countDocuments({ ...mineActs, type: "won", createdAt: { $gte: startOfMonth } }),
@@ -1982,24 +2082,30 @@ router.put("/:id", async (req, res) => {
       return res.status(400).json({ error: "Cannot edit a closed lead." });
     }
 
-    const PROTECTED = new Set([
-      "_id", "leadCode", "stage", "createdBy", "createdAt",
-      "wonDate", "lostReason", "onboardingInviteSent",
-      // companyId is resolved server-side from companyName/type below — never
-      // accept it raw from the client.
-      "companyId",
-      // Slice 2: derived by the model hook / the split service, never client-set.
-      "status", "opportunityId", "workspaceId",
-      // Disposition slice: derived from the pipeline set by POST /:id/disposition.
-      "pipelineId", "disposition", "subDisposition", "dispositionStage", "dispositionStatus", "dispositionAt",
-    ]);
+    // ALLOW-list (audit P1-1): exactly the fields the two lead edit forms
+    // offer — pages/crm/LeadDetailV2.tsx EDITABLE and the legacy
+    // pages/admin/LeadDetail.tsx edit grid. Everything else is ignored and
+    // echoed back in `ignored`, never written:
+    //   • owner (assignedTo / assignedToName) — only POST /:id/assign, which
+    //     carries the FULL gate, the assignment activity and the task /
+    //     opportunity cascade;
+    //   • conversion links (convertedTo*), import bookkeeping
+    //     (importBatchId, possibleDuplicateOf), onboarding*, attribution;
+    //   • everything derived: stage, status, every disposition field,
+    //     opportunityId, companyId (re-anchored below from companyName).
+    // The legacy form posts the whole lead back, so unknown keys are ignored
+    // rather than rejected.
+    const EDITABLE = [
+      "contactName", "contactPhone", "contactEmail", "contactDesignation",
+      "companyName", "industry", "companySize", "location", "address", "website", "gstin",
+      "budget", "dealValue", "currency", "notes", "nextFollowUpDate",
+    ] as const;
 
-    const body = req.body as AnyObj;
-    const hadFollowUpDate = !!(lead as any).nextFollowUpDate;
-    for (const key of Object.keys(body)) {
-      if (!PROTECTED.has(key)) {
-        (lead as any)[key] = body[key];
-      }
+    const body = (req.body || {}) as AnyObj;
+    const allowed = new Set<string>(EDITABLE);
+    const ignored = Object.keys(body).filter((k) => !allowed.has(k));
+    for (const key of EDITABLE) {
+      if (key in body) (lead as any)[key] = body[key];
     }
 
     // Re-anchor on the (post-edit) company. Null it when the lead is now an
@@ -2041,7 +2147,7 @@ router.put("/:id", async (req, res) => {
       }
     }
 
-    return res.json({ lead });
+    return res.json({ lead, ...(ignored.length ? { ignored } : {}) });
   } catch (err) {
     logger.error("leads PUT /:id error", { err });
     return res.status(500).json({ error: "Failed to update lead." });
@@ -2080,6 +2186,7 @@ router.put("/:id/stage", async (req, res) => {
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
     if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
+    if (isCrmV2DispositionEnabled()) return res.status(409).json({ error: STAGE_FOLLOWS_DISPOSITION });
 
     const user = (req as any).user as AnyObj;
     const fromStage = lead.stage;
@@ -2177,6 +2284,7 @@ router.get("/:id/dispositions", async (req, res) => {
       opportunityId: (lead as any).opportunityId ? String((lead as any).opportunityId) : null,
     });
   } catch (err) {
+    if (err instanceof PipelineNotConfiguredError) return res.status(err.status).json({ error: err.message });
     logger.error("leads GET /:id/dispositions error", { err });
     return res.status(500).json({ error: "Failed to load dispositions." });
   }
@@ -2214,7 +2322,7 @@ router.post("/:id/disposition", async (req, res) => {
       followUpTask: result.followUpTask,
     });
   } catch (err: any) {
-    if (err instanceof DispositionError) return res.status(err.status).json({ error: err.message });
+    if (err instanceof DispositionError || err instanceof PipelineNotConfiguredError) return res.status(err.status).json({ error: err.message });
     logger.error("leads POST /:id/disposition error", { err });
     return res.status(500).json({ error: "Failed to save disposition." });
   }
@@ -2429,6 +2537,7 @@ router.post("/:id/win", async (req, res) => {
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
     if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
+    if (isCrmV2DispositionEnabled()) return res.status(409).json({ error: STAGE_FOLLOWS_DISPOSITION });
 
     const user = (req as any).user as AnyObj;
 
@@ -2539,6 +2648,7 @@ router.post("/:id/lose", async (req, res) => {
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
     if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
+    if (isCrmV2DispositionEnabled()) return res.status(409).json({ error: STAGE_FOLLOWS_DISPOSITION });
 
     const { lostReason = "" } = req.body as AnyObj;
     const user = (req as any).user as AnyObj;
@@ -2584,6 +2694,7 @@ router.post("/:id/convert", async (req, res) => {
     const lead = await Lead.findById(req.params.id);
     if (!lead) return res.status(404).json({ error: "Lead not found." });
     if (!ownsLead(leadScope(req), lead)) return res.status(403).json({ error: "This lead is owned by someone else." });
+    if (isCrmV2DispositionEnabled()) return res.status(409).json({ error: STAGE_FOLLOWS_DISPOSITION });
 
     if (lead.convertedToContactId) {
       return res.status(409).json({
