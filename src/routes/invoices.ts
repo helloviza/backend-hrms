@@ -220,6 +220,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
 import CreditNote from "../models/CreditNote.js";
 import { generateInvoicePdf, prefetchInvoiceAssets } from "../utils/invoicePdf.js";
+import { REGISTER_GST_COLUMNS, registerGstCells } from "../utils/invoiceRegister.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { buildLineItemsForBooking } from "../utils/invoiceLineItems.js";
 import { detectGSTType, calculateGSTAmounts, type GSTType } from "../utils/gstDetection.js";
@@ -710,6 +711,8 @@ const INVOICE_COLUMNS = [
   "Paid At",
   "Terms",
   "Notes",
+  // GST columns (utils/invoiceRegister.ts) — stored fields, any layout.
+  ...REGISTER_GST_COLUMNS,
 ];
 
 function invoiceToRow(inv: any): (string | number | undefined)[] {
@@ -730,6 +733,7 @@ function invoiceToRow(inv: any): (string | number | undefined)[] {
     inv.paidAt ? new Date(inv.paidAt).toLocaleDateString("en-IN") : "",
     inv.terms || "Due on Receipt",
     inv.notes || "",
+    ...registerGstCells(inv),
   ];
 }
 
@@ -1111,11 +1115,15 @@ router.get("/export", requirePermission("invoices", "READ"), async (req: any, re
     const headerRow = sheet.addRow(INVOICE_COLUMNS);
     headerRow.font = { bold: true };
 
-    const colWidths = [18, 15, 25, 20, 30, 20, 14, 14, 12, 14, 12, 15, 14, 14, 18, 25];
+    const colWidths = [18, 15, 25, 20, 30, 20, 14, 14, 12, 14, 12, 15, 14, 14, 18, 25,
+      // GST columns: Taxable, Pass-through, CGST, SGST, UTGST, IGST, Supply Type, Place of Supply, Client GSTIN, Layout
+      14, 18, 12, 12, 12, 12, 13, 20, 22, 14];
     colWidths.forEach((w, i) => { sheet.getColumn(i + 1).width = w; });
 
     // Monetary columns: Subtotal=8, Total GST=9, Grand Total=10
     [8, 9, 10].forEach((ci) => { sheet.getColumn(ci).numFmt = "#,##0.00"; });
+    // Taxable Value, Pass-through, CGST, SGST, UTGST, IGST = columns 17-22.
+    [17, 18, 19, 20, 21, 22].forEach((ci) => { sheet.getColumn(ci).numFmt = "#,##0.00"; });
 
     for (const inv of docs) sheet.addRow(invoiceToRow(inv));
 
@@ -2686,6 +2694,44 @@ router.post("/:id/revert-to-draft", requirePermission("invoices", "WRITE"), asyn
 });
 
 /* ── PDF ──────────────────────────────────────────────────────── */
+
+// GET /api/admin/invoices/:id/internal-copy
+// Plumtrips staff only: an ALL_INCLUSIVE invoice rendered in the Separate
+// layout, stamped "INTERNAL COPY – NOT A TAX INVOICE – NOT FOR CUSTOMER" on
+// every page. Streamed straight back: never written to S3 or pdfUrl, never
+// emailed, and no customer route can produce it (only this one passes
+// internalCopy). Same permission as viewing invoices, plus Plumtrips staff
+// only (requirePlatformStaff, as on every write here): a customer company's
+// admin can view its invoices in admin but gets 403 here.
+router.get("/:id/internal-copy", requirePermission("invoices", "READ"), requirePlatformStaff, async (req: any, res: any) => {
+  try {
+    // Belt and braces: never for a caller confined to one tenant.
+    if (invoiceTenantClause(req) !== null) {
+      return res.status(403).json({ error: "Internal copies are for Plumtrips staff only" });
+    }
+    const invoice = mongoose.Types.ObjectId.isValid(req.params.id)
+      ? await Invoice.collection.findOne({ _id: new mongoose.Types.ObjectId(req.params.id) })
+      : null;
+    if (!invoice || !(await invoiceInCallerScope(req, invoice))) return res.status(404).json({ error: "Invoice not found" });
+    if ((invoice as any).invoiceLayout !== "ALL_INCLUSIVE") {
+      return res.status(400).json({ error: "An internal copy is only for All-inclusive invoices — this invoice's own PDF already shows the breakdown." });
+    }
+
+    const enrichedClient = await enrichClientDetails(invoice);
+    const pdf = await generateInvoicePdf(
+      { ...invoice, clientDetails: enrichedClient } as any,
+      undefined,
+      { paid: invoice.status === "PAID", internalCopy: true },
+    );
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${invoice.invoiceNo}-INTERNAL-COPY.pdf"`);
+    res.setHeader("Cache-Control", "no-store");
+    res.end(pdf);
+  } catch (err: any) {
+    console.error("[Invoices internal copy]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // POST /api/admin/invoices/:id/pdf
 router.post("/:id/pdf", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {

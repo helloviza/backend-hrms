@@ -178,7 +178,16 @@ export interface InvoicePdfOptions {
    * against an already-captured Razorpay payment.
    */
   paid?: boolean;
+  /**
+   * Staff-only internal copy (GET /api/admin/invoices/:id/internal-copy):
+   * renders the SEPARATE layout whatever invoice.invoiceLayout says, stamped
+   * INTERNAL_COPY_LABEL on every page. Never stored, emailed or shown to the
+   * customer — only that route sets it.
+   */
+  internalCopy?: boolean;
 }
+
+export const INTERNAL_COPY_LABEL = "INTERNAL COPY – NOT A TAX INVOICE – NOT FOR CUSTOMER";
 
 /* ── Main export ────────────────────────────────────── */
 export async function generateInvoicePdf(
@@ -250,7 +259,9 @@ export async function generateInvoicePdf(
   // ALL_INCLUSIVE (utils/invoiceLayout.ts): one all-in row per booking, no tax
   // columns or tax totals; the GST charged is stated once under the table.
   // Rendered from the same stored lines, so the Total is unchanged.
-  const allInclusive = (invoice as any).invoiceLayout === "ALL_INCLUSIVE";
+  // The internal copy always shows the itemised (Separate) breakdown.
+  const internalCopy = options.internalCopy === true;
+  const allInclusive = !internalCopy && (invoice as any).invoiceLayout === "ALL_INCLUSIVE";
   const allInclusiveRows = allInclusive ? buildAllInclusiveRows(lineItems as any[]) : [];
   const itemisedLines = allInclusive ? [] : lineItems;
 
@@ -264,7 +275,9 @@ export async function generateInvoicePdf(
     const doc = new PDFDocument({
       size: "A4",
       margins: { top: M, bottom: M, left: M, right: M },
-      info: { Title: `Tax Invoice ${invoice.invoiceNo}` },
+      info: { Title: internalCopy ? `${INTERNAL_COPY_LABEL} ${invoice.invoiceNo}` : `Tax Invoice ${invoice.invoiceNo}` },
+      // Only the internal copy revisits pages (to stamp each one at the end).
+      ...(internalCopy ? { bufferPages: true } : {}),
     });
 
     if (useNoto) {
@@ -340,7 +353,7 @@ export async function generateInvoicePdf(
 
     // "TAX INVOICE" + invoice number + invoice date below logo
     doc.fillColor(C_PRIMARY).fontSize(26).font(FONT_BOLD)
-      .text("TAX INVOICE", L, logoBottomY + 6, { width: LEFT_COL_W, lineBreak: false });
+      .text(internalCopy ? "INTERNAL COPY" : "TAX INVOICE", L, logoBottomY + 6, { width: LEFT_COL_W, lineBreak: false });
     doc.fontSize(12).font(FONT_NORMAL).fillColor(C_MID)
       .text(`# ${invoice.invoiceNo}`, L, logoBottomY + 36, { width: LEFT_COL_W, lineBreak: false });
     const invoiceDateDisplay = fmtDate((invoice as any).invoiceDate || invoice.generatedAt);
@@ -861,6 +874,33 @@ export async function generateInvoicePdf(
         const logoStartX = L + CW / 2 + logoTextW / 2 + 4;
         doc.image(FOOTER_LOGO_PATH, logoStartX, footerY - 1, { height: 8, fit: [32, 8] });
       } catch { /* logo draw failed — skip */ }
+    }
+
+    if (internalCopy) {
+      // Every page: a red band in the top and bottom margins and a faint
+      // diagonal watermark across the body. Drawn last, inside the margins,
+      // so the itemised layout underneath is exactly the Separate one.
+      const range = doc.bufferedPageRange();
+      for (let i = range.start; i < range.start + range.count; i++) {
+        doc.switchToPage(i);
+        const pageMargins = doc.page.margins;
+        doc.page.margins = { top: 0, bottom: 0, left: 0, right: 0 };
+        for (const bandY of [6, PG_H - 26]) {
+          doc.save();
+          doc.rect(0, bandY, PG_W, 20).fill("#B91C1C");
+          doc.fillColor("#FFFFFF").font(FONT_BOLD).fontSize(10)
+            .text(INTERNAL_COPY_LABEL, 0, bandY + 5, { width: PG_W, align: "center", lineBreak: false });
+          doc.restore();
+        }
+        doc.save();
+        doc.rotate(-35, { origin: [PG_W / 2, PG_H / 2] });
+        doc.fillColor("#B91C1C").fillOpacity(0.12).font(FONT_BOLD).fontSize(54)
+          .text("INTERNAL COPY", 0, PG_H / 2 - 60, { width: PG_W, align: "center", lineBreak: false });
+        doc.fontSize(22)
+          .text("NOT A TAX INVOICE – NOT FOR CUSTOMER", 0, PG_H / 2 + 4, { width: PG_W, align: "center", lineBreak: false });
+        doc.restore();
+        doc.page.margins = pageMargins;
+      }
     }
 
     doc.end();
