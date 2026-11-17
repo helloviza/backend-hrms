@@ -237,6 +237,7 @@ import User from "../models/User.js";
 import { buildInvoiceQueryFilter } from "./invoices.filters.js";
 import { partnerBookingIds } from "../services/partnerLeadBooking.js";
 import { normalizeGstStatus } from "../utils/customerGst.js";
+import type { InvoiceLayout } from "../utils/invoiceLayout.js";
 import { cancelLinksAfterSubjectCancelled } from "../services/paymentRequests.js";
 import {
   billingOwnUserId, bookingCreatorClause, ownInvoiceClause, invoiceOwnedBy, bookingRefsNotCreatedBy,
@@ -626,6 +627,13 @@ router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ
       });
     }
 
+    // The popup's layout choice: All-inclusive is offered only to a B2C client,
+    // preselected from the client's Business Profiles default.
+    const layoutInfo = {
+      customerGstStatus: normalizeGstStatus(customer.gstStatus),
+      defaultInvoiceLayout: customer.defaultInvoiceLayout || "SEPARATE",
+    };
+
     const { invoiceWorkspaceId, workspace } = await resolveInvoiceWorkspace(customer._id);
     try {
       const ctx = buildInvoiceContext(customer, workspace, companySettings, invoiceWorkspaceId, {
@@ -639,6 +647,7 @@ router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ
       return res.json({
         ok: true,
         customerFound: true,
+        ...layoutInfo,
         supplierState: ctx.detection.supplierState,
         supplierGstin: ctx.issuerDetails.gstin,
         customerState: ctx.detection.customerState,
@@ -655,6 +664,7 @@ router.get("/gst-preview", requireWorkspace, requirePermission("invoices", "READ
         return res.json({
           ...unresolved,
           customerFound: true,
+          ...layoutInfo,
           customerState: customerStateOverride || resolveCustomerState(customer).state || null,
           reason: err.body.message ?? null,
           missingField: err.body.missingField ?? null,
@@ -793,8 +803,13 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     // identical between formats; only presentation differs. This is a SINGLE
     // invoice either way (service format 'COMBINED'); `lineItemStyle` carries
     // the presentation choice.
-    const lineItemStyle: "SEPARATE" | "COMBINED" =
-      req.body?.invoiceFormat === "COMBINED" ? "COMBINED" : "SEPARATE";
+    // ALL_INCLUSIVE (B2C clients only — the service refuses anyone else) is
+    // the SEPARATE lines with a different PDF; see utils/invoiceLayout.ts.
+    const invoiceLayout: InvoiceLayout =
+      req.body?.invoiceFormat === "COMBINED" ? "COMBINED"
+        : req.body?.invoiceFormat === "ALL_INCLUSIVE" ? "ALL_INCLUSIVE"
+          : "SEPARATE";
+    const lineItemStyle: "SEPARATE" | "COMBINED" = invoiceLayout === "COMBINED" ? "COMBINED" : "SEPARATE";
 
     // GST bypass payload (separate from gstTypeOverride — distinct audit trail)
     const gstBypass = req.body?.gstBypass === true;
@@ -830,6 +845,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
       reservation: reservation ?? undefined,
       format: "COMBINED",
       lineItemStyle,
+      invoiceLayout,
       // What the popup shows; blank falls back to the invoice date's month.
       billingPeriod: String(billingPeriod ?? "").trim() || billingPeriodIST(resolvedInvoiceDate),
       invoiceDate: resolvedInvoiceDate,

@@ -26,6 +26,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { buildLineItemsForBooking, buildCombinedLineItems } from "../utils/invoiceLineItems.js";
+import { allInclusiveRefusal, ALL_INCLUSIVE_NOT_ALLOWED, type InvoiceLayout } from "../utils/invoiceLayout.js";
 import { resolveCustomerState, buildAddressStr } from "../utils/invoiceClient.js";
 import { detectGSTType, calculateGSTAmounts, GST_STATE_CODES, UNION_TERRITORIES, type GSTType } from "../utils/gstDetection.js";
 import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
@@ -153,6 +154,11 @@ export interface CreateInvoiceOpts {
   // itemises every booking, 'COMBINED' merges per category. Totals are
   // identical either way. Ignored for format 'SEPARATE'. Default 'SEPARATE'.
   lineItemStyle?: "COMBINED" | "SEPARATE";
+  // PDF layout, stored on the invoice (utils/invoiceLayout.ts). ALL_INCLUSIVE
+  // must come with lineItemStyle 'SEPARATE' (it renders from those lines) and
+  // is refused unless the client's gstStatus is UNREGISTERED. Absent = not
+  // stored, rendered as before (every caller except /generate).
+  invoiceLayout?: InvoiceLayout;
   billingPeriod?: string;
   invoiceDate?: Date | string;
   dueDate?: Date | string;
@@ -546,6 +552,7 @@ async function createOneInvoice(
         terms: opts.terms,
         notes: opts.notes,
         showInclusiveTaxNote: opts.showInclusiveTaxNote === true,
+        ...(opts.invoiceLayout ? { invoiceLayout: opts.invoiceLayout } : {}),
         invoiceDate: resolvedInvoiceDate,
         dueDate: opts.dueDate ? new Date(opts.dueDate) : undefined,
         createdBy: opts.createdBy,
@@ -714,6 +721,19 @@ export async function createInvoiceFromBookings(
   }
 
   const customer = await Customer.findById(wsId).lean();
+
+  // All-inclusive is for B2C clients only. Checked before anything is written
+  // or any reservation released.
+  if (opts.invoiceLayout === "ALL_INCLUSIVE") {
+    const refusal = allInclusiveRefusal((customer as any)?.gstStatus);
+    if (refusal) {
+      throw new InvoiceGenerationError(400, { error: ALL_INCLUSIVE_NOT_ALLOWED, message: refusal });
+    }
+    if (opts.lineItemStyle === "COMBINED") {
+      throw new InvoiceGenerationError(400, { error: "ALL_INCLUSIVE_NEEDS_SEPARATE_LINES", message: "The All-inclusive layout is built from Separate line items." });
+    }
+  }
+
   const { invoiceWorkspaceId, workspace } = await resolveInvoiceWorkspace(wsId);
 
   const companySettings = await getCompanySettings();

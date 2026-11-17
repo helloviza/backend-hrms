@@ -17,6 +17,7 @@ import { validateObjectId } from "../middleware/validateObjectId.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { getCustomerMemberRoleMap, resolveMemberRole } from "../utils/customerMemberRoles.js";
 import { GST_STATUSES, normalizeGstStatus, validateRegisteredGstin } from "../utils/customerGst.js";
+import { resolveDefaultInvoiceLayout } from "../utils/invoiceLayout.js";
 import { applyLegacyGstFields, sendGstRegistrationError } from "../services/gstRegistrations.js";
 import { canManageGstRegistrations } from "../services/gstRegistrationAccess.js";
 
@@ -80,6 +81,7 @@ router.get("/", requireAuth, requireWorkspace, requireAdmin, async (_req: any, r
         // Business Profiles' "Bill From" select shows this for every record;
         // the onboarding detail it loads for promoted records doesn't carry it.
         defaultSellerGstin: c.defaultSellerGstin || "",
+        defaultInvoiceLayout: c.defaultInvoiceLayout || "SEPARATE",
         legalName: c.legalName || c.name,
         website: c.website || "",
         address: c.address || {},
@@ -457,6 +459,20 @@ router.patch(
           if (gstErr) return res.status(400).json({ error: gstErr, code: "GSTIN_INVALID" });
           if (typeof gstSent === "string") req.body.gstNumber = gstSent.trim().toUpperCase();
         }
+      }
+
+      // Default invoice layout: All-inclusive only for an Unregistered (B2C)
+      // client; moving a client off Unregistered drops it back to Separate.
+      if (req.body.defaultInvoiceLayout !== undefined || req.body.gstStatus !== undefined) {
+        const current: any = await Customer.findById(id).select("gstStatus defaultInvoiceLayout").lean();
+        const layout = resolveDefaultInvoiceLayout(
+          req.body.defaultInvoiceLayout,
+          normalizeGstStatus(req.body.gstStatus ?? current?.gstStatus),
+          current?.defaultInvoiceLayout,
+        );
+        if (layout.refused) return res.status(400).json(layout.refused);
+        if (layout.value) req.body.defaultInvoiceLayout = layout.value;
+        else delete req.body.defaultInvoiceLayout;
       }
 
       // GST registrations (R2): the company GSTIN and its state are owned by

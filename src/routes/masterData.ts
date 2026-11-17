@@ -45,6 +45,7 @@ import {
   gstStatusFromForm,
   validateRegisteredGstin,
 } from "../utils/customerGst.js";
+import { resolveDefaultInvoiceLayout, type InvoiceLayout } from "../utils/invoiceLayout.js";
 
 
 const router = Router();
@@ -1012,6 +1013,7 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
       ? await Customer.findOne({ onboardingId: onboardingDoc._id }).exec()
       : null;
     let gstAdapted: Record<string, any> | null = null;
+    let defaultInvoiceLayoutToWrite: InvoiceLayout | undefined;
     if (isBusinessRecord) {
       if (
         body.gstStatus !== undefined &&
@@ -1064,6 +1066,20 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
           }
         }
         body.defaultSellerGstin = sellerGstin;
+      }
+
+      // "Default invoice layout" (what Generate preselects), stored on the
+      // Customer. All-inclusive only for an Unregistered (B2C) client; a save
+      // moving the client off Unregistered drops it back to Separate. Like
+      // Bill From, only Plumtrips staff choose it.
+      if (linkedCustomer) {
+        const layout = resolveDefaultInvoiceLayout(
+          isPlatformStaff(req) ? body.defaultInvoiceLayout : undefined,
+          effectiveStatus,
+          linkedCustomer.defaultInvoiceLayout,
+        );
+        if (layout.refused) return res.status(400).json(layout.refused);
+        defaultInvoiceLayoutToWrite = layout.value;
       }
 
       // GST registrations (R2): a promoted company's GSTIN/state go through
@@ -1347,6 +1363,9 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
         // save never touches it).
         if (typeof body.defaultSellerGstin === "string" && isPlatformStaff(req)) {
           (customer as any).defaultSellerGstin = body.defaultSellerGstin;
+        }
+        if (defaultInvoiceLayoutToWrite) {
+          (customer as any).defaultInvoiceLayout = defaultInvoiceLayoutToWrite;
         }
         await customer.save();
       }

@@ -100,6 +100,8 @@ export interface IInvoice extends Document {
   terms?: string;
   notes?: string;
   showInclusiveTaxNote?: boolean;
+  // PDF presentation only (utils/invoiceLayout.ts). Absent = as before.
+  invoiceLayout?: "SEPARATE" | "COMBINED" | "ALL_INCLUSIVE";
   isDemo?: boolean;
 
   // Set by the consumer erasure cascade (scripts/lib/consumerErasureCascade.ts,
@@ -191,6 +193,9 @@ const InvoiceSchema = new Schema<IInvoice>(
     terms: String,
     notes: String,
     showInclusiveTaxNote: { type: Boolean, default: false },
+    // Layout the PDF was generated with; a re-download keeps it. No default:
+    // older invoices (and bulk/auto ones) render exactly as before.
+    invoiceLayout: { type: String, enum: ["SEPARATE", "COMBINED", "ALL_INCLUSIVE"] },
     // Demo Platform — invoice generated from demo bookings (seed or impersonation)
     isDemo: { type: Boolean, default: false, index: true },
     piiRedactedAt: { type: Date },

@@ -320,6 +320,11 @@ const CustomerSchema = new Schema(
     // resolveSellerGstProfile falls through safely for that case.
     defaultSellerGstin: { type: String, trim: true },
 
+    // Business Profiles "Default invoice layout": what the Generate popup
+    // preselects. ALL_INCLUSIVE only while gstStatus is UNREGISTERED (checked on
+    // save and again at Generate). Unset = Separate.
+    defaultInvoiceLayout: { type: String, enum: ["SEPARATE", "COMBINED", "ALL_INCLUSIVE"] },
+
     /* ============================================================
        CLIENT GST REGISTRATIONS (one company, several state GSTINs)
        ============================================================ */

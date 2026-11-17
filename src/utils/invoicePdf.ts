@@ -9,6 +9,7 @@ import type { IInvoice } from "../models/Invoice.js";
 import { getCompanySettings, type ICompanySettings } from "../models/CompanySettings.js";
 import { numberToWords } from "./numberToWords.js";
 import { invoiceHeaderDisplay } from "./invoiceHeaderDisplay.js";
+import { buildAllInclusiveRows, allInclusiveTaxNote } from "./invoiceLayout.js";
 import logger from "./logger.js";
 
 /* ── Font paths — resolved relative to this file ───── */
@@ -246,6 +247,12 @@ export async function generateInvoicePdf(
     isIgst = true;
   }
   const lineItems = invoice.lineItems ?? [];
+  // ALL_INCLUSIVE (utils/invoiceLayout.ts): one all-in row per booking, no tax
+  // columns or tax totals; the GST charged is stated once under the table.
+  // Rendered from the same stored lines, so the Total is unchanged.
+  const allInclusive = (invoice as any).invoiceLayout === "ALL_INCLUSIVE";
+  const allInclusiveRows = allInclusive ? buildAllInclusiveRows(lineItems as any[]) : [];
+  const itemisedLines = allInclusive ? [] : lineItems;
 
   // index of last SERVICE_FEE row (for disclaimer)
   let lastSvcIdx = -1;
@@ -277,16 +284,23 @@ export async function generateInvoicePdf(
     // GST/AMOUNT columns keep their exact x-positions.
     // IGST (5 cols): DESC 48 | QTY 6 | RATE 15 | IGST 13 | AMT 18
     // Split (6 cols): DESC 39 | QTY 5 | RATE 14 | CGST 12 | SGST 12 | AMT 18
-    const COL_W = isIgst
+    // All-inclusive (2 cols): DESC 80 | AMT 20
+    const COL_W = allInclusive
+      ? [CW * 0.80, CW * 0.20]
+      : isIgst
       ? [CW * 0.48, CW * 0.06, CW * 0.15, CW * 0.13, CW * 0.18]
       : [CW * 0.39, CW * 0.05, CW * 0.14, CW * 0.12, CW * 0.12, CW * 0.18];
     const COL_X: number[] = [L];
     for (let i = 0; i < COL_W.length - 1; i++) COL_X.push(COL_X[i] + COL_W[i]);
     const HDR_H = 20;
-    const HDRS = isIgst
+    const HDRS = allInclusive
+      ? ["DESCRIPTION", "AMOUNT"]
+      : isIgst
       ? ["DESCRIPTION", "QTY", "RATE", "IGST (18%)", "AMOUNT"]
       : ["DESCRIPTION", "QTY", "RATE", "CGST (9%)", `${gstLabel2} (9%)`, "AMOUNT"];
-    const ALIGNS: Array<"center" | "left" | "right"> = isIgst
+    const ALIGNS: Array<"center" | "left" | "right"> = allInclusive
+      ? ["left", "right"]
+      : isIgst
       ? ["left", "center", "right", "right", "right"]
       : ["left", "center", "right", "right", "right", "right"];
 
@@ -522,8 +536,48 @@ export async function generateInvoicePdf(
       bookingPairIdx.push(pairCount);
     }
 
-    for (let idx = 0; idx < lineItems.length; idx++) {
-      const li = lineItems[idx] as any;
+    // All-inclusive rows: description + booking details left, all-in amount right.
+    for (const row of allInclusiveRows) {
+      let sub = row.subDescription.split(" || ").filter((p) => p !== "?").join(" || ").replace(/→/g, "->");
+      if (!useNoto) {
+        sub = sub.replace(/–/g, "-").replace(/—/g, "-").replace(/₹/g, "Rs.").replace(/[^\x00-\x7F]/g, "?");
+      }
+      const descW = COL_W[0] - 8;
+      doc.font(FONT_BOLD).fontSize(9);
+      let estH = 12 + doc.heightOfString(row.description, { width: descW });
+      if (sub) {
+        doc.font(FONT_NORMAL).fontSize(8);
+        estH += 3 + doc.heightOfString(sub, { width: descW });
+      }
+      estH = Math.max(estH, 24);
+      if (y + estH > PG_H - M - 150) {
+        doc.addPage();
+        y = M;
+        drawTableHeader(y);
+        y += HDR_H;
+      }
+      let dY = y + 6;
+      doc.fontSize(9).font(FONT_BOLD).fillColor(C_BODY)
+        .text(row.description, COL_X[0] + 4, dY, { width: descW });
+      dY += doc.heightOfString(row.description, { width: descW, fontSize: 9 }) + 3;
+      if (sub) {
+        doc.fontSize(8).font(FONT_NORMAL).fillColor(C_MID)
+          .text(sub, COL_X[0] + 4, dY, { width: descW });
+      }
+      doc.fontSize(9).font(FONT_NORMAL).fillColor(C_BODY)
+        .text(fmtCur(row.amount), COL_X[1] + 2, y + 7, { width: COL_W[1] - 4, align: "right", lineBreak: false });
+      y += estH;
+    }
+    if (allInclusive) {
+      // Small print: the tax charged, summed across the invoice (stored totals).
+      const note = allInclusiveTaxNote(invoice, fmtCur);
+      y += 6;
+      doc.fontSize(7.5).font(FONT_NORMAL).fillColor(C_MID).text(note, L + 4, y, { width: CW - 8 });
+      y += doc.heightOfString(note, { width: CW - 8, fontSize: 7.5 });
+    }
+
+    for (let idx = 0; idx < itemisedLines.length; idx++) {
+      const li = itemisedLines[idx] as any;
 
       const isLastSvc = idx === lastSvcIdx;
       const descLine1 = li.description || "";
@@ -718,22 +772,25 @@ export async function generateInvoicePdf(
       totY += sz + 7;
     }
 
-    totRow("Sub Total", fmtCur(invoice.subtotal ?? 0));
-    if (isIgst) {
-      totRow("IGST (18%)", fmtCur((invoice as any).igstAmount ?? invoice.totalGST ?? 0));
-    } else {
-      const cgst = (invoice as any).cgstAmount ?? (invoice.totalGST ?? 0) / 2;
-      const sgstOrUtgst = (invoice as any).utgstAmount > 0
-        ? (invoice as any).utgstAmount
-        : (invoice as any).sgstAmount ?? (invoice.totalGST ?? 0) / 2;
-      totRow("CGST (9%)", fmtCur(cgst));
-      totRow(`${gstLabel2} (9%)`, fmtCur(sgstOrUtgst));
-    }
+    // All-inclusive: only the Total and the amount in words.
+    if (!allInclusive) {
+      totRow("Sub Total", fmtCur(invoice.subtotal ?? 0));
+      if (isIgst) {
+        totRow("IGST (18%)", fmtCur((invoice as any).igstAmount ?? invoice.totalGST ?? 0));
+      } else {
+        const cgst = (invoice as any).cgstAmount ?? (invoice.totalGST ?? 0) / 2;
+        const sgstOrUtgst = (invoice as any).utgstAmount > 0
+          ? (invoice as any).utgstAmount
+          : (invoice as any).sgstAmount ?? (invoice.totalGST ?? 0) / 2;
+        totRow("CGST (9%)", fmtCur(cgst));
+        totRow(`${gstLabel2} (9%)`, fmtCur(sgstOrUtgst));
+      }
 
-    // Thin rule
-    doc.strokeColor(C_SURF_MID).lineWidth(0.5)
-      .moveTo(TOT_X, totY).lineTo(R, totY).stroke();
-    totY += 8;
+      // Thin rule
+      doc.strokeColor(C_SURF_MID).lineWidth(0.5)
+        .moveTo(TOT_X, totY).lineTo(R, totY).stroke();
+      totY += 8;
+    }
 
     // "Total" label
     doc.fontSize(13).font(FONT_BOLD).fillColor(C_PRIMARY)
