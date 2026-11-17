@@ -1024,7 +1024,10 @@ router.patch("/:id", validateObjectId("id"), requireAuth, requireWorkspace, asyn
       const fp: any = onboardingDoc.formPayload || {};
       const effectiveStatus = normalizeGstStatus(body.gstStatus ?? linkedCustomer?.gstStatus ?? fp.gstStatus);
       const gstSent = body.gstNumber ?? body.gstin;
-      if (effectiveStatus === "REGISTERED" && (body.gstStatus !== undefined || gstSent !== undefined)) {
+      // A company with GST registrations: its status rules (no Registered with
+      // none active) are the service's, checked in applyLegacyGstFields below.
+      const registrationsOwnStatus = gstSent === undefined && (linkedCustomer?.gstRegistrations?.length || 0) > 0;
+      if (effectiveStatus === "REGISTERED" && !registrationsOwnStatus && (body.gstStatus !== undefined || gstSent !== undefined)) {
         // A blank field keeps the Customer's GSTIN (it is never wiped — see
         // the sync below), so that kept value is what must be valid.
         const gstToCheck = typeof gstSent === "string" && gstSent.trim()

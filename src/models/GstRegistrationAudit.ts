@@ -14,6 +14,7 @@ export const GST_REGISTRATION_ACTIONS = [
   "LEGACY_FIELD", // a pre-registrations writer (old form / API) supplied the company GSTIN
   "ONBOARDING", // created from the onboarding form at approval / promote
   "MIGRATED", // scripts/migrate-gst-registrations.ts
+  "UNREGISTER", // company marked Unregistered: every active registration deactivated in the same write
 ] as const;
 
 const GstRegistrationAuditSchema = new Schema(

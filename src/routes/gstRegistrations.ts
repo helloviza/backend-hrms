@@ -11,7 +11,9 @@
 //   PATCH  /:id/gst-registrations/:regId                 { legalName?, tradeName?, label?, address?, billingEmail?, defaultSellerGstin?, isSez? }
 //   POST   /:id/gst-registrations/:regId/default
 //   POST   /:id/gst-registrations/:regId/deactivate
-//   POST   /:id/gst-registrations/:regId/reactivate
+//   POST   /:id/gst-registrations/:regId/reactivate        { markRegistered? } (required on an Unregistered company)
+//   POST   /:id/gst-registrations/unregister             { registrationIds } mark the company Unregistered:
+//          every active registration is deactivated in the same write; ids = the GSTINs the person confirmed
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth.js";
 import { requirePlatformAdmin } from "../middleware/requirePlatformAdmin.js";
@@ -25,6 +27,7 @@ import {
   checkGstin,
   deactivateRegistration,
   listRegistrations,
+  markUnregistered,
   reactivateRegistration,
   sendGstRegistrationError,
   setDefaultRegistration,
@@ -119,8 +122,18 @@ router.post(
   ...staffOnly,
   requireGstRegistrationsAccess as any,
   handle(async (req) => ({
-    registration: await reactivateRegistration(req.params.id, req.params.regId, actorOf(req, "businessProfiles:reactivate")),
+    registration: await reactivateRegistration(req.params.id, req.params.regId, actorOf(req, "businessProfiles:reactivate"), {
+      markRegistered: req.body?.markRegistered === true,
+    }),
   })),
+);
+
+router.post(
+  "/:id/gst-registrations/unregister",
+  validateObjectId("id"),
+  ...staffOnly,
+  requireGstRegistrationsAccess as any,
+  handle(async (req) => markUnregistered(req.params.id, req.body?.registrationIds, actorOf(req, "businessProfiles:unregister"))),
 );
 
 export default router;

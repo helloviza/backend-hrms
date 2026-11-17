@@ -448,9 +448,12 @@ router.patch(
           return res.status(400).json({ error: "GST status must be REGISTERED, UNREGISTERED or NOT_SET", code: "GST_STATUS_INVALID" });
         }
         if (req.body.gstStatus !== undefined) req.body.gstStatus = normalizeGstStatus(req.body.gstStatus);
-        const current: any = await Customer.findById(id).select("gstStatus gstNumber panNumber").lean();
+        const current: any = await Customer.findById(id).select("gstStatus gstNumber panNumber gstRegistrations._id").lean();
         const status = normalizeGstStatus(req.body.gstStatus ?? current?.gstStatus);
-        if (status === "REGISTERED") {
+        // A company with GST registrations: its status rules (no Registered
+        // with none active) are the service's, checked in applyLegacyGstFields.
+        const registrationsOwnStatus = gstSent === undefined && (current?.gstRegistrations?.length || 0) > 0;
+        if (status === "REGISTERED" && !registrationsOwnStatus) {
           const panSent = req.body.panNumber ?? req.body.pan;
           const gstErr = validateRegisteredGstin(
             gstSent !== undefined ? gstSent : current?.gstNumber,

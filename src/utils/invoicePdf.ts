@@ -257,7 +257,8 @@ export async function generateInvoicePdf(
   }
   const lineItems = invoice.lineItems ?? [];
   // ALL_INCLUSIVE (utils/invoiceLayout.ts): one all-in row per booking, no tax
-  // columns or tax totals; the GST charged is stated once under the table.
+  // columns or tax totals; the GST charged is stated once under the table
+  // (registered client: taxable value + each tax; B2C: "GST included").
   // Rendered from the same stored lines, so the Total is unchanged.
   // The internal copy always shows the itemised (Separate) breakdown.
   const internalCopy = options.internalCopy === true;

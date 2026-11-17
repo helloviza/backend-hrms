@@ -24,6 +24,11 @@
 //    company-level Bill From (Customer.defaultSellerGstin).
 //  - gstStatus stays company-level (D11): adding a registration to a NOT_SET
 //    company makes it REGISTERED; an UNREGISTERED company takes none.
+//  - REGISTERED → UNREGISTERED is one step (markUnregistered): every active
+//    registration is deactivated and the status set in the same write, after
+//    the caller confirms the exact GSTINs. The reverse is an add or a
+//    reactivate with markRegistered — a company with registrations can't be
+//    flipped back to REGISTERED with none active.
 //
 // Writes: the Customer is updated in ONE document write guarded by a revision
 // counter (gstRegistrationsRev), so registrations and their Customer mirrors can
@@ -192,12 +197,15 @@ async function assertSellerGstin(v: unknown): Promise<string> {
   return g;
 }
 
-/** One guarded write of the Customer: registrations + mirrors (+ extra $set). */
+type AuditEntry = { action: string; registrationId?: unknown; gstin?: string; before?: unknown; after?: unknown };
+
+/** One guarded write of the Customer: registrations + mirrors (+ extra $set).
+ *  One audit row per entry (a company-level change may touch several). */
 async function commit(
   customer: any,
   regs: GstRegistration[],
   extraSet: Record<string, unknown>,
-  audit: { action: string; registrationId?: unknown; gstin?: string; before?: unknown; after?: unknown },
+  audit: AuditEntry | AuditEntry[],
   actor: Actor,
 ): Promise<GstRegistration[]> {
   const rev = Number(customer.gstRegistrationsRev || 0);
@@ -210,16 +218,18 @@ async function commit(
     throw new GstRegistrationError(409, "CONCURRENT_EDIT", "Someone else changed this company's GST registrations. Reload and try again.");
   }
   await syncWorkspaceMirror(customer._id, regs);
-  await GstRegistrationAudit.create({
-    customerId: customer._id,
-    registrationId: audit.registrationId,
-    gstin: audit.gstin,
-    action: audit.action,
-    before: audit.before,
-    after: audit.after,
-    actorId: actor.actorId,
-    source: actor.source,
-  });
+  await GstRegistrationAudit.insertMany(
+    (Array.isArray(audit) ? audit : [audit]).map((a) => ({
+      customerId: customer._id,
+      registrationId: a.registrationId,
+      gstin: a.gstin,
+      action: a.action,
+      before: a.before,
+      after: a.after,
+      actorId: actor.actorId,
+      source: actor.source,
+    })),
+  );
   return regs;
 }
 
@@ -259,14 +269,16 @@ export async function listRegistrations(customerId: unknown) {
 
 export async function addRegistration(
   customerId: unknown,
-  input: { gstin: unknown } & Editable & { makeDefault?: boolean },
+  input: { gstin: unknown } & Editable & { makeDefault?: boolean; markRegistered?: boolean },
   actor: Actor,
   action: "ADD" | "LEGACY_FIELD" | "ONBOARDING" | "MIGRATED" = "ADD",
 ): Promise<GstRegistration> {
   const c = await loadCustomer(customerId);
   const status = normalizeGstStatus(c.gstStatus);
-  if (status === "UNREGISTERED") {
-    throw new GstRegistrationError(409, "COMPANY_UNREGISTERED", "This company is Unregistered (B2C). Set its GST status to Registered before adding a GSTIN.");
+  // An Unregistered company becomes Registered only by an explicit add that
+  // says so (markRegistered) — never as a side effect of some other writer.
+  if (status === "UNREGISTERED" && input.markRegistered !== true) {
+    throw new GstRegistrationError(409, "COMPANY_UNREGISTERED", "This company is Unregistered (B2C). Adding a GSTIN marks it Registered — confirm that to continue.");
   }
   const chk = await checkGstin(c, input.gstin);
   if (!chk.ok) throw new GstRegistrationError(chk.code === "GSTIN_ON_OTHER_COMPANY" ? 409 : 400, chk.code!, chk.error!, chk.otherCompany ? { otherCompany: chk.otherCompany } : undefined);
@@ -297,7 +309,19 @@ export async function addRegistration(
   const extra: Record<string, unknown> = {};
   if (!clean(c.panNumber)) extra.panNumber = panFromGstin(reg.gstin); // D1: PAN from the first GSTIN
   if (status !== "REGISTERED") extra.gstStatus = "REGISTERED";
-  await commit(c, regs, extra, { action, registrationId: reg._id, gstin: reg.gstin, after: snapshot(reg) }, actor);
+  await commit(
+    c,
+    regs,
+    extra,
+    {
+      action,
+      registrationId: reg._id,
+      gstin: reg.gstin,
+      ...(status !== "REGISTERED" ? { before: { gstStatus: status } } : {}),
+      after: { ...snapshot(reg), ...(status !== "REGISTERED" ? { gstStatus: "REGISTERED" } : {}) },
+    },
+    actor,
+  );
   return reg;
 }
 
@@ -358,10 +382,16 @@ export async function deactivateRegistration(customerId: unknown, registrationId
   return r;
 }
 
-export async function reactivateRegistration(customerId: unknown, registrationId: unknown, actor: Actor) {
+export async function reactivateRegistration(
+  customerId: unknown,
+  registrationId: unknown,
+  actor: Actor,
+  opts: { markRegistered?: boolean } = {},
+) {
   const c = await loadCustomer(customerId);
-  if (normalizeGstStatus(c.gstStatus) === "UNREGISTERED") {
-    throw new GstRegistrationError(409, "COMPANY_UNREGISTERED", "This company is Unregistered (B2C). Set its GST status to Registered first.");
+  const status = normalizeGstStatus(c.gstStatus);
+  if (status === "UNREGISTERED" && opts.markRegistered !== true) {
+    throw new GstRegistrationError(409, "COMPANY_UNREGISTERED", "This company is Unregistered (B2C). Reactivating a GSTIN marks it Registered — confirm that to continue.");
   }
   const regs: GstRegistration[] = [...(c.gstRegistrations || [])];
   const id = String(oid(registrationId));
@@ -375,8 +405,77 @@ export async function reactivateRegistration(customerId: unknown, registrationId
   r.deactivatedAt = null;
   r.deactivatedBy = null;
   if (!regs.some((x) => x.active && x.isDefault)) r.isDefault = true;
-  await commit(c, regs, {}, { action: "REACTIVATE", registrationId: r._id, gstin: r.gstin, before, after: snapshot(r) }, actor);
+  // Same as add: an active registration means the company is Registered.
+  const flip = status !== "REGISTERED";
+  await commit(
+    c,
+    regs,
+    flip ? { gstStatus: "REGISTERED" } : {},
+    {
+      action: "REACTIVATE",
+      registrationId: r._id,
+      gstin: r.gstin,
+      before: { ...before, ...(flip ? { gstStatus: status } : {}) },
+      after: { ...snapshot(r), ...(flip ? { gstStatus: "REGISTERED" } : {}) },
+    },
+    actor,
+  );
   return r;
+}
+
+/**
+ * REGISTERED → UNREGISTERED in one step: every active registration is
+ * deactivated and gstStatus set to UNREGISTERED in ONE guarded Customer write
+ * (mirrors follow: Customer.gstNumber and CustomerWorkspace.gstNumber blank;
+ * the GST state stays, as for any B2C company — invoices use it for tax).
+ *
+ * `confirmedIds` are the active registrations the person was shown in the
+ * confirm ("This will deactivate N GSTIN(s): …"). If the active set has
+ * changed since, nothing is written (409 CONFIRMATION_STALE with the current
+ * list), so nobody deactivates a GSTIN they never saw.
+ *
+ * Audit: one DEACTIVATE row per registration + one UNREGISTER row for the
+ * company. Already Unregistered with nothing active → no-op.
+ */
+export async function markUnregistered(customerId: unknown, confirmedIds: unknown, actor: Actor) {
+  const c = await loadCustomer(customerId);
+  const status = normalizeGstStatus(c.gstStatus);
+  const regs: GstRegistration[] = [...((c.gstRegistrations || []) as GstRegistration[])];
+  const active = regs.filter((r) => r.active);
+  if (active.length === 0) {
+    if (status === "UNREGISTERED") return { deactivated: [] as GstRegistration[], changed: false };
+    // Nothing blocks the plain status change then; the form saves it as before.
+    throw new GstRegistrationError(409, "NO_ACTIVE_REGISTRATIONS", "This company has no active GST registrations to deactivate. Save the GST status from the form.");
+  }
+
+  const confirmed = new Set((Array.isArray(confirmedIds) ? confirmedIds : []).map((v) => String(v)));
+  const current = new Set(active.map((r) => String(r._id)));
+  if (confirmed.size !== current.size || [...current].some((id) => !confirmed.has(id))) {
+    throw new GstRegistrationError(
+      409,
+      "CONFIRMATION_STALE",
+      "This company's active GST registrations changed since you confirmed. Review them and confirm again.",
+      { active: active.map((r) => ({ _id: String(r._id), gstin: r.gstin, state: r.state, isDefault: r.isDefault })) },
+    );
+  }
+
+  const at = new Date();
+  const audits: AuditEntry[] = [];
+  for (const r of active) {
+    const before = snapshot(r);
+    r.active = false;
+    r.isDefault = false;
+    r.deactivatedAt = at;
+    r.deactivatedBy = actor.actorId || null;
+    audits.push({ action: "DEACTIVATE", registrationId: r._id, gstin: r.gstin, before, after: snapshot(r) });
+  }
+  audits.push({
+    action: "UNREGISTER",
+    before: { gstStatus: status, gstNumber: c.gstNumber || "", activeGstins: active.map((r) => r.gstin) },
+    after: { gstStatus: "UNREGISTERED", gstNumber: "" },
+  });
+  await commit(c, regs, { gstStatus: "UNREGISTERED" }, audits, actor);
+  return { deactivated: active, changed: true };
 }
 
 /**
@@ -387,17 +486,22 @@ export async function reactivateRegistration(customerId: unknown, registrationId
  * made default if it already exists. The previous default stays active.
  * Returns null when X is already the default (nothing to do).
  */
-export async function applyLegacyGstin(customerId: unknown, gstinRaw: unknown, actor: Actor): Promise<GstRegistration | null> {
+export async function applyLegacyGstin(
+  customerId: unknown,
+  gstinRaw: unknown,
+  actor: Actor,
+  opts: { markRegistered?: boolean } = {},
+): Promise<GstRegistration | null> {
   const gstin = normalizeGstin(gstinRaw);
   if (!gstin) return null; // a blank never clears registrations (deactivate does)
   const c = await loadCustomer(customerId);
   const existing = ((c.gstRegistrations || []) as GstRegistration[]).find((r) => r.gstin === gstin);
   if (existing) {
     if (existing.active && existing.isDefault) return null;
-    if (!existing.active) await reactivateRegistration(customerId, existing._id, actor);
+    if (!existing.active) await reactivateRegistration(customerId, existing._id, actor, opts);
     return setDefaultRegistration(customerId, existing._id, actor);
   }
-  return addRegistration(customerId, { gstin, makeDefault: true }, actor, "LEGACY_FIELD");
+  return addRegistration(customerId, { gstin, makeDefault: true, markRegistered: opts.markRegistered }, actor, "LEGACY_FIELD");
 }
 
 /**
@@ -456,12 +560,35 @@ export async function ensureRegistrationFromOnboarding(
 
 /** Company-level checks other writers must run before changing gstStatus or
  *  panNumber on a company that has registrations. Throws on a refusal. */
-export async function assertCompanyChangeAllowed(customerId: unknown, change: { gstStatus?: unknown; panNumber?: unknown }) {
+export async function assertCompanyChangeAllowed(
+  customerId: unknown,
+  change: { gstStatus?: unknown; panNumber?: unknown; gstin?: unknown },
+) {
   const c = await loadCustomer(customerId);
-  const active = ((c.gstRegistrations || []) as GstRegistration[]).filter((r) => r.active);
-  if (!active.length) return;
+  const regs = (c.gstRegistrations || []) as GstRegistration[];
+  const active = regs.filter((r) => r.active);
+  if (!active.length) {
+    // Back to Registered = add or reactivate a registration (which sets the
+    // status itself). A bare flip would leave a Registered company with no
+    // GSTIN to bill. A GSTIN sent with the change is added by the caller.
+    if (
+      regs.length > 0 &&
+      change.gstStatus !== undefined &&
+      normalizeGstStatus(change.gstStatus) === "REGISTERED" &&
+      normalizeGstStatus(c.gstStatus) !== "REGISTERED" &&
+      !normalizeGstin(change.gstin)
+    ) {
+      throw new GstRegistrationError(409, "REGISTRATION_REQUIRED", "To mark this company Registered, add a GST registration or reactivate one in the GST registrations table.");
+    }
+    return;
+  }
   if (change.gstStatus !== undefined && normalizeGstStatus(change.gstStatus) === "UNREGISTERED") {
-    throw new GstRegistrationError(409, "ACTIVE_REGISTRATIONS", `This company still has ${active.length} active GST registration(s). Deactivate them before marking it Unregistered.`);
+    throw new GstRegistrationError(
+      409,
+      "ACTIVE_REGISTRATIONS",
+      `This company still has ${active.length} active GST registration(s). Mark it Unregistered from Business Profiles — that deactivates them in the same step, after a confirm.`,
+      { active: active.map((r) => ({ _id: String(r._id), gstin: r.gstin, state: r.state, isDefault: r.isDefault })) },
+    );
   }
   if (change.panNumber !== undefined) {
     const pan = clean(change.panNumber).toUpperCase();
@@ -525,7 +652,7 @@ export async function applyLegacyGstFields(
     const what = legacyGstChange(await loadCustomer(customerId), body);
     if (what) throw new GstRegistrationError(403, "GST_REGISTRATIONS_ACCESS_REQUIRED", GST_ACCESS_REQUIRED_MESSAGE, { field: what });
   }
-  await assertCompanyChangeAllowed(customerId, { gstStatus: body.gstStatus, panNumber: panSent || undefined });
+  await assertCompanyChangeAllowed(customerId, { gstStatus: body.gstStatus, panNumber: panSent || undefined, gstin: gstSent });
   if (gstSent === undefined && stateSent === undefined) return undefined;
 
   const c = await loadCustomer(customerId);
@@ -552,7 +679,9 @@ export async function applyLegacyGstFields(
       if (panSent && panFromGstin(g) !== panSent) {
         throw new GstRegistrationError(400, "PAN_MISMATCH", `GSTIN "${g}" does not belong to PAN "${panSent}" (characters 3–12 of a GSTIN are the PAN).`);
       }
-      await applyLegacyGstin(customerId, g, actor);
+      // The body itself says Registered (status checked just above), so an
+      // Unregistered company may take this GSTIN.
+      await applyLegacyGstin(customerId, g, actor, { markRegistered: body.gstStatus !== undefined });
     }
   }
 

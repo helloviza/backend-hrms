@@ -42,6 +42,7 @@ const { default: customersRouter } = await import("./customers.js");
 const { default: invoicesRouter } = await import("./invoices.js");
 const { generateInvoicePdf } = await import("../utils/invoicePdf.js");
 const { buildAllInclusiveRows, allInclusiveTaxNote, resolveDefaultInvoiceLayout } = await import("../utils/invoiceLayout.js");
+const { registerGstCells } = await import("../utils/invoiceRegister.js");
 const { default: Customer } = await import("../models/Customer.js");
 const { default: CustomerWorkspace } = await import("../models/CustomerWorkspace.js");
 const { default: ManualBooking } = await import("../models/ManualBooking.js");
@@ -61,6 +62,14 @@ const staff = (r: request.Test) =>
   r.set("x-test-user", JSON.stringify({ _id: String(STAFF), id: String(STAFF), sub: String(STAFF), roles: ["SUPERADMIN"] })).set("x-test-ws", String(HOUSE));
 const col = (n: string) => mongoose.connection.db!.collection(n);
 const GSTIN_DL = "07AAHCM5991L1ZS";
+// Same PAN, Karnataka (the seller's state) — an intra-state registered client.
+const GSTIN_KA = (() => {
+  const CH = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const body = "29AAHCM5991L1Z";
+  let sum = 0;
+  for (let i = 0; i < 14; i++) { const p = CH.indexOf(body[i]) * (i % 2 === 0 ? 1 : 2); sum += Math.floor(p / 36) + (p % 36); }
+  return body + CH[(36 - (sum % 36)) % 36];
+})();
 
 beforeAll(async () => {
   mongod = await MongoMemoryReplSet.create({ replSet: { count: 1 } }); // generation runs in a transaction
@@ -140,16 +149,16 @@ describe("totals are identical to Separate", () => {
   });
 });
 
-describe("refused for a client that is not Unregistered", () => {
-  it.each([["REGISTERED", { gstStatus: "REGISTERED", gstNumber: GSTIN_DL, gstRegisteredState: "Delhi" }], ["NOT_SET", {}]])(
+describe("refused for a client whose GST status is not set", () => {
+  it.each([["NOT_SET", { gstStatus: "NOT_SET" }], ["absent", {}]])(
     "%s → 400, nothing written",
     async (_label, fields) => {
-      const c = await company({ legalName: "Registered Co", ...fields });
+      const c = await company({ legalName: "Unknown Co", ...fields });
       const id = await booking(c._id);
       const r = await generate([id], "ALL_INCLUSIVE");
       expect(r.status).toBe(400);
       expect(r.body.error).toBe("ALL_INCLUSIVE_NOT_ALLOWED");
-      expect(r.body.message).toMatch(/only for clients whose GST status is Unregistered/);
+      expect(r.body.message).toMatch(/needs the client's GST status set to Registered or Unregistered/);
       expect(await col("invoices").countDocuments({})).toBe(0);
       const b: any = await ManualBooking.findById(id).lean();
       expect(b.status).toBe("CONFIRMED");
@@ -159,6 +168,56 @@ describe("refused for a client that is not Unregistered", () => {
       expect((await generate([id], "SEPARATE")).status).toBe(201);
     },
   );
+});
+
+describe("a REGISTERED client gets All-inclusive too", () => {
+  it.each([
+    ["intra-state (CGST+SGST)", GSTIN_KA, "Karnataka", "Taxable value ₹338.98 + CGST @9% ₹30.51 + SGST @9% ₹30.51"],
+    ["inter-state (IGST)", GSTIN_DL, "Delhi", "Taxable value ₹338.98 + IGST @18% ₹61.02"],
+  ])("%s: same stored figures as Separate; Bill To keeps the GSTIN; small print states taxable value + each tax", async (_l, gstin, state, breakdown) => {
+    const a = await company({ legalName: "Reg A", gstStatus: "REGISTERED", gstNumber: gstin, gstRegisteredState: state });
+    const b = await company({ legalName: "Reg B", gstStatus: "REGISTERED", gstNumber: gstin, gstRegisteredState: state });
+    const sep = await generate([await booking(a._id)], "SEPARATE");
+    const all = await generate([await booking(b._id)], "ALL_INCLUSIVE");
+    expect(sep.status, JSON.stringify(sep.body)).toBe(201);
+    expect(all.status, JSON.stringify(all.body)).toBe(201);
+    expect(tax(all.body.invoice)).toEqual(tax(sep.body.invoice));
+    expect(all.body.invoice.clientDetails.gstin).toBe(gstin);
+    expect(all.body.invoice.invoiceLayout).toBe("ALL_INCLUSIVE");
+
+    const t = await pdfText(all.body.invoice);
+    expect(t).toContain(`GSTIN: ${gstin}`);
+    expect(t).not.toContain("GSTIN: Unregistered (B2C)");
+    expect(t).toContain(`Amount inclusive of all taxes and service charges. ${breakdown}`);
+    expect(t.some((s) => s.includes("GST included"))).toBe(false);
+    expect(t).toContain("Flight services");
+    expect(t).toContain("₹10,000.00");
+    for (const gone of ["Transaction Fees", "Sub Total"]) expect(t, gone).not.toContain(gone);
+
+    // Register export: identical GST cells to the Separate invoice except the layout column.
+    const sepCells = registerGstCells(sep.body.invoice);
+    const allCells = registerGstCells(all.body.invoice);
+    expect(allCells.filter((c) => c !== "All-inclusive")).toEqual(sepCells.filter((c) => c !== "Separate"));
+
+    // Internal copy: still the itemised Separate breakdown, no small print.
+    const spy = vi.spyOn(PDFDocument.prototype as any, "text");
+    try {
+      await generateInvoicePdf(all.body.invoice, undefined, { internalCopy: true });
+      const ic = spy.mock.calls.map((x: any[]) => String(x[0]));
+      expect(ic).toContain("Transaction Fees");
+      expect(ic).toContain("Sub Total");
+      expect(ic.some((s) => s.startsWith("Amount inclusive of all taxes"))).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a stored invoice keeps its wording: B2C note stays B2C after the client registers; registered note stays after it unregisters", async () => {
+    const f = (n: number) => `₹${n.toFixed(2)}`;
+    const base = { supplyType: "IGST", totalGST: 61.02, igstAmount: 61.02, lineItems: [{ amount: 9600, igst: 0 }, { amount: 400, igst: 61.02 }] };
+    expect(allInclusiveTaxNote({ ...base, clientDetails: { gstin: "" } }, f)).toBe("Amount inclusive of all taxes and service charges. GST included: IGST @18% ₹61.02");
+    expect(allInclusiveTaxNote({ ...base, clientDetails: { gstin: GSTIN_DL } }, f)).toBe("Amount inclusive of all taxes and service charges. Taxable value ₹338.98 + IGST @18% ₹61.02");
+  });
 });
 
 describe("the PDF", () => {
@@ -177,7 +236,7 @@ describe("the PDF", () => {
       "1 Passenger || Asha Rao || BLR-DEL || 6E 6E-123 || Travel Date: 20 Nov 2026",
       "1 Night x 1 Room || Asha Rao || Taj || Goa || Check-in: 20 Nov 2026",
     ]);
-    expect(t).toContain("Amount inclusive of all taxes and service charges. GST included: CGST ₹61.02 + SGST ₹61.02 = ₹122.04");
+    expect(t).toContain("Amount inclusive of all taxes and service charges. GST included: CGST @9% ₹61.02 + SGST @9% ₹61.02 = ₹122.04");
     for (const gone of ["Transaction Fees", "Sub Total", "QTY", "RATE", "CGST (9%)", "SGST (9%)", "IGST (18%)"]) {
       expect(t, gone).not.toContain(gone);
     }
@@ -190,7 +249,7 @@ describe("the PDF", () => {
     const c = await company({ legalName: "B2C MH", gstStatus: "UNREGISTERED", gstRegisteredState: "Maharashtra" });
     const r = await generate([await booking(c._id)], "ALL_INCLUSIVE");
     const t = await pdfText(r.body.invoice);
-    expect(t).toContain("Amount inclusive of all taxes and service charges. GST included: IGST ₹61.02");
+    expect(t).toContain("Amount inclusive of all taxes and service charges. GST included: IGST @18% ₹61.02");
   });
 
   it("Separate is unchanged (itemised, Sub Total and tax rows)", async () => {
@@ -228,11 +287,18 @@ describe("re-download keeps the layout", () => {
 });
 
 describe("Business Profiles default + popup preview", () => {
-  it("PATCH /customers: All-inclusive refused unless Unregistered; leaving Unregistered drops it to Separate", async () => {
-    const reg = await company({ legalName: "Reg", gstStatus: "REGISTERED", gstNumber: GSTIN_DL, gstRegisteredState: "Delhi" });
-    const bad = await staff(request(app).patch(`/api/customers/${reg._id}`)).send({ defaultInvoiceLayout: "ALL_INCLUSIVE" });
+  it("PATCH /customers: All-inclusive allowed for Registered and Unregistered, refused for Not set; moving to Not set drops it to Separate", async () => {
+    const unset = await company({ legalName: "Unset", gstStatus: "NOT_SET" });
+    const bad = await staff(request(app).patch(`/api/customers/${unset._id}`)).send({ defaultInvoiceLayout: "ALL_INCLUSIVE" });
     expect(bad.status).toBe(400);
     expect(bad.body.error).toBe("ALL_INCLUSIVE_NOT_ALLOWED");
+
+    const reg = await company({ legalName: "Reg", gstStatus: "REGISTERED", gstNumber: GSTIN_DL, gstRegisteredState: "Delhi" });
+    const regOk = await staff(request(app).patch(`/api/customers/${reg._id}`)).send({ defaultInvoiceLayout: "ALL_INCLUSIVE" });
+    expect(regOk.status, JSON.stringify(regOk.body)).toBe(200);
+    expect((await Customer.findById(reg._id).lean() as any).defaultInvoiceLayout).toBe("ALL_INCLUSIVE");
+    const regPrev = await staff(request(app).get(`/api/admin/invoices/gst-preview?customerId=${reg._id}`));
+    expect(regPrev.body).toMatchObject({ customerGstStatus: "REGISTERED", defaultInvoiceLayout: "ALL_INCLUSIVE" });
     expect((await staff(request(app).patch(`/api/customers/${reg._id}`)).send({ defaultInvoiceLayout: "COMBINED" })).status).toBe(200);
     expect((await Customer.findById(reg._id).lean() as any).defaultInvoiceLayout).toBe("COMBINED");
     expect((await staff(request(app).patch(`/api/customers/${reg._id}`)).send({ defaultInvoiceLayout: "NOPE" })).status).toBe(400);
@@ -289,16 +355,18 @@ describe("helpers", () => {
   it("tax note per supply type", () => {
     const f = (n: number) => `₹${n.toFixed(2)}`;
     expect(allInclusiveTaxNote({ supplyType: "CGST_SGST", totalGST: 305.08, cgstAmount: 152.54, sgstAmount: 152.54 }, f))
-      .toBe("Amount inclusive of all taxes and service charges. GST included: CGST ₹152.54 + SGST ₹152.54 = ₹305.08");
-    expect(allInclusiveTaxNote({ supplyType: "CGST_UTGST", totalGST: 10, cgstAmount: 5, utgstAmount: 5 }, f)).toContain("CGST ₹5.00 + UTGST ₹5.00 = ₹10.00");
-    expect(allInclusiveTaxNote({ supplyType: "IGST", totalGST: 305.08, igstAmount: 305.08 }, f)).toContain("GST included: IGST ₹305.08");
+      .toBe("Amount inclusive of all taxes and service charges. GST included: CGST @9% ₹152.54 + SGST @9% ₹152.54 = ₹305.08");
+    expect(allInclusiveTaxNote({ supplyType: "CGST_UTGST", totalGST: 10, cgstAmount: 5, utgstAmount: 5 }, f)).toContain("CGST @9% ₹5.00 + UTGST @9% ₹5.00 = ₹10.00");
+    expect(allInclusiveTaxNote({ supplyType: "IGST", totalGST: 305.08, igstAmount: 305.08 }, f)).toContain("GST included: IGST @18% ₹305.08");
   });
 
   it("default layout resolution", () => {
     expect(resolveDefaultInvoiceLayout("ALL_INCLUSIVE", "UNREGISTERED")).toEqual({ value: "ALL_INCLUSIVE" });
-    expect(resolveDefaultInvoiceLayout("ALL_INCLUSIVE", "REGISTERED").refused?.error).toBe("ALL_INCLUSIVE_NOT_ALLOWED");
+    expect(resolveDefaultInvoiceLayout("ALL_INCLUSIVE", "REGISTERED")).toEqual({ value: "ALL_INCLUSIVE" });
+    expect(resolveDefaultInvoiceLayout("ALL_INCLUSIVE", "NOT_SET").refused?.error).toBe("ALL_INCLUSIVE_NOT_ALLOWED");
     expect(resolveDefaultInvoiceLayout("", "REGISTERED")).toEqual({ value: "SEPARATE" });
-    expect(resolveDefaultInvoiceLayout(undefined, "REGISTERED", "ALL_INCLUSIVE")).toEqual({ value: "SEPARATE" });
+    expect(resolveDefaultInvoiceLayout(undefined, "REGISTERED", "ALL_INCLUSIVE")).toEqual({});
+    expect(resolveDefaultInvoiceLayout(undefined, "NOT_SET", "ALL_INCLUSIVE")).toEqual({ value: "SEPARATE" });
     expect(resolveDefaultInvoiceLayout(undefined, "UNREGISTERED", "ALL_INCLUSIVE")).toEqual({});
   });
 });

@@ -807,7 +807,7 @@ router.post("/generate", requirePermission("invoices", "WRITE"), async (req: any
     // identical between formats; only presentation differs. This is a SINGLE
     // invoice either way (service format 'COMBINED'); `lineItemStyle` carries
     // the presentation choice.
-    // ALL_INCLUSIVE (B2C clients only — the service refuses anyone else) is
+    // ALL_INCLUSIVE (Registered or Unregistered clients — the service refuses NOT_SET) is
     // the SEPARATE lines with a different PDF; see utils/invoiceLayout.ts.
     const invoiceLayout: InvoiceLayout =
       req.body?.invoiceFormat === "COMBINED" ? "COMBINED"

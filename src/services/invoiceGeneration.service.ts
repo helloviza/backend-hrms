@@ -156,7 +156,7 @@ export interface CreateInvoiceOpts {
   lineItemStyle?: "COMBINED" | "SEPARATE";
   // PDF layout, stored on the invoice (utils/invoiceLayout.ts). ALL_INCLUSIVE
   // must come with lineItemStyle 'SEPARATE' (it renders from those lines) and
-  // is refused unless the client's gstStatus is UNREGISTERED. Absent = not
+  // is refused unless the client's gstStatus is REGISTERED or UNREGISTERED. Absent = not
   // stored, rendered as before (every caller except /generate).
   invoiceLayout?: InvoiceLayout;
   billingPeriod?: string;
@@ -722,7 +722,7 @@ export async function createInvoiceFromBookings(
 
   const customer = await Customer.findById(wsId).lean();
 
-  // All-inclusive is for B2C clients only. Checked before anything is written
+  // All-inclusive needs a set GST status (Registered or Unregistered). Checked before anything is written
   // or any reservation released.
   if (opts.invoiceLayout === "ALL_INCLUSIVE") {
     const refusal = allInclusiveRefusal((customer as any)?.gstStatus);
