@@ -7,16 +7,14 @@
 //   ALL_INCLUSIVE  one row per booking at its all-in price; tax shown only as
 //                  one line of small print under the table. Registered and
 //                  Unregistered (B2C) clients; not a client whose status is
-//                  not set. A registered client's Bill To keeps its GSTIN and
-//                  the small print states the taxable value and each tax.
+//                  not set. A registered client's Bill To keeps its GSTIN; the
+//                  small print (each tax, its rate and amount) is the same for both.
 //
 // ALL_INCLUSIVE is presentation only: the invoice is generated with exactly
 // the SEPARATE line items, so subtotal / GST / grand total, the CGST/SGST/IGST
 // split, the stored lineItems (GST filing reads them) and numbering are
 // identical to a SEPARATE invoice. The stored `invoiceLayout` is what makes a
 // re-download render the same way it was generated.
-
-import { invoiceTaxBreakdown } from "./invoiceRegister.js";
 
 export const INVOICE_LAYOUTS = ["SEPARATE", "COMBINED", "ALL_INCLUSIVE"] as const;
 export type InvoiceLayout = (typeof INVOICE_LAYOUTS)[number];
@@ -30,8 +28,8 @@ export const ALL_INCLUSIVE_NOT_ALLOWED = "ALL_INCLUSIVE_NOT_ALLOWED";
 
 /** null = allowed. A client whose GST status is REGISTERED or UNREGISTERED
  *  may get an all-inclusive invoice; one whose status is not set may not —
- *  the small print depends on which it is (allInclusiveTaxNote). A registered
- *  client still gets the taxable value and each tax stated, for input credit. */
+ *  a registered client's Bill To keeps its GSTIN. The small print
+ *  (allInclusiveTaxNote) is the same for both. */
 export function allInclusiveRefusal(gstStatus: unknown): string | null {
   const s = String(gstStatus ?? "").toUpperCase();
   return s === "REGISTERED" || s === "UNREGISTERED"
@@ -163,26 +161,14 @@ export function allInclusiveGstParts(invoice: any): { parts: { label: string; ra
 }
 
 /**
- * The small print under an all-inclusive table, from STORED invoice fields so
- * a re-download always reads as issued. Which wording = whether the stored
- * Bill To carries a client GSTIN:
- *   with a GSTIN (registered client):
- *     "Amount inclusive of all taxes and service charges. Taxable value ₹X + CGST @9% ₹a + SGST @9% ₹b"
- *     (or "+ IGST @18% ₹c"); X = the register export's Taxable Value (GST-bearing
- *     lines ex-GST = the fee, summed per invoice — invoiceTaxBreakdown).
- *   without (Unregistered / B2C):
- *     "Amount inclusive of all taxes and service charges. GST included: CGST @9% ₹152.54 + SGST @9% ₹152.54 = ₹305.08"
- *     (or "GST included: IGST @18% ₹c")
+ * The small print under an all-inclusive table, from STORED invoice totals so
+ * a re-download always reads as issued. Same for registered and unregistered
+ * clients:
+ *   inter-state: "Amount inclusive of all taxes - IGST @18% ₹c"
+ *   intra-state: "Amount inclusive of all taxes - CGST @9% ₹a + SGST @9% ₹b"
+ *   UT:          "Amount inclusive of all taxes - CGST @9% ₹a + UTGST @9% ₹b"
  */
 export function allInclusiveTaxNote(invoice: any, fmt: (n: number) => string): string {
-  const { parts, total } = allInclusiveGstParts(invoice);
-  const tax = (p: { label: string; rate: number; amount: number }) => `${p.label} @${p.rate}% ${fmt(p.amount)}`;
-  if (String(invoice?.clientDetails?.gstin ?? "").trim()) {
-    const { taxableValue } = invoiceTaxBreakdown(invoice);
-    return `Amount inclusive of all taxes and service charges. Taxable value ${fmt(taxableValue)} + ${parts.map(tax).join(" + ")}`;
-  }
-  const breakdown = parts.length > 1
-    ? `${parts.map(tax).join(" + ")} = ${fmt(total)}`
-    : tax(parts[0]);
-  return `Amount inclusive of all taxes and service charges. GST included: ${breakdown}`;
+  const { parts } = allInclusiveGstParts(invoice);
+  return `Amount inclusive of all taxes - ${parts.map((p) => `${p.label} @${p.rate}% ${fmt(p.amount)}`).join(" + ")}`;
 }

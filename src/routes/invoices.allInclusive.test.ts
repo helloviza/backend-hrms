@@ -172,9 +172,9 @@ describe("refused for a client whose GST status is not set", () => {
 
 describe("a REGISTERED client gets All-inclusive too", () => {
   it.each([
-    ["intra-state (CGST+SGST)", GSTIN_KA, "Karnataka", "Taxable value ₹338.98 + CGST @9% ₹30.51 + SGST @9% ₹30.51"],
-    ["inter-state (IGST)", GSTIN_DL, "Delhi", "Taxable value ₹338.98 + IGST @18% ₹61.02"],
-  ])("%s: same stored figures as Separate; Bill To keeps the GSTIN; small print states taxable value + each tax", async (_l, gstin, state, breakdown) => {
+    ["intra-state (CGST+SGST)", GSTIN_KA, "Karnataka", "CGST @9% ₹30.51 + SGST @9% ₹30.51"],
+    ["inter-state (IGST)", GSTIN_DL, "Delhi", "IGST @18% ₹61.02"],
+  ])("%s: same stored figures as Separate; Bill To keeps the GSTIN; small print states each tax with its rate", async (_l, gstin, state, breakdown) => {
     const a = await company({ legalName: "Reg A", gstStatus: "REGISTERED", gstNumber: gstin, gstRegisteredState: state });
     const b = await company({ legalName: "Reg B", gstStatus: "REGISTERED", gstNumber: gstin, gstRegisteredState: state });
     const sep = await generate([await booking(a._id)], "SEPARATE");
@@ -188,8 +188,8 @@ describe("a REGISTERED client gets All-inclusive too", () => {
     const t = await pdfText(all.body.invoice);
     expect(t).toContain(`GSTIN: ${gstin}`);
     expect(t).not.toContain("GSTIN: Unregistered (B2C)");
-    expect(t).toContain(`Amount inclusive of all taxes and service charges. ${breakdown}`);
-    expect(t.some((s) => s.includes("GST included"))).toBe(false);
+    expect(t).toContain(`Amount inclusive of all taxes - ${breakdown}`);
+    for (const gone of ["service charges", "Taxable value", "GST included"]) expect(t.some((s) => s.includes(gone)), gone).toBe(false);
     expect(t).toContain("Flight services");
     expect(t).toContain("₹10,000.00");
     for (const gone of ["Transaction Fees", "Sub Total"]) expect(t, gone).not.toContain(gone);
@@ -212,11 +212,11 @@ describe("a REGISTERED client gets All-inclusive too", () => {
     }
   });
 
-  it("a stored invoice keeps its wording: B2C note stays B2C after the client registers; registered note stays after it unregisters", async () => {
+  it("the note is worded the same with or without a client GSTIN", async () => {
     const f = (n: number) => `₹${n.toFixed(2)}`;
     const base = { supplyType: "IGST", totalGST: 61.02, igstAmount: 61.02, lineItems: [{ amount: 9600, igst: 0 }, { amount: 400, igst: 61.02 }] };
-    expect(allInclusiveTaxNote({ ...base, clientDetails: { gstin: "" } }, f)).toBe("Amount inclusive of all taxes and service charges. GST included: IGST @18% ₹61.02");
-    expect(allInclusiveTaxNote({ ...base, clientDetails: { gstin: GSTIN_DL } }, f)).toBe("Amount inclusive of all taxes and service charges. Taxable value ₹338.98 + IGST @18% ₹61.02");
+    expect(allInclusiveTaxNote({ ...base, clientDetails: { gstin: "" } }, f)).toBe("Amount inclusive of all taxes - IGST @18% ₹61.02");
+    expect(allInclusiveTaxNote({ ...base, clientDetails: { gstin: GSTIN_DL } }, f)).toBe("Amount inclusive of all taxes - IGST @18% ₹61.02");
   });
 });
 
@@ -236,7 +236,7 @@ describe("the PDF", () => {
       "1 Passenger || Asha Rao || BLR-DEL || 6E 6E-123 || Travel Date: 20 Nov 2026",
       "1 Night x 1 Room || Asha Rao || Taj || Goa || Check-in: 20 Nov 2026",
     ]);
-    expect(t).toContain("Amount inclusive of all taxes and service charges. GST included: CGST @9% ₹61.02 + SGST @9% ₹61.02 = ₹122.04");
+    expect(t).toContain("Amount inclusive of all taxes - CGST @9% ₹61.02 + SGST @9% ₹61.02");
     for (const gone of ["Transaction Fees", "Sub Total", "QTY", "RATE", "CGST (9%)", "SGST (9%)", "IGST (18%)"]) {
       expect(t, gone).not.toContain(gone);
     }
@@ -249,7 +249,7 @@ describe("the PDF", () => {
     const c = await company({ legalName: "B2C MH", gstStatus: "UNREGISTERED", gstRegisteredState: "Maharashtra" });
     const r = await generate([await booking(c._id)], "ALL_INCLUSIVE");
     const t = await pdfText(r.body.invoice);
-    expect(t).toContain("Amount inclusive of all taxes and service charges. GST included: IGST @18% ₹61.02");
+    expect(t).toContain("Amount inclusive of all taxes - IGST @18% ₹61.02");
   });
 
   it("Separate is unchanged (itemised, Sub Total and tax rows)", async () => {
@@ -355,9 +355,9 @@ describe("helpers", () => {
   it("tax note per supply type", () => {
     const f = (n: number) => `₹${n.toFixed(2)}`;
     expect(allInclusiveTaxNote({ supplyType: "CGST_SGST", totalGST: 305.08, cgstAmount: 152.54, sgstAmount: 152.54 }, f))
-      .toBe("Amount inclusive of all taxes and service charges. GST included: CGST @9% ₹152.54 + SGST @9% ₹152.54 = ₹305.08");
-    expect(allInclusiveTaxNote({ supplyType: "CGST_UTGST", totalGST: 10, cgstAmount: 5, utgstAmount: 5 }, f)).toContain("CGST @9% ₹5.00 + UTGST @9% ₹5.00 = ₹10.00");
-    expect(allInclusiveTaxNote({ supplyType: "IGST", totalGST: 305.08, igstAmount: 305.08 }, f)).toContain("GST included: IGST @18% ₹305.08");
+      .toBe("Amount inclusive of all taxes - CGST @9% ₹152.54 + SGST @9% ₹152.54");
+    expect(allInclusiveTaxNote({ supplyType: "CGST_UTGST", totalGST: 10, cgstAmount: 5, utgstAmount: 5 }, f)).toBe("Amount inclusive of all taxes - CGST @9% ₹5.00 + UTGST @9% ₹5.00");
+    expect(allInclusiveTaxNote({ supplyType: "IGST", totalGST: 305.08, igstAmount: 305.08 }, f)).toBe("Amount inclusive of all taxes - IGST @18% ₹305.08");
   });
 
   it("default layout resolution", () => {
