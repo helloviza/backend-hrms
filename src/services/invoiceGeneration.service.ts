@@ -27,7 +27,7 @@ import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
 import { buildLineItemsForBooking, buildCombinedLineItems } from "../utils/invoiceLineItems.js";
-import { allInclusiveRefusal, ALL_INCLUSIVE_NOT_ALLOWED, type InvoiceLayout } from "../utils/invoiceLayout.js";
+import { allInclusiveRefusal, ALL_INCLUSIVE_NOT_ALLOWED, parseInvoiceLayout, type InvoiceLayout } from "../utils/invoiceLayout.js";
 import { resolveCustomerState, buildAddressStr } from "../utils/invoiceClient.js";
 import { detectGSTType, calculateGSTAmounts, GST_STATE_CODES, UNION_TERRITORIES, type GSTType } from "../utils/gstDetection.js";
 import { resolveSellerGstProfile, SellerGstinNotFoundError } from "../utils/sellerGstResolver.js";
@@ -158,8 +158,13 @@ export interface CreateInvoiceOpts {
   // PDF layout, stored on the invoice (utils/invoiceLayout.ts). ALL_INCLUSIVE
   // must come with lineItemStyle 'SEPARATE' (it renders from those lines) and
   // is refused unless the client's gstStatus is REGISTERED or UNREGISTERED. Absent = not
-  // stored, rendered as before (every caller except /generate).
+  // stored, rendered as before (D2C), unless invoiceLayoutFromClientDefault.
+  // For format 'SEPARATE' (one invoice per booking) COMBINED gives each
+  // invoice the per-category lines.
   invoiceLayout?: InvoiceLayout;
+  // /bulk-generate: no invoiceLayout sent → the client's Business Profiles
+  // "Default invoice layout" (Separate when unset), under the same rules.
+  invoiceLayoutFromClientDefault?: boolean;
   billingPeriod?: string;
   invoiceDate?: Date | string;
   dueDate?: Date | string;
@@ -724,6 +729,10 @@ export async function createInvoiceFromBookings(
 
   const customer = await Customer.findById(wsId).lean();
 
+  if (!opts.invoiceLayout && opts.invoiceLayoutFromClientDefault) {
+    opts = { ...opts, invoiceLayout: parseInvoiceLayout((customer as any)?.defaultInvoiceLayout) ?? "SEPARATE" };
+  }
+
   // All-inclusive needs a set GST status (Registered or Unregistered). Checked before anything is written
   // or any reservation released.
   if (opts.invoiceLayout === "ALL_INCLUSIVE") {
@@ -779,7 +788,7 @@ export async function createInvoiceFromBookings(
     }
     const takesReserved = !!reuse?.bookingId && String(booking._id) === reuse.bookingId;
     try {
-      const invoice = await createOneInvoice([booking], ctx, opts, false, resolvedInvoiceDate, takesReserved ? reuse ?? undefined : undefined);
+      const invoice = await createOneInvoice([booking], ctx, opts, opts.invoiceLayout === "COMBINED", resolvedInvoiceDate, takesReserved ? reuse ?? undefined : undefined);
       created.push(invoice);
     } catch (err: any) {
       if (takesReserved) throw err;

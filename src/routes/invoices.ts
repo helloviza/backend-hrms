@@ -223,7 +223,7 @@ import CreditNote from "../models/CreditNote.js";
 import { generateInvoicePdf, prefetchInvoiceAssets } from "../utils/invoicePdf.js";
 import { REGISTER_GST_COLUMNS, registerGstCells } from "../utils/invoiceRegister.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
-import { buildLineItemsForBooking } from "../utils/invoiceLineItems.js";
+import { buildLineItemsForBooking, buildCombinedLineItems } from "../utils/invoiceLineItems.js";
 import { detectGSTType, calculateGSTAmounts, type GSTType } from "../utils/gstDetection.js";
 import { env } from "../config/env.js";
 import { resolveCustomerState, buildAddressStr } from "../utils/invoiceClient.js";
@@ -239,8 +239,7 @@ import User from "../models/User.js";
 import { buildInvoiceQueryFilter } from "./invoices.filters.js";
 import { partnerBookingIds } from "../services/partnerLeadBooking.js";
 import { normalizeGstStatus } from "../utils/customerGst.js";
-import type { InvoiceLayout } from "../utils/invoiceLayout.js";
-import { cancelLinksAfterSubjectCancelled } from "../services/paymentRequests.js";
+import { allInclusiveRefusal, ALL_INCLUSIVE_NOT_ALLOWED, parseInvoiceLayout, type InvoiceLayout } from "../utils/invoiceLayout.js";import { cancelLinksAfterSubjectCancelled } from "../services/paymentRequests.js";
 import {
   billingOwnUserId, bookingCreatorClause, ownInvoiceClause, invoiceOwnedBy, bookingRefsNotCreatedBy,
 } from "../utils/billingOwnScope.js";
@@ -911,6 +910,17 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
       return res.status(400).json({ error: "bookingIds array is required" });
     }
 
+    // Layout for every invoice in the batch. Not sent → the client's Default
+    // invoice layout (the service resolves it; All-inclusive under the same
+    // rule as /generate).
+    const sentLayout = req.body?.invoiceFormat;
+    const invoiceLayout = sentLayout === undefined || sentLayout === null || sentLayout === ""
+      ? undefined
+      : parseInvoiceLayout(sentLayout);
+    if (invoiceLayout === null) {
+      return res.status(400).json({ error: "INVOICE_LAYOUT_INVALID", message: "Invoice layout must be Separate, Combined or All-inclusive." });
+    }
+
     // A tenant caller may only invoice its own workspace's bookings — the whole
     // batch is refused, nothing is generated.
     if (await bookingsOutsideTenantScope(req, bookingIds)) {
@@ -950,6 +960,8 @@ router.post("/bulk-generate", requirePermission("invoices", "WRITE"), async (req
     const created = await createInvoiceFromBookings(bookingIds, {
       reservation: reservation ?? undefined,
       format: "SEPARATE",
+      invoiceLayout,
+      invoiceLayoutFromClientDefault: true,
       billingPeriod,
       invoiceDate: resolvedInvoiceDate,
       dueDate: resolvedDueDate,
@@ -2694,6 +2706,250 @@ router.post("/:id/revert-to-draft", requirePermission("invoices", "WRITE"), asyn
     res.json({ ok: true, invoice });
   } catch (err: any) {
     console.error("[Invoices revert-to-draft]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ── Change layout ────────────────────────────────────────────── */
+
+// POST /api/admin/invoices/:id/layout  { layout, confirmSent? }
+// Staff "Change layout": Separate / Combined / All-inclusive. Presentation
+// only: invoice number, subtotal, GST and its split, grand total and every
+// other stored figure stay as they are. Separate ↔ All-inclusive keeps the
+// stored lines (both render from the Separate lines). To or from Combined,
+// the lines are rebuilt from the invoice's bookings in the other style, and
+// only when the stored lines are still exactly what generation wrote (same
+// refs, rows, amounts and GST) and the rebuilt lines sum to the same amounts;
+// an invoice whose lines were edited is refused (409 LAYOUT_LINES_EDITED).
+// DRAFT: allowed. SENT: needs confirmSent (the client may already have the
+// old PDF). Any other status: refused. Logged in editHistory, and the stored
+// PDF is rendered again.
+class LayoutChangeError extends Error {
+  constructor(public httpStatus: number, public body: Record<string, unknown>) {
+    super(String(body.message ?? body.error));
+  }
+}
+
+const lineStyleOf = (l: InvoiceLayout): "SEPARATE" | "COMBINED" => (l === "COMBINED" ? "COMBINED" : "SEPARATE");
+const cents = (v: unknown) => Math.round((Number(v) || 0) * 100);
+const linesFingerprint = (lines: any[]) =>
+  JSON.stringify((lines || []).map((l) => [String(l?.bookingRef ?? ""), String(l?.rowType ?? ""), cents(l?.amount), cents(l?.igst)]));
+const linesSums = (lines: any[]) => ({
+  amount: (lines || []).reduce((s, l) => s + cents(l?.amount), 0),
+  gst: (lines || []).reduce((s, l) => s + cents(l?.igst), 0),
+});
+
+// Layout changes are refused for any invoice GENERATED before this instant
+// (17 Nov 2026 00:00 IST, when stored layouts went live). The generated
+// timestamp, not invoiceDate: a reissued invoice can carry an older date.
+export const LAYOUT_CHANGE_CUTOFF = new Date("2026-11-16T18:30:00.000Z");
+export const LAYOUT_CHANGE_CUTOFF_LABEL = "17 Nov 2026";
+
+const generatedAtOf = (inv: any): Date | null => {
+  const d = inv?.generatedAt ?? inv?.createdAt;
+  const t = d ? new Date(d) : null;
+  return t && !isNaN(t.getTime()) ? t : null;
+};
+
+/**
+ * One invoice's layout change, in its own transaction. Returns null when the
+ * invoice already has that layout (nothing written), else what changed.
+ * Throws LayoutChangeError for every refusal. The PDF is the caller's job.
+ */
+async function applyLayoutChange(
+  req: any,
+  invoiceId: mongoose.Types.ObjectId,
+  target: InvoiceLayout,
+  confirmSent: boolean,
+): Promise<{ from: InvoiceLayout; invoiceNo: string } | null> {
+  const session = await mongoose.startSession();
+  let changed: { from: InvoiceLayout; invoiceNo: string } | null = null;
+  try {
+    await session.withTransaction(async () => {
+      changed = null;
+      const raw: any = await Invoice.collection.findOne({ _id: invoiceId }, { session });
+      if (!raw || !(await invoiceInCallerScope(req, raw))) throw new LayoutChangeError(404, { error: "Invoice not found" });
+
+      const generatedAt = generatedAtOf(raw);
+      if (!generatedAt || generatedAt < LAYOUT_CHANGE_CUTOFF) {
+        throw new LayoutChangeError(400, {
+          error: "GENERATED_BEFORE_CUTOFF",
+          message: `Generated before ${LAYOUT_CHANGE_CUTOFF_LABEL}`,
+        });
+      }
+      if (raw.status !== "DRAFT" && raw.status !== "SENT") {
+        throw new LayoutChangeError(400, {
+          error: "LAYOUT_CHANGE_NOT_ALLOWED",
+          message: `The layout can be changed on a Draft or Sent invoice only (this one is ${raw.status}).`,
+        });
+      }
+      if (target === "ALL_INCLUSIVE") {
+        const ids = [...(await invoiceCustomerIds(raw, session))].filter((id) => mongoose.Types.ObjectId.isValid(id));
+        const customer: any = await Customer.findOne({ _id: { $in: ids } }).select("gstStatus").session(session).lean();
+        const refusal = allInclusiveRefusal(customer?.gstStatus);
+        if (refusal) throw new LayoutChangeError(400, { error: ALL_INCLUSIVE_NOT_ALLOWED, message: refusal });
+      }
+
+      const storedLines: any[] = Array.isArray(raw.lineItems) ? raw.lineItems : [];
+      const bookingIds = (raw.bookingIds || []).map(String);
+      const found: any[] = bookingIds.length
+        ? await ManualBooking.find({ _id: { $in: bookingIds } }).session(session).lean()
+        : [];
+      const byId = new Map(found.map((b: any) => [String(b._id), b]));
+      const bookings = bookingIds.map((id: string) => byId.get(id)).filter(Boolean);
+      const rebuild = (style: "SEPARATE" | "COMBINED") =>
+        bookings.length !== bookingIds.length || !bookings.length
+          ? null
+          : style === "COMBINED" ? buildCombinedLineItems(bookings) : bookings.flatMap((b: any) => buildLineItemsForBooking(b));
+      const rebuilt = { SEPARATE: rebuild("SEPARATE"), COMBINED: rebuild("COMBINED") };
+      const storedFp = linesFingerprint(storedLines);
+
+      // No stored layout (bulk invoices before this fix): Combined when the
+      // lines are exactly the Combined build (and not also the Separate one).
+      const from: InvoiceLayout = parseInvoiceLayout(raw.invoiceLayout)
+        ?? (rebuilt.COMBINED && storedFp === linesFingerprint(rebuilt.COMBINED)
+            && !(rebuilt.SEPARATE && storedFp === linesFingerprint(rebuilt.SEPARATE)) ? "COMBINED" : "SEPARATE");
+      if (from === target) return;
+      if (raw.status === "SENT" && !confirmSent) {
+        throw new LayoutChangeError(409, {
+          error: "CONFIRM_SENT_REQUIRED",
+          message: "This invoice has been sent. The client may already have the old PDF.",
+        });
+      }
+
+      let newLines: any[] | null = null;
+      if (lineStyleOf(from) !== lineStyleOf(target)) {
+        const current = rebuilt[lineStyleOf(from)];
+        const next = rebuilt[lineStyleOf(target)];
+        const editedRefusal = new LayoutChangeError(409, {
+          error: "LAYOUT_LINES_EDITED",
+          message: `This invoice's lines no longer match its bookings (edited after it was generated), so they can't be regrouped as ${target === "COMBINED" ? "Combined" : "Separate"} without changing figures. Use Separate or All-inclusive, or cancel and reissue.`,
+        });
+        if (!current || !next || storedFp !== linesFingerprint(current)) throw editedRefusal;
+        const a = linesSums(storedLines), b = linesSums(next);
+        if (a.amount !== b.amount || a.gst !== b.gst) throw editedRefusal;
+        newLines = next;
+      }
+
+      const now = new Date();
+      const editedBy = mongoose.Types.ObjectId.isValid(String(req.user?._id)) ? new mongoose.Types.ObjectId(String(req.user._id)) : req.user?._id;
+      const newValues: Record<string, unknown> = { invoiceLayout: target };
+      const oldValues: Record<string, unknown> = { invoiceLayout: raw.invoiceLayout ?? null };
+      if (raw.status === "SENT") newValues.sentInvoiceConfirmed = true;
+      if (newLines) {
+        oldValues.lineItems = storedLines.map(compactLine);
+        newValues.lineItems = newLines.map(compactLine);
+      }
+      const upd = await Invoice.collection.updateOne(
+        { _id: invoiceId, status: raw.status, invoiceLayout: raw.invoiceLayout ?? null },
+        {
+          $set: { invoiceLayout: target, editedAt: now, editedBy, ...(newLines ? { lineItems: newLines } : {}) },
+          $push: { editHistory: { editedAt: now, editedBy, fieldsChanged: newLines ? ["invoiceLayout", "lineItems"] : ["invoiceLayout"], oldValues, newValues } } as any,
+        },
+        { session },
+      );
+      if (upd.matchedCount !== 1) {
+        throw new LayoutChangeError(409, { error: "INVOICE_CHANGED", message: "The invoice changed while this was saving. Reload and try again." });
+      }
+      changed = { from, invoiceNo: raw.invoiceNo };
+    });
+  } finally {
+    session.endSession();
+  }
+  return changed;
+}
+
+router.post("/:id/layout", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  const target = parseInvoiceLayout(req.body?.layout);
+  if (!target) {
+    return res.status(400).json({ error: "INVOICE_LAYOUT_INVALID", message: "Layout must be Separate, Combined or All-inclusive." });
+  }
+  if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(404).json({ error: "Invoice not found" });
+  const invoiceId = new mongoose.Types.ObjectId(req.params.id);
+  try {
+    const done = await applyLayoutChange(req, invoiceId, target, req.body?.confirmSent === true);
+    if (!done) {
+      const invoice = await Invoice.collection.findOne({ _id: invoiceId });
+      return res.json({ ok: true, unchanged: true, invoice });
+    }
+    // The stored PDF follows the new layout (never throws; Download renders it again on failure).
+    const pdf = await renderReissuedPdf({ _id: invoiceId, invoiceNo: done.invoiceNo });
+    const invoice = await Invoice.collection.findOne({ _id: invoiceId });
+    res.json({ ok: true, from: done.from, invoice, ...(pdf.pdfError ? { pdfError: pdf.pdfError } : { pdfUrl: pdf.pdfUrl }) });
+  } catch (err: any) {
+    if (err instanceof LayoutChangeError) return res.status(err.httpStatus).json(err.body);
+    console.error("[Invoices change layout]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/invoices/bulk-layout  { invoiceIds, layout, confirmSent? }
+// The single action applied to each invoice in turn, same rules. Selected
+// SENT invoices need ONE confirmSent for the whole batch: without it the
+// request is refused (409, nothing changed) with the SENT numbers. Each row
+// ends up changed / skipped (a rule refused it, or already in that layout) /
+// failed (unexpected error); each change is its own transaction, logged in
+// that invoice's editHistory, and its stored PDF is rendered again.
+const BULK_LAYOUT_MAX = 500;
+const LAYOUT_LABEL: Record<InvoiceLayout, string> = { SEPARATE: "Separate", COMBINED: "Combined", ALL_INCLUSIVE: "All-inclusive" };
+router.post("/bulk-layout", requirePermission("invoices", "WRITE"), async (req: any, res: any) => {
+  try {
+    const target = parseInvoiceLayout(req.body?.layout);
+    if (!target) {
+      return res.status(400).json({ error: "INVOICE_LAYOUT_INVALID", message: "Layout must be Separate, Combined or All-inclusive." });
+    }
+    const ids: string[] = Array.isArray(req.body?.invoiceIds)
+      ? [...new Set<string>(req.body.invoiceIds.map(String))].filter((s) => mongoose.Types.ObjectId.isValid(s))
+      : [];
+    if (!ids.length) return res.status(400).json({ error: "invoiceIds array is required" });
+    if (ids.length > BULK_LAYOUT_MAX) return res.status(400).json({ error: `At most ${BULK_LAYOUT_MAX} invoices at a time.` });
+    const confirmSent = req.body?.confirmSent === true;
+
+    const rows: any[] = await Invoice.collection
+      .find({ _id: { $in: ids.map((s) => new mongoose.Types.ObjectId(s)) } }, { projection: { lineItems: 0, editHistory: 0 } })
+      .toArray();
+    const visible = new Map<string, any>();
+    for (const r of rows) if (await invoiceInCallerScope(req, r)) visible.set(String(r._id), r);
+
+    // One combined confirm for every SENT invoice the change would touch.
+    const sent = [...visible.values()].filter((r) => {
+      const g = generatedAtOf(r);
+      return r.status === "SENT" && g && g >= LAYOUT_CHANGE_CUTOFF && parseInvoiceLayout(r.invoiceLayout) !== target;
+    });
+    if (sent.length && !confirmSent) {
+      return res.status(409).json({
+        error: "CONFIRM_SENT_REQUIRED",
+        message: `${sent.length} of the selected invoices ${sent.length === 1 ? "has" : "have"} been sent. The client may already have the old PDF.`,
+        sentCount: sent.length,
+        sentInvoiceNos: sent.map((r) => r.invoiceNo),
+      });
+    }
+
+    const changed: { invoiceId: string; invoiceNo: string; from: InvoiceLayout; pdfError?: string }[] = [];
+    const skipped: { invoiceId: string; invoiceNo: string; code: string; reason: string }[] = [];
+    const failed: { invoiceId: string; invoiceNo: string; error: string }[] = [];
+
+    for (const id of ids) {
+      const row = visible.get(id);
+      const invoiceNo = String(row?.invoiceNo ?? "");
+      if (!row) { skipped.push({ invoiceId: id, invoiceNo, code: "NOT_FOUND", reason: "Invoice not found" }); continue; }
+      try {
+        const done = await applyLayoutChange(req, new mongoose.Types.ObjectId(id), target, confirmSent);
+        if (!done) { skipped.push({ invoiceId: id, invoiceNo, code: "ALREADY", reason: `Already ${LAYOUT_LABEL[target]}` }); continue; }
+        const pdf = await renderReissuedPdf({ _id: id, invoiceNo: done.invoiceNo });
+        changed.push({ invoiceId: id, invoiceNo, from: done.from, ...(pdf.pdfError ? { pdfError: pdf.pdfError } : {}) });
+      } catch (err: any) {
+        if (err instanceof LayoutChangeError && err.httpStatus < 500) {
+          skipped.push({ invoiceId: id, invoiceNo, code: String(err.body.error), reason: String(err.body.message ?? err.body.error) });
+        } else {
+          console.error("[Invoices bulk-layout]", invoiceNo, err?.message);
+          failed.push({ invoiceId: id, invoiceNo, error: err?.message || "Failed" });
+        }
+      }
+    }
+    res.json({ ok: true, layout: target, changed, skipped, failed });
+  } catch (err: any) {
+    console.error("[Invoices bulk-layout]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
