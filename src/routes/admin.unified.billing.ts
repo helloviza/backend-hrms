@@ -10,6 +10,12 @@ import User from "../models/User.js";
 import Employee from "../models/Employee.js";
 import CustomerMember from "../models/CustomerMember.js";
 import { isHouseUser } from "../middleware/requirePlatformAdmin.js";
+import { computeFlightInsights } from "../services/flightInsights.js";
+import {
+  computeLeadTime, computeHotelRates, computeTopRoutes, computeCarbon, computeServiceCards,
+  SERVICE_CARDS, type ServiceCardKey,
+} from "../services/travelKpis.js";
+import { quarterPlan, buildQuarterly, type QuarterRow, type QuarterlyStats } from "../services/quarterlySpend.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -219,30 +225,39 @@ interface HeatmapResponse {
   insight: string;
 }
 
-interface QuarterRow { label: string; partial: boolean; flight: number; hotel: number; other: number; total: number }
 interface QuarterlyResponse {
   ok: true;
   quarters: QuarterRow[];
-  stats: { q1Closed: number | null; q2ToDate: number; q2Projected: number | null };
+  stats: QuarterlyStats;
 }
 
 const DOW_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
 /* ─────────────────────────────────────────────────────────────
  * Bucketing — shared by /summary sparklines and /spend-trend so the
- * two series align (identical boundaries + count). Uniform offset buckets
- * (1-day / 7-day / 30-day) anchored at `from`, so the "previous period"
- * series is the SAME window shifted back by its own length.
+ * two series align (identical boundaries + count).
+ *
+ * Days are IST calendar days. Manual rows store bookedAt / travelDate as UTC
+ * midnight of the IST date, SBT rows carry real instants; grouping with
+ * timezone Asia/Kolkata puts both on the IST date they belong to (the old
+ * UTC grouping moved an SBT booking made 00:00–05:30 IST to the day before).
+ * Bucket boundaries are "day-key epochs": Date.UTC of the IST date.
  *
  * Granularity thresholds (range = to − from):
  *   ≤ 14 days → daily (1-day buckets)
- *   15–70 days → weekly (7-day buckets)
- *   > 70 days → monthly (30-day buckets)
+ *   15–70 days → weekly (7-day buckets from `from`)
+ *   > 70 days → monthly = IST CALENDAR months (Travel Spend audit N10; was
+ *               fixed 30-day blocks labelled as months). The first / last
+ *               month may be partial.
+ * The previous period is the same window shifted back: by its length for
+ * daily / weekly, by the same number of calendar months for monthly.
  * ───────────────────────────────────────────────────────────── */
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const DAY_MS = 86400000;
+const IST_TZ = "Asia/Kolkata";
 
 interface RangeBucket { label: string; date: string; start: number; end: number }
-interface BucketPlan { granularity: Granularity; unitMs: number; periodMs: number; windowStartMs: number; buckets: RangeBucket[] }
+interface BucketPlan { granularity: Granularity; buckets: RangeBucket[]; prevBuckets: RangeBucket[] }
 
 function pickGranularity(rangeDays: number): { granularity: Granularity; unitDays: number } {
   if (rangeDays <= 14) return { granularity: "daily", unitDays: 1 };
@@ -256,64 +271,109 @@ function fmtLabel(startMs: number, g: Granularity): string {
   return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
 }
 
-function buildBucketPlan(fromDate: Date, toDate: Date): BucketPlan {
-  const fromMs = fromDate.getTime();
-  const toMs = toDate.getTime();
-  const rangeDays = Math.max(0, (toMs - fromMs) / 86400000);
-  const { granularity, unitDays } = pickGranularity(rangeDays);
-  const unitMs = unitDays * 86400000;
-  const buckets: RangeBucket[] = [];
-  let start = fromMs;
-  while (start <= toMs) {
-    buckets.push({
-      label: fmtLabel(start, granularity),
-      date: new Date(start).toISOString().slice(0, 10),
-      start,
-      end: start + unitMs,
-    });
-    start += unitMs;
-  }
-  // Always emit at least one bucket so the series is never empty.
-  if (buckets.length === 0) {
-    buckets.push({ label: fmtLabel(fromMs, granularity), date: new Date(fromMs).toISOString().slice(0, 10), start: fromMs, end: fromMs + unitMs });
-  }
-  return { granularity, unitMs, periodMs: buckets.length * unitMs, windowStartMs: fromMs, buckets };
-}
-
+/** "YYYY-MM-DD" → Date.UTC of that date. */
 function dayKeyToEpoch(s: string): number {
   return Date.parse(`${s}T00:00:00Z`);
 }
 
-// Resolve the [from,to] window: query params if present, else the data's
-// min/max for the selected dateField within scope, else the last 30 days.
-async function resolveWindow(baseMatch: any, dateField: string, req: any): Promise<{ fromDate: Date; toDate: Date }> {
+/** An instant → the day-key epoch of its IST date. */
+export function istDayEpoch(d: Date): number {
+  return dayKeyToEpoch(new Date(d.getTime() + 5.5 * 3600 * 1000).toISOString().slice(0, 10));
+}
+
+/** Same day-of-month `n` months earlier/later, clamped to the month's end. */
+function addMonths(dayMs: number, n: number): number {
+  const d = new Date(dayMs);
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth() + n;
+  const last = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+  return Date.UTC(y, m, Math.min(d.getUTCDate(), last));
+}
+
+const mk = (start: number, end: number, g: Granularity): RangeBucket => ({
+  label: fmtLabel(start, g), date: new Date(start).toISOString().slice(0, 10), start, end,
+});
+
+/** `fromDay` / `toDay` are day-key epochs (inclusive). Exported for tests. */
+export function buildBucketPlan(fromDay: number, toDay: number): BucketPlan {
+  const endExcl = toDay + DAY_MS;
+  const rangeDays = Math.max(0, (toDay - fromDay) / DAY_MS);
+  const { granularity, unitDays } = pickGranularity(rangeDays);
+  const buckets: RangeBucket[] = [];
+  const prevBuckets: RangeBucket[] = [];
+
+  if (granularity === "monthly") {
+    let start = fromDay;
+    while (start < endExcl) {
+      const d = new Date(start);
+      const monthEnd = Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
+      buckets.push(mk(start, Math.min(monthEnd, endExcl), granularity));
+      start = monthEnd;
+    }
+    const n = buckets.length;
+    for (const b of buckets) prevBuckets.push(mk(addMonths(b.start, -n), addMonths(b.end, -n), granularity));
+  } else {
+    const unitMs = unitDays * DAY_MS;
+    for (let start = fromDay; start < endExcl; start += unitMs) buckets.push(mk(start, start + unitMs, granularity));
+    const periodMs = buckets.length * unitMs;
+    for (const b of buckets) prevBuckets.push(mk(b.start - periodMs, b.end - periodMs, granularity));
+  }
+  // Always emit at least one bucket so the series is never empty.
+  if (!buckets.length) {
+    buckets.push(mk(fromDay, fromDay + DAY_MS, granularity));
+    prevBuckets.push(mk(fromDay - DAY_MS, fromDay, granularity));
+  }
+  return { granularity, buckets, prevBuckets };
+}
+
+/** [from, to] of a bucket list as the instants fetchDailyConfirmed filters on. */
+function bucketWindow(b: RangeBucket[]): { from: Date; to: Date } {
+  return { from: new Date(b[0].start), to: new Date(b[b.length - 1].end - 1000) };
+}
+
+// Resolve the [from,to] window as IST day-key epochs: query params if
+// present, else the data's min/max for the selected dateField within scope,
+// else the last 30 days.
+async function resolveWindow(baseMatch: any, dateField: string, req: any): Promise<{ fromDay: number; toDay: number }> {
   const from = req.query.from as string | undefined;
   const to = req.query.to as string | undefined;
-  if (from && to) return { fromDate: new Date(from), toDate: new Date(`${to}T23:59:59Z`) };
+  if (from && to) return { fromDay: dayKeyToEpoch(from), toDay: dayKeyToEpoch(to) };
   const [mm] = await TravelBooking.aggregate([
     { $match: { ...baseMatch, status: "CONFIRMED" } },
     { $group: { _id: null, min: { $min: `$${dateField}` }, max: { $max: `$${dateField}` } } },
   ]).exec();
-  if (mm?.min && mm?.max) return { fromDate: new Date(mm.min), toDate: new Date(mm.max) };
-  const now = new Date();
-  return { fromDate: new Date(now.getTime() - 30 * 86400000), toDate: now };
+  if (mm?.min && mm?.max) return { fromDay: istDayEpoch(new Date(mm.min)), toDay: istDayEpoch(new Date(mm.max)) };
+  const today = istDayEpoch(new Date());
+  return { fromDay: today - 30 * DAY_MS, toDay: today };
 }
 
-interface DailyRow { t: number; spend: number; trips: number; users: string[] }
+interface DailyRow { t: number; spend: number; trips: number; travellers: string[] }
 
-// CONFIRMED daily rollup for an arbitrary window. Overrides ONLY the date
-// filter on the scoped match — tenant/user scope, paymentMode and service
-// filters from buildScopedMatch are all retained.
+// The passenger identity /summary's Travellers card and /top-travellers use:
+// travellerName (lower-cased) on manual rows, userId on SBT rows. The
+// sparkline used to count distinct userId — the staff booker on manual rows —
+// so card and sparkline counted different things (audit N9).
+const TRAVELLER_KEY_EXPR = {
+  $cond: [
+    { $gt: [{ $strLenCP: { $ifNull: ["$travellerName", ""] } }, 0] },
+    { $concat: ["name:", { $toLower: "$travellerName" }] },
+    { $concat: ["uid:", { $toString: "$userId" }] },
+  ],
+};
+
+// CONFIRMED daily rollup (IST days) for an arbitrary window. Overrides ONLY
+// the date filter on the scoped match — tenant/user scope, paymentMode and
+// service filters from buildScopedMatch are all retained.
 async function fetchDailyConfirmed(baseMatch: any, dateField: string, winFrom: Date, winTo: Date): Promise<DailyRow[]> {
   const m: any = { ...baseMatch, status: "CONFIRMED", [dateField]: { $gte: winFrom, $lte: winTo } };
   const rows = await TravelBooking.aggregate([
     { $match: m },
     {
       $group: {
-        _id: { $dateToString: { format: "%Y-%m-%d", date: `$${dateField}`, timezone: "UTC" } },
+        _id: { $dateToString: { format: "%Y-%m-%d", date: `$${dateField}`, timezone: IST_TZ } },
         spend: { $sum: "$amount" },
         trips: { $sum: 1 },
-        users: { $addToSet: "$userId" },
+        travellers: { $addToSet: TRAVELLER_KEY_EXPR },
       },
     },
   ]).exec();
@@ -321,25 +381,51 @@ async function fetchDailyConfirmed(baseMatch: any, dateField: string, winFrom: D
     t: dayKeyToEpoch(r._id),
     spend: r.spend || 0,
     trips: r.trips || 0,
-    users: (r.users || []).map((u: any) => String(u)),
+    travellers: (r.travellers || []).map((u: any) => String(u)),
   }));
 }
 
-// Assign daily rows into `bucketCount` buckets relative to `windowStartMs`
-// (use the shifted start for the previous period). Returns aligned arrays.
-function rollIntoBuckets(daily: DailyRow[], bucketCount: number, windowStartMs: number, unitMs: number) {
-  const spend = new Array<number>(bucketCount).fill(0);
-  const trips = new Array<number>(bucketCount).fill(0);
-  const userSets: Set<string>[] = Array.from({ length: bucketCount }, () => new Set<string>());
+// Assign daily rows into the given buckets (clamped to the ends). Returns aligned arrays.
+export function rollIntoBuckets(daily: DailyRow[], buckets: RangeBucket[]) {
+  const n = buckets.length;
+  const spend = new Array<number>(n).fill(0);
+  const trips = new Array<number>(n).fill(0);
+  const sets: Set<string>[] = Array.from({ length: n }, () => new Set<string>());
   for (const d of daily) {
-    let idx = Math.floor((d.t - windowStartMs) / unitMs);
-    if (idx < 0) idx = 0;
-    if (idx >= bucketCount) idx = bucketCount - 1;
+    let idx = buckets.findIndex((b) => d.t >= b.start && d.t < b.end);
+    if (idx < 0) idx = d.t < buckets[0].start ? 0 : n - 1;
     spend[idx] += d.spend;
     trips[idx] += d.trips;
-    for (const u of d.users) userSets[idx].add(u);
+    for (const u of d.travellers) sets[idx].add(u);
   }
-  return { spend, trips, travellers: userSets.map((s) => s.size) };
+  return { spend, trips, travellers: sets.map((s) => s.size) };
+}
+
+/* ── Recent Bookings / CSV filters (audit N6, N8) ── */
+const STATUSES = ["CONFIRMED", "PENDING", "CANCELLED", "FAILED"] as const;
+
+/** ?status=CONFIRMED | CONFIRMED,PENDING | ALL (or absent) → match clause or null. */
+export function statusFilter(raw: unknown): { $in: string[] } | null {
+  const vals = String(raw ?? "").split(",").map((v) => v.trim().toUpperCase()).filter(Boolean);
+  if (!vals.length || vals.includes("ALL")) return null;
+  const ok = vals.filter((v) => (STATUSES as readonly string[]).includes(v));
+  return ok.length ? { $in: ok } : { $in: ["__none__"] };
+}
+
+/** ?sort=date|amount|service&dir=asc|desc → a stable Mongo sort (newest first by default). */
+export function bookingSort(q: any, dateField: string): Record<string, 1 | -1> {
+  const dir: 1 | -1 = String(q?.dir || "").toLowerCase() === "asc" ? 1 : -1;
+  const key = String(q?.sort || "date").toLowerCase();
+  const field = key === "amount" ? "amount" : key === "service" ? "service" : dateField;
+  return field === dateField ? { [field]: dir, _id: dir } : { [field]: dir, [dateField]: -1, _id: -1 };
+}
+
+/** IST calendar date of an instant, "YYYY-MM-DD" ("" when absent). */
+export function istDate(v: unknown): string {
+  if (!v) return "";
+  const d = new Date(v as any);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Date(d.getTime() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
 function csvEscape(v: any): string {
@@ -521,10 +607,11 @@ router.get("/summary", async (req: Request, res: Response) => {
 
     // sparklines — SAME bucketing as /spend-trend (same window + plan) so the
     // panels align. CONFIRMED only; travellers = distinct userId per bucket.
-    const { fromDate: spkFrom, toDate: spkTo } = await resolveWindow(match, dateField, req);
-    const plan = buildBucketPlan(spkFrom, spkTo);
-    const daily = await fetchDailyConfirmed(match, dateField, spkFrom, spkTo);
-    const rolled = rollIntoBuckets(daily, plan.buckets.length, plan.windowStartMs, plan.unitMs);
+    const { fromDay, toDay } = await resolveWindow(match, dateField, req);
+    const plan = buildBucketPlan(fromDay, toDay);
+    const win = bucketWindow(plan.buckets);
+    const daily = await fetchDailyConfirmed(match, dateField, win.from, win.to);
+    const rolled = rollIntoBuckets(daily, plan.buckets);
     const sparklines: Sparklines = {
       total: rolled.spend,
       trips: rolled.trips,
@@ -564,21 +651,20 @@ router.get("/spend-trend", async (req: Request, res: Response) => {
     const match = buildScopedMatch(req);
     const df = resolveDateField(req as any);
 
-    const { fromDate, toDate } = await resolveWindow(match, df, req);
-    const plan = buildBucketPlan(fromDate, toDate);
+    const { fromDay, toDay } = await resolveWindow(match, df, req);
+    const plan = buildBucketPlan(fromDay, toDay);
     const n = plan.buckets.length;
 
     // thisPeriod
-    const thisDaily = await fetchDailyConfirmed(match, df, fromDate, toDate);
-    const thisRoll = rollIntoBuckets(thisDaily, n, plan.windowStartMs, plan.unitMs);
+    const thisWin = bucketWindow(plan.buckets);
+    const thisDaily = await fetchDailyConfirmed(match, df, thisWin.from, thisWin.to);
+    const thisRoll = rollIntoBuckets(thisDaily, plan.buckets);
 
-    // lastPeriod = the SAME window shifted back by its own length (Previous
-    // period, NOT last year — data only starts 30 Jan 2026). Bucketed identically.
-    const prevStartMs = plan.windowStartMs - plan.periodMs;
-    const prevFrom = new Date(prevStartMs);
-    const prevTo = new Date(plan.windowStartMs - 1);
-    const prevDaily = await fetchDailyConfirmed(match, df, prevFrom, prevTo);
-    const prevRoll = rollIntoBuckets(prevDaily, n, prevStartMs, plan.unitMs);
+    // lastPeriod = the SAME window shifted back (by its length, or by the
+    // same number of calendar months) — Previous period, NOT last year.
+    const prevWin = bucketWindow(plan.prevBuckets);
+    const prevDaily = await fetchDailyConfirmed(match, df, prevWin.from, prevWin.to);
+    const prevRoll = rollIntoBuckets(prevDaily, plan.prevBuckets);
 
     const buckets: TrendBucket[] = plan.buckets.map((b, i) => ({
       label: b.label,
@@ -887,17 +973,20 @@ router.get("/spend-by-department", async (req: Request, res: Response) => {
 router.get("/bookings", async (req: Request, res: Response) => {
   try {
     const match = buildScopedMatch(req);
-    if (req.query.status) match.status = req.query.status;
+    const st = statusFilter(req.query.status);
+    if (st) match.status = st;
 
     const page = Math.max(1, parseInt(req.query.page as string) || 1);
     const limit = Math.min(200, Math.max(1, parseInt(req.query.limit as string) || 20));
     const skip = (page - 1) * limit;
 
-    const sortField = resolveDateField(req as any);
+    // Server-side sort + paging over the whole range (audit N8 — the page
+    // used to fetch 20 rows and sort / page only those).
+    const sort = bookingSort(req.query, resolveDateField(req as any));
     const [bookings, total] = await Promise.all([
       TravelBooking.find(match)
         .populate("userId", "name firstName lastName email")
-        .sort({ [sortField]: -1 })
+        .sort(sort)
         .skip(skip)
         .limit(limit)
         .lean()
@@ -938,6 +1027,7 @@ router.get("/bookings", async (req: Request, res: Response) => {
         paymentMode: b.paymentMode,
         source: b.source,
         destination: b.destination,
+        destinationCity: b.destinationCity ?? null,
         origin: b.origin,
         bookedAt: b.bookedAt,
         travelDate: b.travelDate,
@@ -967,29 +1057,25 @@ router.get("/bookings", async (req: Request, res: Response) => {
 router.get("/bookings/export.csv", async (req: Request, res: Response) => {
   try {
     const CSV_HEADER =
-      "Date,Service,Traveller,Email,Traveler ID,Department,Origin,Destination,Amount,Status,Payment Mode,Source,Booking Reference";
+      "Date (IST),Travel Date (IST),Service,Traveller,Email,Traveler ID,Origin,Destination,Destination City,Destination Country,Amount,Status,Payment Mode,Source,Booking Reference";
 
+    // Same status filter as the Recent Bookings table (audit N6): the page
+    // sends CONFIRMED by default so the export matches Total Spend.
     const match = buildScopedMatch(req);
-    if (req.query.status) match.status = req.query.status;
+    const st = statusFilter(req.query.status);
+    if (st) match.status = st;
 
-    const csvSortField = resolveDateField(req as any);
     const bookings = await TravelBooking.find(match)
       .populate("userId", "name firstName lastName email")
-      .sort({ [csvSortField]: -1 })
+      .sort(bookingSort(req.query, resolveDateField(req as any)))
       .lean()
       .exec();
 
     const userIds = bookings.map((b: any) =>
       b.userId && typeof b.userId === "object" ? b.userId._id : b.userId,
     );
-    const employees = await Employee.find({ ownerId: { $in: userIds } })
-      .select("ownerId department")
-      .lean()
-      .exec();
-    const empMap: Record<string, string> = {};
-    for (const e of employees as any[]) {
-      empMap[String(e.ownerId)] = e.department || "";
-    }
+    // No Department column (Phase B additions, 2026-11-18): the only source
+    // was the BOOKER's employee record, which is ops staff on manual rows.
 
     // Effective traveller email per row: passenger for manual rows, booker's
     // populated email for SBT rows. Used for both the CSV column and the
@@ -1001,43 +1087,47 @@ router.get("/bookings/export.csv", async (req: Request, res: Response) => {
       return String(e || "").toLowerCase();
     };
 
-    // Batch-lookup travelerId by effective traveller email
+    // Batch-lookup travelerId by effective traveller email WITHIN the row's
+    // own company (tenantId = CustomerMember.customerId) — an email shared
+    // across companies must not pull another company's traveller ID (N6).
     const emails = [...new Set(
       (bookings as any[]).map(effEmail).filter(Boolean),
     )];
-    const travelerMembers = await CustomerMember.find({ email: { $in: emails } })
-      .select("email travelerId")
-      .lean()
-      .exec();
+    const tenants = [...new Set((bookings as any[]).map((b) => String(b.tenantId || "")).filter(Boolean))];
+    const travelerMembers = emails.length && tenants.length
+      ? await CustomerMember.find({ email: { $in: emails }, customerId: { $in: tenants } })
+          .select("email customerId travelerId")
+          .lean()
+          .exec()
+      : [];
     const travelerMap = new Map<string, string>(
-      (travelerMembers as any[]).map((m) => [String(m.email).toLowerCase(), m.travelerId || ""]),
+      (travelerMembers as any[]).map((m) => [`${m.customerId}|${String(m.email).toLowerCase()}`, m.travelerId || ""]),
     );
 
     const lines: string[] = [CSV_HEADER];
 
     for (const b of bookings as any[]) {
       const pop = b.userId && typeof b.userId === "object" ? b.userId : null;
-      const uid = pop ? String(pop._id) : String(b.userId || "");
       const hasName = !!(b.travellerName && String(b.travellerName).trim());
       const userName = pop
         ? pop.name || [pop.firstName, pop.lastName].filter(Boolean).join(" ") || ""
         : "";
-      // Manual rows: show the passenger, not the booker; don't attribute the
-      // booker's department to the passenger.
+      // Manual rows: show the passenger, not the booker.
       const name = hasName ? b.travellerName : userName;
       const email = effEmail(b);
-      const department = hasName ? "" : empMap[uid] || "";
 
       lines.push(
         [
-          csvEscape(b.bookedAt),
+          csvEscape(istDate(b.bookedAt)),
+          csvEscape(istDate(b.travelDate)),
           csvEscape(b.service),
           csvEscape(name),
           csvEscape(email),
-          csvEscape(travelerMap.get(email) || ""),
-          csvEscape(department),
+          csvEscape(travelerMap.get(`${b.tenantId}|${email}`) || ""),
           csvEscape(b.origin),
           csvEscape(b.destination),
+          csvEscape(b.destinationCity || ""),
+          csvEscape(b.destinationCountry || ""),
           csvEscape(b.amount),
           csvEscape(b.status),
           csvEscape(b.paymentMode),
@@ -1075,19 +1165,21 @@ router.get("/heatmap", async (req: Request, res: Response) => {
     const WEEKS = 13;
     const DAY = 86400000;
     const now = new Date();
-    // Week starts SUNDAY (UTC). Current week's Sunday 00:00 UTC:
-    const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    // Week starts SUNDAY, IST calendar days (day-key epochs). Current week's Sunday:
+    const todayUTC = istDayEpoch(now);
     const currentWeekStartMs = todayUTC - new Date(todayUTC).getUTCDay() * DAY;
     const windowStartMs = currentWeekStartMs - (WEEKS - 1) * 7 * DAY; // week 0 = oldest
     const windowEndMs = currentWeekStartMs + 7 * DAY; // end of current week (exclusive)
 
-    const match: any = { ...base, bookedAt: { $gte: new Date(windowStartMs), $lt: new Date(windowEndMs) } };
+    // Day-key epochs → IST-midnight instants for the filter.
+    const IST_MS = 5.5 * 3600 * 1000;
+    const match: any = { ...base, bookedAt: { $gte: new Date(windowStartMs - IST_MS), $lt: new Date(windowEndMs - IST_MS) } };
 
     const rows = await TravelBooking.aggregate([
       { $match: match },
       {
         $group: {
-          _id: { $dateToString: { format: "%Y-%m-%d", date: "$bookedAt", timezone: "UTC" } },
+          _id: { $dateToString: { format: "%Y-%m-%d", date: "$bookedAt", timezone: IST_TZ } },
           count: { $sum: 1 },
         },
       },
@@ -1145,18 +1237,28 @@ router.get("/heatmap", async (req: Request, res: Response) => {
  * ═════════════════════════════════════════════════════════════ */
 router.get("/quarterly", async (req: Request, res: Response) => {
   try {
-    // Scoped match (tenant/user scope + paymentMode + any from/to on dateField)
-    // + CONFIRMED. Grouped by calendar quarter of the selected dateField.
+    // Scoped match (tenant/user scope + paymentMode + service) + CONFIRMED,
+    // grouped by IST calendar quarter of the selected dateField (audit N10).
+    // The panel shows the last QUARTERS_SHOWN quarters ending with the quarter
+    // of `to` (default: today) — it no longer narrows to the date preset, which
+    // on the default "This month" left a single partial quarter.
     const df = resolveDateField(req as any);
-    const match = { ...buildScopedMatch(req), status: "CONFIRMED" };
+    const match: any = { ...buildScopedMatch(req), status: "CONFIRMED" };
+    delete match.bookedAt;
+    delete match.travelDate;
+
+    const now = new Date();
+    const anchor = req.query.to ? new Date(`${req.query.to}T00:00:00Z`) : new Date(istDayEpoch(now));
+    const plan = quarterPlan(anchor, now);
+    match[df] = { $gte: new Date(plan.windowFromMs - 5.5 * 3600 * 1000), $lt: new Date(plan.windowToMs - 5.5 * 3600 * 1000) };
 
     const rows = await TravelBooking.aggregate([
       { $match: match },
       {
         $group: {
           _id: {
-            y: { $year: `$${df}` },
-            q: { $ceil: { $divide: [{ $month: `$${df}` }, 3] } },
+            y: { $year: { date: `$${df}`, timezone: IST_TZ } },
+            q: { $ceil: { $divide: [{ $month: { date: `$${df}`, timezone: IST_TZ } }, 3] } },
             svc: "$service",
           },
           amount: { $sum: "$amount" },
@@ -1164,63 +1266,96 @@ router.get("/quarterly", async (req: Request, res: Response) => {
       },
     ]).exec();
 
-    // Fold service into flight / hotel / other per (year, quarter).
-    const qmap = new Map<string, { y: number; q: number; flight: number; hotel: number; other: number }>();
-    for (const r of rows as any[]) {
-      const { y, q, svc } = r._id;
-      const key = `${y}-${q}`;
-      let e = qmap.get(key);
-      if (!e) { e = { y, q, flight: 0, hotel: 0, other: 0 }; qmap.set(key, e); }
-      if (svc === "FLIGHT") e.flight += r.amount;
-      else if (svc === "HOTEL") e.hotel += r.amount;
-      else e.other += r.amount; // Visa, Cab, Forex, Holiday, MICE, Train, Other …
-    }
-
-    const now = new Date();
-    const nowY = now.getUTCFullYear();
-    const nowQ = Math.ceil((now.getUTCMonth() + 1) / 3);
-
-    const entries = [...qmap.values()].sort((a, b) => a.y - b.y || a.q - b.q);
-    const quarters: QuarterRow[] = entries.map((e) => {
-      const total = e.flight + e.hotel + e.other;
-      const partial = e.y === nowY && e.q === nowQ;
-      return { label: `Q${e.q}${partial ? "*" : ""}`, partial, flight: e.flight, hotel: e.hotel, other: e.other, total };
-    });
-
-    // stats — referenced to the CURRENT year (nowY).
-    const q1 = entries.find((e) => e.y === nowY && e.q === 1);
-    const q2 = entries.find((e) => e.y === nowY && e.q === 2);
-    const q1Total = q1 ? q1.flight + q1.hotel + q1.other : null;
-    // Q1 closed once we're past it (same year, current quarter > 1).
-    const q1Closed = q1Total != null && nowQ > 1 ? q1Total : null;
-    const q2ToDate = q2 ? q2.flight + q2.hotel + q2.other : 0;
-
-    // q2Projected = q2ToDate / daysElapsedInQuarter × totalDaysInQuarter (run-rate).
-    let q2Projected: number | null = null;
-    if (q2) {
-      if (nowQ === 2) {
-        const qStart = Date.UTC(nowY, 3, 1); // Apr 1
-        const qEnd = Date.UTC(nowY, 6, 1); // Jul 1 (exclusive)
-        const totalDays = Math.round((qEnd - qStart) / 86400000); // 91
-        const todayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-        let daysElapsed = Math.floor((todayUTC - qStart) / 86400000) + 1;
-        if (daysElapsed < 1) daysElapsed = 1;
-        if (daysElapsed > totalDays) daysElapsed = totalDays;
-        q2Projected = Math.round((q2ToDate / daysElapsed) * totalDays);
-      } else {
-        // Q2 already closed → projection is the realised total.
-        q2Projected = q2ToDate;
-      }
-    }
-
-    const payload: QuarterlyResponse = {
-      ok: true,
-      quarters,
-      stats: { q1Closed, q2ToDate, q2Projected },
-    };
+    const payload: QuarterlyResponse = buildQuarterly(rows as any[], plan, now);
     res.json(payload);
   } catch (err: any) {
     res.status(500).json({ error: "Failed to fetch quarterly", detail: err?.message });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════
+ * GET /flight-insights  (CONFIRMED only — Phase B panels)
+ *   Domestic vs International (flights, hotels), Airline share (split by
+ *   booking), Departure time slot (first leg, IST) + coverage.
+ *   One request for all three panels; same scope + filters as the rest.
+ * ═════════════════════════════════════════════════════════════ */
+router.get("/flight-insights", async (req: Request, res: Response) => {
+  try {
+    const match: any = { ...buildScopedMatch(req), status: "CONFIRMED" };
+    const svc = match.service?.$in as string[] | undefined;
+    const wanted = ["FLIGHT", "HOTEL"].filter((s) => !svc || svc.includes(s));
+    match.service = { $in: wanted };
+    const rows = wanted.length
+      ? await TravelBooking.find(match)
+          .select("service amount isInternational metadata.carrierShares metadata.departMinutesIST metadata.departTimeUnknown metadata.departTimeSource metadata.cabinClass metadata.cabinClassSource")
+          .lean()
+          .exec()
+      : [];
+    res.json({ ok: true, ...computeFlightInsights(rows as any[]) });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch flight insights", detail: err?.message });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════
+ * GET /travel-kpis  (CONFIRMED only — Phase B additions, 2026-11-18)
+ *   Lead time + last-minute share, hotel nightly rate by city + average
+ *   stay, top routes, carbon — each with its coverage. One request, same
+ *   scope + filters as the rest.
+ * ═════════════════════════════════════════════════════════════ */
+router.get("/travel-kpis", async (req: Request, res: Response) => {
+  try {
+    const match: any = { ...buildScopedMatch(req), status: "CONFIRMED" };
+    const svc = match.service?.$in as string[] | undefined;
+    const wanted = ["FLIGHT", "HOTEL"].filter((s) => !svc || svc.includes(s));
+    match.service = { $in: wanted };
+    const rows: any[] = wanted.length
+      ? await TravelBooking.find(match)
+          .select("service amount bookedAt travelDate destinationCity reference metadata.originCity metadata.nights metadata.rooms")
+          .lean()
+          .exec()
+      : [];
+    const flightRefs = rows.filter((r) => r.service === "FLIGHT" && r.reference).map((r) => r.reference);
+    const records = flightRefs.length
+      ? await mongoose.connection.collection("carbonrecords")
+          .find({ bookingId: { $in: flightRefs }, status: "calculated" }, { projection: { bookingId: 1, co2eKg: 1, distanceKm: 1 } })
+          .toArray()
+      : [];
+    res.json({
+      ok: true,
+      leadTime: computeLeadTime(rows),
+      hotels: computeHotelRates(rows),
+      routes: computeTopRoutes(rows),
+      carbon: computeCarbon(flightRefs, records as any[]),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch travel KPIs", detail: err?.message });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════
+ * GET /service-cards  (Phase B additions, 2026-11-18)
+ *   Visa / Forex / eSIM: processed (CONFIRMED), under processing (PENDING),
+ *   total + average cost; visa outcomes once recorded on the booking. The
+ *   US visa appointment fee mirrors as OTHER, so it is matched by its
+ *   manual type. A service filter keeps only the cards it names.
+ * ═════════════════════════════════════════════════════════════ */
+router.get("/service-cards", async (req: Request, res: Response) => {
+  try {
+    const match: any = buildScopedMatch(req);
+    const svc = match.service?.$in as string[] | undefined;
+    delete match.service;
+    match.status = { $in: ["CONFIRMED", "PENDING"] };
+    match.$or = [{ service: { $in: [...SERVICE_CARDS] } }, { "metadata.manualType": "US_VISA_EARLY_APPOINTMENT_FEE" }];
+    const rows = await TravelBooking.find(match)
+      .select("service status amount metadata.manualType metadata.visaOutcome")
+      .lean()
+      .exec();
+    const cards = computeServiceCards(rows as any[]);
+    if (svc) for (const k of SERVICE_CARDS) if (!svc.includes(k)) delete (cards as Partial<Record<ServiceCardKey, unknown>>)[k];
+    res.json({ ok: true, cards });
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to fetch service cards", detail: err?.message });
   }
 });
 

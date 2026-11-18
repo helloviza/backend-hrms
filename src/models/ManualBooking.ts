@@ -1,9 +1,15 @@
 import { Schema, model, type Document } from "mongoose";
 import TravelBooking from "./TravelBooking.js";
 import CustomerWorkspace from "./CustomerWorkspace.js";
-import { lookupDestination, lookupDestinationFuzzy } from "../data/destinationLookup.js";
+import { resolveManualDestination, internationalFrom, isManualFlightType, manualFlightAnalytics } from "../services/travelMirrorAnalytics.js";
 import { returnJourneyStart } from "../services/flightLegs.js";
 import { attachMirrorResyncHooks } from "../utils/mirrorResyncHooks.js";
+import { travelLookup } from "../data/destinationLookup.js";
+import { loadTicketRows, ticketDeparture, ticketCabin, realCabin, firstStop } from "../services/ticketFallback.js";
+
+/** Optional outcome of a manual visa booking (Phase B additions, 2026-11-18). Editable later. */
+export const VISA_OUTCOMES = ["APPROVED", "REJECTED", "AWAITING"] as const;
+export type VisaOutcome = (typeof VISA_OUTCOMES)[number];
 
 // The frontend restates these lists in pages/admin/ManualBookingForm.tsx (the
 // dropdown) and pages/admin/ManualBookings.tsx (the filter);
@@ -111,6 +117,8 @@ export interface ManualBookingLeg {
   departTime?: string;
   arriveDate?: Date;
   arriveTime?: string;
+  /** The operator chose "Unknown" for the departure time (Phase B form rule). */
+  departTimeUnknown?: boolean;
   cabinClass?: string;
   /** Layover printed AFTER this leg (e.g. "2h 15m"); present ⇒ the next leg is a connection. */
   layover?: string;
@@ -154,6 +162,8 @@ export interface IManualBooking extends Document {
     // Visa Service group only.
     visaCountry?: string;
     visaType?: string;
+    /** Visa outcome, optional (VISA / US visa fee rows). Travel Spend counts it once present. */
+    visaOutcome?: VisaOutcome;
     // Multi-leg flights (Step 4). ADDITIVE: legacy rows have neither field
     // (absent — `undefined` under .lean(), `[]` on a hydrated doc), so every
     // reader guards with `Array.isArray(legs) && legs.length`. When legs are
@@ -420,6 +430,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
       vehicleType: String,
       visaCountry: String,
       visaType: String,
+      visaOutcome: { type: String, enum: [...VISA_OUTCOMES, null], default: undefined },
       tripType: { type: String, enum: MANUAL_BOOKING_TRIP_TYPES },
       legs: {
         type: [
@@ -433,6 +444,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
               departTime: String,
               arriveDate: Date,
               arriveTime: String,
+              departTimeUnknown: Boolean,
               cabinClass: String,
               layover: String,
             },
@@ -1058,25 +1070,56 @@ export async function buildManualBookingMirror(doc: any): Promise<Record<string,
   // if T3 found neither a city nor a country (e.g. `destination` held a
   // hotel name), fuzzy-match itinerary.destination then sector — recovers
   // the hotel-name-not-city case the backfill's audit flagged.
-  let destinationCity: string | null = null;
-  let destinationCountry: string | null = null;
-  let isInternational: boolean | null = null;
-  const t3 = lookupDestination(destination);
-  if (t3 && (t3.city || t3.country)) {
-    destinationCity = t3.city;
-    destinationCountry = t3.country;
-    isInternational = t3.international;
-  } else {
-    for (const cand of [doc.itinerary?.destination, doc.sector]) {
-      const hit = lookupDestinationFuzzy(cand);
-      if (hit?.city) {
-        destinationCity = hit.city;
-        destinationCountry = hit.country;
-        isInternational = hit.international;
-        break;
+  // Phase B (2026-11-18) adds the visa / rail / country-only / hotel-name
+  // tiers — services/travelMirrorAnalytics.ts resolveManualDestination.
+  const { destinationCity, destinationCountry } = resolveManualDestination(doc, destination);
+  const isFlight = isManualFlightType(type);
+  const legsSrc: any[] = Array.isArray(doc.itinerary?.legs) ? doc.itinerary.legs : [];
+  // Flights: international when ANY leg starts or ends outside India
+  // (decision 2026-11-18); legacy single-sector rows use origin + destination.
+  const isInternational = isFlight
+    ? internationalFrom(
+        legsSrc.length ? legsSrc.flatMap((l: any) => [l.origin, l.destination]) : [origin, destination],
+        destinationCountry,
+      )
+    : destinationCountry == null ? null : destinationCountry !== "IN";
+  const flight = isFlight ? manualFlightAnalytics(doc) : null;
+
+  // Phase B additions (2026-11-18): when the booking has no departure time or
+  // no real cabin, fall back to its extracted ticket — mirror only, flagged
+  // "ticket". Rules: services/ticketFallback.ts.
+  let departTimeSource: "booking" | "ticket" | null = null;
+  let departTimeFromTz: string | null = null;
+  let cabinClass: string | null = null;
+  let cabinClassSource: "booking" | "ticket" | null = null;
+  let originCity: string | null = null;
+  if (flight) {
+    const bookingCabin = realCabin(legsSrc[0]?.cabinClass);
+    if (flight.departMinutesIST != null) departTimeSource = "booking";
+    if (bookingCabin) { cabinClass = bookingCabin; cabinClassSource = "booking"; }
+    if (flight.departMinutesIST == null || !bookingCabin) {
+      const rows = await loadTicketRows(doc._id);
+      if (rows.length) {
+        let seg: number | null = null;
+        if (flight.departMinutesIST == null) {
+          const t = ticketDeparture(doc, rows);
+          if (t.ok) {
+            flight.departMinutesIST = t.minutesIST;
+            flight.departTimeIST = t.departTimeIST;
+            departTimeSource = "ticket";
+            departTimeFromTz = t.fromTz;
+            seg = t.segmentIndex;
+          }
+        }
+        if (!bookingCabin) {
+          const c = ticketCabin(rows, seg);
+          if (c) { cabinClass = c; cabinClassSource = "ticket"; }
+        }
       }
     }
+    originCity = travelLookup(firstStop(legsSrc[0]?.origin ?? origin))?.city ?? null;
   }
+  const visaOutcome = doc.itinerary?.visaOutcome || null;
 
   // Customer-facing billed total only — never supplier cost / markup.
   const amount =
@@ -1133,9 +1176,33 @@ export async function buildManualBookingMirror(doc: any): Promise<Record<string,
             flightNo: l.flightNo || "",
             airline: l.airline || "",
             departDate: l.departDate ? new Date(l.departDate) : null,
+            // Printed clock text, as stored on the booking (Phase B).
+            departTime: l.departTime || "",
             arriveDate: l.arriveDate ? new Date(l.arriveDate) : null,
+            arriveTime: l.arriveTime || "",
           }))
         : [],
+      // Phase B analytics (flights only): flat flight no., carriers split by
+      // booking (shares sum to 1), first leg's departure as IST clock time.
+      ...(flight
+        ? {
+            flightNo: doc.itinerary?.flightNo || "",
+            carrierShares: flight.carrierShares,
+            departTimeIST: flight.departTimeIST,
+            departMinutesIST: flight.departMinutesIST,
+            departTimeUnknown: flight.departTimeUnknown,
+            departTimeSource,
+            departTimeFromTz,
+            cabinClass,
+            cabinClassSource,
+            originCity,
+          }
+        : {}),
+      // Hotels: stay length + rooms for the nightly-rate panel (Phase B additions).
+      ...(isHotel
+        ? { nights: Number(doc.itinerary?.nights) || null, rooms: Number(doc.itinerary?.roomCount) || 1 }
+        : {}),
+      ...(visaOutcome ? { visaOutcome } : {}),
     },
   };
   if (workspaceId) update.workspaceId = workspaceId;

@@ -21,7 +21,14 @@
 // run, and the report prints each targeted row before → after plus the
 // Travel Spend totals (all-time, Oct 2026, Nov 2026) before and after.
 //
-//   MONGO_URI=… npx tsx src/scripts/resync-travel-booking-mirrors.ts --expect-db=<db> [--apply] [--json=<file>]
+//   MONGO_URI=… npx tsx src/scripts/resync-travel-booking-mirrors.ts --expect-db=<db> [--include-analytics] [--apply] [--json=<file>]
+//
+// --include-analytics (Phase B backfill, 2026-11-18): ALSO target rows whose
+// analytics fields differ — destinationCity / destinationCountry /
+// isInternational and the metadata blob (legs' times, flat flight no.,
+// carrierShares, departTimeIST). The report then adds the Travel Spend
+// Phase B panels before → after: Domestic / International, top airlines and
+// departure-time coverage (services/flightInsights.ts, the endpoint's code).
 //
 // It reads MONGO_URI from the shell only (no dotenv): run it under a
 // sanitised env with just MONGO_URI set.
@@ -30,6 +37,7 @@ import fs from "node:fs";
 import { buildManualBookingMirror, resyncManualBookingMirrors } from "../models/ManualBooking.js";
 import { buildSBTBookingMirror, resyncSBTBookingMirrors } from "../models/SBTBooking.js";
 import { buildSBTHotelBookingMirror, resyncSBTHotelBookingMirrors } from "../models/SBTHotelBooking.js";
+import { computeFlightInsights, type FlightInsights } from "../services/flightInsights.js";
 
 export const CRITICAL_FIELDS = ["status", "amount", "tenantId", "isActive", "isDemo", "isTest"] as const;
 export const COMPARED_FIELDS = [
@@ -37,6 +45,9 @@ export const COMPARED_FIELDS = [
   "service", "userId", "paymentMode", "bookedAt", "travelDate", "travelDateEnd", "workspaceId",
   "destinationCity", "destinationCountry", "isInternational", "travellerName", "createdByDemoUser",
 ] as const;
+
+/** Targeted only with --include-analytics. "metadata" is compared as a whole. */
+export const ANALYTICS_FIELDS = ["destinationCity", "destinationCountry", "isInternational", "metadata"] as const;
 
 type Source = "ManualBooking" | "SBTBooking" | "SBTHotelBooking";
 
@@ -65,6 +76,7 @@ export type ResyncReport = {
   nonCriticalDrift: Record<string, number>;
   rows: RowDiff[];
   totals: Record<string, { before: Totals; after: Totals }>;
+  insights: Record<string, { before: FlightInsights; after: FlightInsights }> | null;
   written: Record<Source, { synced: number; failed: number; missing: number }> | null;
 };
 
@@ -74,6 +86,11 @@ export const WINDOWS: Window[] = [
   // (admin.unified.billing.ts buildScopedMatch).
   { label: "Oct 2026", from: new Date("2026-10-01T00:00:00Z"), to: new Date("2026-10-31T23:59:59Z") },
   { label: "Nov 2026", from: new Date("2026-11-01T00:00:00Z"), to: new Date("2026-11-30T23:59:59Z") },
+];
+
+export const INSIGHT_WINDOWS: Window[] = [
+  { label: "All time", from: null, to: null },
+  { label: "Since 1 Jul 2026", from: new Date("2026-07-01T00:00:00Z"), to: null },
 ];
 
 /* ── comparison helpers ── */
@@ -89,9 +106,35 @@ const isoOrNull = (v: unknown) => (v ? new Date(v as any).toISOString() : null);
 /** Does this row count in Total Spend's live filter (buildScopedMatch)? */
 const isLive = (r: any) => r && r.isDemo !== true && r.isTest !== true && r.isActive !== false;
 
-function diffRow(expected: Record<string, any>, current: Record<string, any> | null) {
+/** Key-order-independent JSON (dates as ISO), for comparing the metadata blob. */
+export function stableJson(v: unknown): string {
+  const walk = (x: any): any => {
+    if (x === undefined) return null;
+    if (x instanceof Date) return x.toISOString();
+    if (x && typeof x === "object" && typeof x.toHexString === "function") return x.toHexString();
+    if (Array.isArray(x)) return x.map(walk);
+    if (x && typeof x === "object") return Object.fromEntries(Object.keys(x).sort().filter((k) => x[k] !== undefined).map((k) => [k, walk(x[k])]));
+    return x;
+  };
+  return JSON.stringify(walk(v ?? {}));
+}
+
+function diffRow(expected: Record<string, any>, current: Record<string, any> | null, analytics = false) {
   const changes: Record<string, { before: unknown; after: unknown }> = {};
+  if (analytics) {
+    for (const f of ANALYTICS_FIELDS) {
+      if (!(f in expected)) continue;
+      if (f === "metadata") {
+        if (stableJson(expected.metadata) !== stableJson(current?.metadata)) changes.metadata = { before: "(differs)", after: "(rebuilt)" };
+        continue;
+      }
+      const a = norm(expected[f]);
+      const b = norm(current ? current[f] : undefined);
+      if (a !== b) changes[f] = { before: b, after: a };
+    }
+  }
   for (const f of COMPARED_FIELDS) {
+    if (analytics && (ANALYTICS_FIELDS as readonly string[]).includes(f)) continue;
     if (!(f in expected)) continue; // sync doesn't write it (e.g. workspaceId unresolved) → apply won't change it
     let after = expected[f];
     if (f === "isActive" && after === undefined) after = true;
@@ -142,6 +185,8 @@ function refOf(source: Source, doc: any): string {
 export async function resyncTravelBookingMirrors(opts: {
   apply: boolean;
   expectDb?: string;
+  /** Also target analytics-field drift and report the Phase B panels. */
+  includeAnalytics?: boolean;
   log?: (line: string) => void;
 }): Promise<ResyncReport> {
   const log = opts.log ?? ((l: string) => console.log(l));
@@ -150,7 +195,8 @@ export async function resyncTravelBookingMirrors(opts: {
   if (!opts.expectDb) throw new Error(`REFUSING: --expect-db=<name> is required (connected db: "${db}").`);
   if (opts.expectDb !== db) throw new Error(`REFUSING: --expect-db="${opts.expectDb}" but connected db is "${db}".`);
   const host = (conn as any).host || "";
-  log(`host ${host} · db ${db} · ${opts.apply ? "APPLY" : "DRY RUN"}`);
+  const analytics = opts.includeAnalytics === true;
+  log(`host ${host} · db ${db} · ${opts.apply ? "APPLY" : "DRY RUN"}${analytics ? " · include analytics" : ""}`);
 
   const mirror = conn.collection("travelbookings");
   const mirrorRows = await mirror.find({ referenceModel: { $in: ["ManualBooking", "SBTBooking", "SBTHotelBooking"] } }).toArray();
@@ -160,8 +206,10 @@ export async function resyncTravelBookingMirrors(opts: {
     db, host, apply: opts.apply,
     scanned: { ManualBooking: 0, SBTBooking: 0, SBTHotelBooking: 0 },
     targeted: { ManualBooking: 0, SBTBooking: 0, SBTHotelBooking: 0 },
-    categories: {}, nonCriticalDrift: {}, rows: [], totals: {}, written: null,
+    categories: {}, nonCriticalDrift: {}, rows: [], totals: {}, insights: null, written: null,
   };
+  // ref → the row the live sync would write; used for the insights "after".
+  const expectedByRef = new Map<string, Record<string, any>>();
 
   const sources: { source: Source; coll: string; filter: any; build: (d: any) => Promise<any> | any }[] = [
     { source: "ManualBooking", coll: "manualbookings", filter: { source: { $nin: ["SBT", "SBT_AUTO"] } }, build: buildManualBookingMirror },
@@ -175,9 +223,11 @@ export async function resyncTravelBookingMirrors(opts: {
     for (const doc of docs) {
       const expected = await s.build(doc);
       if (!expected) continue;
+      expectedByRef.set(String(doc._id), expected);
       const current = mirrorByRef.get(String(doc._id)) ?? null;
-      const changes = diffRow(expected, current);
-      const critical = !current || CRITICAL_FIELDS.some((f) => f in changes);
+      const changes = diffRow(expected, current, analytics);
+      const critical = !current || CRITICAL_FIELDS.some((f) => f in changes)
+        || (analytics && ANALYTICS_FIELDS.some((f) => f in changes));
       if (!critical) {
         for (const f of Object.keys(changes)) report.nonCriticalDrift[`${s.source}.${f}`] = (report.nonCriticalDrift[`${s.source}.${f}`] ?? 0) + 1;
         continue;
@@ -212,7 +262,9 @@ export async function resyncTravelBookingMirrors(opts: {
       report.targeted[s.source] += 1;
       const cat = row.missing
         ? `${s.source}: not mirrored (source ${row.sourceStatus})`
-        : `${s.source}: source ${row.sourceStatus} → mirror ${row.before.status}${changes.status ? "" : " (" + Object.keys(changes).filter((f) => (CRITICAL_FIELDS as readonly string[]).includes(f)).join(", ") + ")"}`;
+        : CRITICAL_FIELDS.some((f) => f in changes)
+          ? `${s.source}: source ${row.sourceStatus} → mirror ${row.before.status}${changes.status ? "" : " (" + Object.keys(changes).filter((f) => (CRITICAL_FIELDS as readonly string[]).includes(f)).join(", ") + ")"}`
+          : `${s.source}: analytics only (${Object.keys(changes).filter((f) => (ANALYTICS_FIELDS as readonly string[]).includes(f)).join(", ")})`;
       const c = (report.categories[cat] ??= { rows: 0, beforeAmount: 0, afterAmount: 0 });
       c.rows += 1;
       c.beforeAmount += row.before.amount;
@@ -233,6 +285,30 @@ export async function resyncTravelBookingMirrors(opts: {
     report.totals[w.label] = { before, after };
   }
 
+  if (analytics) {
+    // Every live CONFIRMED mirror row, as it is now and as it would be after
+    // the apply (targeted rows replaced by their rebuilt values, new rows
+    // added, retired CONCIERGE rows dropped).
+    const targeted = new Set(report.rows.map((r) => r.id));
+    const retired = new Set(report.rows.map((r) => r.retiresConciergeRow?.id).filter(Boolean) as string[]);
+    const otherRows = await mirror.find({ referenceModel: { $nin: ["ManualBooking", "SBTBooking", "SBTHotelBooking"] } }).toArray();
+    const afterRows: any[] = [];
+    for (const m of mirrorRows as any[]) {
+      const e = targeted.has(String(m.reference)) ? expectedByRef.get(String(m.reference)) : null;
+      afterRows.push(e ? { ...m, ...e } : m);
+    }
+    for (const r of report.rows) if (r.missing) afterRows.push(expectedByRef.get(r.id));
+    const afterOther = (otherRows as any[]).filter((m) => !retired.has(String(m._id)));
+    const live = (rows: any[], w: Window) => rows.filter((r) => r && r.status === "CONFIRMED" && isLive(r) && inWindow(isoOrNull(r.bookedAt), w));
+    report.insights = {};
+    for (const w of INSIGHT_WINDOWS) {
+      report.insights[w.label] = {
+        before: computeFlightInsights(live([...mirrorRows, ...otherRows], w)),
+        after: computeFlightInsights(live([...afterRows, ...afterOther], w)),
+      };
+    }
+  }
+
   if (opts.apply) {
     const idsOf = (src: Source) => report.rows.filter((r) => r.source === src).map((r) => new mongoose.Types.ObjectId(r.id));
     report.written = {
@@ -245,6 +321,39 @@ export async function resyncTravelBookingMirrors(opts: {
 }
 
 /* ── printing ── */
+function printInsights(ins: NonNullable<ResyncReport["insights"]>, log: (l: string) => void) {
+  const lakh = (n: number) => "₹" + (n / 1e5).toFixed(2) + " L";
+  for (const [label, { before, after }] of Object.entries(ins)) {
+    log("\n── Phase B panels · " + label + " (live CONFIRMED) ──");
+    for (const svc of ["FLIGHT", "HOTEL"] as const) {
+      const f = (d: FlightInsights) => {
+        const x = d.domesticInternational[svc];
+        return "dom " + x.domestic.count + " " + lakh(x.domestic.spend) + " · intl " + x.international.count + " " + lakh(x.international.spend) + " · unknown " + x.unknown.count + " " + lakh(x.unknown.spend);
+      };
+      log("  " + svc.padEnd(6) + " before  " + f(before));
+      log("  " + "".padEnd(6) + " after   " + f(after));
+    }
+    const air = (d: FlightInsights) => d.airlines.rows.map((a) => a.name + " " + a.countPct + "%/" + a.spendPct + "%").join(" · ");
+    log("  Airlines (count% / spend%) before: " + air(before));
+    log("  Airlines (count% / spend%) after:  " + air(after));
+    const cov = (d: FlightInsights) => {
+      const t = d.departureSlots;
+      const p = t.total ? ((100 * t.timed) / t.total).toFixed(1) : "0";
+      return t.timed + " of " + t.total + " flights (" + p + "%, " + (t.fromTicket ?? 0) + " from ticket) · " + t.slots.map((x) => x.slot + " " + x.pct + "%").join(" ");
+    };
+    log("  Time slots before: " + cov(before));
+    log("  Time slots after:  " + cov(after));
+    // Cabin class (Phase B additions): real cabins only; fare codes stay unknown.
+    const cab = (d: FlightInsights) => {
+      const c = d.cabins;
+      if (!c) return "(not in mirror yet)";
+      const p = c.total ? ((100 * c.known) / c.total).toFixed(1) : "0";
+      return c.known + " of " + c.total + " flights (" + p + "%, " + c.fromTicket + " from ticket) · " + c.rows.map((x) => x.cabin + " " + x.count).join(" · ");
+    };
+    log("  Cabin before: " + cab(before));
+    log("  Cabin after:  " + cab(after));
+  }
+}
 const inr = (n: number) => `₹${Math.round(n).toLocaleString("en-IN")}`;
 const fmt = (v: unknown) => (v === null ? "∅" : typeof v === "number" ? String(v) : String(v));
 
@@ -270,6 +379,7 @@ export function printReport(r: ResyncReport, log: (l: string) => void = console.
     const d = after.spend - before.spend;
     log(`  ${label.padEnd(9)} Total Spend ${inr(before.spend)} → ${inr(after.spend)} (${d >= 0 ? "+" : ""}${inr(d)}) · trips ${before.trips} → ${after.trips} · cancelled ${inr(before.cancelledSpend)} → ${inr(after.cancelledSpend)} · pending ${before.pendingTrips} → ${after.pendingTrips}`);
   }
+  if (r.insights) printInsights(r.insights, log);
   if (r.written) log(`\nwritten ${JSON.stringify(r.written)}`);
   else log(`\nDRY RUN — nothing written. Re-run with --apply to write.`);
 }
@@ -285,6 +395,7 @@ export function blockDriverWrites() {
 
 async function main() {
   const apply = process.argv.includes("--apply");
+  const includeAnalytics = process.argv.includes("--include-analytics");
   const expectDb = process.argv.find((a) => a.startsWith("--expect-db="))?.split("=")[1];
   const jsonOut = process.argv.find((a) => a.startsWith("--json="))?.split("=").slice(1).join("=");
   const uri = process.env.MONGO_URI;
@@ -294,7 +405,7 @@ async function main() {
   if (!apply) blockDriverWrites();
   await mongoose.connect(uri, { autoIndex: false, autoCreate: false });
   try {
-    const report = await resyncTravelBookingMirrors({ apply, expectDb });
+    const report = await resyncTravelBookingMirrors({ apply, expectDb, includeAnalytics });
     printReport(report);
     if (jsonOut) fs.writeFileSync(jsonOut, JSON.stringify(report, null, 2));
   } finally {

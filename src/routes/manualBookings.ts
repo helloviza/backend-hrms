@@ -40,6 +40,7 @@ import {
   extractDocument,
   isExtractableMime,
   MAX_EXTRACTABLE_BYTES,
+  refreshBookingMirrorSafely,
 } from "../services/documentExtraction.service.js";
 import { buildFlightAutofill } from "../services/flightAutofill.js";
 import { buildHotelAutofill } from "../services/hotelAutofill.js";
@@ -52,6 +53,7 @@ import { bookingsByRequest, requestBookingSummaries, requestBookingSummary } fro
 import { isPartnerLeadCase } from "../services/partnerLeadCase.js";
 import { partnerCaseForBooking, recordPartnerBookingStatus } from "../services/partnerLeadBooking.js";
 import { isNcLead, ncLeadRequiredErrors } from "../utils/ncLead.js";
+import { departTimeGateErrors } from "../utils/departTimeGate.js";
 import { HOTEL_TYPES, SUPPLIER_NAME_REQUIRED, GIVEN_BY_REQUIRED, CHECKOUT_REQUIRED, statusGatedRequiredErrors } from "../utils/bookingStatusGate.js";
 import { countedBookingMatch, countedStatusClause, countsInMetrics } from "../utils/bookingMetrics.js";
 import { cancelLinksAfterBookingCancelled } from "../services/paymentRequests.js";
@@ -506,7 +508,9 @@ const BOOKING_COLUMNS = [
   "Status",
   "Sub Status",
   "Price Benefits",
-  "Request Process TAT",
+  // Was "Request Process TAT": the value is travel date − request date
+  // (= booking lead time), not a turnaround (Phase B additions, 2026-11-18).
+  "Lead Time",
   "Invoice Raised Date",
   "Invoice Status",
   "Invoice Pending Days",
@@ -948,9 +952,14 @@ async function createBooking(req: any, res: any, enquiry: boolean) {
     // other status gets the full rule set with supplier / given by / hotel
     // check-out gated on status — optional at Pending / WIP, required at
     // Confirmed (utils/bookingStatusGate.ts; every booking, not only partner).
+    // Flights also need each leg's departure time (or "Unknown") on the move
+    // into Done — utils/departTimeGate.ts (Travel Spend Phase B).
     const vErrors = isNcLead(status, body.subStatus)
       ? ncLeadRequiredErrors({ ...body, status })
-      : statusGatedRequiredErrors(validateBookingRequired(body), { ...body, status });
+      : [
+          ...statusGatedRequiredErrors(validateBookingRequired(body), { ...body, status }),
+          ...departTimeGateErrors({ ...body, status }),
+        ];
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
@@ -2342,11 +2351,14 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
     // and Option B again on a row that was already Confirmed. utils/bookingStatusGate.ts.
     const vErrors = isNcLead(booking.status, booking.subStatus)
       ? ncLeadRequiredErrors(booking)
-      : statusGatedRequiredErrors(
-          isNcLead(before.status, before.subStatus) ? validateBookingRequired(booking) : validateBookingRequiredForUpdate(booking, before),
-          booking,
-          before.status,
-        );
+      : [
+          ...statusGatedRequiredErrors(
+            isNcLead(before.status, before.subStatus) ? validateBookingRequired(booking) : validateBookingRequiredForUpdate(booking, before),
+            booking,
+            before.status,
+          ),
+          ...departTimeGateErrors(booking, before.status),
+        ];
     if (vErrors.length) {
       return res.status(400).json({ error: vErrors.join("; "), details: vErrors });
     }
@@ -2905,6 +2917,9 @@ router.patch(
       }
 
       await doc.save();
+      // Corrected rows feed Travel Spend's ticket fallback (departure time,
+      // cabin) — refresh the booking's mirror row. Never fails the request.
+      if (Array.isArray(req.body?.flightRows)) await refreshBookingMirrorSafely(doc);
       res.json({ ok: true, document: doc.toObject() });
     } catch (err: any) {
       console.error("[ManualBookings EXTRACTED patch]", err.message);

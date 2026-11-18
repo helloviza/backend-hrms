@@ -197,6 +197,395 @@ export const DESTINATION_LOOKUP: Record<string, DestinationEntry> = {
   "south africa": e(null, "ZA"),
 };
 
+/**
+ * Travel Spend ONLY (Phase B, 2026-11-18, audit N3) — used by the
+ * TravelBooking mirror through the travel* functions below. Kept OUT of
+ * DESTINATION_LOOKUP on purpose: Pluto (hotel destination, places, user
+ * location, panel city) and services/location.service.ts read that table and
+ * treat "in the table" as meaningful (e.g. a hotel city Pluto can serve), so
+ * adding London or Thane there would change their behaviour.
+ */
+export const TRAVEL_SPEND_EXTRA: Record<string, DestinationEntry> = {
+  // ════ Phase B additions (2026-11-18, Travel Spend audit N3) ════
+  // Built from the unresolved values in confirmed rows since July 2026.
+  // Approved: NMI → Mumbai (Navi Mumbai Intl, same merge as "navi mumbai"),
+  // DXN → Noida (Noida Intl, Jewar). Every key of 3 letters or fewer is
+  // EXACT-match only (see fuzzyEligible) — "sea" must never match
+  // "Blue Sea Beach Resort".
+
+  // ── IATA airport / city codes ──
+  "nmi": e("Mumbai", "IN"),
+  "dxn": e("Noida", "IN"),
+  "ixs": e("Silchar", "IN"),
+  "ixb": e("Siliguri", "IN"),
+  "hsr": e("Rajkot", "IN"),
+  "raj": e("Rajkot", "IN"),
+  "vns": e("Varanasi", "IN"),
+  "udr": e("Udaipur", "IN"),
+  "atq": e("Amritsar", "IN"),
+  "goi": e("Goa", "IN"),
+  "gox": e("Goa", "IN"),
+  "ixm": e("Madurai", "IN"),
+  "dib": e("Dibrugarh", "IN"),
+  "ccj": e("Kozhikode", "IN"),
+  "stv": e("Surat", "IN"),
+  "trv": e("Thiruvananthapuram", "IN"),
+  "dmu": e("Dimapur", "IN"),
+  "rdp": e("Durgapur", "IN"),
+  "knu": e("Kanpur", "IN"),
+  "ixa": e("Agartala", "IN"),
+  "tcr": e("Thoothukudi", "IN"),
+  "ixe": e("Mangaluru", "IN"),
+  "hbx": e("Hubballi", "IN"),
+  "pny": e("Puducherry", "IN"),
+  "sdw": e("Sindhudurg", "IN"),
+  "hdo": e("Ghaziabad", "IN"),
+  "tir": e("Tirupati", "IN"),
+  "ixj": e("Jammu", "IN"),
+  "bhj": e("Bhuj", "IN"),
+  "ixd": e("Prayagraj", "IN"),
+  "jlr": e("Jabalpur", "IN"),
+  "bdq": e("Vadodara", "IN"),
+  "imf": e("Imphal", "IN"),
+  "ixu": e("Aurangabad", "IN"),
+  "gop": e("Gorakhpur", "IN"),
+  "dhm": e("Dharamshala", "IN"),
+  "ixz": e("Port Blair", "IN"),
+  "ixl": e("Leh", "IN"),
+  "gay": e("Gaya", "IN"),
+  "mnl": e("Manila", "PH"),
+  "syd": e("Sydney", "AU"),
+  "cmb": e("Colombo", "LK"),
+  "mel": e("Melbourne", "AU"),
+  "avv": e("Melbourne", "AU"),
+  "auh": e("Abu Dhabi", "AE"),
+  "doh": e("Doha", "QA"),
+  "ist": e("Istanbul", "TR"),
+  "saw": e("Istanbul", "TR"),
+  "waw": e("Warsaw", "PL"),
+  "kul": e("Kuala Lumpur", "MY"),
+  "hkg": e("Hong Kong", "HK"),
+  "lux": e("Luxembourg", "LU"),
+  "lhr": e("London", "GB"),
+  "lcy": e("London", "GB"),
+  "ltn": e("London", "GB"),
+  "lgw": e("London", "GB"),
+  "stn": e("London", "GB"),
+  "vno": e("Vilnius", "LT"),
+  "kun": e("Kaunas", "LT"),
+  "mco": e("Orlando", "US"),
+  "jed": e("Jeddah", "SA"),
+  "bkk": e("Bangkok", "TH"),
+  "dmk": e("Bangkok", "TH"),
+  "bhx": e("Birmingham", "GB"),
+  "dus": e("Düsseldorf", "DE"),
+  "dusseldorf": e("Düsseldorf", "DE"),
+  // Ticket departure airports (Phase B additions, 2026-11-18)
+  "add": e("Addis Ababa", "ET"),
+  "addis ababa": e("Addis Ababa", "ET"),
+  "her": e("Heraklion", "GR"),
+  "heraklion": e("Heraklion", "GR"),
+  "akl": e("Auckland", "NZ"),
+  "auckland": e("Auckland", "NZ"),
+  "san": e("San Diego", "US"),
+  "szx": e("Shenzhen", "CN"),
+  "cmn": e("Casablanca", "MA"),
+  "sez": e("Mahé", "SC"),
+  "ruh": e("Riyadh", "SA"),
+  "muc": e("Munich", "DE"),
+  "dmm": e("Dammam", "SA"),
+  "hkt": e("Phuket", "TH"),
+  "bos": e("Boston", "US"),
+  "phx": e("Phoenix", "US"),
+  "sea": e("Seattle", "US"),
+  "dal": e("Dallas", "US"),
+  "dfw": e("Dallas", "US"),
+  "msp": e("Minneapolis", "US"),
+  "phl": e("Philadelphia", "US"),
+  "cai": e("Cairo", "EG"),
+  "cpt": e("Cape Town", "ZA"),
+  "jnb": e("Johannesburg", "ZA"),
+  "bne": e("Brisbane", "AU"),
+  "mad": e("Madrid", "ES"),
+  "ath": e("Athens", "GR"),
+  "zrh": e("Zurich", "CH"),
+  "jfk": e("New York", "US"),
+  "lga": e("New York", "US"),
+  "ewr": e("New York", "US"),
+  "nbo": e("Nairobi", "KE"),
+  "scl": e("Santiago", "CL"),
+  "lis": e("Lisbon", "PT"),
+  "fra": e("Frankfurt", "DE"),
+  "str": e("Stuttgart", "DE"),
+  "pkx": e("Beijing", "CN"),
+  "pek": e("Beijing", "CN"),
+  "fco": e("Rome", "IT"),
+  "rom": e("Rome", "IT"),
+  "bna": e("Nashville", "US"),
+  "can": e("Guangzhou", "CN"),
+  "dps": e("Bali", "ID"),
+  "msy": e("New Orleans", "US"),
+  "gru": e("São Paulo", "BR"),
+  "cdg": e("Paris", "FR"),
+  "ory": e("Paris", "FR"),
+  "kbv": e("Krabi", "TH"),
+  "ala": e("Almaty", "KZ"),
+  "hel": e("Helsinki", "FI"),
+  "nrt": e("Tokyo", "JP"),
+  "hnd": e("Tokyo", "JP"),
+  "kef": e("Reykjavik", "IS"),
+  "ord": e("Chicago", "US"),
+  "jtr": e("Santorini", "GR"),
+  "shj": e("Sharjah", "AE"),
+  "bgy": e("Milan", "IT"),
+  "mxp": e("Milan", "IT"),
+  "alc": e("Alicante", "ES"),
+  "cor": e("Cordoba", "AR"),
+  "was": e("Washington", "US"),
+  "iad": e("Washington", "US"),
+  "sfo": e("San Francisco", "US"),
+  "lax": e("Los Angeles", "US"),
+  "yyz": e("Toronto", "CA"),
+  "mct": e("Muscat", "OM"),
+  "bah": e("Bahrain", "BH"),
+  "kwi": e("Kuwait City", "KW"),
+  "cgk": e("Jakarta", "ID"),
+  "ktm": e("Kathmandu", "NP"),
+  "dac": e("Dhaka", "BD"),
+  "mle": e("Male", "MV"),
+  "icn": e("Seoul", "KR"),
+  "gva": e("Geneva", "CH"),
+  "man": e("Manchester", "GB"),
+  "edi": e("Edinburgh", "GB"),
+  "dub": e("Dublin", "IE"),
+  "cph": e("Copenhagen", "DK"),
+  "arn": e("Stockholm", "SE"),
+  "osl": e("Oslo", "NO"),
+  "prg": e("Prague", "CZ"),
+  "bud": e("Budapest", "HU"),
+  "rvn": e("Rovaniemi", "FI"),
+
+  // ── city, hotel-district, state and country names ──
+  "agr": e("Agra", "IN"),
+  "manila": e("Manila", "PH"),
+  "abu dhabi": e("Abu Dhabi", "AE"),
+  "london": e("London", "GB"),
+  "luxembourg": e("Luxembourg", "LU"),
+  "ghent": e("Ghent", "BE"),
+  "gent": e("Ghent", "BE"),
+  "riyadh": e("Riyadh", "SA"),
+  "hong kong": e("Hong Kong", "HK"),
+  "hongkong": e("Hong Kong", "HK"),
+  "istanbul": e("Istanbul", "TR"),
+  "birmingham": e("Birmingham", "GB"),
+  "sandton": e("Johannesburg", "ZA"),
+  "rovaniemi": e("Rovaniemi", "FI"),
+  "casablanca": e("Casablanca", "MA"),
+  "seattle": e("Seattle", "US"),
+  "shenzhen": e("Shenzhen", "CN"),
+  "helsinki": e("Helsinki", "FI"),
+  "colombo": e("Colombo", "LK"),
+  "orlando": e("Orlando", "US"),
+  "pasay": e("Manila", "PH"),
+  "makati": e("Manila", "PH"),
+  "paranaque": e("Manila", "PH"),
+  "araneta city": e("Manila", "PH"),
+  "rome": e("Rome", "IT"),
+  "jeddah": e("Jeddah", "SA"),
+  "jedah": e("Jeddah", "SA"),
+  "krabi": e("Krabi", "TH"),
+  "karabi": e("Krabi", "TH"),
+  "doha": e("Doha", "QA"),
+  "sao paulo": e("São Paulo", "BR"),
+  "santiago": e("Santiago", "CL"),
+  "prague": e("Prague", "CZ"),
+  "frankfurt": e("Frankfurt", "DE"),
+  "lisbon": e("Lisbon", "PT"),
+  "dammam": e("Dammam", "SA"),
+  "phoenix": e("Phoenix", "US"),
+  "des moines": e("Des Moines", "US"),
+  "macquarie park": e("Sydney", "AU"),
+  "schipol": e("Amsterdam", "NL"),
+  "schiphol": e("Amsterdam", "NL"),
+  "karmelava": e("Kaunas", "LT"),
+  "karmėlava": e("Kaunas", "LT"),
+  "stryków": e("Strykow", "PL"),
+  "strykow": e("Strykow", "PL"),
+  "reston": e("Reston", "US"),
+  "moulineaux": e("Paris", "FR"),
+  "archena": e("Archena", "ES"),
+  "brisbane": e("Brisbane", "AU"),
+  "warsaw": e("Warsaw", "PL"),
+  "vilnius": e("Vilnius", "LT"),
+  "bangkok": e("Bangkok", "TH"),
+  "paris": e("Paris", "FR"),
+  "munich": e("Munich", "DE"),
+  "tokyo": e("Tokyo", "JP"),
+  "goa": e("Goa", "IN"),
+  "anjuna": e("Goa", "IN"),
+  "patiala": e("Patiala", "IN"),
+  "rajkot": e("Rajkot", "IN"),
+  "solapur": e("Solapur", "IN"),
+  "gwalior": e("Gwalior", "IN"),
+  "gangtok": e("Gangtok", "IN"),
+  "pondicherry": e("Puducherry", "IN"),
+  "puducherry": e("Puducherry", "IN"),
+  "jhansi": e("Jhansi", "IN"),
+  "noida": e("Noida", "IN"),
+  "ludhiana": e("Ludhiana", "IN"),
+  "dibrugarh": e("Dibrugarh", "IN"),
+  "madurai": e("Madurai", "IN"),
+  "jabalpur": e("Jabalpur", "IN"),
+  "bhubneshwar": e("Bhubaneswar", "IN"),
+  "jaydev vihar": e("Bhubaneswar", "IN"),
+  "sagar": e("Sagar", "IN"),
+  "jammu": e("Jammu", "IN"),
+  "thiruvananthapuram": e("Thiruvananthapuram", "IN"),
+  "trivandrum": e("Thiruvananthapuram", "IN"),
+  "namchi": e("Namchi", "IN"),
+  "roorkee": e("Roorkee", "IN"),
+  "roorkie": e("Roorkee", "IN"),
+  "gauwhati": e("Guwahati", "IN"),
+  "kanpur": e("Kanpur", "IN"),
+  "gandhi nagar": e("Gandhinagar", "IN"),
+  "gandhinagar": e("Gandhinagar", "IN"),
+  "dimapur": e("Dimapur", "IN"),
+  "shimla": e("Shimla", "IN"),
+  "hydrabad": e("Hyderabad", "IN"),
+  "howrah": e("Howrah", "IN"),
+  "hamirpur": e("Hamirpur", "IN"),
+  "faridabaad": e("Faridabad", "IN"),
+  "gonda": e("Gonda", "IN"),
+  "rameshwaram": e("Rameswaram", "IN"),
+  "yavatmal": e("Yavatmal", "IN"),
+  "thane": e("Thane", "IN"),
+  "balrampur": e("Balrampur", "IN"),
+  "balampur": e("Balrampur", "IN"),
+  "siliguri": e("Siliguri", "IN"),
+  "pratapgarh": e("Pratapgarh", "IN"),
+  "gomti nagar": e("Lucknow", "IN"),
+  "ananthapuramu": e("Anantapur", "IN"),
+  "anantapur": e("Anantapur", "IN"),
+  "kadapa": e("Kadapa", "IN"),
+  "kurnool": e("Kurnool", "IN"),
+  "aurangabad": e("Aurangabad", "IN"),
+  "karjat": e("Karjat", "IN"),
+  "agartala": e("Agartala", "IN"),
+  "satellite": e("Ahmedabad", "IN"),
+  "ghansoli": e("Mumbai", "IN"),
+  "lalitpur": e("Lalitpur", "IN"),
+  "coorg": e("Coorg", "IN"),
+  "chitrakoot dham": e("Chitrakoot", "IN"),
+  "chitrakoot": e("Chitrakoot", "IN"),
+  "sitabuldi": e("Nagpur", "IN"),
+  "badaun": e("Budaun", "IN"),
+  "farukhabad": e("Farrukhabad", "IN"),
+  "banglore": e("Bengaluru", "IN"),
+  "visakapatnam": e("Visakhapatnam", "IN"),
+  "ujjain": e("Ujjain", "IN"),
+  "ghazipur": e("Ghazipur", "IN"),
+  "gorakhpur": e("Gorakhpur", "IN"),
+  "azamgarh": e("Azamgarh", "IN"),
+  "neemuch": e("Neemuch", "IN"),
+  "guna": e("Guna", "IN"),
+  "khalapur": e("Khalapur", "IN"),
+  "indukurpet": e("Indukurpet", "IN"),
+  "ajabgarh": e("Ajabgarh", "IN"),
+  "amritsar": e("Amritsar", "IN"),
+  "surat": e("Surat", "IN"),
+  "vadodara": e("Vadodara", "IN"),
+  "mangalore": e("Mangaluru", "IN"),
+  "mangaluru": e("Mangaluru", "IN"),
+  "mysore": e("Mysuru", "IN"),
+  "mysuru": e("Mysuru", "IN"),
+  "agra": e("Agra", "IN"),
+  "ghaziabad": e("Ghaziabad", "IN"),
+  "prayagraj": e("Prayagraj", "IN"),
+  "allahabad": e("Prayagraj", "IN"),
+  "mumabi": e("Mumbai", "IN"),
+  "uae": e(null, "AE"),
+  "united arab emirates": e(null, "AE"),
+  "philippines": e(null, "PH"),
+  "england": e(null, "GB"),
+  "uk": e(null, "GB"),
+  "united kingdom": e(null, "GB"),
+  "belgium": e(null, "BE"),
+  "brazil": e(null, "BR"),
+  "lithuania": e(null, "LT"),
+  "usa": e(null, "US"),
+  "united states": e(null, "US"),
+  "maldives": e(null, "MV"),
+  "queensland": e(null, "AU"),
+  "greece": e(null, "GR"),
+  "jordan": e(null, "JO"),
+  "saudi arabia": e(null, "SA"),
+  "germany": e(null, "DE"),
+  "france": e(null, "FR"),
+  "new zealand": e(null, "NZ"),
+  "turkey": e(null, "TR"),
+  "turkiye": e(null, "TR"),
+  "portugal": e(null, "PT"),
+  "italy": e(null, "IT"),
+  "japan": e(null, "JP"),
+  "canada": e(null, "CA"),
+  "thailand": e(null, "TH"),
+  "malaysia": e(null, "MY"),
+  "indonesia": e(null, "ID"),
+  "sri lanka": e(null, "LK"),
+  "nepal": e(null, "NP"),
+  "india": e(null, "IN"),
+  "up": e(null, "IN"),
+  "uttar pradesh": e(null, "IN"),
+  "assam": e(null, "IN"),
+  "gujarat": e(null, "IN"),
+  "punjab": e(null, "IN"),
+  "madhya pradesh": e(null, "IN"),
+  "karnataka": e(null, "IN"),
+  "odhisa": e(null, "IN"),
+  "rajasthan": e(null, "IN"),
+  "kerala": e(null, "IN"),
+  "maharashtra": e(null, "IN"),
+  "sikkim": e(null, "IN"),
+  "krishnanagar": e("Krishnanagar", "IN"),
+  "shillong": e("Shillong", "IN"),
+  "silchar": e("Silchar", "IN"),
+  "nairobi": e("Nairobi", "KE"),
+  "nashville": e("Nashville", "US"),
+  "plano": e("Plano", "US"),
+  "tallinn": e("Tallinn", "EE"),
+  "haberfield": e("Sydney", "AU"),
+  "bensalem": e("Philadelphia", "US"),
+  "bensalem philadelphia": e("Philadelphia", "US"),
+  "philadelphia": e("Philadelphia", "US"),
+  "kadiri": e("Kadiri", "IN"),
+  "yelagiri": e("Yelagiri", "IN"),
+  "madanapalle": e("Madanapalle", "IN"),
+  "cuddalore": e("Cuddalore", "IN"),
+  "virar east": e("Virar", "IN"),
+  "virar": e("Virar", "IN"),
+  "kaushambi": e("Kaushambi", "IN"),
+  "robertsganj": e("Robertsganj", "IN"),
+  "kannauj": e("Kannauj", "IN"),
+  "mathura": e("Mathura", "IN"),
+  "panaji": e("Goa", "IN"),
+  "mainpuri": e("Mainpuri", "IN"),
+  "ajmer": e("Ajmer", "IN"),
+  "hubballi": e("Hubballi", "IN"),
+  "hubli": e("Hubballi", "IN"),
+  "kota": e("Kota", "IN"),
+  "balangir": e("Balangir", "IN"),
+  "barwani": e("Barwani", "IN"),
+  "sambalpur": e("Sambalpur", "IN"),
+  "davanagere": e("Davanagere", "IN"),
+  "etah": e("Etah", "IN"),
+  "ashram road": e("Ahmedabad", "IN"),
+  "bihar": e(null, "IN"),
+  "tamil nadu": e(null, "IN"),
+  "west bengal": e(null, "IN"),
+  "andhra pradesh": e(null, "IN"),
+  "telangana": e(null, "IN"),
+};
+
 /** City keys (entries with a non-null city) for fuzzy containment, longest-first. */
 const CITY_KEYS_BY_LENGTH = Object.keys(DESTINATION_LOOKUP)
   .filter((k) => DESTINATION_LOOKUP[k].city != null)
@@ -260,6 +649,135 @@ export function lookupDestinationFuzzy(raw: unknown): DestinationEntry | null {
     if (re.test(k)) return DESTINATION_LOOKUP[ck];
   }
   return null;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Travel Spend lookups (Phase B) — DESTINATION_LOOKUP + TRAVEL_SPEND_EXTRA.
+ * Only the TravelBooking mirror builders (services/travelMirrorAnalytics.ts,
+ * models/SBTBooking.ts, models/SBTHotelBooking.ts) use these.
+ * ──────────────────────────────────────────────────────────────────────── */
+export const TRAVEL_SPEND_LOOKUP: Record<string, DestinationEntry> = { ...DESTINATION_LOOKUP, ...TRAVEL_SPEND_EXTRA };
+
+/**
+ * Keys of 3 letters or fewer (IATA codes, "kl") are EXACT-match only in the
+ * travel fuzzy tiers (decision 2026-11-18): inside free text they are
+ * ordinary words — "sea" in "Blue Sea Beach Resort", "man", "can", "was".
+ * "goa" is a city name, not a code, so it stays fuzzy.
+ */
+const SHORT_FUZZY_ALLOW = new Set(["goa"]);
+const fuzzyEligible = (k: string) => k.length > 3 || SHORT_FUZZY_ALLOW.has(k);
+
+const TRAVEL_CITY_KEYS = Object.keys(TRAVEL_SPEND_LOOKUP)
+  .filter((k) => TRAVEL_SPEND_LOOKUP[k].city != null && fuzzyEligible(k))
+  .sort((a, b) => b.length - a.length);
+
+/** Country / state / region keys (no city), 3+ letters ("usa", "uae"; never "up", "uk"). */
+const TRAVEL_COUNTRY_KEYS = Object.keys(TRAVEL_SPEND_LOOKUP)
+  .filter((k) => TRAVEL_SPEND_LOOKUP[k].city == null && TRAVEL_SPEND_LOOKUP[k].country != null && k.length >= 3)
+  .sort((a, b) => b.length - a.length);
+
+// Letters incl. accented Latin, so "karmėlava" is one word.
+const WORD = "a-z\\u00C0-\\u024F";
+function containsWord(haystack: string, key: string): boolean {
+  const esc = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^${WORD}])${esc}([^${WORD}]|$)`, "i").test(haystack);
+}
+
+/** Exact lookup over the Travel Spend table. */
+export function travelLookup(raw: unknown): DestinationEntry | null {
+  const k = normKey(raw);
+  if (!k) return null;
+  return TRAVEL_SPEND_LOOKUP[k] ?? null;
+}
+
+/** Exact first, then whole-word city containment (keys of 4+ letters, plus "goa"). */
+export function travelLookupFuzzy(raw: unknown): DestinationEntry | null {
+  const exact = travelLookup(raw);
+  if (exact) return exact;
+  const k = normKey(raw);
+  if (!k) return null;
+  for (const ck of TRAVEL_CITY_KEYS) if (containsWord(k, ck)) return TRAVEL_SPEND_LOOKUP[ck];
+  return null;
+}
+
+/**
+ * Country-only fuzzy tier (T5): exact first, then whole-word containment of a
+ * country / state / region name ("Balangir, Odisha" → IN, "Phoenix , USA" →
+ * US). Never assigns a city.
+ */
+export function travelCountryFuzzy(raw: unknown): string | null {
+  const exact = travelLookup(raw);
+  if (exact?.country) return exact.country;
+  const k = normKey(raw);
+  if (!k) return null;
+  for (const ck of TRAVEL_COUNTRY_KEYS) if (containsWord(k, ck)) return TRAVEL_SPEND_LOOKUP[ck].country;
+  return null;
+}
+
+/** Country of a single airport / city code or name — null when unknown. */
+export function travelCountryOf(raw: unknown): string | null {
+  return travelLookup(raw)?.country ?? null;
+}
+
+/** canonicalCity over the Travel Spend table. */
+export function travelCanonicalCity(name: unknown): string | null {
+  const s = String(name ?? "").trim();
+  if (!s) return null;
+  return travelLookup(s)?.city ?? s;
+}
+
+/** countryFor over the Travel Spend table. */
+export function travelCountryFor(...candidates: unknown[]): string | null {
+  for (const c of candidates) {
+    const hit = travelLookup(c);
+    if (hit?.country) return hit.country;
+  }
+  return null;
+}
+
+/**
+ * Visa rows (Phase B decision): `itinerary.visaCountry` names a COUNTRY — a
+ * "Dubai" visa is a UAE visa — so a visa row gets a country and NEVER a city.
+ * Free-text noise is stripped first: "(super fast)", "e-visa", "visa",
+ * "expedite charge", "2 year", a trailing "NA".
+ */
+export const VISA_COUNTRY: Record<string, string> = {
+  "dubai": "AE", "uae": "AE", "australia": "AU", "jordan": "JO", "usa": "US", "us": "US",
+  "singapore": "SG", "china": "CN", "saudi arabia": "SA", "uk": "GB", "united kingdom": "GB",
+  "germany": "DE", "spain": "ES", "greece": "GR", "france": "FR", "new zealand": "NZ",
+  "vietnam": "VN", "thailand": "TH", "japan": "JP", "canada": "CA",
+  "uk to usa": "US", // approved 2026-11-18: a US visa applied for from the UK
+};
+
+export function normVisaCountry(raw: unknown): string {
+  return normKey(raw)
+    .replace(/\(.*?\)/g, " ")
+    .replace(/\b(e-?visa|visa|expedite|charges?|super fast|\d+ years?|na)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function visaCountryCode(raw: unknown): string | null {
+  const k = normVisaCountry(raw);
+  if (!k) return null;
+  if (k in VISA_COUNTRY) return VISA_COUNTRY[k];
+  return travelCountryFuzzy(k);
+}
+
+/**
+ * Indian Railways station codes — TRAIN rows ONLY. They collide with IATA
+ * (BRC is Bariloche, CNB Coonabarabran), so they never join the main table.
+ */
+export const RAIL_STATIONS: Record<string, string> = {
+  "ndls": "Delhi", "nzm": "Delhi", "anvt": "Delhi", "dli": "Delhi", "rnc": "Ranchi", "ju": "Jodhpur",
+  "ldh": "Ludhiana", "cnb": "Kanpur", "sc": "Hyderabad", "secundrabad": "Hyderabad", "secunderabad": "Hyderabad",
+  "bnz": "Lucknow", "lko": "Lucknow", "vglj": "Jhansi", "sbib": "Ahmedabad", "adi": "Ahmedabad",
+  "ghy": "Guwahati", "dmv": "Dimapur", "brc": "Vadodara", "roorkee": "Roorkee", "bct": "Mumbai",
+  "csmt": "Mumbai", "hwh": "Kolkata", "sbc": "Bengaluru", "ypr": "Bengaluru",
+};
+
+export function railStationCity(raw: unknown): string | null {
+  return RAIL_STATIONS[normKey(raw)] ?? null;
 }
 
 /**

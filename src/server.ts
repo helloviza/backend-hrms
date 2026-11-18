@@ -1043,6 +1043,10 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
 // Dashboards
 app.use("/api/dashboard", dashboardRouter);
 
+// Per-user UI preferences (Travel Spend show/hide cards) — own row only.
+import mePreferencesRouter from "./routes/me.preferences.js";
+app.use("/api/me/preferences", requireAuth, mePreferencesRouter);
+
 // HR
 app.use("/api/hr/policies", hrPoliciesRouter);
 app.use("/api/hr", hrOrgChartRouter);
@@ -1454,6 +1458,11 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
         // BUCKET-C-3: Orphaned PENDING booking cleanup (hourly)
         const { startOrphanPendingCleanupCron } = await import("./jobs/orphan-pending-cleanup.js");
         startOrphanPendingCleanupCron();
+
+        // Travel Spend FU-1: HELD hotel holds past check-in → FAILED in the
+        // TravelBooking mirror (source untouched). Daily, 00:20 IST.
+        const { startStaleHotelHoldMirrorCron } = await import("./jobs/stale-hotel-hold-mirror.js");
+        startStaleHotelHoldMirrorCron();
 
         // SBT checkout backstop: paid-but-not-booked → refund + ops alert (every 5 min)
         const { startSbtCheckoutSweepCron } = await import("./jobs/sbt-checkout-sweep.js");

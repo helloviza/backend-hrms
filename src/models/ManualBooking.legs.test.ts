@@ -225,7 +225,9 @@ describe("the TravelBooking mirror gets a single, correct origin/destination —
     expect(m.metadata.tripType).toBe("ROUND_TRIP");
     expect(m.metadata.legs.map((l: any) => `${l.origin}-${l.destination}/${l.flightNo}`)).toEqual(["DEL-BOM/AI 101", "BOM-DEL/AI 102"]);
     expect(m.metadata.legs[1].departDate).toEqual(D("2026-10-20"));
-    expect(Object.keys(m.metadata.legs[0]).sort()).toEqual(["airline", "arriveDate", "departDate", "destination", "flightNo", "origin"]);
+    // Descriptive only — no cost on a leg. Phase B (2026-11-18) added the
+    // printed depart / arrive times for the Departure time panel.
+    expect(Object.keys(m.metadata.legs[0]).sort()).toEqual(["airline", "arriveDate", "arriveTime", "departDate", "departTime", "destination", "flightNo", "origin"]);
   });
 
   it("a legacy booking mirrors empty legs/tripType metadata", async () => {

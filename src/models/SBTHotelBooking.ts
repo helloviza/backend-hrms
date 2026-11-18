@@ -3,6 +3,8 @@ import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import TravelBooking from "./TravelBooking.js";
 import { attachMirrorResyncHooks } from "../utils/mirrorResyncHooks.js";
 import { parseTBODate } from "../lib/tbo-date.js";
+import { travelCanonicalCity as canonicalCity, travelCountryFor as countryFor } from "../data/destinationLookup.js";
+import { resolveSbtTenantId } from "../services/sbtMirrorTenant.js";
 
 function tboDateSetter(v: any): Date | null | undefined {
   if (v === null || v === undefined) return v;
@@ -297,22 +299,51 @@ SBTHotelBookingSchema.index({ clientReferenceId: 1 }, { unique: true, sparse: tr
 SBTHotelBookingSchema.index({ pendingStatusCheckAt: 1, statusCheckDone: 1 });
 
 /* ── Sync to TravelBooking on save ── */
-function mapStatus(s: string): "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" {
+
+/** Today's date in IST, "YYYY-MM-DD". */
+export function istDateKey(now: Date = new Date()): string {
+  return new Date(now.getTime() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+/**
+ * SBTHotelBooking.status → TravelBooking.status (Travel Spend FU-1, decision
+ * 2026-11-18). Dead holds no longer sit in "Pending" for ever:
+ *   EXPIRED / CLOSED / ORPHAN_CLEANED → FAILED
+ *   CANCEL_PENDING                    → CANCELLED
+ *   HELD whose check-in (IST) has passed → FAILED — in the MIRROR only; the
+ *     source stays HELD. jobs/stale-hotel-hold-mirror.ts re-syncs these daily
+ *     because nothing writes the booking when the date simply passes.
+ *   HELD (check-in today or later), PENDING and anything unknown → PENDING
+ */
+export function mapHotelMirrorStatus(
+  s: string,
+  checkIn?: unknown,
+  now: Date = new Date(),
+): "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" {
   if (s === "CONFIRMED") return "CONFIRMED";
-  if (s === "CANCELLED") return "CANCELLED";
-  if (s === "FAILED") return "FAILED";
-  return "PENDING"; // HELD and unknown map to PENDING in TravelBooking
+  if (s === "CANCELLED" || s === "CANCEL_PENDING") return "CANCELLED";
+  if (s === "FAILED" || s === "EXPIRED" || s === "CLOSED" || s === "ORPHAN_CLEANED") return "FAILED";
+  if (s === "HELD") {
+    const ci = String(checkIn ?? "").trim().slice(0, 10);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(ci) && ci < istDateKey(now)) return "FAILED";
+  }
+  return "PENDING";
 }
 
 /** The TravelBooking row this booking should have (no write). Shared by
  *  the sync below and scripts/resync-travel-booking-mirrors.ts's dry run. */
-export function buildSBTHotelBookingMirror(doc: any): Record<string, any> {
+function hotelCountry(doc: any): string | null {
+  return (doc.countryCode || "").trim().toUpperCase() || countryFor(doc.cityName);
+}
+
+export async function buildSBTHotelBookingMirror(doc: any, now: Date = new Date()): Promise<Record<string, any>> {
   return {
-    tenantId: doc.customerId || "default",
+    // Customer _id, resolved like the flight mirror (services/sbtMirrorTenant.ts, audit N7).
+    tenantId: await resolveSbtTenantId(doc),
     service: "HOTEL",
     amount: doc.totalFare || doc.netAmount || 0,
     userId: doc.userId,
-    status: mapStatus(doc.status),
+    status: mapHotelMirrorStatus(doc.status, doc.checkIn, now),
     paymentMode: doc.paymentMode === "personal" ? "PERSONAL" : "OFFICIAL",
     source: "SBT",
     reference: doc._id,
@@ -324,11 +355,14 @@ export function buildSBTHotelBookingMirror(doc: any): Record<string, any> {
     // Cities-only Top Destinations: carry the authoritative source city +
     // country through (previously countryCode was dropped). countryCode is
     // already ISO-2; isInternational is null when country is unknown.
-    destinationCity: doc.cityName || null,
-    destinationCountry: (doc.countryCode || "").trim().toUpperCase() || null,
-    isInternational: (doc.countryCode || "").trim()
-      ? (doc.countryCode || "").trim().toUpperCase() !== "IN"
-      : null,
+    // Canonical spelling when the lookup knows it ("New Delhi" → Delhi,
+    // "Bombay/ Mumbai" → Mumbai) so Top Destinations doesn't split a city.
+    destinationCity: canonicalCity(doc.cityName),
+    // countryCode when TBO sent one, else the city's country from the lookup
+    // ("New Delhi" → IN) — older rows have no countryCode, and the May
+    // backfill had set their country from the city.
+    destinationCountry: hotelCountry(doc),
+    isInternational: hotelCountry(doc) == null ? null : hotelCountry(doc) !== "IN",
     origin: "",
     bookedAt: doc.bookedAt || doc.createdAt,
     travelDate: doc.checkIn ? new Date(doc.checkIn) : null,
@@ -339,14 +373,26 @@ export function buildSBTHotelBookingMirror(doc: any): Record<string, any> {
       checkOut: doc.checkOut,
       rooms: doc.rooms,
       guests: doc.guests?.length || 0,
+      // Stay length for the nightly-rate panel (Phase B additions).
+      nights: stayNights(doc.checkIn, doc.checkOut),
     },
   };
+}
+
+/** Nights between two YYYY-MM-DD(…) dates, or null when either is missing or the stay isn't 1–59 nights. */
+export function stayNights(checkIn: unknown, checkOut: unknown): number | null {
+  const day = (v: unknown) => {
+    const m = String(v ?? "").trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+    return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) : NaN;
+  };
+  const n = Math.round((day(checkOut) - day(checkIn)) / 86400000);
+  return Number.isFinite(n) && n >= 1 && n < 60 ? n : null;
 }
 
 /** Upsert this booking's TravelBooking mirror row from the source doc
  *  (hydrated or lean). Throws on failure — callers decide. */
 export async function syncSBTHotelBookingToMirror(doc: any): Promise<void> {
-  await TravelBooking.findOneAndUpdate({ reference: doc._id }, buildSBTHotelBookingMirror(doc), { upsert: true, new: true });
+  await TravelBooking.findOneAndUpdate({ reference: doc._id }, await buildSBTHotelBookingMirror(doc), { upsert: true, new: true });
 }
 
 SBTHotelBookingSchema.post("save", async function (doc: any) {
@@ -361,7 +407,7 @@ SBTHotelBookingSchema.post("save", async function (doc: any) {
  *  writes any of them re-syncs the mirror (utils/mirrorResyncHooks.ts) —
  *  status transitions, fare updates and isDemo/isTest flags used to skip
  *  the save hook and leave the mirror stale (Travel Spend audit N4). */
-export const SBT_HOTEL_BOOKING_MIRROR_PATHS = ["customerId", "totalFare", "netAmount", "userId", "status", "paymentMode", "isDemo", "isTest", "cityName", "countryCode", "bookedAt", "createdAt", "checkIn", "checkOut", "hotelName", "rooms", "guests"] as const;
+export const SBT_HOTEL_BOOKING_MIRROR_PATHS = ["customerId", "workspaceId", "totalFare", "netAmount", "userId", "status", "paymentMode", "isDemo", "isTest", "cityName", "countryCode", "bookedAt", "createdAt", "checkIn", "checkOut", "hotelName", "rooms", "guests"] as const;
 
 export async function resyncSBTHotelBookingMirrors(ids: unknown[]): Promise<{ synced: number; failed: number; missing: number }> {
   const out = { synced: 0, failed: 0, missing: 0 };

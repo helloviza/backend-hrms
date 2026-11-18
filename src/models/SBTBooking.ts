@@ -2,7 +2,11 @@ import { Schema, model, type Document } from "mongoose";
 import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import TravelBooking from "./TravelBooking.js";
 import { attachMirrorResyncHooks } from "../utils/mirrorResyncHooks.js";
-import { canonicalCity, countryFor } from "../data/destinationLookup.js";
+import { travelCanonicalCity as canonicalCity, travelCountryFor as countryFor } from "../data/destinationLookup.js";
+import { internationalFrom, sbtFlightAnalytics } from "../services/travelMirrorAnalytics.js";
+import { sbtCabin } from "../services/ticketFallback.js";
+import { parseSbtLocalAsIST } from "../utils/flightTime.js";
+import { resolveSbtTenantId } from "../services/sbtMirrorTenant.js";
 
 export interface ISBTBooking extends Document {
   userId: Schema.Types.ObjectId;
@@ -286,16 +290,19 @@ function mapStatus(s: string): "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" 
 }
 
 /** The TravelBooking row this booking should have (no write). Shared by
- *  the sync below and scripts/resync-travel-booking-mirrors.ts's dry run. */
-export function buildSBTBookingMirror(doc: any): Record<string, any> {
+ *  the sync below and scripts/resync-travel-booking-mirrors.ts's dry run.
+ *  Async since Phase B: tenantId resolves to the Customer _id
+ *  (services/sbtMirrorTenant.ts, audit N7). */
+export async function buildSBTBookingMirror(doc: any): Promise<Record<string, any>> {
   // Cities-only Top Destinations ranking fields — Tier 2 of the backfill's
   // resolver (backfill-destination-fields.ts's `resolve()`): trust the
   // structured destination.city field (canonicalized via the lookup
   // table), country from destination.code (IATA) falling back to city.
   const destCity = canonicalCity(doc.destination?.city);
   const destCountry = countryFor(doc.destination?.code, doc.destination?.city);
+  const flight = sbtFlightAnalytics(doc);
   return {
-    tenantId: doc.customerId || "default",
+    tenantId: await resolveSbtTenantId(doc),
     service: "FLIGHT",
     amount: doc.totalFare || 0,
     userId: doc.userId,
@@ -310,16 +317,31 @@ export function buildSBTBookingMirror(doc: any): Record<string, any> {
     destination: doc.destination?.city || "",
     destinationCity: destCity,
     destinationCountry: destCountry,
-    isInternational: destCountry == null ? null : destCountry !== "IN",
+    // Any end outside India (decision 2026-11-18) — origin counts too.
+    isInternational: internationalFrom([doc.origin?.code, doc.destination?.code], destCountry),
     origin: doc.origin?.city || "",
     bookedAt: doc.bookedAt || doc.createdAt,
-    travelDate: doc.departureTime ? new Date(doc.departureTime) : null,
-    travelDateEnd: doc.arrivalTime ? new Date(doc.arrivalTime) : null,
+    // departureTime / arrivalTime are IST wall clock with no zone — read as
+    // IST, not in the server zone (decision 2026-11-18).
+    travelDate: parseSbtLocalAsIST(doc.departureTime),
+    travelDateEnd: parseSbtLocalAsIST(doc.arrivalTime),
     metadata: {
       airlineName: doc.airlineName,
       flightNumber: doc.flightNumber,
       pnr: doc.pnr,
       passengers: doc.passengers?.length || 0,
+      // Phase B analytics: same keys as the manual flight mirror.
+      flightNo: doc.flightNumber || "",
+      carrierShares: flight.carrierShares,
+      departTimeIST: flight.departTimeIST,
+      departMinutesIST: flight.departMinutesIST,
+      departTimeUnknown: false,
+      departTimeSource: flight.departMinutesIST != null ? "booking" : null,
+      departTimeFromTz: null,
+      // Phase B additions: TBO cabin code → cabin; origin city for Top routes.
+      cabinClass: sbtCabin(doc.cabin),
+      cabinClassSource: sbtCabin(doc.cabin) ? "booking" : null,
+      originCity: canonicalCity(doc.origin?.city) || null,
     },
   };
 }
@@ -327,7 +349,7 @@ export function buildSBTBookingMirror(doc: any): Record<string, any> {
 /** Upsert this booking's TravelBooking mirror row from the source doc
  *  (hydrated or lean). Throws on failure — callers decide. */
 export async function syncSBTBookingToMirror(doc: any): Promise<void> {
-  await TravelBooking.findOneAndUpdate({ reference: doc._id }, buildSBTBookingMirror(doc), { upsert: true, new: true });
+  await TravelBooking.findOneAndUpdate({ reference: doc._id }, await buildSBTBookingMirror(doc), { upsert: true, new: true });
 }
 
 SBTBookingSchema.post("save", async function (doc: any) {
@@ -342,7 +364,7 @@ SBTBookingSchema.post("save", async function (doc: any) {
  *  writes any of them re-syncs the mirror (utils/mirrorResyncHooks.ts) —
  *  status transitions, fare updates and isDemo/isTest flags used to skip
  *  the save hook and leave the mirror stale (Travel Spend audit N4). */
-export const SBT_BOOKING_MIRROR_PATHS = ["customerId", "totalFare", "userId", "status", "paymentMode", "isDemo", "isTest", "destination", "origin", "bookedAt", "createdAt", "departureTime", "arrivalTime", "airlineName", "flightNumber", "pnr", "passengers"] as const;
+export const SBT_BOOKING_MIRROR_PATHS = ["customerId", "workspaceId", "airlineCode", "totalFare", "userId", "status", "paymentMode", "isDemo", "isTest", "destination", "origin", "bookedAt", "createdAt", "departureTime", "arrivalTime", "airlineName", "flightNumber", "pnr", "passengers", "cabin"] as const;
 
 export async function resyncSBTBookingMirrors(ids: unknown[]): Promise<{ synced: number; failed: number; missing: number }> {
   const out = { synced: 0, failed: 0, missing: 0 };

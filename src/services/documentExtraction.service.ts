@@ -380,6 +380,21 @@ export async function reclaimStaleProcessing(): Promise<number> {
 }
 
 /**
+ * Re-sync the Travel Spend mirror row of the manual booking this document
+ * belongs to. A dynamic import keeps this module free of booking-model
+ * imports (see the file header); failures are logged, never thrown.
+ */
+export async function refreshBookingMirrorSafely(doc: Pick<ExtractedDocumentDoc, "sourceModule" | "bookingId" | "_id">): Promise<void> {
+  if (doc.sourceModule !== "manualBookings" || !doc.bookingId) return;
+  try {
+    const { resyncManualBookingMirrors } = await import("../models/ManualBooking.js");
+    await resyncManualBookingMirrors([doc.bookingId]);
+  } catch (err: any) {
+    logger.warn("[DocExtraction] mirror refresh failed", { id: String(doc._id), error: err?.message });
+  }
+}
+
+/**
  * Run one claimed row end to end and persist the outcome. Never throws — a
  * failure is recorded on the row (requeued while attempts remain, `failed`
  * once exhausted) so one bad document can't stop the sweep.
@@ -420,6 +435,11 @@ export async function runExtraction(doc: ExtractedDocumentDoc): Promise<void> {
     // that misses its carbon pass here is picked up by
     // scripts/compute-carbon-records.ts, which is idempotent.
     await computeCarbonSafely(doc, logger);
+
+    // Travel Spend falls back to the ticket for a missing departure time /
+    // cabin (services/ticketFallback.ts), so refresh the booking's mirror row
+    // now. Same never-affects-the-save contract as carbon above.
+    await refreshBookingMirrorSafely(doc);
 
     logger.info("[DocExtraction] extracted", {
       id: String(doc._id),
