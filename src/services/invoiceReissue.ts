@@ -20,6 +20,7 @@
 import mongoose from "mongoose";
 import Invoice from "../models/Invoice.js";
 import ManualBooking from "../models/ManualBooking.js";
+import { flushMirrorResync } from "../utils/mirrorResyncHooks.js";
 import CreditNote from "../models/CreditNote.js";
 import PaymentRequest from "../models/PaymentRequest.js";
 import ArchivedInvoice, { type ArchiveMode } from "../models/ArchivedInvoice.js";
@@ -444,6 +445,7 @@ export async function archiveInvoice(opts: {
     }
     throw err;
   } finally {
+    await flushMirrorResync(session); // TravelBooking rows for the bookings this transaction moved
     await session.endSession();
   }
 

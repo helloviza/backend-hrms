@@ -216,6 +216,7 @@ workspaceRouter.put("/:id/declare-payment", async (req: any, res: any) => {
 });
 
 import ManualBooking from "../models/ManualBooking.js";
+import { flushMirrorResync } from "../utils/mirrorResyncHooks.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
 import CreditNote from "../models/CreditNote.js";
@@ -1362,6 +1363,7 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
         throw new HttpError(409, "The invoice changed while you were adding bookings (or is no longer a DRAFT). Refresh and try again.");
       }
     });
+    await flushMirrorResync(session); // mirror rows current before the response
 
     loyaltyTouch({ invoiceId: invoiceObjectId });
     // Partner revenue share for the claimed bookings — after the commit, never inside it.
@@ -1374,6 +1376,7 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
     console.error("[Invoices add-bookings]", err.message);
     res.status(500).json({ error: err.message });
   } finally {
+    await flushMirrorResync(session); // TravelBooking rows for the bookings this transaction moved
     session.endSession();
   }
 });
@@ -2290,6 +2293,7 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
       await invoice.save({ session });
       responseInvoice = invoice.toObject();
     });
+    await flushMirrorResync(session); // mirror rows current before the response
     if (responseInvoice) loyaltyTouch({ invoiceId: responseInvoice._id });
 
     if (partnerRemoved.length) await clearPartnerShareSafe(partnerRemoved, "invoice.edit.remove");
@@ -2303,6 +2307,7 @@ router.patch("/:id", requirePermission("invoices", "WRITE"), async (req: any, re
     console.error("[Invoices PATCH]", err.message);
     res.status(500).json({ error: err.message });
   } finally {
+    await flushMirrorResync(session); // TravelBooking rows for the bookings this transaction moved
     session.endSession();
   }
 });

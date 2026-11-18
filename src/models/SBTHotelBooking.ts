@@ -1,6 +1,7 @@
 import { Schema, model, type Document } from "mongoose";
 import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import TravelBooking from "./TravelBooking.js";
+import { attachMirrorResyncHooks } from "../utils/mirrorResyncHooks.js";
 import { parseTBODate } from "../lib/tbo-date.js";
 
 function tboDateSetter(v: any): Date | null | undefined {
@@ -303,49 +304,87 @@ function mapStatus(s: string): "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" 
   return "PENDING"; // HELD and unknown map to PENDING in TravelBooking
 }
 
+/** The TravelBooking row this booking should have (no write). Shared by
+ *  the sync below and scripts/resync-travel-booking-mirrors.ts's dry run. */
+export function buildSBTHotelBookingMirror(doc: any): Record<string, any> {
+  return {
+    tenantId: doc.customerId || "default",
+    service: "HOTEL",
+    amount: doc.totalFare || doc.netAmount || 0,
+    userId: doc.userId,
+    status: mapStatus(doc.status),
+    paymentMode: doc.paymentMode === "personal" ? "PERSONAL" : "OFFICIAL",
+    source: "SBT",
+    reference: doc._id,
+    referenceModel: "SBTHotelBooking",
+    // Mirror the flags every TravelBooking reader filters on.
+    isDemo: doc.isDemo === true,
+    isTest: doc.isTest === true,
+    destination: doc.cityName || "",
+    // Cities-only Top Destinations: carry the authoritative source city +
+    // country through (previously countryCode was dropped). countryCode is
+    // already ISO-2; isInternational is null when country is unknown.
+    destinationCity: doc.cityName || null,
+    destinationCountry: (doc.countryCode || "").trim().toUpperCase() || null,
+    isInternational: (doc.countryCode || "").trim()
+      ? (doc.countryCode || "").trim().toUpperCase() !== "IN"
+      : null,
+    origin: "",
+    bookedAt: doc.bookedAt || doc.createdAt,
+    travelDate: doc.checkIn ? new Date(doc.checkIn) : null,
+    travelDateEnd: doc.checkOut ? new Date(doc.checkOut) : null,
+    metadata: {
+      hotelName: doc.hotelName,
+      checkIn: doc.checkIn,
+      checkOut: doc.checkOut,
+      rooms: doc.rooms,
+      guests: doc.guests?.length || 0,
+    },
+  };
+}
+
+/** Upsert this booking's TravelBooking mirror row from the source doc
+ *  (hydrated or lean). Throws on failure — callers decide. */
+export async function syncSBTHotelBookingToMirror(doc: any): Promise<void> {
+  await TravelBooking.findOneAndUpdate({ reference: doc._id }, buildSBTHotelBookingMirror(doc), { upsert: true, new: true });
+}
+
 SBTHotelBookingSchema.post("save", async function (doc: any) {
   try {
-    await TravelBooking.findOneAndUpdate(
-      { reference: doc._id },
-      {
-        tenantId: doc.customerId || "default",
-        service: "HOTEL",
-        amount: doc.totalFare || doc.netAmount || 0,
-        userId: doc.userId,
-        status: mapStatus(doc.status),
-        paymentMode: doc.paymentMode === "personal" ? "PERSONAL" : "OFFICIAL",
-        source: "SBT",
-        reference: doc._id,
-        referenceModel: "SBTHotelBooking",
-        // Mirror the flags every TravelBooking reader filters on.
-        isDemo: doc.isDemo === true,
-        isTest: doc.isTest === true,
-        destination: doc.cityName || "",
-        // Cities-only Top Destinations: carry the authoritative source city +
-        // country through (previously countryCode was dropped). countryCode is
-        // already ISO-2; isInternational is null when country is unknown.
-        destinationCity: doc.cityName || null,
-        destinationCountry: (doc.countryCode || "").trim().toUpperCase() || null,
-        isInternational: (doc.countryCode || "").trim()
-          ? (doc.countryCode || "").trim().toUpperCase() !== "IN"
-          : null,
-        origin: "",
-        bookedAt: doc.bookedAt || doc.createdAt,
-        travelDate: doc.checkIn ? new Date(doc.checkIn) : null,
-        travelDateEnd: doc.checkOut ? new Date(doc.checkOut) : null,
-        metadata: {
-          hotelName: doc.hotelName,
-          checkIn: doc.checkIn,
-          checkOut: doc.checkOut,
-          rooms: doc.rooms,
-          guests: doc.guests?.length || 0,
-        },
-      },
-      { upsert: true, new: true },
-    );
+    await syncSBTHotelBookingToMirror(doc);
   } catch (e) {
     console.warn("TravelBooking sync failed:", (e as any)?.message);
   }
 });
 
-export default model<ISBTHotelBooking>("SBTHotelBooking", SBTHotelBookingSchema);
+/** Paths syncSBTHotelBookingToMirror reads. A findOneAndUpdate / updateOne / updateMany that
+ *  writes any of them re-syncs the mirror (utils/mirrorResyncHooks.ts) —
+ *  status transitions, fare updates and isDemo/isTest flags used to skip
+ *  the save hook and leave the mirror stale (Travel Spend audit N4). */
+export const SBT_HOTEL_BOOKING_MIRROR_PATHS = ["customerId", "totalFare", "netAmount", "userId", "status", "paymentMode", "isDemo", "isTest", "cityName", "countryCode", "bookedAt", "createdAt", "checkIn", "checkOut", "hotelName", "rooms", "guests"] as const;
+
+export async function resyncSBTHotelBookingMirrors(ids: unknown[]): Promise<{ synced: number; failed: number; missing: number }> {
+  const out = { synced: 0, failed: 0, missing: 0 };
+  if (!ids.length) return out;
+  const docs = await SBTHotelBookingModel.find({ _id: { $in: ids } }).lean();
+  out.missing = ids.length - docs.length;
+  for (const doc of docs) {
+    try {
+      await syncSBTHotelBookingToMirror(doc);
+      out.synced += 1;
+    } catch (e) {
+      out.failed += 1;
+      console.warn("TravelBooking resync (sbt-hotel) failed:", String((doc as any)._id), (e as any)?.message);
+    }
+  }
+  return out;
+}
+
+attachMirrorResyncHooks(SBTHotelBookingSchema, {
+  label: "sbt-hotel",
+  mirrorPaths: SBT_HOTEL_BOOKING_MIRROR_PATHS,
+  resync: (ids) => resyncSBTHotelBookingMirrors(ids),
+});
+
+const SBTHotelBookingModel = model<ISBTHotelBooking>("SBTHotelBooking", SBTHotelBookingSchema);
+export default SBTHotelBookingModel;

@@ -3,6 +3,7 @@ import TravelBooking from "./TravelBooking.js";
 import CustomerWorkspace from "./CustomerWorkspace.js";
 import { lookupDestination, lookupDestinationFuzzy } from "../data/destinationLookup.js";
 import { returnJourneyStart } from "../services/flightLegs.js";
+import { attachMirrorResyncHooks } from "../utils/mirrorResyncHooks.js";
 
 // The frontend restates these lists in pages/admin/ManualBookingForm.tsx (the
 // dropdown) and pages/admin/ManualBookings.tsx (the filter);
@@ -1017,11 +1018,14 @@ export async function retireConciergeRowForRequest(requestId: unknown, bookingId
   );
 }
 
-export async function syncManualBookingToMirror(doc: any): Promise<void> {
+/** The TravelBooking row this booking should have (no write), or null for
+ *  SBT-origin bookings, which mirror from the SBT side. Shared by the sync
+ *  below and scripts/resync-travel-booking-mirrors.ts's dry run. */
+export async function buildManualBookingMirror(doc: any): Promise<Record<string, any> | null> {
   // Skip SBT-origin rows — those already mirror in from the SBT side (avoid
   // double-count). ADMIN_QUEUE (Book Now) bookings mirror like any manual
   // booking; their sourceBookingId is the ApprovalRequest, not an SBT row.
-  if (doc.source === "SBT" || doc.source === "SBT_AUTO") return;
+  if (doc.source === "SBT" || doc.source === "SBT_AUTO") return null;
 
   const tenantId = String(doc.workspaceId); // = Customer._id (the canonical key)
 
@@ -1135,6 +1139,12 @@ export async function syncManualBookingToMirror(doc: any): Promise<void> {
     },
   };
   if (workspaceId) update.workspaceId = workspaceId;
+  return update;
+}
+
+export async function syncManualBookingToMirror(doc: any): Promise<void> {
+  const update = await buildManualBookingMirror(doc);
+  if (!update) return;
 
   await TravelBooking.findOneAndUpdate({ reference: doc._id }, update, {
     upsert: true,
@@ -1154,4 +1164,45 @@ ManualBookingSchema.post("save", async function (doc: any) {
   }
 });
 
-export default model<IManualBooking>("ManualBooking", ManualBookingSchema);
+/**
+ * Paths syncManualBookingToMirror reads. An updateOne / updateMany /
+ * findOneAndUpdate that writes any of them re-syncs the mirror row for the
+ * matched bookings (utils/mirrorResyncHooks.ts) — invoice claim / cancel /
+ * edit / reissue move status, the client move rewrites workspaceId. Writes
+ * to anything else (partnerShare, createdByEmail, bookingMonth…) skip it.
+ */
+export const MANUAL_BOOKING_MIRROR_PATHS = [
+  "status", "workspaceId", "type", "sector", "itinerary", "pricing", "passengers",
+  "bookedBy", "isActive", "isDemo", "createdByDemoUser", "bookingDate", "createdAt",
+  "travelDate", "returnDate", "bookingRef", "source", "sourceBookingId",
+] as const;
+
+/** Re-sync the mirror rows of these bookings from the committed source.
+ *  Per-row failures are counted, never thrown. */
+export async function resyncManualBookingMirrors(
+  ids: unknown[],
+): Promise<{ synced: number; failed: number; missing: number }> {
+  const out = { synced: 0, failed: 0, missing: 0 };
+  if (!ids.length) return out;
+  const docs = await ManualBookingModel.find({ _id: { $in: ids } }).lean();
+  out.missing = ids.length - docs.length;
+  for (const doc of docs) {
+    try {
+      await syncManualBookingToMirror(doc);
+      out.synced += 1;
+    } catch (e) {
+      out.failed += 1;
+      console.warn("TravelBooking resync (manual) failed:", String((doc as any)._id), (e as any)?.message);
+    }
+  }
+  return out;
+}
+
+attachMirrorResyncHooks(ManualBookingSchema, {
+  label: "manual",
+  mirrorPaths: MANUAL_BOOKING_MIRROR_PATHS,
+  resync: (ids) => resyncManualBookingMirrors(ids),
+});
+
+const ManualBookingModel = model<IManualBooking>("ManualBooking", ManualBookingSchema);
+export default ManualBookingModel;

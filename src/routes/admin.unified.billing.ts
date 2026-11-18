@@ -69,7 +69,7 @@ interface AccessScope {
   accessLevel: AccessLevel;
 }
 
-function resolveAccessScope(user: any): AccessScope {
+export function resolveAccessScope(user: any): AccessScope {
   const roles: string[] = Array.isArray(user?.roles) ? user.roles : [];
   const normRoles = roles.map((r) =>
     String(r).toUpperCase().replace(/[\s_-]+/g, ""),
@@ -99,9 +99,13 @@ function resolveAccessScope(user: any): AccessScope {
     }
   }
 
-  // L2 / CUSTOMER_APPROVER → ORG (see all org bookings)
-  // Note: TravelBooking has no approverId field so we scope to the full org
-  if (accessRole === "L2" || normRoles.includes("CUSTOMERAPPROVER")) {
+  // L2 / CUSTOMER_APPROVER / APPROVER → ORG (see all org bookings)
+  // Note: TravelBooking has no approverId field so we scope to the full org.
+  // APPROVER is the role customer approvers actually carry (roles
+  // [CUSTOMER, APPROVER]); it used to fall through to OWN, where userId is
+  // the staff booker on manual rows, so approvers saw an empty dashboard
+  // (Travel Spend audit 2026-11, 3b). REQUESTER stays OWN for now.
+  if (accessRole === "L2" || normRoles.includes("CUSTOMERAPPROVER") || normRoles.includes("APPROVER")) {
     if (tenantId) {
       return { matchFilter: { tenantId }, accessLevel: "ORG" };
     }

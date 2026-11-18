@@ -1,6 +1,7 @@
 import { Schema, model, type Document } from "mongoose";
 import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import TravelBooking from "./TravelBooking.js";
+import { attachMirrorResyncHooks } from "../utils/mirrorResyncHooks.js";
 import { canonicalCity, countryFor } from "../data/destinationLookup.js";
 
 export interface ISBTBooking extends Document {
@@ -284,49 +285,87 @@ function mapStatus(s: string): "CONFIRMED" | "CANCELLED" | "PENDING" | "FAILED" 
   return "PENDING";
 }
 
+/** The TravelBooking row this booking should have (no write). Shared by
+ *  the sync below and scripts/resync-travel-booking-mirrors.ts's dry run. */
+export function buildSBTBookingMirror(doc: any): Record<string, any> {
+  // Cities-only Top Destinations ranking fields — Tier 2 of the backfill's
+  // resolver (backfill-destination-fields.ts's `resolve()`): trust the
+  // structured destination.city field (canonicalized via the lookup
+  // table), country from destination.code (IATA) falling back to city.
+  const destCity = canonicalCity(doc.destination?.city);
+  const destCountry = countryFor(doc.destination?.code, doc.destination?.city);
+  return {
+    tenantId: doc.customerId || "default",
+    service: "FLIGHT",
+    amount: doc.totalFare || 0,
+    userId: doc.userId,
+    status: mapStatus(doc.status),
+    paymentMode: doc.paymentMode === "personal" ? "PERSONAL" : "OFFICIAL",
+    source: "SBT",
+    reference: doc._id,
+    referenceModel: "SBTBooking",
+    // Mirror the flags every TravelBooking reader filters on.
+    isDemo: doc.isDemo === true,
+    isTest: doc.isTest === true,
+    destination: doc.destination?.city || "",
+    destinationCity: destCity,
+    destinationCountry: destCountry,
+    isInternational: destCountry == null ? null : destCountry !== "IN",
+    origin: doc.origin?.city || "",
+    bookedAt: doc.bookedAt || doc.createdAt,
+    travelDate: doc.departureTime ? new Date(doc.departureTime) : null,
+    travelDateEnd: doc.arrivalTime ? new Date(doc.arrivalTime) : null,
+    metadata: {
+      airlineName: doc.airlineName,
+      flightNumber: doc.flightNumber,
+      pnr: doc.pnr,
+      passengers: doc.passengers?.length || 0,
+    },
+  };
+}
+
+/** Upsert this booking's TravelBooking mirror row from the source doc
+ *  (hydrated or lean). Throws on failure — callers decide. */
+export async function syncSBTBookingToMirror(doc: any): Promise<void> {
+  await TravelBooking.findOneAndUpdate({ reference: doc._id }, buildSBTBookingMirror(doc), { upsert: true, new: true });
+}
+
 SBTBookingSchema.post("save", async function (doc: any) {
   try {
-    // Cities-only Top Destinations ranking fields — Tier 2 of the backfill's
-    // resolver (backfill-destination-fields.ts's `resolve()`): trust the
-    // structured destination.city field (canonicalized via the lookup
-    // table), country from destination.code (IATA) falling back to city.
-    const destCity = canonicalCity(doc.destination?.city);
-    const destCountry = countryFor(doc.destination?.code, doc.destination?.city);
-    await TravelBooking.findOneAndUpdate(
-      { reference: doc._id },
-      {
-        tenantId: doc.customerId || "default",
-        service: "FLIGHT",
-        amount: doc.totalFare || 0,
-        userId: doc.userId,
-        status: mapStatus(doc.status),
-        paymentMode: doc.paymentMode === "personal" ? "PERSONAL" : "OFFICIAL",
-        source: "SBT",
-        reference: doc._id,
-        referenceModel: "SBTBooking",
-        // Mirror the flags every TravelBooking reader filters on.
-        isDemo: doc.isDemo === true,
-        isTest: doc.isTest === true,
-        destination: doc.destination?.city || "",
-        destinationCity: destCity,
-        destinationCountry: destCountry,
-        isInternational: destCountry == null ? null : destCountry !== "IN",
-        origin: doc.origin?.city || "",
-        bookedAt: doc.bookedAt || doc.createdAt,
-        travelDate: doc.departureTime ? new Date(doc.departureTime) : null,
-        travelDateEnd: doc.arrivalTime ? new Date(doc.arrivalTime) : null,
-        metadata: {
-          airlineName: doc.airlineName,
-          flightNumber: doc.flightNumber,
-          pnr: doc.pnr,
-          passengers: doc.passengers?.length || 0,
-        },
-      },
-      { upsert: true, new: true },
-    );
+    await syncSBTBookingToMirror(doc);
   } catch (e) {
     console.warn("TravelBooking sync failed:", (e as any)?.message);
   }
 });
 
-export default model<ISBTBooking>("SBTBooking", SBTBookingSchema);
+/** Paths syncSBTBookingToMirror reads. A findOneAndUpdate / updateOne / updateMany that
+ *  writes any of them re-syncs the mirror (utils/mirrorResyncHooks.ts) —
+ *  status transitions, fare updates and isDemo/isTest flags used to skip
+ *  the save hook and leave the mirror stale (Travel Spend audit N4). */
+export const SBT_BOOKING_MIRROR_PATHS = ["customerId", "totalFare", "userId", "status", "paymentMode", "isDemo", "isTest", "destination", "origin", "bookedAt", "createdAt", "departureTime", "arrivalTime", "airlineName", "flightNumber", "pnr", "passengers"] as const;
+
+export async function resyncSBTBookingMirrors(ids: unknown[]): Promise<{ synced: number; failed: number; missing: number }> {
+  const out = { synced: 0, failed: 0, missing: 0 };
+  if (!ids.length) return out;
+  const docs = await SBTBookingModel.find({ _id: { $in: ids } }).lean();
+  out.missing = ids.length - docs.length;
+  for (const doc of docs) {
+    try {
+      await syncSBTBookingToMirror(doc);
+      out.synced += 1;
+    } catch (e) {
+      out.failed += 1;
+      console.warn("TravelBooking resync (sbt-flight) failed:", String((doc as any)._id), (e as any)?.message);
+    }
+  }
+  return out;
+}
+
+attachMirrorResyncHooks(SBTBookingSchema, {
+  label: "sbt-flight",
+  mirrorPaths: SBT_BOOKING_MIRROR_PATHS,
+  resync: (ids) => resyncSBTBookingMirrors(ids),
+});
+
+const SBTBookingModel = model<ISBTBooking>("SBTBooking", SBTBookingSchema);
+export default SBTBookingModel;

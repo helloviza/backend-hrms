@@ -22,6 +22,7 @@
 import mongoose from "mongoose";
 import Invoice from "../models/Invoice.js";
 import ManualBooking from "../models/ManualBooking.js";
+import { flushMirrorResync } from "../utils/mirrorResyncHooks.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import Customer from "../models/Customer.js";
 import { getCompanySettings } from "../models/CompanySettings.js";
@@ -562,6 +563,7 @@ async function createOneInvoice(
       await Invoice.collection.updateOne({ _id: invoiceId }, { $set: { lineItems } }, { session });
     });
   } finally {
+    await flushMirrorResync(session); // TravelBooking rows for the bookings this transaction moved
     await session.endSession();
   }
 
