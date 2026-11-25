@@ -433,6 +433,36 @@ describe("overview, health and audit", () => {
 
 /* ── Import from Expense Bands, cities ───────────────────────────────── */
 
+describe("setting: what domestic means (Policy Compliance)", () => {
+  const stored = async (w = WS) => ((await col("customerworkspaces").findOne({ _id: w })) as any).config.policyDomesticBasis;
+  it("defaults to India; leader and staff change it, audited once with the old and new value; approver cannot; other companies untouched", async () => {
+    expect((await call("get", C, LEADER, WS)).body.settings).toEqual({ domesticBasis: "INDIA" });
+    expect((await call("put", `${C}/settings`, APPROVER, WS).send({ domesticBasis: "WORK_COUNTRY" })).status).toBe(403);
+    expect(await stored()).toBeUndefined();
+
+    expect((await call("put", `${C}/settings`, LEADER, WS).send({ domesticBasis: "WORK_COUNTRY" })).body).toEqual({ settings: { domesticBasis: "WORK_COUNTRY" } });
+    expect(await stored()).toBe("WORK_COUNTRY");
+    expect(await stored(WS_B)).toBeUndefined();
+    expect((await call("get", C, APPROVER, WS)).body.settings).toEqual({ domesticBasis: "WORK_COUNTRY" });
+    await call("put", `${C}/settings`, LEADER, WS).send({ domesticBasis: "WORK_COUNTRY" }); // same value: not logged again
+    const rows: any[] = await TravelPolicyAudit.find({ workspaceId: WS, action: "SETTING_CHANGED" }).lean();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      categories: ["SETTING"],
+      summary: "Domestic now means: within the traveller's work country",
+      changes: [{ field: "Domestic means", from: "Within India", to: "Within the traveller's work country" }],
+    });
+    expect((await call("put", `${S}/settings`, STAFF).send({ domesticBasis: "INDIA" })).status).toBe(200);
+    expect(await stored()).toBe("INDIA");
+  });
+  it("refuses any other value", async () => {
+    for (const domesticBasis of ["EUROPE", "", null, { $ne: 1 }]) {
+      expect((await call("put", `${C}/settings`, LEADER, WS).send({ domesticBasis })).status).toBe(400);
+    }
+    expect(await stored()).toBeUndefined();
+  });
+});
+
 describe("M15 / M17 expense bands and cities", () => {
   it("M15: says which bands it skipped, keeps tier names unique, and seeds the city list for every starting point", async () => {
     await col("expensebands").insertMany([

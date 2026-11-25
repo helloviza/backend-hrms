@@ -137,6 +137,9 @@ export interface CustomerWorkspaceDocument extends Document {
     // no backfill is required for correctness.
     baseCurrency?: string;
 
+    /** Policy Compliance: what counts as a domestic trip. Absent = "INDIA". Set from Travel Policy (audited). */
+    policyDomesticBasis?: "INDIA" | "WORK_COUNTRY";
+
     // RETIRED (approval-engine sub-step 4, 2026-09-16): expenseEscalationThreshold,
     // seniorApproverId and advanceEscalationThreshold moved to
     // ExpenseApprovalPolicy.legacyEscalation (models/ExpenseApprovalPolicy.ts)
@@ -320,6 +323,7 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
       // get the same default from getWorkspaceBaseCurrency(). Only changeable
       // while the workspace has zero expenses (routes/expenseAdmin.ts).
       baseCurrency: { type: String, trim: true, uppercase: true, default: "INR" },
+      policyDomesticBasis: { type: String, enum: ["INDIA", "WORK_COUNTRY"], default: "INDIA" },
       // expenseEscalationThreshold / seniorApproverId / advanceEscalationThreshold:
       // RETIRED — see ExpenseApprovalPolicy.legacyEscalation (sub-step 4).
       // Visa approval gate — SCHEMA DEFAULT false. Every existing workspace

@@ -2,6 +2,7 @@
 import { Router } from "express";
 import type { Request, Response, NextFunction } from "express";
 import mongoose from "mongoose";
+import ExcelJS from "exceljs";
 import { requireAuth } from "../middleware/auth.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
 import { resolveWorkspaceForUser } from "../middleware/requireWorkspace.js";
@@ -15,6 +16,8 @@ import {
   computeLeadTime, computeHotelRates, computeTopRoutes, computeCarbon, computeServiceCards,
   SERVICE_CARDS, type ServiceCardKey,
 } from "../services/travelKpis.js";
+import { summarise, sortViolations, type RegionBy } from "../services/policyCompliance/evaluate.js";
+import { loadComplianceTrips, complianceState, EXPORT_COLUMNS, exportCell } from "../services/policyCompliance/service.js";
 import { quarterPlan, buildQuarterly, type QuarterRow, type QuarterlyStats } from "../services/quarterlySpend.js";
 
 const router = Router();
@@ -156,11 +159,13 @@ function buildScopedMatch(req: any): any {
   if (pm === "OFFICIAL" || pm === "PERSONAL") match.paymentMode = pm;
 
   // Apply role-based access scope
-  const { matchFilter } = resolveAccessScope(req.user);
+  const { matchFilter, accessLevel } = resolveAccessScope(req.user);
   Object.assign(match, matchFilter);
 
   // Demo Platform — exclude demo bookings from production travel-spend views.
-  match.isDemo = { $ne: true };
+  // A demo login sees ONLY its own company's (or its own) demo bookings, as in
+  // myBookings; never from a GLOBAL scope.
+  match.isDemo = req.user?.isDemoUser === true && accessLevel !== "GLOBAL" ? true : { $ne: true };
   // Internal test bookings (scripts/mark-sbt-test-data.ts) never count.
   match.isTest = { $ne: true };
 
@@ -1356,6 +1361,73 @@ router.get("/service-cards", async (req: Request, res: Response) => {
     res.json({ ok: true, cards });
   } catch (err: any) {
     res.status(500).json({ error: "Failed to fetch service cards", detail: err?.message });
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════
+ * GET /policy-compliance  (CONFIRMED flights + hotels)
+ *   Was each trip requested the minimum days ahead that the Travel Policy
+ *   in force on the request date asks for? services/policyCompliance/.
+ *   enabled:false = the Travel Policy module is off: the page shows nothing.
+ *   ?regionBy=work (default) | destination
+ * GET /policy-compliance/export?format=csv|xlsx — every violation in range.
+ * ═════════════════════════════════════════════════════════════ */
+const VIOLATIONS_SHOWN = 1000;
+
+const complianceAccess = (req: Request) => {
+  const { accessLevel } = resolveAccessScope((req as any).user);
+  const u: any = (req as any).user;
+  return { staff: accessLevel === "GLOBAL", tenantId: String(u?.customerId || u?.businessId || "") };
+};
+
+router.get("/policy-compliance", async (req: Request, res: Response) => {
+  try {
+    const regionBy: RegionBy = req.query.regionBy === "destination" ? "destination" : "work";
+    const { staff, tenantId } = complianceAccess(req);
+    const state = await complianceState(staff ? null : tenantId);
+    if (!state.enabled) return res.json({ ok: true, enabled: false, configured: false });
+    const trips = await loadComplianceTrips(buildScopedMatch(req));
+    const violations = sortViolations(trips);
+    return res.json({
+      ok: true,
+      ...state,
+      regionBy,
+      showCompany: staff,
+      ...summarise(trips, regionBy),
+      violations: violations.slice(0, VIOLATIONS_SHOWN),
+      violationsTotal: violations.length,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: "Failed to fetch policy compliance", detail: err?.message });
+  }
+});
+
+/** A cell that starts like a formula is written as text (names and sectors are typed by people). */
+const textCell = (v: string | number) => (typeof v === "string" && /^[=+\-@\t\r]/.test(v) ? `'${v}` : v);
+
+router.get("/policy-compliance/export", async (req: Request, res: Response) => {
+  try {
+    const { staff } = complianceAccess(req);
+    const rows = sortViolations(await loadComplianceTrips(buildScopedMatch(req)));
+    const cols = staff ? [{ key: "company" as const, label: "Company", width: 26 }, ...EXPORT_COLUMNS] : EXPORT_COLUMNS;
+    const body = rows.map((t) => cols.map((c) => textCell(exportCell(t, c.key))));
+    if (req.query.format === "xlsx") {
+      const wb = new ExcelJS.Workbook();
+      const sh = wb.addWorksheet("Policy violations", { views: [{ state: "frozen", ySplit: 1 }] });
+      sh.addRow(cols.map((c) => c.label)).font = { bold: true };
+      for (const b of body) sh.addRow(b);
+      sh.columns.forEach((c, i) => { c.width = cols[i].width; });
+      sh.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: cols.length } };
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", 'attachment; filename="policy-violations.xlsx"');
+      return res.send(Buffer.from(await wb.xlsx.writeBuffer()));
+    }
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="policy-violations.csv"');
+    // BOM: Excel reads the arrows in "Delhi → London" as UTF-8.
+    return res.send("\uFEFF" + [cols.map((c) => csvEscape(c.label)), ...body.map((b) => b.map(csvEscape))].map((l) => l.join(",")).join("\n"));
+  } catch (err: any) {
+    return res.status(500).json({ error: "Failed to export policy violations", detail: err?.message });
   }
 });
 

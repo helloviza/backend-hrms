@@ -19,6 +19,7 @@ import ExpenseBand from "../models/ExpenseBand.js";
 import User from "../models/User.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import logger from "../utils/logger.js";
+import { DOMESTIC_BASES, readDomesticBasis, type DomesticBasis } from "./policyCompliance/evaluate.js";
 import { ISO_COUNTRIES, ISO_CURRENCIES, isIsoCountry } from "../data/isoCodes.js";
 import { TEMPLATE_CITIES, TEMPLATE_RULES, TEMPLATE_TIERS, TEMPLATE_VERSION } from "../data/travelPolicyTemplate.js";
 import {
@@ -37,6 +38,7 @@ import {
   isIsoDate,
   istToday,
   normalizeKey,
+  pickVersionAt,
   policyGaps,
   resolveTier,
   samePolicy,
@@ -44,7 +46,6 @@ import {
   validateForPublish,
   valueWarnings,
   versionState,
-  windowContains,
   windowsOverlap,
   type CityClass,
   type DraftContent,
@@ -226,9 +227,8 @@ export async function listVersions(workspaceId: Oid) {
 /** The version in force on `day` (IST), or null = Not configured. Never falls back to the template. */
 export async function resolveVersionAt(workspaceId: Oid, day: string) {
   const rows = await TravelPolicyVersion.find({ workspaceId, status: "PUBLISHED", effectiveFrom: { $lte: day } })
-    .sort({ effectiveFrom: -1 })
     .lean();
-  return rows.find((v) => windowContains(v, day)) ?? null;
+  return pickVersionAt(rows, day);
 }
 
 export async function getVersion(workspaceId: Oid, id: string) {
@@ -902,9 +902,9 @@ export interface MappingRow {
 }
 
 /** Everything buildMapping needs from the database, read once so several tier sets can be resolved against it. */
-async function loadTravellers(workspaceId: Oid) {
-  const travellers: any[] = await TravellerProfile.find({ workspaceId, isActive: true })
-    .select("firstName middleName lastName email employeeId travelerId departmentId designationId bandNumber claimedBy")
+export async function loadTravellers(workspaceId: Oid, opts: { includeInactive?: boolean } = {}) {
+  const travellers: any[] = await TravellerProfile.find(opts.includeInactive ? { workspaceId } : { workspaceId, isActive: true })
+    .select("firstName middleName lastName email employeeId travelerId departmentId designationId bandNumber claimedBy workLocation isActive")
     .sort({ firstName: 1, lastName: 1, _id: 1 })
     .limit(20000)
     .lean();
@@ -942,12 +942,18 @@ function resolveRows(loaded: Awaited<ReturnType<typeof loadTravellers>>, tiers: 
       bandNumber,
       bandSource: t.bandNumber != null ? "PROFILE" : loginBand != null ? "LOGIN" : null,
       hasLogin: !!t.claimedBy,
-      resolution: resolveTier({ designationId, bandNumber }, tiers, a),
+      resolution: travellerTier(loaded, t, tiers),
       override: a
         ? { tierKey: a.tierKey ?? null, excluded: a.excluded ?? null, reason: a.reason || "", setBy: a.setBy, updatedAt: a.updatedAt }
         : null,
     };
   });
+}
+
+/** One traveller's tier under `tiers`, from what loadTravellers read (the profile's band wins over the login's). */
+export function travellerTier(loaded: Awaited<ReturnType<typeof loadTravellers>>, t: any, tiers: Tier[]): TierResolution {
+  const bandNumber = t.bandNumber ?? (t.claimedBy ? (loaded.band.get(String(t.claimedBy)) ?? null) : null);
+  return resolveTier({ designationId: t.designationId ? String(t.designationId) : null, bandNumber }, tiers, loaded.assign.get(String(t._id)) ?? null);
 }
 
 export async function buildMapping(workspaceId: Oid, tiers: Tier[]): Promise<MappingRow[]> {
@@ -1128,7 +1134,7 @@ export interface HealthItem {
 export async function getOverview(workspaceId: Oid, today = istToday(), opts: { showDraft?: boolean; canWrite?: boolean; entry?: "CLIENT" | "STAFF" } = {}) {
   const showDraft = opts.showDraft !== false;
   const canWrite = opts.canWrite ?? showDraft;
-  const ws: any = await CustomerWorkspace.findById(workspaceId).select("companyName customerId config.features").lean();
+  const ws: any = await CustomerWorkspace.findById(workspaceId).select("companyName customerId config.features config.policyDomesticBasis").lean();
   const all: any[] = await listVersions(workspaceId);
   const realDraft = all.find((v) => v.status === "DRAFT") ?? null;
   const versions = showDraft ? all : all.filter((v) => v.status !== "DRAFT");
@@ -1194,6 +1200,7 @@ export async function getOverview(workspaceId: Oid, today = istToday(), opts: { 
   for (const v of [...versions].reverse()) for (const t of v.tiers || []) tierNames[t.tierKey] = t.name;
   return {
     workspace: { _id: String(workspaceId), name: ws?.companyName || "", travelPolicyEnabled: !!ws?.config?.features?.travelPolicyEnabled },
+    settings: { domesticBasis: readDomesticBasis(ws?.config?.policyDomesticBasis) },
     today,
     active: active ? summarizeVersion(active, today) : null,
     scheduled: scheduled.map((s) => summarizeVersion(s, today)),
@@ -1214,6 +1221,32 @@ export async function getOverview(workspaceId: Oid, today = istToday(), opts: { 
 }
 
 /** Id of the open draft, if any (to keep its audit rows from people who may not see it). */
+const BASIS_LABEL: Record<DomesticBasis, string> = { INDIA: "Within India", WORK_COUNTRY: "Within the traveller's work country" };
+
+/** What "domestic" means for this workspace's Policy Compliance. Not versioned: it applies to past trips too. */
+export async function setDomesticBasis(workspaceId: Oid, actor: PolicyActor, value: unknown, reason?: string) {
+  if (!DOMESTIC_BASES.includes(value as DomesticBasis)) throw new TravelPolicyError(400, "Choose what domestic means");
+  const next = value as DomesticBasis;
+  const prev: any = await CustomerWorkspace.findOneAndUpdate({ _id: workspaceId }, { $set: { "config.policyDomesticBasis": next } }, { new: false })
+    .select("config.policyDomesticBasis")
+    .lean();
+  if (!prev) throw new TravelPolicyError(404, "Workspace not found");
+  const before = readDomesticBasis(prev.config?.policyDomesticBasis);
+  if (before !== next) {
+    await appendAudit({
+      workspaceId,
+      action: "SETTING_CHANGED",
+      entity: "ORG",
+      categories: ["SETTING"],
+      summary: `Domestic now means: ${BASIS_LABEL[next].toLowerCase().replace("india", "India")}`,
+      changes: [{ category: "SETTING", field: "Domestic means", from: BASIS_LABEL[before], to: BASIS_LABEL[next] }],
+      reason,
+      actor,
+    });
+  }
+  return { domesticBasis: next };
+}
+
 export async function openDraftId(workspaceId: Oid): Promise<string | null> {
   const d: any = await TravelPolicyVersion.findOne({ workspaceId, status: "DRAFT" }).select("_id").lean();
   return d ? String(d._id) : null;

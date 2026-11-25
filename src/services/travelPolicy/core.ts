@@ -89,6 +89,8 @@ export interface HotelParams {
   maxPerNight: number | null;
   taxesIncluded: boolean;
   maxStarRating: number | null;
+  /** Minimum days between the request and check-in. Absent / null = no rule. Domestic vs international comes from the rule's own scope. */
+  minAdvanceDays?: number | null;
 }
 export interface ForexParams {
   eligible: boolean;
@@ -266,6 +268,15 @@ export function windowContains(v: { effectiveFrom?: string | null; effectiveTo?:
   return !v.effectiveTo || v.effectiveTo >= day;
 }
 
+/** The published version whose window contains `day`, or null. `versions` may be in any order. */
+export function pickVersionAt<T extends { status: string; effectiveFrom?: string | null; effectiveTo?: string | null }>(versions: T[], day: string): T | null {
+  return (
+    versions
+      .filter((v) => v.status === "PUBLISHED" && windowContains(v, day))
+      .sort((a, b) => String(b.effectiveFrom).localeCompare(String(a.effectiveFrom)))[0] ?? null
+  );
+}
+
 /** Do two windows overlap? (null `to` = open-ended) */
 export function windowsOverlap(
   a: { effectiveFrom: string; effectiveTo?: string | null },
@@ -359,6 +370,7 @@ export function sanitizeParams(category: Category, p: any, path: string, errors:
         maxPerNight: money(p.maxPerNight, `${path} · Max per night`, errors),
         taxesIncluded: bool(p.taxesIncluded, true),
         maxStarRating: stars,
+        minAdvanceDays: wholeDays(p.minAdvanceDays, `${path} · Min advance`, errors),
       };
     }
     case "FOREX": {
@@ -709,13 +721,17 @@ export interface Destination {
 /**
  * City class of a destination: any country other than India is
  * INTERNATIONAL; an Indian city takes its active city-master row's class;
- * an Indian city not in the master (or deactivated) is OTHER.
+ * an Indian city not in the master (or deactivated) is OTHER. `home` is the
+ * country that counts as domestic (Policy Compliance, "within the traveller's
+ * work country"); everything else uses India.
  */
-export function classifyDestination(dest: Destination, cities: CityForClass[]): CityClass {
-  const country = String(dest.country || "IN").toUpperCase();
-  if (country !== "IN") return "INTERNATIONAL";
-  const row = dest.cityKey ? cities.find((c) => c.isActive && c.nameKey === dest.cityKey && c.country === "IN") : undefined;
-  return row ? row.category : "OTHER";
+export function classifyDestination(dest: Destination, cities: CityForClass[], home = "IN"): CityClass {
+  const country = String(dest.country || home).toUpperCase();
+  if (country !== home) return "INTERNATIONAL";
+  const row = dest.cityKey ? cities.find((c) => c.isActive && c.nameKey === dest.cityKey && c.country === home) : undefined;
+  if (!row) return "OTHER";
+  // A foreign city is listed as International; at home it is not.
+  return home !== "IN" && row.category === "INTERNATIONAL" ? "OTHER" : row.category;
 }
 
 export function cityKeyOf(c: Pick<CityForClass, "cityKey" | "nameKey">): string {
@@ -752,13 +768,14 @@ export function selectRule(
   tierKey: string,
   dest: Destination,
   cities: CityForClass[],
+  home = "IN",
 ): RuleMatch | null {
   const candidates = rules.filter((r) => r.category === category && r.tierKey === tierKey);
   if (!candidates.length) return null;
-  const country = String(dest.country || "IN").toUpperCase();
+  const country = String(dest.country || home).toUpperCase();
   const region = regionOfCountry(country);
-  const cityClass = classifyDestination(dest, cities);
-  const listKey = destinationCityKey(dest, cities);
+  const cityClass = classifyDestination(dest, cities, home);
+  const listKey = destinationCityKey({ ...dest, country }, cities);
   const matches = (r: Rule): boolean => {
     switch (r.scope.kind) {
       case "CITY":
@@ -790,12 +807,13 @@ export interface Change {
 }
 
 // Key order must not matter: Mongo, the sanitiser and the browser each build
-// the same rule with its keys in a different order.
+// the same rule with its keys in a different order. A field saved before it
+// existed is absent where a newer save has null: both mean "not set".
 const canonical = (v: any): any =>
   Array.isArray(v)
     ? v.map(canonical)
     : v && typeof v === "object"
-      ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canonical(v[k])]))
+      ? Object.fromEntries(Object.keys(v).filter((k) => v[k] !== null && v[k] !== undefined).sort().map((k) => [k, canonical(v[k])]))
       : v;
 const json = (v: unknown) => JSON.stringify(canonical(v ?? null));
 

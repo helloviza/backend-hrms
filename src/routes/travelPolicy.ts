@@ -54,6 +54,7 @@ import {
   saveDraft,
   seedCitiesIfEmpty,
   setAssignments,
+  setDomesticBasis,
   summarizeVersion,
   updateCity,
 } from "../services/travelPolicy.service.js";
@@ -262,6 +263,15 @@ function coreRouter() {
           hideVersionId: c.seesDraft ? null : await openDraftId(c.workspaceId),
         }),
       );
+    }),
+  );
+
+  r.put(
+    "/settings",
+    requireWrite,
+    wrap("settings", async (req, res) => {
+      const c = ctx(res);
+      res.json({ settings: await setDomesticBasis(c.workspaceId, c.actor, req.body?.domesticBasis, req.body?.reason) });
     }),
   );
 

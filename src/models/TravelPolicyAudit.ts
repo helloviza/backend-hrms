@@ -29,7 +29,8 @@ export type TravelPolicyAuditAction =
   | "TRAVELLERS_IMPORTED"
   | "DEPARTMENT_CREATED"
   | "DESIGNATION_CREATED"
-  | "DESIGNATION_UPDATED";
+  | "DESIGNATION_UPDATED"
+  | "SETTING_CHANGED";
 
 export interface ITravelPolicyAudit extends Document {
   workspaceId: mongoose.Types.ObjectId;
