@@ -88,6 +88,8 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   // gstRegistrations is deliberately UNMAPPED too: Business Profiles is HOUSE
   // staff only, and services/gstRegistrationAccess.ts refuses any caller
   // outside HOUSE whatever their grant says.
+  // travelPolicy is UNMAPPED for the same reason: the staff entry
+  // (routes/travelPolicy.ts) refuses any caller outside HOUSE.
 };
 
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";

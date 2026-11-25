@@ -44,6 +44,11 @@ export interface WorkspaceFeatures {
   // are earned whatever this says (services/loyalty.ts never reads it).
   // SCHEMA DEFAULT false; not in any plan preset — superadmin toggle only.
   loyaltyRewardsEnabled?: boolean;
+  // Travel Policy module (docs/audits/travel-policy-audit.md, D5): the client
+  // portal's Travel Policy tab + /api/workspace/travel-policy. SCHEMA DEFAULT
+  // false; not in any plan preset — Workspace Manager toggle only. Plumtrips
+  // staff can prepare a policy from Admin → Travel Policy while it is off.
+  travelPolicyEnabled?: boolean;
   // Partner revenue share dashboard (/api/my-bookings/revenue). SCHEMA
   // DEFAULT false; set only by routes/admin.partnerRevenue.ts when a partner
   // config is saved (= its `enabled`) or removed (false).
@@ -361,6 +366,7 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
         plumconnectEnabled: { type: Boolean, default: false },
         // Plumtrips Rewards client view — visibility only, see the interface.
         loyaltyRewardsEnabled: { type: Boolean, default: false },
+        travelPolicyEnabled: { type: Boolean, default: false },
         // Approval live-search prices — see the interface.
         approvalFlightPricesEnabled: { type: Boolean, default: false },
         approvalHotelPricesEnabled: { type: Boolean, default: false },

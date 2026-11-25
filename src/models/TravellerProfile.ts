@@ -278,6 +278,15 @@ export interface TravellerProfileDocument extends Document {
    */
   employeeId?: string;
 
+  /**
+   * Travel Policy band (L1–L10), set by the Travel Policy traveller import.
+   * Read ONLY to resolve a travel tier (services/travelPolicy.service.ts),
+   * where it wins over the login's User.bandNumber. Kept apart from that on
+   * purpose: User.bandNumber also drives expense limits and SBT caps, which a
+   * travel-policy spreadsheet must not change — and most travellers have no login.
+   */
+  bandNumber?: number | null;
+
   title?: string;
   firstName: string;
   middleName?: string;
@@ -504,6 +513,7 @@ const TravellerProfileSchema = new Schema<TravellerProfileDocument>(
     workLocation: { type: String, trim: true },
     reportingManagerId: { type: Schema.Types.ObjectId, ref: "User" },
     employeeId: { type: String, trim: true },
+    bandNumber: { type: Number, min: 1, max: 10 },
 
     title: { type: String, trim: true },
     firstName: { type: String, required: true, trim: true },

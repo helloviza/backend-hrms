@@ -199,6 +199,10 @@
     "gstRegistrations": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L2": {
@@ -399,6 +403,10 @@
       "scope": "NONE"
     },
     "gstRegistrations": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -603,6 +611,10 @@
     "gstRegistrations": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L4": {
@@ -803,6 +815,10 @@
       "scope": "NONE"
     },
     "gstRegistrations": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1007,6 +1023,10 @@
     "gstRegistrations": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L6": {
@@ -1207,6 +1227,10 @@
       "scope": "NONE"
     },
     "gstRegistrations": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1411,6 +1435,10 @@
     "gstRegistrations": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L8": {
@@ -1611,6 +1639,10 @@
       "scope": "NONE"
     },
     "gstRegistrations": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1815,6 +1847,10 @@
     "gstRegistrations": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_SBT": {
@@ -2017,6 +2053,10 @@
     "gstRegistrations": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_APPROVAL": {
@@ -2217,6 +2257,10 @@
       "scope": "NONE"
     },
     "gstRegistrations": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -2425,6 +2469,10 @@
     "gstRegistrations": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L0": {
@@ -2629,6 +2677,10 @@
       "scope": "NONE"
     },
     "gstRegistrations": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
     }

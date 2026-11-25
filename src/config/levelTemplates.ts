@@ -114,6 +114,10 @@ type ModulesTemplate = {
   // any GSTIN or GST state change on the legacy edit paths. Level only, HOUSE
   // staff only, per-user: NONE everywhere below.
   gstRegistrations:  ModulePermission
+  // Client travel policies on behalf of a company (2026-11-19,
+  // routes/travelPolicy.ts staff entry): READ = view, WRITE+ = edit/publish.
+  // Level only, HOUSE staff only, per-user: NONE everywhere below.
+  travelPolicy:      ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -172,6 +176,7 @@ const L1: ModulesTemplate = {
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
+  travelPolicy: NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -265,6 +270,7 @@ const L6: ModulesTemplate = {
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
+  travelPolicy: NONE,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -288,6 +294,7 @@ const L7: ModulesTemplate = {
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
+  travelPolicy: NONE,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -346,6 +353,7 @@ const L8: ModulesTemplate = {
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
+  travelPolicy: NONE,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -404,6 +412,7 @@ const VENDOR: ModulesTemplate = {
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
+  travelPolicy: NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -462,6 +471,7 @@ const CUSTOMER_SBT: ModulesTemplate = {
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
+  travelPolicy: NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -520,6 +530,7 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
+  travelPolicy: NONE,
 }
 
 // ── TENANT_ADMIN template ─────────────────────────────────────────────────────
@@ -625,6 +636,7 @@ const TENANT_ADMIN: ModulesTemplate = {
   invoiceDelete:   NONE,
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
+  travelPolicy: NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

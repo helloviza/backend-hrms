@@ -242,6 +242,9 @@ export interface UserPermissionDoc extends Document {
     /** Client GST registrations — services/gstRegistrationAccess.ts. Level only;
      * any access above NONE grants it; HOUSE staff only; no level template. */
     gstRegistrations: ModulePermission
+    /** Client travel policies, staff entry (routes/travelPolicy.ts). Level only:
+     * READ = view, WRITE+ = edit/publish; HOUSE staff only; no level template. */
+    travelPolicy: ModulePermission
   }
 
   grantedBy: string
@@ -330,6 +333,7 @@ const modulesSchema = new Schema(
     invoiceDelete: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     invoiceReissue: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     gstRegistrations: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    travelPolicy: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
   },
   { _id: false }
 )

@@ -945,6 +945,13 @@ app.use("/api/workspace/invites", inviteRouter);
 app.use("/api/workspace/branding", workspaceBrandingRouter);
 app.use("/api/workspace/travellers", travellerProfilesRouter);
 
+// Travel Policy module (docs/audits/travel-policy-audit.md). Client entry:
+// the caller's own workspace (feature flag + leader/approver checked inside).
+// Staff entry: SuperAdmin or a HOUSE user with the travelPolicy grant.
+import { clientTravelPolicyRouter, staffTravelPolicyRouter } from "./routes/travelPolicy.js";
+app.use("/api/workspace/travel-policy", requireAuth, requireWorkspace, clientTravelPolicyRouter);
+app.use("/api/admin/travel-policy", requireAuth, staffTravelPolicyRouter);
+
 // SUPERADMIN provisioning
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin.js";
 import superadminWorkspacesRouter from "./routes/superadmin.workspaces.js";
@@ -1383,6 +1390,10 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       // error if the reserved-number partial unique index is missing.
       const { ensureInvoiceReissueIndexes } = await import("./bootstrap/ensureInvoiceReissueIndexes.js");
       await ensureInvoiceReissueIndexes().catch((e: unknown) => logger.error("[INVOICE INDEXES] ensure failed", { e }));
+
+      // Travel Policy: one-draft-per-workspace + versionNumber uniqueness.
+      const { ensureTravelPolicyIndexes } = await import("./bootstrap/ensureTravelPolicyIndexes.js");
+      await ensureTravelPolicyIndexes().catch((e: unknown) => logger.warn("[TRAVEL POLICY INDEXES] ensure failed", { e }));
 
       // CRM dispositions: seed the default calling pipeline ("Corporate
       // Calling") when the DB has none. The ONLY automatic seed — requests
