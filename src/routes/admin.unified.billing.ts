@@ -17,7 +17,9 @@ import {
   SERVICE_CARDS, type ServiceCardKey,
 } from "../services/travelKpis.js";
 import { summarise, sortViolations, type RegionBy } from "../services/policyCompliance/evaluate.js";
-import { loadComplianceTrips, complianceState, EXPORT_COLUMNS, exportCell } from "../services/policyCompliance/service.js";
+import {
+  loadComplianceTrips, complianceState, domesticBasisFor, classifyForCompany, DOMESTIC_FIELDS, EXPORT_COLUMNS, exportCell,
+} from "../services/policyCompliance/service.js";
 import { quarterPlan, buildQuarterly, type QuarterRow, type QuarterlyStats } from "../services/quarterlySpend.js";
 
 const router = Router();
@@ -1278,11 +1280,21 @@ router.get("/quarterly", async (req: Request, res: Response) => {
   }
 });
 
+/** The one company this view is limited to, or null when it spans companies (staff, all companies). */
+function viewedCompany(req: any, match: any): string | null {
+  if (typeof match.tenantId === "string" && match.tenantId) return match.tenantId;
+  if (resolveAccessScope(req.user).accessLevel === "GLOBAL") return null;
+  return String(req.user?.customerId || req.user?.businessId || "") || null;
+}
+
 /* ═════════════════════════════════════════════════════════════
  * GET /flight-insights  (CONFIRMED only — Phase B panels)
  *   Domestic vs International (flights, hotels), Airline share (split by
  *   booking), Departure time slot (first leg, IST) + coverage.
  *   One request for all three panels; same scope + filters as the rest.
+ *   Domestic vs International: a view of ONE company follows that company's
+ *   "Domestic means" setting, as Policy Compliance does. A view across
+ *   companies (Plumtrips staff) keeps the India rule.
  * ═════════════════════════════════════════════════════════════ */
 router.get("/flight-insights", async (req: Request, res: Response) => {
   try {
@@ -1290,13 +1302,17 @@ router.get("/flight-insights", async (req: Request, res: Response) => {
     const svc = match.service?.$in as string[] | undefined;
     const wanted = ["FLIGHT", "HOTEL"].filter((s) => !svc || svc.includes(s));
     match.service = { $in: wanted };
-    const rows = wanted.length
-      ? await TravelBooking.find(match)
-          .select("service amount isInternational metadata.carrierShares metadata.departMinutesIST metadata.departTimeUnknown metadata.departTimeSource metadata.cabinClass metadata.cabinClassSource")
-          .lean()
-          .exec()
-      : [];
-    res.json({ ok: true, ...computeFlightInsights(rows as any[]) });
+    const tenantId = viewedCompany(req, match);
+    const { basis, workspaceId } = await domesticBasisFor(tenantId);
+    const fields = "service amount isInternational metadata.carrierShares metadata.departMinutesIST metadata.departTimeUnknown metadata.departTimeSource metadata.cabinClass metadata.cabinClassSource";
+    let rows: any[] = [];
+    if (wanted.length && basis === "WORK_COUNTRY") {
+      rows = await TravelBooking.find(match).select(`${fields} ${DOMESTIC_FIELDS}`).populate("userId", "name firstName lastName email").lean().exec();
+      rows = await classifyForCompany(rows, tenantId!, workspaceId!);
+    } else if (wanted.length) {
+      rows = await TravelBooking.find(match).select(fields).lean().exec();
+    }
+    res.json({ ok: true, domesticBasis: basis, ...computeFlightInsights(rows) });
   } catch (err: any) {
     res.status(500).json({ error: "Failed to fetch flight insights", detail: err?.message });
   }

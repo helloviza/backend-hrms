@@ -157,6 +157,27 @@ function endDay(r: any): string | null {
   return days[days.length - 1] ?? null;
 }
 
+/** Who travelled, for buildTravellerIndex. Manual rows carry the passenger; SBT rows have none, so the account holder is the traveller (as in Top travellers). */
+function travellerOf(r: any) {
+  const lead = leadName(r.travellerName);
+  const user = r.userId && typeof r.userId === "object" && "_id" in r.userId ? r.userId : null;
+  const userName = user ? user.name || [user.firstName, user.lastName].filter(Boolean).join(" ") : "";
+  return {
+    profileId: r.metadata?.travellerProfileId,
+    userId: lead ? null : user?._id,
+    email: lead ? r.travellerEmail : user?.email,
+    name: lead || userName,
+  };
+}
+
+const internationalOf = (home: string, r: any): boolean | null =>
+  isInternationalFor(home, {
+    service: r.service,
+    mirrorInternational: typeof r.isInternational === "boolean" ? r.isInternational : null,
+    destinationCountry: r.destinationCountry || null,
+    endpoints: r.service === "FLIGHT" ? flightEndpoints(r) : [],
+  });
+
 /** CONFIRMED flights and hotels of the match, grouped into trips, each with its outcome. */
 export async function loadComplianceTrips(scopedMatch: Record<string, any>): Promise<ComplianceTrip[]> {
   const svc = scopedMatch.service?.$in as string[] | undefined;
@@ -174,28 +195,13 @@ export async function loadComplianceTrips(scopedMatch: Record<string, any>): Pro
 
   const bookings = measured.map((r): ComplianceBooking => {
     const policy = policies.get(String(r.tenantId))!;
-    // Manual rows carry the passenger; SBT rows have none, so the account
-    // holder is the traveller (as in Top travellers).
-    const lead = leadName(r.travellerName);
-    const user = r.userId && typeof r.userId === "object" && "_id" in r.userId ? r.userId : null;
-    const userName = user ? user.name || [user.firstName, user.lastName].filter(Boolean).join(" ") : "";
-    const who = {
-      profileId: r.metadata?.travellerProfileId,
-      userId: lead ? null : user?._id,
-      email: lead ? r.travellerEmail : user?.email,
-      name: lead || userName,
-    };
+    const who = travellerOf(r);
     const profile: any = policy.find ? policy.find(who) : null;
     const requestedOn = istDayOf(links.dates.get(String(r.reference)) ?? r.bookedAt);
     const travelOn = istDayOf(r.travelDate);
     const workCountry = profile ? workLocationCountry(profile.workLocation) : null;
     const home = homeCountry(policy.domesticBasis, workCountry);
-    const isInternational = isInternationalFor(home, {
-      service: r.service,
-      mirrorInternational: typeof r.isInternational === "boolean" ? r.isInternational : null,
-      destinationCountry: r.destinationCountry || null,
-      endpoints: r.service === "FLIGHT" ? flightEndpoints(r) : [],
-    });
+    const isInternational = internationalOf(home, r);
     const verdict = evaluateTrip(
       {
         service: r.service,
@@ -234,6 +240,42 @@ export async function loadComplianceTrips(scopedMatch: Record<string, any>): Pro
     };
   });
   return buildTrips(bookings);
+}
+
+/* ── Domestic vs International panel (one company at a time) ──────────── */
+
+/** What classifyForCompany reads, on top of what the panel itself needs. */
+export const DOMESTIC_FIELDS =
+  "tenantId userId destinationCountry origin travellerName travellerEmail metadata.originCity metadata.travellerProfileId metadata.legs";
+
+/**
+ * What "domestic" means on a Travel Spend view of ONE company: its Travel
+ * Policy setting, or India when the module is off or the view spans companies
+ * (tenantId null).
+ */
+export async function domesticBasisFor(tenantId: string | null): Promise<{ basis: DomesticBasis; workspaceId: string | null }> {
+  if (!tenantId) return { basis: "INDIA", workspaceId: null };
+  const [w]: any[] = await CustomerWorkspace.find({ customerId: tenantId, "config.features.travelPolicyEnabled": true })
+    .select("config.policyDomesticBasis")
+    .limit(1)
+    .lean();
+  return { basis: readDomesticBasis(w?.config?.policyDomesticBasis), workspaceId: w ? String(w._id) : null };
+}
+
+/**
+ * The rows with `isInternational` as seen from each traveller's work country:
+ * the same rule Policy Compliance applies to the same bookings. A row of
+ * another company keeps the India rule.
+ */
+export async function classifyForCompany<T extends Record<string, any>>(rows: T[], tenantId: string, workspaceId: string): Promise<T[]> {
+  const { travellers } = await loadTravellers(new mongoose.Types.ObjectId(workspaceId), { includeInactive: true });
+  const find = buildTravellerIndex<any>(travellers);
+  return rows.map((r) => {
+    if (String(r.tenantId) !== tenantId) return r;
+    const profile = find(travellerOf(r));
+    const home = homeCountry("WORK_COUNTRY", profile ? workLocationCountry(profile.workLocation) : null);
+    return { ...r, isInternational: internationalOf(home, r) };
+  });
 }
 
 /**

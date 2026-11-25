@@ -83,6 +83,89 @@ beforeEach(async () => {
   ]);
 });
 
+describe("GET /flight-insights: what domestic means", () => {
+  const setBasis = (basis: string | null, enabled = true) =>
+    col("customerworkspaces").updateOne({ _id: WS_ACME }, { $set: { "config.features.travelPolicyEnabled": enabled, "config.policyDomesticBasis": basis } });
+  const panel = async (u: any) => {
+    const r = await get(u, `/flight-insights${Q}`);
+    expect(r.status).toBe(200);
+    const pick = (x: any) => [x.domestic.count, x.international.count, x.unknown.count];
+    return { basis: r.body.domesticBasis, flights: pick(r.body.domesticInternational.FLIGHT), hotels: pick(r.body.domesticInternational.HOTEL), body: r.body };
+  };
+  // Asha works in Sydney; No Band has no work location (India).
+  const seed = () =>
+    col("travelbookings").insertMany([
+      row({ origin: "Sydney", destinationCity: "Melbourne", destinationCountry: "AU", isInternational: true, metadata: { originCity: "Sydney" }, amount: 300 }), // at home in Australia
+      row({ amount: 100 }), // Delhi to Mumbai: abroad for Asha
+      row({ origin: "Sydney", destinationCity: "London", destinationCountry: "GB", isInternational: true, metadata: { originCity: "Sydney" } }),
+      row({ origin: "Sydney", destinationCity: null, destinationCountry: null, isInternational: true, metadata: { originCity: "Sydney" } }), // other end unknown
+      row({ travellerName: "No Band", travellerEmail: "noband@acme.test" }), // India
+      row({ travellerName: "Stranger", travellerEmail: "", isInternational: true, destinationCountry: "AU", destinationCity: "Sydney" }), // no profile: India rule
+      row({ service: "HOTEL", isInternational: true, destinationCountry: "AU", destinationCity: "Melbourne", metadata: { hotelName: "Crown" } }),
+      row({ service: "HOTEL", metadata: { hotelName: "Taj" } }), // Mumbai
+      row({ tenantId: BETA, isInternational: true, destinationCountry: "AU" }),
+      row({ status: "PENDING" }), row({ isTest: true }), row({ isDemo: true }),
+    ]);
+
+  it("a company view follows its setting; India is the default", async () => {
+    await seed();
+    expect(await panel(acmeLeader)).toMatchObject({ basis: "INDIA", flights: [2, 4, 0], hotels: [1, 1, 0] });
+    await setBasis("WORK_COUNTRY");
+    const after = await panel(acmeLeader);
+    expect(after).toMatchObject({ basis: "WORK_COUNTRY", flights: [2, 3, 1], hotels: [1, 1, 0] });
+    expect(after.body.domesticInternational.FLIGHT.domestic.spend).toBe(1300); // Sydney to Melbourne + No Band
+    await setBasis("INDIA");
+    expect((await panel(acmeLeader)).flights).toEqual([2, 4, 0]);
+  });
+
+  it("agrees with Policy Compliance, trip for trip", async () => {
+    await seed();
+    await setBasis("WORK_COUNTRY");
+    const split = async (p: string) => (await get(acmeLeader, p)).body;
+    const pc = await split(`/policy-compliance${Q}&service=FLIGHT`);
+    const { FLIGHT } = (await split(`/flight-insights${Q}`)).domesticInternational;
+    // Every seeded flight is a trip of its own: each goes somewhere else, or with someone else.
+    expect([pc.split.DOMESTIC.trips, pc.split.INTERNATIONAL.trips, pc.split.UNKNOWN.trips]).toEqual([FLIGHT.domestic.count, FLIGHT.international.count, FLIGHT.unknown.count]);
+  });
+
+  it("works before any policy version is published", async () => {
+    await seed();
+    await setBasis("WORK_COUNTRY");
+    await col("travelpolicyversions").deleteMany({ workspaceId: WS_ACME });
+    expect((await panel(acmeLeader)).flights).toEqual([2, 3, 1]);
+  });
+
+  it("staff across companies keep the India rule, whatever a company chose", async () => {
+    await seed();
+    await setBasis("WORK_COUNTRY");
+    expect(await panel(superadmin)).toMatchObject({ basis: "INDIA", flights: [2, 5, 0], hotels: [1, 1, 0] });
+  });
+
+  it("another company, and a company with the module off, keep the India rule", async () => {
+    await seed();
+    await setBasis("WORK_COUNTRY");
+    expect(await panel(betaLeader)).toMatchObject({ basis: "INDIA", flights: [0, 1, 0] });
+    await setBasis("WORK_COUNTRY", false);
+    expect(await panel(acmeLeader)).toMatchObject({ basis: "INDIA", flights: [2, 4, 0] });
+  });
+
+  it("a traveller who sees only their own bookings gets their company's rule", async () => {
+    await seed();
+    await setBasis("WORK_COUNTRY");
+    const me = { _id: String(STAFF), roles: ["REQUESTER"], customerId: ACME };
+    // STAFF booked every row here, Beta's too: that one keeps the India rule.
+    expect(await panel(me)).toMatchObject({ basis: "WORK_COUNTRY", flights: [2, 4, 1] });
+  });
+
+  it("only the domestic split changes: airlines, times and cabins are the same", async () => {
+    await seed();
+    const before = (await panel(acmeLeader)).body;
+    await setBasis("WORK_COUNTRY");
+    const after = (await panel(acmeLeader)).body;
+    for (const k of ["airlines", "departureSlots", "cabins"]) expect(after[k]).toEqual(before[k]);
+  });
+});
+
 describe("GET /policy-compliance", () => {
   it("evaluates against the version in force on the request date, with the traveller's details", async () => {
     await col("travelbookings").insertMany([
@@ -152,7 +235,7 @@ describe("GET /policy-compliance", () => {
     expect((await get(acmeLeader, `/policy-compliance${Q}`)).body).toMatchObject({ enabled: true, configured: false });
   });
 
-  it("domestic = work country: the setting changes the class and the days asked for; other panels do not move", async () => {
+  it("domestic = work country: the setting changes the class and the days asked for; staff across companies see no change", async () => {
     // Asha works in Australia (band 1 → std: 10 domestic, 14 international).
     await col("travelbookings").insertMany([
       row({ isInternational: true, origin: "Sydney", destinationCity: "Melbourne", destinationCountry: "AU", travelDate: day("2026-11-22"), metadata: { originCity: "Sydney" } }), // 12 days
@@ -162,11 +245,11 @@ describe("GET /policy-compliance", () => {
       const b = (await get(acmeLeader, `/policy-compliance${Q}`)).body;
       return { dom: b.split.DOMESTIC.trips, intl: b.split.INTERNATIONAL.trips, late: b.violations.map((v: any) => [v.sector, v.requiredDays]) };
     };
-    const before = (await get(acmeLeader, `/flight-insights${Q}`)).body;
+    const before = (await get(superadmin, `/flight-insights${Q}`)).body;
     expect(await look()).toEqual({ dom: 1, intl: 1, late: [["Sydney → Melbourne", 14]] });
     await col("customerworkspaces").updateOne({ _id: WS_ACME }, { $set: { "config.policyDomesticBasis": "WORK_COUNTRY" } });
     expect(await look()).toEqual({ dom: 1, intl: 1, late: [["Delhi → Mumbai", 14]] });
-    expect((await get(acmeLeader, `/flight-insights${Q}`)).body).toEqual(before);
+    expect((await get(superadmin, `/flight-insights${Q}`)).body).toEqual(before);
     // No work location → India.
     await col("travellerprofiles").updateMany({}, { $unset: { workLocation: 1 } });
     expect(await look()).toEqual({ dom: 1, intl: 1, late: [["Sydney → Melbourne", 14]] });
