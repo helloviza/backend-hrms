@@ -23,6 +23,7 @@ import User from "../models/User.js";
 import SBTMultiCityTrace from "../models/SBTMultiCityTrace.js";
 import SBTWalletLedger from "../models/SBTWalletLedger.js";
 import { checkUsageAlert, walletState } from "./sbtWallet.js";
+import { billingModeOfWorkspace } from "./sbtWalletMode.js";
 import mongoose from "mongoose";
 import { requireFeature } from "../middleware/requireFeature.js";
 import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
@@ -466,7 +467,17 @@ export async function reserveOfficial(
   if (!admin && !ws?.sbtOfficialBooking?.enabled) {
     return refuse(403, "WALLET_DISABLED", "Business wallet is not enabled for this workspace");
   }
-  const available = Math.max(0, walletState(ws).available);
+  const state = walletState(ws);
+  const available = Math.max(0, state.available);
+  // Prepaid (services/sbtWalletMode.ts): the limit is held at 0, so what is
+  // available is the advance the company has paid in — say so.
+  if (state.billingMode === "PREPAID") {
+    return refuse(
+      402,
+      "LIMIT_EXCEEDED",
+      `Your company books on Prepaid. This booking (₹${amt.toLocaleString("en-IN")}) is more than the advance paid in (₹${state.advance.toLocaleString("en-IN")}) — please pay Plumtrips in advance, or book as Personal.`,
+    );
+  }
   return refuse(
     402,
     "LIMIT_EXCEEDED",
@@ -826,6 +837,8 @@ export async function claimOfficial(
   const doc = await SBTPayment.create({
     ...row, ...scope, _id, mode: "OFFICIAL", status: "CLAIMED", amountPaise: Math.round(row.amount * 100),
     monthKey: reserved.monthKey, claimedAt: new Date(),
+    // Snapshot (spec §3.6): a later mode change never moves this booking.
+    walletMode: await billingModeOfWorkspace(scope.workspaceId),
   });
   return { ok: true, row: doc.toObject() };
 }
@@ -1027,5 +1040,8 @@ export async function paymentFactsForSave(
     supplierResponses: Array.isArray(row.supplierResponses) ? row.supplierResponses : [],
     // The margin the quotes recorded (services/sbtMargin.ts) — the booking's margin.
     margin: row.margin && typeof row.margin === "object" ? (row.margin as PaymentMargin) : null,
+    // Snapshots for the booking (spec §3.6 / §3.7).
+    walletMode: row.mode === "OFFICIAL" ? (row.walletMode ?? null) : null,
+    billTo: row.billTo && typeof row.billTo === "object" ? row.billTo : null,
   };
 }

@@ -189,6 +189,9 @@ export interface LinkContext {
   via: "AUTO" | "IMPORT";
   actor?: { _id?: unknown; email?: string } | null;
   paymentId?: string;
+  /** Snapshots from checkout (P4): the SBT booking's own, else its payment row's. */
+  walletMode?: "PREPAID" | "POSTPAID" | null;
+  billTo?: AnyObj | null;
   now?: Date;
 }
 
@@ -220,6 +223,7 @@ export function mapSbtToManualBooking(model: SbtLinkModel, sbt: AnyObj, ctx: Lin
     notes,
     isDemo: sbt.isDemo === true,
     createdByDemoUser: sbt.createdByDemoUser === true,
+    ...(ctx.billTo ? { billTo: ctx.billTo } : {}),
     pricingLocked: {
       at: now, by: "SYSTEM", reason: "SBT_API_PRICE",
       actualPrice, quotedPrice, gstMode: "ON_MARKUP", gstPercent: 18, currency: "INR", type: lockedType,
@@ -233,7 +237,7 @@ export function mapSbtToManualBooking(model: SbtLinkModel, sbt: AnyObj, ctx: Lin
     legIndex: typeof sbt.legIndex === "number" ? sbt.legIndex : undefined,
     returnPnr: sbt.returnPnr || undefined,
     paymentMode: sbt.paymentMode === "official" ? "official" : "personal",
-    walletMode: null,
+    walletMode: ctx.walletMode ?? null,
     sbtStatus: String(sbt.status || ""),
     syncedAt: now,
     createdVia: ctx.via,
@@ -323,9 +327,10 @@ async function customerIdFor(sbt: AnyObj): Promise<string | null> {
   return (await Customer.exists({ _id: cid })) ? cid : null;
 }
 
-async function paymentIdFor(model: SbtLinkModel, sbt: AnyObj): Promise<string | undefined> {
+/** The checkout payment row behind this SBT booking: its id and snapshots. */
+async function paymentRowFor(model: SbtLinkModel, sbt: AnyObj): Promise<{ id?: string; walletMode?: "PREPAID" | "POSTPAID" | null; billTo?: AnyObj | null }> {
   const db = mongoose.connection.db;
-  if (!db) return undefined;
+  if (!db) return {};
   const id = String(sbt._id);
   // The same keys paymentFactsForSave matched the booking's payment by
   // (services/sbtPaymentGate.ts), plus the ids the checkout records after.
@@ -338,9 +343,14 @@ async function paymentIdFor(model: SbtLinkModel, sbt: AnyObj): Promise<string | 
     // Workspace, not user: a booking made for an L1's request is owned by the
     // requester while the payment row is the booker's.
     { product: model === "SBTBooking" ? "FLIGHT" : "HOTEL", workspaceId: String(sbt.workspaceId), $or: or },
-    { projection: { _id: 1 }, sort: { createdAt: -1 } },
+    { projection: { _id: 1, mode: 1, walletMode: 1, billTo: 1 }, sort: { createdAt: -1 } },
   );
-  return row?._id ? String(row._id) : undefined;
+  if (!row?._id) return {};
+  return {
+    id: String(row._id),
+    walletMode: row.mode === "OFFICIAL" && (row.walletMode === "PREPAID" || row.walletMode === "POSTPAID") ? row.walletMode : null,
+    billTo: row.billTo && typeof row.billTo === "object" ? row.billTo : null,
+  };
 }
 
 /* ── When a booking is ready to link ───────────────────────────────── */
@@ -404,8 +414,10 @@ export async function ensureLinkedManualBooking(
     if (!customerId) return await failed(model, sbt, "NO_CUSTOMER", "The SBT workspace has no client company", record);
 
     const user: any = sbt.userId ? await User.findById(sbt.userId).select("email phone name").lean() : null;
-    const paymentId = await paymentIdFor(model, sbt);
-    const data = mapSbtToManualBooking(model, sbt, { customerId, user, via: opts.via, actor: opts.actor, paymentId, now: opts.now });
+    const pay = await paymentRowFor(model, sbt);
+    const walletMode = sbt.walletMode === "PREPAID" || sbt.walletMode === "POSTPAID" ? sbt.walletMode : pay.walletMode ?? null;
+    const billTo = sbt.billTo && typeof sbt.billTo === "object" ? sbt.billTo : pay.billTo ?? null;
+    const data = mapSbtToManualBooking(model, sbt, { customerId, user, via: opts.via, actor: opts.actor, paymentId: pay.id, walletMode, billTo, now: opts.now });
     if (!data.travelDate) return await failed(model, sbt, "NO_TRAVEL_DATE", "The SBT booking has no readable travel date", record);
 
     let saved: any;

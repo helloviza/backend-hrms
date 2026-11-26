@@ -13,6 +13,10 @@ const SBTConfigSchema = new Schema(
     // older ones are the P2 backfill's job.
     manualLinkEnabled: { type: Boolean, default: false },
     manualLinkEnabledAt: { type: Date, default: null },
+    // "Invoice to" at SBT checkout (spec §3.7, P4), on the "global" row. OFF =
+    // the checkout shows no Invoice-to block and stores no bill-to: bookings
+    // are invoiced to the company, as before.
+    invoiceToEnabled: { type: Boolean, default: false },
     updatedBy: { type: String, default: "" },
   },
   { timestamps: true },

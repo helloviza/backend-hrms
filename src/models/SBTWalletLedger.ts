@@ -10,6 +10,9 @@ import { Schema, model, type Document } from "mongoose";
  *   PAYMENT_RECEIVED     CREDIT  −amount        Super Admin: payment from the company
  *   ADJUSTMENT           either  ±amount        Super Admin, reason required
  *   LIMIT_CHANGE         NONE    —              Super Admin, reason required (limitBefore → limitAfter)
+ *   MODE_CHANGE          NONE    —              walletBillingMode grant: POSTPAID ⇄ PREPAID, reason required
+ *                                               (modeBefore → modeAfter; limitBefore → limitAfter, as the
+ *                                               Prepaid switch holds the limit at 0 — services/sbtWalletMode.ts)
  *
  * `usedAfter` is the company's `used` right after the move. `idempotencyKey`
  * is unique, so a retried release, a replayed cancellation or a double-submitted
@@ -18,8 +21,10 @@ import { Schema, model, type Document } from "mongoose";
  * Booking / traveller / trip details are read from the payment row and the
  * booking at display time (services/sbtWallet.ts), never stored as a copy.
  */
-export type WalletEntryType = "BOOKING" | "CANCELLATION_REFUND" | "PAYMENT_RECEIVED" | "ADJUSTMENT" | "LIMIT_CHANGE";
-export const WALLET_ENTRY_TYPES: WalletEntryType[] = ["BOOKING", "CANCELLATION_REFUND", "PAYMENT_RECEIVED", "ADJUSTMENT", "LIMIT_CHANGE"];
+export type WalletEntryType = "BOOKING" | "CANCELLATION_REFUND" | "PAYMENT_RECEIVED" | "ADJUSTMENT" | "LIMIT_CHANGE" | "MODE_CHANGE";
+export const WALLET_ENTRY_TYPES: WalletEntryType[] = ["BOOKING", "CANCELLATION_REFUND", "PAYMENT_RECEIVED", "ADJUSTMENT", "LIMIT_CHANGE", "MODE_CHANGE"];
+export type WalletBillingMode = "POSTPAID" | "PREPAID";
+export const WALLET_BILLING_MODES: WalletBillingMode[] = ["POSTPAID", "PREPAID"];
 export type WalletPaymentMode = "NEFT" | "UPI" | "CHEQUE" | "OTHER";
 export const WALLET_PAYMENT_MODES: WalletPaymentMode[] = ["NEFT", "UPI", "CHEQUE", "OTHER"];
 
@@ -39,6 +44,10 @@ export interface ISBTWalletLedger extends Document {
   payment?: { mode: WalletPaymentMode; reference?: string; paymentDate?: Date };
   limitBefore?: number;
   limitAfter?: number;
+  modeBefore?: WalletBillingMode;
+  modeAfter?: WalletBillingMode;
+  /** MODE_CHANGE to Prepaid accepted while the company owed money (D-6). */
+  forced?: boolean;
   paymentId?: string; // SBTPayment._id
   bookingDocId?: string; // SBTBooking / SBTHotelBooking _id
   product?: "FLIGHT" | "HOTEL";
@@ -69,6 +78,9 @@ const SBTWalletLedgerSchema = new Schema<ISBTWalletLedger>(
     },
     limitBefore: { type: Number },
     limitAfter: { type: Number },
+    modeBefore: { type: String, enum: WALLET_BILLING_MODES },
+    modeAfter: { type: String, enum: WALLET_BILLING_MODES },
+    forced: { type: Boolean },
     paymentId: { type: String, index: true },
     bookingDocId: { type: String },
     product: { type: String, enum: ["FLIGHT", "HOTEL"] },

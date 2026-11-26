@@ -992,6 +992,7 @@ import sbtFlightsRouter from "./routes/sbt.flights.js";
 import sbtHotelsRouter from "./routes/sbt.hotels.js";
 import sbtRequestsRouter from "./routes/sbt.requests.js";
 import sbtWalletRouter from "./routes/sbt.wallet.js";
+import sbtInvoiceToRouter from "./routes/sbt.invoiceTo.js";
 import sbtConfigRouter from "./routes/sbt.config.js";
 import sbtCityImageRouter from "./routes/sbt.cityImage.js";
 import travelFormRouter from "./routes/travelForm.js";
@@ -1006,6 +1007,7 @@ if (env.DEPLOYMENT_MODE === "plumbox") {
   app.use("/api/sbt/hotels", sbtHotelsRouter);
   app.use("/api/sbt/requests", sbtRequestsRouter);
   app.use("/api/sbt/wallet", sbtWalletRouter);
+  app.use("/api/sbt/invoice-to", sbtInvoiceToRouter);
   app.use("/api/sbt/config", sbtConfigRouter);
   app.use("/api/sbt/city-image", sbtCityImageRouter);
   app.use("/api/travel-forms", requireAuth, requireWorkspace, requireFeature("travelFormEnabled"), travelFormRouter);
@@ -1030,12 +1032,15 @@ import adminBillingRouter from "./routes/admin.billing.js";
 import unifiedBillingRoutes from "./routes/admin.unified.billing.js";
 // SBT Business Wallets — every company's credit line (SUPERADMIN only)
 import adminBusinessWalletsRouter from "./routes/admin.businessWallets.js";
+// Wallet billing mode + SBT invoicing settings (walletBillingMode grant) — mounted first.
+import adminWalletBillingRouter from "./routes/admin.walletBilling.js";
 
 if (env.DEPLOYMENT_MODE === "plumbox") {
   // KEEP_IN_PLUMBOX — Travel admin (SBT config, billing console, unified billing)
   app.use("/api/admin/sbt", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), adminSBTRouter);
   // requireAuth + requireAdmin + requireSuperAdmin inside the router, same as /api/admin/sbt/margins.
   app.use("/api/admin/partner-revenue", requireAuth, requireWorkspace, adminPartnerRevenueRouter);
+  app.use("/api/admin/business-wallets", adminWalletBillingRouter);
   app.use("/api/admin/business-wallets", adminBusinessWalletsRouter);
   app.use("/api/admin/billing", requireAuth, requireWorkspace, requireFeature("sbtEnabled"), adminBillingRouter);
   // NO requireFeature — same reasoning as /api/my-bookings. These are READ-ONLY

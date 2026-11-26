@@ -218,10 +218,28 @@ export interface CustomerWorkspaceDocument extends Document {
     lastPaymentAt?: Date | null;
     /** Set by scripts/migrate-wallet-credit-line.ts. */
     creditLineMigratedAt?: Date | null;
+    /**
+     * POSTPAID (absent = POSTPAID, today's credit line) or PREPAID: the company
+     * spends only what it paid in — the credit limit is held at 0, so a booking
+     * passes only while `used` is negative (an advance). The limit in force when
+     * the company went Prepaid waits in prepaidSavedLimit and comes back on the
+     * switch to Postpaid. Changed only by services/sbtWalletMode.ts (audited as
+     * an SBTWalletLedger MODE_CHANGE row). docs/specs/sbt-to-manual-booking-spec.md §3.6.
+     */
+    billingMode?: "POSTPAID" | "PREPAID";
+    prepaidSavedLimit?: number | null;
     /** LEGACY (monthly model) — read only by the migration. */
     monthlyLimit: number;
     currentMonthSpend: number;
     lastResetMonth: string;
+  };
+
+  /** SBT invoicing settings (spec §3.7, D-10: staff only). */
+  sbtBilling?: {
+    /** A Personal (Razorpay) booking may be invoiced to the company. Default OFF. */
+    allowPersonalInvoiceToCompany?: boolean;
+    updatedBy?: string;
+    updatedAt?: Date;
   };
 
   // Admin user (set after first user creation during self-service signup)
@@ -443,10 +461,20 @@ const CustomerWorkspaceSchema = new Schema<CustomerWorkspaceDocument>(
       usageAlertSent: { type: Boolean },
       lastPaymentAt: { type: Date },
       creditLineMigratedAt: { type: Date },
+      // No default: absent = POSTPAID (services/sbtWalletMode.ts billingModeOf).
+      billingMode: { type: String, enum: ["POSTPAID", "PREPAID"] },
+      prepaidSavedLimit: { type: Number },
       // LEGACY monthly model — kept for the migration; nothing else reads them.
       monthlyLimit: { type: Number, default: 100000 },
       currentMonthSpend: { type: Number, default: 0 },
       lastResetMonth: { type: String, default: '' },
+    },
+
+    // SBT invoicing settings (staff only). No defaults: absent = OFF.
+    sbtBilling: {
+      allowPersonalInvoiceToCompany: { type: Boolean },
+      updatedBy: { type: String },
+      updatedAt: { type: Date },
     },
 
     phone: { type: String, trim: true, default: "" },

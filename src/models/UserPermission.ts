@@ -245,6 +245,9 @@ export interface UserPermissionDoc extends Document {
     /** Client travel policies, staff entry (routes/travelPolicy.ts). Level only:
      * READ = view, WRITE+ = edit/publish; HOUSE staff only; no level template. */
     travelPolicy: ModulePermission
+    /** SBT wallet billing mode + SBT invoicing settings (services/sbtWalletMode.ts).
+     * Level only, FULL needed; HOUSE staff only; no level template. */
+    walletBillingMode: ModulePermission
   }
 
   grantedBy: string
@@ -334,6 +337,7 @@ const modulesSchema = new Schema(
     invoiceReissue: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     gstRegistrations: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
     travelPolicy: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
+    walletBillingMode: { type: modulePermissionSchema, default: () => ({ access: 'NONE', scope: 'NONE' }) },
   },
   { _id: false }
 )

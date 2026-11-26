@@ -5,6 +5,7 @@ import { resolveManualDestination, internationalFrom, isManualFlightType, manual
 import { returnJourneyStart } from "../services/flightLegs.js";
 import { attachMirrorResyncHooks, updatedTopLevelPaths } from "../utils/mirrorResyncHooks.js";
 import { SBT_LINK_INDEX_NAME, PriceLockedError, lockedPricingChanges } from "../utils/sbtLinkLock.js";
+import { BillToSchema, type BillTo } from "./billToSchema.js";
 import { travelLookup } from "../data/destinationLookup.js";
 import { loadTicketRows, ticketDeparture, ticketCabin, realCabin, firstStop } from "../services/ticketFallback.js";
 
@@ -366,6 +367,12 @@ export interface IManualBooking extends Document {
    * currency / type, or add line items (pre-save and query guards below).
    */
   pricingLocked?: ManualBookingPricingLock;
+  /**
+   * Who this booking is invoiced to — the checkout snapshot of an SBT booking
+   * (spec §3.7; copied by services/sbtManualLink.ts). Invoicing maps it to the
+   * client block and the place of supply. Absent = the company, as before.
+   */
+  billTo?: BillTo;
   /** Saved although its PNR matched an SBT booking (§3.4). */
   duplicateAck?: { at: Date; by?: Schema.Types.ObjectId; byName?: string; matches: Record<string, unknown>[] };
   // Free-form bag (Demo Platform uses metadata.demoRef for seed idempotency;
@@ -683,6 +690,7 @@ const ManualBookingSchema = new Schema<IManualBooking>(
       ),
       default: undefined,
     },
+    billTo: { type: BillToSchema, default: undefined },
     duplicateAck: {
       type: new Schema(
         {

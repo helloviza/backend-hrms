@@ -3,6 +3,7 @@ import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import TravelBooking from "./TravelBooking.js";
 import { attachMirrorResyncHooks } from "../utils/mirrorResyncHooks.js";
 import { queueManualLink, queueManualLinks } from "../services/sbtManualLinkTrigger.js";
+import { BillToSchema, type BillTo } from "./billToSchema.js";
 import { travelCanonicalCity as canonicalCity, travelCountryFor as countryFor } from "../data/destinationLookup.js";
 import { internationalFrom, sbtFlightAnalytics } from "../services/travelMirrorAnalytics.js";
 import { sbtCabin } from "../services/ticketFallback.js";
@@ -138,6 +139,9 @@ export interface ISBTBooking extends Document {
   manualLinkAttempts?: number;
   manualLinkAttemptAt?: Date | null;
   manualLinkAlertedAt?: Date | null;
+  /** Snapshots from the checkout payment row (spec §3.6 / §3.7). */
+  walletMode?: "PREPAID" | "POSTPAID" | null;
+  billTo?: BillTo;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -284,6 +288,8 @@ const SBTBookingSchema = new Schema(
     manualLinkAttempts: { type: Number, default: undefined },
     manualLinkAttemptAt: { type: Date, default: undefined },
     manualLinkAlertedAt: { type: Date, default: undefined },
+    walletMode: { type: String, enum: ["PREPAID", "POSTPAID", null], default: undefined },
+    billTo: { type: BillToSchema, default: undefined },
   },
   { timestamps: true },
 );

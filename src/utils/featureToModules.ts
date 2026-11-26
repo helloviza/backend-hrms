@@ -90,6 +90,8 @@ const MODULE_FEATURE_MAP: Record<string, Array<keyof WorkspaceFeatures>> = {
   // outside HOUSE whatever their grant says.
   // travelPolicy is UNMAPPED for the same reason: the staff entry
   // (routes/travelPolicy.ts) refuses any caller outside HOUSE.
+  // walletBillingMode is UNMAPPED too: services/sbtWalletMode.ts refuses any
+  // caller outside HOUSE whatever their grant says.
 };
 
 const PLUMTRIPS_HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";

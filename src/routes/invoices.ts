@@ -252,6 +252,7 @@ import InvoiceNumberReservation from "../models/InvoiceNumberReservation.js";
 import { UserPermission } from "../models/UserPermission.js";
 import { storeInvoicePdf, presignArchivedInvoicePdf } from "../utils/invoicePdfStore.js";
 import { reservedIndexAvailable, RESERVED_INDEX_UNAVAILABLE_MESSAGE } from "../bootstrap/ensureInvoiceReissueIndexes.js";
+import { hasMixedBillTo, MIXED_BILL_TO, MIXED_BILL_TO_MESSAGE } from "../services/invoiceBillTo.js";
 
 
 /** Today's IST calendar date as YYYY-MM-DD, for the "settled today" stat.
@@ -515,6 +516,29 @@ export async function enrichClientDetails(invoice: any): Promise<any> {
   const custAddr: any = (liveCustomer as any)?.address ?? {};
   // Only fall back to workspace address when Customer has no structured address
   const addrSrc: any = (!custAddr.street && !custAddr.city) ? cwsAddrRaw : {};
+
+  // A bill-to snapshot (an SBT booking invoiced to a chosen GSTIN or a person,
+  // services/invoiceBillTo.ts) is the whole client block: nothing is filled
+  // from the company's live record, and a person with no GSTIN is B2C.
+  if (snap.billToKind === "COMPANY" || snap.billToKind === "INDIVIDUAL") {
+    const liveStatus = normalizeGstStatus((liveCustomer as any)?.gstStatus);
+    return {
+      companyName:    snap.companyName    || "",
+      gstin:          snap.gstin          || "",
+      gstStatus:      snap.billToKind === "INDIVIDUAL" ? (snap.gstin ? "REGISTERED" : "UNREGISTERED") : (snap.gstin ? "REGISTERED" : liveStatus),
+      state:          snap.state          || "",
+      addressLine1:   snap.addressLine1   || "",
+      addressLine2:   snap.addressLine2   || "",
+      city:           snap.city           || "",
+      pincode:        snap.pincode        || "",
+      country:        snap.country        || "India",
+      email:          snap.email          || "",
+      contactPerson:  snap.contactPerson  || "",
+      billingAddress: snap.billingAddress || "",
+      billToKind:     snap.billToKind,
+      ...(snap.billToRegistrationId ? { billToRegistrationId: snap.billToRegistrationId } : {}),
+    };
+  }
 
   const merged: any = {
     companyName:    snap.companyName    || (liveCustomer as any)?.legalName    || (liveCustomer as any)?.companyName || (liveCustomer as any)?.name || "",
@@ -1292,6 +1316,18 @@ router.post("/:id/add-bookings", requirePermission("invoices", "WRITE"), async (
       return res.status(400).json({
         error: `${alreadyInvoiced.length} booking(s) are already invoiced`,
         refs: alreadyInvoiced.map((b: any) => b.bookingRef),
+      });
+    }
+
+    // One invoice, one bill-to (spec §3.7, D-9): the added bookings must be
+    // invoiced to the same party as the ones already on the invoice.
+    const onInvoice = (await ManualBooking.find({ _id: { $in: (invoice.bookingIds || []) } }).select("bookingRef billTo").lean()) as any[];
+    if (hasMixedBillTo([...onInvoice, ...(newBookings as any[])])) {
+      return res.status(409).json({
+        error: MIXED_BILL_TO,
+        code: MIXED_BILL_TO,
+        message: MIXED_BILL_TO_MESSAGE,
+        refs: (newBookings as any[]).map((b: any) => b.bookingRef),
       });
     }
 

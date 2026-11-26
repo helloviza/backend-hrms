@@ -38,6 +38,8 @@ import {
 } from "./sbtPaymentGate.js";
 import { createRazorpayOrder, razorpayConfigured, razorpayKeyId } from "./sbtRazorpay.js";
 import { requestBookingRefusal, markRequestBooked } from "./sbtRequestBooking.js";
+import { resolveCheckoutBillTo } from "./sbtInvoiceTo.js";
+import { billingModeOfWorkspace } from "./sbtWalletMode.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 
@@ -561,6 +563,10 @@ export function createCheckoutHandler(product: "FLIGHT" | "HOTEL") {
       // only while PENDING — refused here, before any money moves.
       const notBookable = await requestBookingRefusal(req, save, product === "FLIGHT" ? "flight" : "hotel");
       if (notBookable) return res.status(notBookable.status).json({ error: notBookable.error, code: notBookable.code });
+      // Invoice to (spec §3.7): validated before any money moves; refused
+      // choices never reach the payment.
+      const invoiceTo = await resolveCheckoutBillTo(req as AnyObj, mode, b.invoiceTo);
+      if ("error" in invoiceTo) return res.status(invoiceTo.status).json({ error: invoiceTo.error, code: invoiceTo.code });
       let row: AnyObj;
 
       if (product === "FLIGHT") {
@@ -600,6 +606,9 @@ export function createCheckoutHandler(product: "FLIGHT" | "HOTEL") {
 
       row.fulfilment = { kind, request, save };
       row.actor = actorOf(req);
+      // Snapshots (spec §3.6 / §3.7): never re-read later.
+      if (invoiceTo.billTo) row.billTo = invoiceTo.billTo;
+      if (mode === "official") row.walletMode = await billingModeOfWorkspace(scope.workspaceId);
       row.amountPaise = Math.round(row.amount * 100);
 
       if (mode === "official" && (req as AnyObj).user?.isDemoUser === true) {

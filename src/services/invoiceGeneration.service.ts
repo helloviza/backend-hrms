@@ -36,6 +36,7 @@ import { snapshotPartnerShareSafe } from "./partnerRevenue.js";
 import { partnerBookingIds } from "./partnerLeadBooking.js";
 import InvoiceNumberReservation from "../models/InvoiceNumberReservation.js";
 import { consumeReservation, releaseReservation, reuseRefusal, ReissueError } from "./invoiceReissue.js";
+import { hasMixedBillTo, sharedBillTo, applyBillToClient, MIXED_BILL_TO, MIXED_BILL_TO_MESSAGE } from "./invoiceBillTo.js";
 
 /* ── Error type so route wrappers can reproduce the exact HTTP responses ── */
 
@@ -716,6 +717,17 @@ export async function createInvoiceFromBookings(
   // case being a PARTNER_LINK case; no other booking is affected.
   const partnerIds = await partnerBookingIds(bookings as any[]);
   const partnerNotConfirmed = (b: any) => partnerIds.has(String(b._id)) && b.status !== "CONFIRMED";
+  // One invoice, one bill-to (spec §3.7, D-9): a COMBINED invoice can't mix
+  // bookings invoiced to different parties. Checked before anything is written.
+  if (opts.format === "COMBINED" && hasMixedBillTo(bookings as any[])) {
+    throw new InvoiceGenerationError(409, {
+      error: MIXED_BILL_TO,
+      code: MIXED_BILL_TO,
+      message: MIXED_BILL_TO_MESSAGE,
+      refs: (bookings as any[]).map((b: any) => b.bookingRef),
+    });
+  }
+
   if (opts.format === "COMBINED") {
     const notConfirmed = (bookings as any[]).filter(partnerNotConfirmed);
     if (notConfirmed.length) {
@@ -757,6 +769,18 @@ export async function createInvoiceFromBookings(
     ctx = applyClientDetailsOverride(ctx, opts.clientDetailsOverride);
   }
 
+  // A booking's own bill-to snapshot (SBT checkout, spec §3.7) decides its
+  // invoice's party and place of supply — over the popup's state override.
+  // Bookings without one use the context above, unchanged.
+  const ctxFor = (bs: any[]): InvoiceContext => {
+    const billTo = sharedBillTo(bs);
+    if (!billTo) return ctx;
+    const withState = buildInvoiceContext(customer, workspace, companySettings, invoiceWorkspaceId, {
+      ...opts, customerStateOverride: String(billTo.state || ""),
+    });
+    return applyBillToClient(withState, billTo);
+  };
+
   if (opts.format === "COMBINED") {
     // None already invoiced (whole-batch reject — preserves /generate behavior).
     const alreadyInvoiced = (bookings as any[]).filter((b: any) => b.status === "INVOICED");
@@ -768,7 +792,7 @@ export async function createInvoiceFromBookings(
     }
     const reuse = await resolveReservationDecision(bookings as any[], ctx, opts, resolvedInvoiceDate, companySettings);
     const useCombinedLineItems = opts.lineItemStyle === "COMBINED";
-    const invoice = await createOneInvoice(bookings as any[], ctx, opts, useCombinedLineItems, resolvedInvoiceDate, reuse?.number ? reuse : undefined);
+    const invoice = await createOneInvoice(bookings as any[], ctxFor(bookings as any[]), opts, useCombinedLineItems, resolvedInvoiceDate, reuse?.number ? reuse : undefined);
     return [invoice];
   }
 
@@ -788,7 +812,7 @@ export async function createInvoiceFromBookings(
     }
     const takesReserved = !!reuse?.bookingId && String(booking._id) === reuse.bookingId;
     try {
-      const invoice = await createOneInvoice([booking], ctx, opts, opts.invoiceLayout === "COMBINED", resolvedInvoiceDate, takesReserved ? reuse ?? undefined : undefined);
+      const invoice = await createOneInvoice([booking], ctxFor([booking]), opts, opts.invoiceLayout === "COMBINED", resolvedInvoiceDate, takesReserved ? reuse ?? undefined : undefined);
       created.push(invoice);
     } catch (err: any) {
       if (takesReserved) throw err;

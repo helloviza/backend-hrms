@@ -83,6 +83,9 @@ export interface IInvoice extends Document {
     contactPerson?: string;
     email?: string;
     state?: string;
+    /** Set when the booking carried a bill-to snapshot (services/invoiceBillTo.ts). */
+    billToKind?: "COMPANY" | "INDIVIDUAL";
+    billToRegistrationId?: string;
   };
   // PAYMENT_DECLARED: the customer has claimed payment via the portal
   // (SENT -> PAYMENT_DECLARED, customer-only transition) — NOT the same as
@@ -182,6 +185,10 @@ const InvoiceSchema = new Schema<IInvoice>(
       contactPerson: String,
       email: String,
       state: String,
+      // Set when the booking carried a bill-to snapshot (services/invoiceBillTo.ts):
+      // COMPANY = a chosen GST registration, INDIVIDUAL = a person (B2C without a GSTIN).
+      billToKind: { type: String, enum: ["COMPANY", "INDIVIDUAL"] },
+      billToRegistrationId: String,
     },
     status: { type: String, enum: ["DRAFT", "SENT", "PAYMENT_DECLARED", "PAID", "CANCELLED"], default: "DRAFT" },
     paymentDeclaredAt: Date,

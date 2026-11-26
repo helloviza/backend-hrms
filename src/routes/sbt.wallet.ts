@@ -9,6 +9,7 @@ import { sbtBookerGuards } from "../services/sbtPaymentGate.js";
 import { walletState, statement, statementCsv, statementXlsx } from "../services/sbtWallet.js";
 import { dateRangeOr400 } from "../utils/dateRange.js";
 import { companyNameFor } from "../services/companyNames.js";
+import { canManageWalletBilling, sbtBillingOf } from "../services/sbtWalletMode.js";
 
 // The company's SBT Business Wallet — a credit line (services/sbtWallet.ts).
 //   GET /check?amount=     can this booking be paid from the wallet?
@@ -71,6 +72,9 @@ router.get("/check", requireSBT, ...sbtBookerGuards, async (req: any, res: any) 
       return res.json({
         sufficient: false,
         reason: "limit_exceeded",
+        // Prepaid (services/sbtWalletMode.ts): the advance is what is available.
+        billingMode: s.billingMode,
+        advance: s.advance,
         bookingAmount: amount,
         creditLimit: s.creditLimit,
         used: s.used,
@@ -102,8 +106,12 @@ router.get("/check", requireSBT, ...sbtBookerGuards, async (req: any, res: any) 
 // GET /api/sbt/wallet/summary
 router.get("/summary", requireSBT, async (req: any, res: any) => {
   try {
-    const ws = (await CustomerWorkspace.findById(req.workspaceObjectId).select("sbtOfficialBooking companyName customerId slug").lean()) as any;
+    const ws = (await CustomerWorkspace.findById(req.workspaceObjectId).select("sbtOfficialBooking sbtBilling companyName customerId slug").lean()) as any;
     const s = walletState(ws);
+    // Staff with the walletBillingMode grant also get what the billing control needs (spec §3.6, D-7).
+    const staff = ws && (await canManageWalletBilling(req))
+      ? { workspaceId: String(ws._id), canManageBilling: true, prepaidSavedLimit: ws.sbtOfficialBooking?.prepaidSavedLimit ?? null, sbtBilling: sbtBillingOf(ws) }
+      : undefined;
     res.json({
       ok: true,
       companyName: ws ? await companyNameFor(ws) : "",
@@ -114,6 +122,9 @@ router.get("/summary", requireSBT, async (req: any, res: any) => {
       usagePct: s.usagePct,
       lastPaymentAt: s.lastPaymentAt,
       wholeCompany: seesWholeCompany(req),
+      billingMode: s.billingMode,
+      advance: s.advance,
+      ...(staff ? { staff } : {}),
     });
   } catch (err: any) {
     console.error("[SBT Wallet Summary]", err.message);

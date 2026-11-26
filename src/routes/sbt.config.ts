@@ -49,6 +49,9 @@ router.get("/wallet", requireSBT, async (req: any, res: any) => {
       monthlyLimit: s.creditLimit,
       currentMonthSpend: s.used,
       remaining: Math.max(0, s.available),
+      // Prepaid (services/sbtWalletMode.ts): checkout shows the advance, not a limit.
+      billingMode: s.billingMode,
+      advance: s.advance,
     });
   } catch (err: any) {
     console.error("[SBT Config Wallet]", err.message);

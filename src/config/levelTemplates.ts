@@ -118,6 +118,10 @@ type ModulesTemplate = {
   // routes/travelPolicy.ts staff entry): READ = view, WRITE+ = edit/publish.
   // Level only, HOUSE staff only, per-user: NONE everywhere below.
   travelPolicy:      ModulePermission
+  // SBT Business Wallet billing mode (Postpaid ⇄ Prepaid) and the company's
+  // SBT invoicing settings (spec §3.6 / D-7, D-10; services/sbtWalletMode.ts):
+  // FULL needed. Level only, HOUSE staff only, per-user: NONE everywhere below.
+  walletBillingMode: ModulePermission
 }
 
 // ── L1 — Employee (base) ──────────────────────────────────────────────────────
@@ -177,6 +181,7 @@ const L1: ModulesTemplate = {
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
   travelPolicy: NONE,
+  walletBillingMode: NONE,
 }
 
 // ── L2 — Senior Employee ──────────────────────────────────────────────────────
@@ -271,6 +276,7 @@ const L6: ModulesTemplate = {
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
   travelPolicy: NONE,
+  walletBillingMode: NONE,
 }
 
 // ── L7 — MIS / Reporting ──────────────────────────────────────────────────────
@@ -295,6 +301,7 @@ const L7: ModulesTemplate = {
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
   travelPolicy: NONE,
+  walletBillingMode: NONE,
 }
 
 // ── L8 — Super Admin (display-only template) ──────────────────────────────────
@@ -354,6 +361,7 @@ const L8: ModulesTemplate = {
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
   travelPolicy: NONE,
+  walletBillingMode: NONE,
 }
 
 // ── VENDOR template ───────────────────────────────────────────────────────────
@@ -413,6 +421,7 @@ const VENDOR: ModulesTemplate = {
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
   travelPolicy: NONE,
+  walletBillingMode: NONE,
 }
 
 // ── CUSTOMER_SBT template ─────────────────────────────────────────────────────
@@ -472,6 +481,7 @@ const CUSTOMER_SBT: ModulesTemplate = {
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
   travelPolicy: NONE,
+  walletBillingMode: NONE,
 }
 
 // ── CUSTOMER_APPROVAL template ────────────────────────────────────────────────
@@ -531,6 +541,7 @@ const CUSTOMER_APPROVAL: ModulesTemplate = {
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
   travelPolicy: NONE,
+  walletBillingMode: NONE,
 }
 
 // ── TENANT_ADMIN template ─────────────────────────────────────────────────────
@@ -637,6 +648,7 @@ const TENANT_ADMIN: ModulesTemplate = {
   invoiceReissue:  NONE,
   gstRegistrations: NONE,
   travelPolicy: NONE,
+  walletBillingMode: NONE,
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────

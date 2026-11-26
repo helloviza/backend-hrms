@@ -1,4 +1,5 @@
 import { Schema, model, type Document } from "mongoose";
+import { BillToSchema, type BillTo } from "./billToSchema.js";
 
 /**
  * SBTPayment — one row per SBT payment attempt: the amount the SERVER priced,
@@ -95,6 +96,11 @@ export interface ISBTPayment extends Document {
   // server never reserves or credits the limit for these rows.
   isDemo?: boolean;
   isTest: boolean;
+  /** Wallet billing mode at checkout (OFFICIAL rows; null for Razorpay). A snapshot:
+   *  a later mode change never moves this booking (spec §3.6). */
+  walletMode?: "PREPAID" | "POSTPAID" | null;
+  /** Who the booking is invoiced to, chosen and validated at checkout (spec §3.7). */
+  billTo?: BillTo;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -145,6 +151,8 @@ const SBTPaymentSchema = new Schema<ISBTPayment>(
     opsAlertedAt: { type: Date },
     isDemo: { type: Boolean, default: false },
     isTest: { type: Boolean, default: false, index: true },
+    walletMode: { type: String, enum: ["PREPAID", "POSTPAID", null], default: undefined },
+    billTo: { type: BillToSchema, default: undefined },
   },
   { timestamps: true },
 );

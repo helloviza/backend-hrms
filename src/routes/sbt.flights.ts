@@ -1969,6 +1969,9 @@ router.post("/bookings/save", requireAuth, requireSBT, requireFlightAccess, ...s
       paymentStatus: payFacts ? "paid" : "pending",
       paymentTimestamp: payFacts?.paidAt ? new Date(payFacts.paidAt) : undefined,
       paymentMode: payFacts?.paymentMode ?? (b.paymentMode === "official" ? "official" : "personal"),
+      // Snapshots from the payment row (spec §3.6 / §3.7) — never from the body.
+      ...(payFacts?.walletMode ? { walletMode: payFacts.walletMode } : {}),
+      ...(payFacts?.billTo ? { billTo: payFacts.billTo } : {}),
       fareBreakdown: b.fareBreakdown || undefined,
       ticketingStatus: b.ticketingStatus || "NOT_ATTEMPTED",
       bookedAt: new Date(),

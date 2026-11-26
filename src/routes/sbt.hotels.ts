@@ -2373,6 +2373,9 @@ router.post("/bookings/:id/generate-voucher", requireAuth, requireSBT, requireHo
         paymentStatus: "paid",
         // What the payment row charged for this voucher — never the hold's browser figure.
         totalFare: Number(voucherPay.amount) || 0,
+        // Snapshots from the payment row (spec §3.6 / §3.7).
+        ...(voucherPay.mode === "OFFICIAL" && voucherPay.walletMode ? { walletMode: voucherPay.walletMode } : {}),
+        ...(voucherPay.billTo ? { billTo: voucherPay.billTo } : {}),
         ...(voucherPay.razorpayPaymentId ? { paymentId: voucherPay.razorpayPaymentId } : {}),
         ...(voucherPay.razorpayOrderId ? { razorpayOrderId: voucherPay.razorpayOrderId, razorpayAmount: voucherPay.amountPaise } : {}),
       } }).catch(() => {});
@@ -2712,6 +2715,9 @@ router.post("/bookings/save", requireAuth, requireSBT, requireHotelAccess, ...sb
       lastVoucherDate: parseTBODate(b.lastVoucherDate) ?? undefined,
       lastCancellationDate: parseTBODate(b.lastCancellationDate),
       paymentMode: payFacts?.paymentMode ?? (b.isHeld ? "personal" : b.paymentMode === "official" ? "official" : "personal"),
+      // Snapshots from the payment row (spec §3.6 / §3.7) — never from the body.
+      ...(payFacts?.walletMode ? { walletMode: payFacts.walletMode } : {}),
+      ...(payFacts?.billTo ? { billTo: payFacts.billTo } : {}),
       inclusion: typeof b.inclusion === "string" ? b.inclusion : "",
       rateConditions: Array.isArray(b.rateConditions) ? b.rateConditions.map(String) : [],
       amenities: Array.isArray(b.amenities) ? b.amenities.map(String) : [],

@@ -55,6 +55,10 @@ export interface WalletState {
   available: number;
   usagePct: number;
   lastPaymentAt: Date | null;
+  /** POSTPAID (default) or PREPAID — services/sbtWalletMode.ts. */
+  billingMode: "POSTPAID" | "PREPAID";
+  /** Prepaid only: the advance still unspent (−used when used < 0), else 0. */
+  advance: number;
 }
 
 export function walletState(ws: AnyObj | null | undefined): WalletState {
@@ -68,6 +72,8 @@ export function walletState(ws: AnyObj | null | undefined): WalletState {
     available: round2(creditLimit - used),
     usagePct: creditLimit > 0 ? Math.round((used / creditLimit) * 1000) / 10 : used > 0 ? 100 : 0,
     lastPaymentAt: ob.lastPaymentAt || null,
+    billingMode: ob.billingMode === "PREPAID" ? "PREPAID" : "POSTPAID",
+    advance: used < 0 ? round2(-used) : 0,
   };
 }
 
@@ -290,6 +296,9 @@ export async function changeLimit(
   if (typeof limit !== "number" || !Number.isFinite(limit) || limit < 0 || limit > 1e10) return fail(400, "Enter a credit limit of 0 or more");
   const reason = cleanText(input.reason);
   if (!reason) return fail(400, "A reason is required");
+  // Prepaid holds the limit at 0 (services/sbtWalletMode.ts); a limit set now
+  // would silently turn it back into credit.
+  if (walletState(ws).billingMode === "PREPAID") return fail(409, "This company is Prepaid — its credit limit stays at ₹0. Switch it to Postpaid to set a limit.");
   const before = walletState(ws).creditLimit;
   const after = round2(limit);
   if (before === after) return fail(400, "That is already the credit limit");
@@ -321,6 +330,8 @@ export interface StatementRow {
   payment: { mode: string; reference: string; paymentDate: Date | null } | null;
   limitBefore?: number;
   limitAfter?: number;
+  modeBefore?: "POSTPAID" | "PREPAID";
+  modeAfter?: "POSTPAID" | "PREPAID";
   // staff only
   enteredBy?: string;
   internalNote?: string;
@@ -339,9 +350,16 @@ const DESCRIPTIONS: Record<string, string> = {
   PAYMENT: "Payment received",
   LIMIT_CHANGE: "Credit limit changed",
 };
+const modeName = (m: unknown) => (m === "PREPAID" ? "Prepaid" : "Postpaid");
 function describe(e: AnyObj, type: WalletEntryType, staff: boolean): string {
   const r = String(e.reason || "");
   if (r === "ADJUSTMENT_CREDIT" || r === "ADJUSTMENT_DEBIT") return adjustmentLabel(r === "ADJUSTMENT_CREDIT" ? "CREDIT" : "DEBIT", staff);
+  if (type === "MODE_CHANGE") {
+    const base = `Billing changed to ${modeName(e.modeAfter)}`;
+    if (!staff) return base;
+    const limits = ` (credit limit ${inr(num(e.limitBefore))} → ${inr(num(e.limitAfter))})`;
+    return `${base}${limits}${e.forced ? " — switched while money was owed" : ""}`;
+  }
   if (DESCRIPTIONS[r]) return DESCRIPTIONS[r];
   if (type === "CANCELLATION_REFUND") return "Booking not completed — amount released";
   return r;
@@ -464,13 +482,14 @@ export async function statement(workspaceId: unknown, opts: StatementQuery = {})
       travellers,
       trip,
       bookedBy: row?.userId ? nameOrUnknown(names.get(String(row.userId))) : "",
-      description: type === "ADJUSTMENT" || type === "LIMIT_CHANGE" || type === "PAYMENT_RECEIVED"
+      description: type === "ADJUSTMENT" || type === "LIMIT_CHANGE" || type === "PAYMENT_RECEIVED" || (type === "MODE_CHANGE" && opts.staff === true)
         ? [describe(e, type, opts.staff === true), e.remark].filter(Boolean).join(" — ")
         : describe(e, type, opts.staff === true),
       payment: e.payment?.mode
         ? { mode: e.payment.mode, reference: e.payment.reference || "", paymentDate: e.payment.paymentDate || null }
         : null,
-      ...(type === "LIMIT_CHANGE" ? { limitBefore: num(e.limitBefore), limitAfter: num(e.limitAfter) } : {}),
+      ...(type === "LIMIT_CHANGE" || type === "MODE_CHANGE" ? { limitBefore: num(e.limitBefore), limitAfter: num(e.limitAfter) } : {}),
+      ...(type === "MODE_CHANGE" ? { modeBefore: e.modeBefore === "PREPAID" ? "PREPAID" : "POSTPAID", modeAfter: e.modeAfter === "PREPAID" ? "PREPAID" : "POSTPAID" } : {}),
       _ownerIds: [...owners],
     };
     if (opts.staff) {
@@ -499,6 +518,7 @@ const TYPE_LABEL: Record<WalletEntryType, string> = {
   PAYMENT_RECEIVED: "Payment received",
   ADJUSTMENT: "Adjustment",
   LIMIT_CHANGE: "Limit change",
+  MODE_CHANGE: "Billing mode change",
 };
 export const typeLabel = (t: WalletEntryType) => TYPE_LABEL[t] || t;
 /** A row's type as the statement and downloads print it (adjustments say which way). */
@@ -517,7 +537,7 @@ function columns(staff: boolean): Array<[string, (r: StatementRow) => string | n
     ["Travellers", (r) => r.travellers],
     ["Trip", (r) => r.trip],
     ["Booked by", (r) => r.bookedBy],
-    ["Amount (₹)", (r) => (r.type === "LIMIT_CHANGE" ? "" : signedAmount(r))],
+    ["Amount (₹)", (r) => (r.type === "LIMIT_CHANGE" || r.type === "MODE_CHANGE" ? "" : signedAmount(r))],
     ["Used after (₹)", (r) => (r.usedAfter == null ? "" : r.usedAfter)],
     ["Payment mode", (r) => r.payment?.mode || ""],
     ["Reference", (r) => r.payment?.reference || ""],

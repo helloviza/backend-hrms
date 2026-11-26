@@ -233,6 +233,36 @@ router.put("/manual-link", requireSuperAdmin, async (req: any, res: any) => {
   }
 });
 
+/* ─────────────── SBT checkout "Invoice to" switch (SUPERADMIN only) ───────────────
+ * docs/specs/sbt-to-manual-booking-spec.md §3.7 (P4). OFF = no Invoice-to
+ * block at checkout and no bill-to stored (bookings invoiced to the company,
+ * as before). Takes effect within 30 s (services/sbtInvoiceTo.ts cache).
+ */
+router.get("/invoice-to", requireSuperAdmin, async (_req: any, res: any) => {
+  try {
+    const doc: any = await SBTConfig.findOne({ key: "global" }).select("invoiceToEnabled").lean();
+    res.json({ ok: true, enabled: doc?.invoiceToEnabled === true });
+  } catch (err: any) {
+    console.error("[Admin SBT invoice-to GET]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put("/invoice-to", requireSuperAdmin, async (req: any, res: any) => {
+  try {
+    if (typeof req.body?.enabled !== "boolean") return res.status(400).json({ error: "enabled (boolean) is required" });
+    const userId = String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? "");
+    await SBTConfig.updateOne({ key: "global" }, { $set: { invoiceToEnabled: req.body.enabled, updatedBy: userId } }, { upsert: true });
+    const { resetInvoiceToCache } = await import("../services/sbtInvoiceTo.js");
+    resetInvoiceToCache();
+    console.log(`[Admin SBT invoice-to] ${req.body.enabled ? "ON" : "OFF"} by ${userId}`);
+    res.json({ ok: true, enabled: req.body.enabled });
+  } catch (err: any) {
+    console.error("[Admin SBT invoice-to PUT]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* ───────────────────────── margins (SUPERADMIN only) ─────────────────────────
  * Plumtrips' markup on every customer's fares: the defaults (master switch +
  * four percents, versioned), one optional override per company, and an

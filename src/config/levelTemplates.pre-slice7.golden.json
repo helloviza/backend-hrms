@@ -203,6 +203,10 @@
     "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "walletBillingMode": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L2": {
@@ -407,6 +411,10 @@
       "scope": "NONE"
     },
     "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "walletBillingMode": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -615,6 +623,10 @@
     "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "walletBillingMode": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L4": {
@@ -819,6 +831,10 @@
       "scope": "NONE"
     },
     "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "walletBillingMode": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1027,6 +1043,10 @@
     "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "walletBillingMode": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L6": {
@@ -1231,6 +1251,10 @@
       "scope": "NONE"
     },
     "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "walletBillingMode": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1439,6 +1463,10 @@
     "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "walletBillingMode": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L8": {
@@ -1643,6 +1671,10 @@
       "scope": "NONE"
     },
     "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "walletBillingMode": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -1851,6 +1883,10 @@
     "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "walletBillingMode": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_SBT": {
@@ -2057,6 +2093,10 @@
     "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "walletBillingMode": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "CUSTOMER_APPROVAL": {
@@ -2261,6 +2301,10 @@
       "scope": "NONE"
     },
     "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "walletBillingMode": {
       "access": "NONE",
       "scope": "NONE"
     }
@@ -2473,6 +2517,10 @@
     "travelPolicy": {
       "access": "NONE",
       "scope": "NONE"
+    },
+    "walletBillingMode": {
+      "access": "NONE",
+      "scope": "NONE"
     }
   },
   "L0": {
@@ -2681,6 +2729,10 @@
       "scope": "NONE"
     },
     "travelPolicy": {
+      "access": "NONE",
+      "scope": "NONE"
+    },
+    "walletBillingMode": {
       "access": "NONE",
       "scope": "NONE"
     }

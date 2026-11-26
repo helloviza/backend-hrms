@@ -1,6 +1,10 @@
 // apps/backend/src/routes/admin.businessWallets.ts
 //
-// House "Business Wallets" (SUPERADMIN only, enforced here on every route):
+// House "Business Wallets" (SUPERADMIN, enforced here on every route — except
+// that a holder of the walletBillingMode grant at FULL, Plumtrips staff only,
+// may READ: the list, a company and its statement, and their downloads. Every
+// write below stays SuperAdmin-only; the billing-mode and "allow personal
+// bookings invoiced to company" writes live in routes/admin.walletBilling.ts):
 //   GET  /                         every company's credit line (?q, ?format=csv|xlsx)
 //   GET  /:workspaceId             one company: balance + full statement with staff
 //                                  extras (entered by, internal note); ?from&to, ?types,
@@ -13,6 +17,8 @@ import express from "express";
 import ExcelJS from "exceljs";
 import { requireAuth } from "../middleware/auth.js";
 import { requireSuperAdmin } from "../middleware/requireSuperAdmin.js";
+import { isSuperAdmin } from "../middleware/isSuperAdmin.js";
+import { canManageWalletBilling } from "../services/sbtWalletMode.js";
 import CustomerWorkspace from "../models/CustomerWorkspace.js";
 import {
   walletState,
@@ -31,7 +37,32 @@ import { HOUSE_WORKSPACE_ID } from "../utils/bookingAccess.js";
 import { companyNames, companyNameFor, UNNAMED_COMPANY } from "../services/companyNames.js";
 
 const router = express.Router();
-router.use(requireAuth, requireSuperAdmin);
+/**
+ * SuperAdmin: everything. walletBillingMode holder (FULL, HOUSE staff —
+ * services/sbtWalletMode.ts): GET only, so they can find a company and see
+ * its wallet before changing its billing. Anyone else: the SuperAdmin 403.
+ */
+async function superAdminOrBillingReader(req: any, res: any, next: any) {
+  try {
+    if (isSuperAdmin(req)) {
+      req.walletAccess = "SUPERADMIN";
+      return next();
+    }
+    if (req.method === "GET" && (await canManageWalletBilling(req))) {
+      req.walletAccess = "BILLING";
+      return next();
+    }
+    return requireSuperAdmin(req, res, next);
+  } catch (err) {
+    return next(err);
+  }
+}
+/** May record payments, adjustments and limit changes (SuperAdmin only). */
+const canManageMoney = (req: any) => req.walletAccess === "SUPERADMIN";
+
+router.use(requireAuth, superAdminOrBillingReader);
+/** Writes: SuperAdmin only, whatever the read gate let through. */
+const superAdminOnly = requireSuperAdmin;
 
 const actorOf = (req: any) => String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? "");
 const WS_FIELDS = "companyName customerId slug sbtOfficialBooking";
@@ -50,6 +81,8 @@ function companyRow(w: any, name: string) {
     usagePct: s.usagePct,
     nearLimit: s.creditLimit > 0 ? s.used >= s.creditLimit * USAGE_ALERT_RATIO : s.used > 0,
     lastPaymentAt: s.lastPaymentAt,
+    billingMode: s.billingMode,
+    advance: s.advance,
   };
 }
 
@@ -71,16 +104,18 @@ router.get("/", async (req: any, res: any) => {
     const docs = (await CustomerWorkspace.find(filter).select(WS_FIELDS).lean()) as any[];
     const names = await companyNames(docs);
     const q = String(req.query?.q || "").trim().toLowerCase().slice(0, 80);
+    const modeQ = String(req.query?.billingMode || "").toUpperCase();
     const rows = docs
       .map((w) => companyRow(w, names.get(String(w._id)) || UNNAMED_COMPANY))
       .filter((r) => !q || r.companyName.toLowerCase().includes(q))
+      .filter((r) => (modeQ === "PREPAID" || modeQ === "POSTPAID" ? r.billingMode === modeQ : true))
       .sort((a, b) => b.usagePct - a.usagePct || a.companyName.localeCompare(b.companyName));
 
     const format = String(req.query.format || "");
     if (format === "csv" || format === "xlsx") {
-      const head = ["Company", "Wallet on", "Credit limit (₹)", "Used (₹)", "Available (₹)", "% used", "Last payment"];
+      const head = ["Company", "Wallet on", "Billing", "Credit limit (₹)", "Used (₹)", "Available (₹)", "% used", "Last payment"];
       const body = rows.map((r) => [
-        r.companyName, r.enabled ? "Yes" : "No", r.creditLimit, r.used, r.available, r.usagePct,
+        r.companyName, r.enabled ? "Yes" : "No", r.billingMode === "PREPAID" ? "Prepaid" : "Postpaid", r.creditLimit, r.used, r.available, r.usagePct,
         r.lastPaymentAt ? new Date(r.lastPaymentAt).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" }) : "",
       ]);
       const base = `business-wallets-${new Date().toISOString().slice(0, 10)}`;
@@ -94,12 +129,12 @@ router.get("/", async (req: any, res: any) => {
       const sh = wb.addWorksheet("Business Wallets");
       sh.addRow(head).font = { bold: true };
       for (const b of body) sh.addRow(b);
-      sh.columns.forEach((c, i) => { c.width = [30, 10, 16, 16, 16, 10, 14][i] || 14; });
+      sh.columns.forEach((c, i) => { c.width = [30, 10, 10, 16, 16, 16, 10, 14][i] || 14; });
       res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
       res.setHeader("Content-Disposition", `attachment; filename="${base}.xlsx"`);
       return res.send(Buffer.from(await wb.xlsx.writeBuffer()));
     }
-    res.json({ ok: true, companies: rows });
+    res.json({ ok: true, companies: rows, canManageMoney: canManageMoney(req) });
   } catch (err: any) {
     console.error("[Business Wallets list]", err.message);
     res.status(500).json({ error: "Could not load business wallets" });
@@ -131,7 +166,7 @@ router.get("/:workspaceId", async (req: any, res: any) => {
       res.setHeader("Content-Disposition", `attachment; filename="${base}.xlsx"`);
       return res.send(await statementXlsx(rows, `Business Wallet statement — ${name}`, true));
     }
-    res.json({ ok: true, company: companyRow(ws, name), rows });
+    res.json({ ok: true, company: companyRow(ws, name), rows, canManageMoney: canManageMoney(req) });
   } catch (err: any) {
     console.error("[Business Wallet statement]", err.message);
     res.status(500).json({ error: "Could not load the statement" });
@@ -143,7 +178,7 @@ function send(res: any, r: ActionResult) {
   return res.json({ ok: true, entryId: r.entryId, wallet: r.state });
 }
 
-router.post("/:workspaceId/payments", async (req: any, res: any) => {
+router.post("/:workspaceId/payments", superAdminOnly, async (req: any, res: any) => {
   try {
     send(res, await recordPayment(req.params.workspaceId, req.body || {}, actorOf(req)));
   } catch (err: any) {
@@ -152,7 +187,7 @@ router.post("/:workspaceId/payments", async (req: any, res: any) => {
   }
 });
 
-router.post("/:workspaceId/adjustments", async (req: any, res: any) => {
+router.post("/:workspaceId/adjustments", superAdminOnly, async (req: any, res: any) => {
   try {
     send(res, await adjust(req.params.workspaceId, req.body || {}, actorOf(req)));
   } catch (err: any) {
@@ -161,7 +196,7 @@ router.post("/:workspaceId/adjustments", async (req: any, res: any) => {
   }
 });
 
-router.put("/:workspaceId/limit", async (req: any, res: any) => {
+router.put("/:workspaceId/limit", superAdminOnly, async (req: any, res: any) => {
   try {
     send(res, await changeLimit(req.params.workspaceId, req.body || {}, actorOf(req)));
   } catch (err: any) {
