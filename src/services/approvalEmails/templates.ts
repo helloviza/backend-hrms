@@ -44,6 +44,7 @@ import {
 import { safe, serviceOf, SERVICE_LABEL, tripModel, type TripModel } from "./tripModel.js";
 import { isPartnerLeadCase } from "../partnerLeadCase.js";
 import type { ApprovalEmailEvent } from "./map.js";
+import { hasWorkflow, stepClaim } from "../approvalWorkflow/engine.js";
 
 type AnyObj = Record<string, any>;
 const str = (v: any) => String(v ?? "").trim();
@@ -84,6 +85,12 @@ export type EmailCtx = {
   failure?: { event: string; subject: string; to: string[]; cc: string[]; attempts: number; error: string };
   /** For a stable "expires by" line in rendered samples. */
   now?: Date;
+  /** Approval workflow: a Workspace Leader decided instead of the step's approver (D3). */
+  override?: { reason: string; stepLabel: string };
+  /** request_step_pending: the step that was just approved. */
+  stepLabel?: string;
+  /** request_watcher_fyi: which moment this is (D9). */
+  watcherEvent?: "submitted" | "approved" | "declined" | "booking_done";
 };
 
 export type Rendered = { subject: string; html: string; kind: MailKind };
@@ -153,10 +160,14 @@ function approverRequestHtml(event: ApprovalEmailEvent, ctx: EmailCtx, recipient
   const t = tripModel(ar);
   const id = String(ar?._id || "");
   const who = safe(requesterName(ar));
-  const approveUrl = decisionLinkUrl("request", id, recipient, null, "approve");
+  // Workflow requests: every link is bound to the step it decides.
+  const step = stepClaim(ar);
+  const approveUrl = decisionLinkUrl("request", id, recipient, null, "approve", step);
 
   const hero: Hero =
-    event === "request_reminder"
+    event === "request_step_pending"
+      ? { badge: "Approval needed", tone: "orange", headline: `${theirs(ar, t)} needs your approval`, instruction: `${safe(ctx.actorName) || "The previous approver"} approved the ${escapeHtml(str(ctx.stepLabel).toLowerCase() || "previous step")}${ctx.override ? " (Workspace Leader override)" : ""}. It now needs your decision.` }
+      : event === "request_reminder"
       ? { badge: `Reminder ${ctx.reminderNo || 1} of 3`, tone: "orange", headline: `${theirs(ar, t)} is still waiting for your approval`, instruction: "Please approve, decline or ask a question below." }
       : event === "request_resubmitted"
       ? { badge: "Resubmitted", tone: "orange", headline: `${theirs(ar, t)} is back for your approval`, instruction: `${who} edited and resubmitted it after it was declined.` }
@@ -168,13 +179,13 @@ function approverRequestHtml(event: ApprovalEmailEvent, ctx: EmailCtx, recipient
 
   const notes =
     event === "clarification_answered"
-      ? [noteBox("Your question", safe(ctx.question)), noteBox(`${requesterName(ar)}'s reply${ctx.edited ? " (request edited)" : ""}`, safe(ctx.reply))]
-      : [requestNote(ar)];
+      ? [noteBox("Your question", safe(ctx.question)), noteBox(`${requesterName(ar)}'s reply${ctx.edited ? " (request edited)" : ""}`, safe(ctx.reply)), ...purposeNotes(ar)]
+      : [requestNote(ar), ...purposeNotes(ar), ...(event === "request_step_pending" ? overrideNotes(ctx) : [])];
 
   const buttons = approveUrl
     ? buttonGroup({ label: "Approve request", href: approveUrl, glyph: "&#10003;" }, [
-        { label: "Decline", href: decisionLinkUrl("request", id, recipient, null, "decline"), style: "danger", glyph: "&#10005;" },
-        { label: "Ask a question", href: decisionLinkUrl("request", id, recipient, null, "clarify"), style: "warn" },
+        { label: "Decline", href: decisionLinkUrl("request", id, recipient, null, "decline", step), style: "danger", glyph: "&#10005;" },
+        { label: "Ask a question", href: decisionLinkUrl("request", id, recipient, null, "clarify", step), style: "warn" },
       ])
     : buttonGroup({ label: "Open Plumbox to decide", href: deciderInboxUrl() });
 
@@ -197,9 +208,11 @@ function submitConfirmationHtml(ctx: EmailCtx) {
       badge: "Submitted",
       tone: "blue",
       headline: `${yours(t)} has been sent for approval`,
-      instruction: `It's with ${safe(approver)} now; a Workspace Leader may also decide. We'll email you as soon as it's decided.`,
+      instruction: hasWorkflow(ar)
+        ? `It's with ${safe(approver)} now. We'll email you as soon as it's decided.`
+        : `It's with ${safe(approver)} now; a Workspace Leader may also decide. We'll email you as soon as it's decided.`,
     },
-    blocks: body(ar, t, myRequestsUrl(), { notes: [requestNote(ar)], after: [viewButton(myRequestsUrl())] }),
+    blocks: body(ar, t, myRequestsUrl(), { notes: [requestNote(ar), ...purposeNotes(ar)], after: [viewButton(myRequestsUrl())] }),
   });
 }
 
@@ -232,10 +245,16 @@ function requestApprovedHtml(ctx: EmailCtx) {
       badge: "Approved",
       tone: "green",
       headline: `${yours(t)} is approved`,
-      instruction: `${by} approved it. The ${TRAVEL_DESK_NAME} will now ${direct ? "book it" : "prepare a proposal for you"}.`,
+      instruction: `${by} approved it${ctx.override ? " (Workspace Leader override)" : ""}. The ${TRAVEL_DESK_NAME} will now ${direct ? "book it" : "prepare a proposal for you"}.`,
     },
-    blocks: body(ar, t, myRequestsUrl(), { after: [viewButton(myRequestsUrl())] }),
+    blocks: body(ar, t, myRequestsUrl(), { notes: overrideNotes(ctx), after: [viewButton(myRequestsUrl())] }),
   });
+}
+
+/** D3: a Workspace Leader decided instead of the step's approver — always said, with the reason. */
+function overrideNotes(ctx: EmailCtx): string[] {
+  if (!ctx.override) return [];
+  return [noteBox(`Workspace Leader override (instead of the ${str(ctx.override.stepLabel).toLowerCase() || "approver"})`, safe(ctx.override.reason))];
 }
 
 function requestDeclinedHtml(ctx: EmailCtx) {
@@ -249,9 +268,12 @@ function requestDeclinedHtml(ctx: EmailCtx) {
       badge: "Declined",
       tone: "red",
       headline: `${yours(t)} was declined`,
-      instruction: `${by} declined it. You can edit and resubmit it from My Requests.`,
+      instruction: `${by} declined it${ctx.override ? " (Workspace Leader override)" : ""}. You can edit and resubmit it from My Requests.`,
     },
-    blocks: body(ar, t, myRequestsUrl(), { notes: [noteBox("Reason", safe(ctx.reason))], after: [viewButton(myRequestsUrl())] }),
+    blocks: body(ar, t, myRequestsUrl(), {
+      notes: ctx.override ? overrideNotes(ctx) : [noteBox("Reason", safe(ctx.reason))],
+      after: [viewButton(myRequestsUrl())],
+    }),
   });
 }
 
@@ -291,10 +313,74 @@ function decisionFyiHtml(event: ApprovalEmailEvent, ctx: EmailCtx) {
       badge: outcome === "approved" ? "Approved" : outcome === "declined" ? "Declined" : "Changes requested",
       tone: outcome === "approved" ? "green" : outcome === "declined" ? "red" : "blue",
       headline,
-      instruction: `Decided by ${by}. No action is needed from you.`,
+      instruction: `Decided by ${by}${ctx.override ? " (Workspace Leader override)" : ""}. No action is needed from you.`,
     },
-    blocks: body(ar, t, href, { notes: [noteBox("Note", safe(ctx.reason))], after: [viewButton(href)] }),
+    blocks: body(ar, t, href, { notes: ctx.override ? overrideNotes(ctx) : [noteBox("Note", safe(ctx.reason))], after: [viewButton(href)] }),
   });
+}
+
+/**
+ * Approval workflow FYI — the watcher (e.g. the reporting manager: D9) or the
+ * client's travel admins (D1). Never a decision link: a watcher can view the
+ * request but cannot approve or decline it.
+ */
+function workflowFyiHtml(event: ApprovalEmailEvent, ctx: EmailCtx) {
+  const ar = ctx.ar;
+  const t = tripModel(ar);
+  const forAdmins = event === "request_travel_admin_fyi";
+  const moment = forAdmins ? "approved" : ctx.watcherEvent || "submitted";
+  const by = safe(ctx.actorName) || "the approver";
+  const step = (ar?.workflow?.steps || []).find((s: AnyObj) => s?.role === "WATCHER" && s?.status === "WATCHING");
+  const as = step
+    ? `${safe(requesterName(ar))}'s ${escapeHtml(String(step.label || "").replace(/\s*\(FYI\)\s*$/i, "").toLowerCase())}`
+    : "a watcher";
+  const lines: Record<string, { badge: string; tone: Hero["tone"]; headline: string; instruction: string }> = {
+    submitted: {
+      badge: "For your information",
+      tone: "blue",
+      headline: `${theirs(ar, t)} was sent for approval`,
+      instruction: `It is with ${safe(str(ar?.managerName) || "the approver")}.`,
+    },
+    approved: {
+      badge: "Approved",
+      tone: "green",
+      headline: `${theirs(ar, t)} was approved`,
+      instruction: `${by} approved it${ctx.override ? " (Workspace Leader override)" : ""}. The ${TRAVEL_DESK_NAME} will now book it.`,
+    },
+    declined: {
+      badge: "Declined",
+      tone: "red",
+      headline: `${theirs(ar, t)} was declined`,
+      instruction: `${by} declined it${ctx.override ? " (Workspace Leader override)" : ""}.`,
+    },
+    booking_done: {
+      badge: "Booked",
+      tone: "green",
+      headline: `${theirs(ar, t)} is booked`,
+      instruction: `The ${TRAVEL_DESK_NAME} has finished booking it.`,
+    },
+  };
+  const l = lines[moment] || lines.submitted;
+  const note = forAdmins
+    ? "You get this as a travel admin for your company. No action is needed."
+    : `You are copied as ${as}, for information only. You can view the request, but you cannot approve or decline it.`;
+  const notes = [
+    ...(ctx.override ? overrideNotes(ctx) : moment === "declined" ? [noteBox("Reason", safe(ctx.reason))] : []),
+    ...purposeNotes(ar),
+  ];
+  return doc({
+    title: forAdmins ? "Request approved" : "For your information",
+    preheader: `${caseCode(ar)}: ${l.headline.replace(/<[^>]+>/g, "")}. No action is needed from you.`,
+    hero: { badge: l.badge, tone: l.tone, headline: l.headline, instruction: `${l.instruction} ${note}` },
+    blocks: body(ar, t, deciderInboxUrl(), { notes, after: [viewButton(deciderInboxUrl())] }),
+  });
+}
+
+/** The trip's purpose (approval workflow, D8) — no block at all when there is none. */
+function purposeNotes(ar: AnyObj): string[] {
+  const p = ar?.workflow?.purpose;
+  if (!p?.code) return [];
+  return [noteBox("Purpose of travel", safe(p.text ? `${p.code} — ${p.text}` : p.code))];
 }
 
 /* ───────────────────────── ops (staff) ───────────────────────── */
@@ -331,7 +417,7 @@ function deskNewCaseHtml(event: ApprovalEmailEvent, ctx: EmailCtx) {
     hero,
     staff: true,
     blocks: body(ar, t, href, {
-      notes: cancelled ? [noteBox("Reason", safe(ctx.reason))] : [requestNote(ar)],
+      notes: cancelled ? [noteBox("Reason", safe(ctx.reason))] : [requestNote(ar), ...purposeNotes(ar)],
       after: [factsCard("Case", facts), viewButton(href)],
     }),
   });
@@ -613,6 +699,7 @@ function subjectFor(event: ApprovalEmailEvent, ctx: EmailCtx): string {
   const cust = str(ar?.customerName) || "Workspace";
   const verbP = ctx.decision === "APPROVED" ? "approved" : ctx.decision === "DECLINED" ? "declined" : "sent back for changes";
   switch (event) {
+    case "request_step_pending":
     case "request_submitted_approver":
     case "request_submitted_leaders":
     case "request_resent":
@@ -667,6 +754,12 @@ function subjectFor(event: ApprovalEmailEvent, ctx: EmailCtx): string {
       return `Your booking is on hold — ${code}`;
     case "booking_cancelled":
       return `Booking Update — Request Cancelled — ${code}`;
+    case "request_watcher_fyi": {
+      const state = { submitted: "was submitted", approved: "was approved", declined: "was declined", booking_done: "is booked" }[ctx.watcherEvent || "submitted"];
+      return `FYI: ${requesterName(ar)}'s travel request ${state} — ${code}`;
+    }
+    case "request_travel_admin_fyi":
+      return `Approved — ${requesterName(ar)}'s travel request — ${code}`;
     case "booking_done":
       return `Your Booking has been Processed — ${cust} (${code})`;
     case "documents_ready":
@@ -677,6 +770,9 @@ function subjectFor(event: ApprovalEmailEvent, ctx: EmailCtx): string {
 }
 
 const KIND: Partial<Record<ApprovalEmailEvent, MailKind>> = {
+  request_step_pending: "REQUESTS",
+  request_watcher_fyi: "APPROVALS",
+  request_travel_admin_fyi: "APPROVALS",
   request_submitted_approver: "REQUESTS",
   request_submitted_leaders: "REQUESTS",
   request_resent: "REQUESTS",
@@ -702,6 +798,7 @@ const KIND: Partial<Record<ApprovalEmailEvent, MailKind>> = {
 export function renderApprovalEmail(event: ApprovalEmailEvent, ctx: EmailCtx, recipient = ""): Rendered {
   let html = "";
   switch (event) {
+    case "request_step_pending":
     case "request_submitted_approver":
     case "request_submitted_leaders":
     case "request_resent":
@@ -709,6 +806,10 @@ export function renderApprovalEmail(event: ApprovalEmailEvent, ctx: EmailCtx, re
     case "request_reminder":
     case "clarification_answered":
       html = approverRequestHtml(event, ctx, recipient);
+      break;
+    case "request_watcher_fyi":
+    case "request_travel_admin_fyi":
+      html = workflowFyiHtml(event, ctx);
       break;
     case "request_submitted_confirmation":
       html = submitConfirmationHtml(ctx);

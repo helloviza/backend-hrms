@@ -91,6 +91,17 @@ function hasSmtpConfigured() {
 }
 
 /* -------------------- FROM resolution -------------------- */
+/**
+ * The bare address a mail kind is sent from today ("approvals@…"), without
+ * its display name — approval-workflow email level A puts the client's name
+ * in front of OUR address (services/approvalWorkflow/sender.ts).
+ */
+export function mailFromAddress(kind?: MailKind | string): string {
+  const raw = pickFrom({ kind } as any);
+  const m = raw.match(/<([^>]+)>/);
+  return (m ? m[1] : raw).trim();
+}
+
 function pickFrom(args: SendMailArgs) {
   // 1️⃣ Explicit override always wins
   if (args.from) return String(args.from).trim();

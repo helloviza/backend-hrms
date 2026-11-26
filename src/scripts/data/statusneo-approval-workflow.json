@@ -1,0 +1,40 @@
+{
+  "template": "DEPT_HEAD_WATCHER",
+  "enabled": true,
+  "raisedBy": "EMPLOYEE",
+  "requestOnlyMode": true,
+  "purpose": {
+    "required": true,
+    "options": ["Client meeting", "Project-delivery", "Training", "Internal meeting", "Conference-event", "Other"]
+  },
+  "completion": "ALL_SERVICES_BOOKED",
+  "leadersMayDecide": "OVERRIDE_WITH_REASON",
+  "steps": [
+    {
+      "key": "head",
+      "label": "Department head approval",
+      "phase": "REQUEST",
+      "type": "DEPARTMENT_HEAD",
+      "role": "APPROVER",
+      "decisionRule": "ANY",
+      "fallback": "DEFAULT_APPROVER",
+      "selfRule": "NEXT_IN_LINE",
+      "samePersonRule": "AUTO_PASS"
+    },
+    {
+      "key": "rm",
+      "label": "Reporting manager (FYI)",
+      "phase": "REQUEST",
+      "type": "REPORTING_MANAGER",
+      "role": "WATCHER",
+      "fallback": "SKIP",
+      "watcherEvents": ["submitted", "approved", "declined", "booking_done"]
+    }
+  ],
+  "groups": [],
+  "email": {
+    "travelAdminEmails": [],
+    "sender": { "level": "A", "displayName": "StatusNeo Travel via Plumtrips", "replyTo": "" },
+    "events": {}
+  }
+}

@@ -30,6 +30,23 @@ import {
 } from "../services/approvalDecisions.js";
 import { stripPriceText, setNoStore } from "./approvals.security.js";
 import { pickTripSummary } from "./approvals.email.js";
+import { hasWorkflow, linkRecipients, stepClaim, currentStepOf } from "../services/approvalWorkflow/engine.js";
+
+/**
+ * Approval workflow requests: a link decides ONE step (its claim,
+ * "<round>.<index>.<key>"). A link for a step that is no longer current — the
+ * step was decided, the request moved on, or it was resubmitted — is stale.
+ * A workflow request's link with no claim at all is stale too.
+ */
+function staleStep(ar: Record<string, any>, link: { step?: string }): boolean {
+  if (!hasWorkflow(ar)) return false;
+  return !link.step || link.step !== stepClaim(ar);
+}
+const STALE_STEP = {
+  ok: false,
+  error: "This step has already been decided, so this link no longer works. Open Plumbox to see the request.",
+  code: "STEP_ALREADY_DECIDED",
+};
 
 const router = Router();
 
@@ -65,11 +82,16 @@ async function displayName(email: string) {
   return str(u?.name || [u?.firstName, u?.lastName].filter(Boolean).join(" ")) || email;
 }
 
-async function requestView(ar: AnyObj, email: string) {
+async function requestView(ar: AnyObj, email: string, link: { step?: string } = {}) {
+  const stale = staleStep(ar, link);
   const actionable =
+    !stale &&
     str(ar.status).toLowerCase() === "pending" &&
     (REQUEST_ACTIONABLE_STAGES as any[]).includes(ar.stage ? str(ar.stage).toUpperCase() : null);
-  const allowed = actionable ? (await requestDeciders(ar)).includes(email) : false;
+  // Workflow requests: only the current step's assignees act by link (D3).
+  const deciders = hasWorkflow(ar) ? linkRecipients(ar) : await requestDeciders(ar);
+  const allowed = actionable ? deciders.includes(email) : false;
+  const wfStep = hasWorkflow(ar) ? currentStepOf(ar).step : null;
   return {
     kind: "request",
     ticketId: str(ar.ticketId) || String(ar._id).slice(-6).toUpperCase(),
@@ -79,6 +101,7 @@ async function requestView(ar: AnyObj, email: string) {
     travellers: travellerNames(ar.cartItems || []),
     comments: stripPriceText(str(ar.comments)) || undefined,
     state: actionable ? (allowed ? "OPEN" : "NOT_ALLOWED") : "DECIDED",
+    ...(hasWorkflow(ar) ? { step: wfStep && !stale ? wfStep.label : undefined, ...(stale ? { stale: true } : {}) } : {}),
     decided: actionable ? undefined : publicDecided(decidedBy(ar)),
     actions: actionable && allowed ? ["approve", "decline", "clarify"] : [],
     clarifications: (Array.isArray(ar.clarifications) ? ar.clarifications : []).map((c: any) => ({
@@ -127,7 +150,7 @@ router.get("/:token", async (req, res) => {
     if (link.kind === "request") {
       const ar: any = await ApprovalRequest.findOne({ _id: link.id }).lean().exec();
       if (!ar) return res.status(404).json({ ok: false, error: "Request not found", code: "NOT_FOUND" });
-      const view: AnyObj = await requestView(ar, link.email);
+      const view: AnyObj = await requestView(ar, link.email, link);
       if (used) Object.assign(view, { state: "USED", actions: [] });
       return res.json({ ok: true, link: view });
     }
@@ -157,6 +180,8 @@ router.post("/:token", async (req, res) => {
     if (link.kind === "request") {
       const map: AnyObj = { approve: "approved", decline: "declined", clarify: "clarify" };
       if (!map[action]) return res.status(400).json({ ok: false, error: "Invalid action", code: "INVALID_ACTION" });
+      const current: any = await ApprovalRequest.findOne({ _id: link.id }).lean().exec();
+      if (current && staleStep(current, link)) return res.status(409).json(STALE_STEP);
       const doc = await applyRequestDecision({ requestId: link.id, actor, action: map[action], reason });
       targetId = doc._id;
     } else {

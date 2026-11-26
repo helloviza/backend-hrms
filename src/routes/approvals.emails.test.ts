@@ -257,7 +257,7 @@ describe("the email map", () => {
 
 describe("the email design (one layout for every email)", () => {
   const TONE: Record<string, string> = {
-    request_submitted_approver: "orange", request_submitted_leaders: "orange", request_resent: "orange", request_resubmitted: "orange",
+    request_step_pending: "orange", request_watcher_fyi: "blue", request_travel_admin_fyi: "green", request_submitted_approver: "orange", request_submitted_leaders: "orange", request_resent: "orange", request_resubmitted: "orange",
     request_reminder: "orange", clarification_answered: "orange", clarification_asked: "orange", proposal_submitted: "orange",
     proposal_reminder: "orange", proposal_ready: "orange",
     request_approved: "green", request_approved_fyi: "green", proposal_approved: "green", booking_done: "green", documents_ready: "green",

@@ -32,6 +32,15 @@ import {
   proposalOpsEmails,
 } from "./approvalDeciders.js";
 import { notifySafely } from "./approvalEmails/dispatch.js";
+import type { EmailCtx } from "./approvalEmails/templates.js";
+import {
+  hasWorkflow,
+  currentStepOf,
+  assigneeEmails,
+  isWatcher,
+  nextApproverStep,
+  type WorkflowSnapshot,
+} from "./approvalWorkflow/engine.js";
 
 export { workspaceOf, activeLeaderEmails, requestDeciders, proposalDeciders, proposalOpsEmails };
 export { decisionLinkUrl } from "./approvalEmails/links.js";
@@ -138,6 +147,9 @@ export async function applyRequestDecision(opts: {
     throw new DecisionError(409, "ALREADY_DECIDED", "This request has already been decided.", { decided: decidedBy(ar) });
   }
 
+  // Raised under an approval workflow: its chain decides (step engine below).
+  if (hasWorkflow(ar)) return applyWorkflowDecision(ar, actor, action, reason);
+
   await assertActorMayDecide(await requestDeciders(ar), actor, ar);
 
   const email = norm(actor.email);
@@ -194,6 +206,172 @@ export async function applyRequestDecision(opts: {
   if (action === "approved") {
     const allocated = await enterOpsQueue(doc, name);
     if (allocated.assignedTo || allocated.flagged) return (await ApprovalRequest.findById(doc._id).exec()) || doc;
+  }
+  return doc;
+}
+
+/* ───────────────────────── workflow decision (step engine) ───────────────────────── */
+
+/**
+ * A decision on a request raised under an approval workflow
+ * (docs/audits/request-workflow-audit.md §12.2, D3):
+ *   - a watcher can never decide (in-app or by link);
+ *   - the current step's assignees decide; approving a step that is not the
+ *     last moves the request to the next approver step (it stays pending,
+ *     REQUEST_RAISED) and that step's assignees get "approval needed";
+ *     approving the last one approves the request exactly as today
+ *     (REQUEST_APPROVED / PROPOSAL_PENDING, ops queue, emails);
+ *   - a decline at any step ends the request (REQUEST_DECLINED), as today;
+ *   - Workspace Leaders, per leadersMayDecide: ALLOW → as an assignee;
+ *     DENY → never; OVERRIDE_WITH_REASON → approve or decline the CURRENT
+ *     STEP in-app only, with a mandatory reason (the step is OVERRIDDEN and
+ *     the chain continues to the next approver step, or approves the request
+ *     if it was the last; an override decline ends it like any decline),
+ *     recorded in workflow.overrides and shown on the request and in the
+ *     emails;
+ *   - an email link may be used only by a current-step assignee;
+ *   - first decision wins per step: the update is conditional on the round
+ *     and the step index.
+ */
+async function applyWorkflowDecision(ar: AnyObj, actor: DecisionActor, action: RequestDecisionAction, reason: string): Promise<any> {
+  const wf: WorkflowSnapshot = ar.workflow;
+  const email = norm(actor.email);
+  const { index, step } = currentStepOf(ar);
+
+  if (email && isWatcher(ar, email)) {
+    throw new DecisionError(
+      403,
+      "WATCHER_CANNOT_DECIDE",
+      "You are copied on this request for information only. You cannot approve or decline it.",
+    );
+  }
+  if (email && email === norm(ar?.frontlinerEmail)) {
+    throw new DecisionError(403, "SELF_APPROVAL_NOT_ALLOWED", "You cannot approve or decline your own request.");
+  }
+  if (!step) throw new DecisionError(409, "ALREADY_DECIDED", "This request has already been decided.", { decided: decidedBy(ar) });
+
+  const isAssignee = assigneeEmails(step).includes(email);
+  let override = false;
+  if (!isAssignee) {
+    const leaders = await activeLeaderEmails(await workspaceOf(ar), ar);
+    const isLeader = !!email && leaders.includes(email);
+    if (actor.via === "email" || !isLeader || wf.leadersMayDecide === "DENY") {
+      throw new DecisionError(403, "NOT_AN_APPROVER", "You are no longer an approver for this request.");
+    }
+    if (wf.leadersMayDecide === "OVERRIDE_WITH_REASON") {
+      if (action === "clarify") {
+        throw new DecisionError(403, "OVERRIDE_CLARIFY_NOT_ALLOWED", `Only ${step.label.toLowerCase()} can ask the requester a question.`);
+      }
+      if (!reason) {
+        throw new DecisionError(
+          400,
+          "OVERRIDE_REASON_REQUIRED",
+          `This request is waiting for ${step.label.toLowerCase()}. To ${action === "approved" ? "approve" : "decline"} it instead, give a reason.`,
+        );
+      }
+      override = true;
+    }
+  }
+  if (await isUserInactive(email, ar?.workspaceId?._id || ar?.workspaceId || ar?.meta?.customerWorkspaceId)) {
+    throw new DecisionError(403, "NOT_AN_APPROVER", "Your account is not active.");
+  }
+
+  const name = str(actor.name) || (await actorName(actor)) || email;
+  const now = new Date();
+  const next: WorkflowSnapshot = JSON.parse(JSON.stringify(wf));
+  const decided = { email, name, via: actor.via, override };
+  const set: AnyObj = {};
+  let advancedTo = -1;
+
+  if (action === "clarify") {
+    set.stage = "REQUEST_NEEDS_CLARIFICATION";
+  } else if (action === "declined") {
+    Object.assign(next.steps[index], { status: "DECLINED", decidedAt: now, decidedBy: decided, note: reason });
+    next.currentStep = -1;
+    next.pendingEmails = [];
+    Object.assign(set, { status: "declined", stage: "REQUEST_DECLINED", adminState: "cancelled", approvedByEmail: email, approvedByName: name });
+  } else {
+    // An override decides the CURRENT step only; the chain then continues.
+    Object.assign(next.steps[index], { status: override ? "OVERRIDDEN" : "APPROVED", decidedAt: now, decidedBy: decided, note: reason });
+    advancedTo = nextApproverStep(next, index);
+    if (advancedTo >= 0) {
+      Object.assign(next.steps[advancedTo], { status: "PENDING", routedAt: now });
+      next.currentStep = advancedTo;
+      next.pendingEmails = assigneeEmails(next.steps[advancedTo]);
+      const first = next.steps[advancedTo].assignees[0];
+      Object.assign(set, { managerEmail: first.email, managerName: first.name || first.email, managerId: first.userId || undefined });
+    } else {
+      next.currentStep = -1;
+      next.pendingEmails = [];
+    }
+  }
+  const finalApproval = action === "approved" && advancedTo < 0;
+  if (finalApproval) {
+    Object.assign(set, { status: "approved", stage: approvedStageFor(ar), adminState: "pending", approvedByEmail: email, approvedByName: name });
+  }
+  if (override) {
+    next.overrides = [...(next.overrides || []), { stepKey: step.key, action: action as "approved" | "declined", byEmail: email, byName: name, reason, at: now }];
+  }
+  if (action !== "clarify") set.workflow = next;
+
+  // First decision wins, per step and round.
+  const claimed = await ApprovalRequest.findOneAndUpdate(
+    {
+      _id: ar._id,
+      status: "pending",
+      stage: { $in: REQUEST_ACTIONABLE_STAGES },
+      "workflow.round": wf.round,
+      "workflow.currentStep": index,
+    },
+    { $set: set },
+    { new: true },
+  ).exec();
+  if (!claimed) {
+    const nowDoc: any = await ApprovalRequest.findOne({ _id: ar._id }).lean().exec();
+    throw new DecisionError(409, "ALREADY_DECIDED", "This step has already been decided.", { decided: decidedBy(nowDoc || ar) });
+  }
+
+  const doc: any = await ApprovalRequest.findOne({ _id: ar._id }).exec();
+  doc.history = Array.isArray(doc.history) ? doc.history : [];
+  const base = action === "clarify" ? "clarification_requested" : advancedTo >= 0 ? "step_approved" : action;
+  const overrideText = override ? `Workspace Leader override of ${step.label.toLowerCase()} — reason: ${reason}` : "";
+  doc.history.push({
+    action: actor.via === "email" ? `email_${base}` : base,
+    at: now,
+    by: actor.via === "email" ? `email:${email}` : actor.sub || "unknown",
+    comment: overrideText || (advancedTo >= 0 ? `${step.label} approved${reason ? ` — ${reason}` : ""}` : reason || undefined),
+    userEmail: email,
+    userName: name,
+  });
+  if (action === "clarify") {
+    doc.clarifications = Array.isArray(doc.clarifications) ? doc.clarifications : [];
+    doc.clarifications.push({ kind: "question", text: reason, at: now, byEmail: email, byName: name });
+  }
+  await doc.save();
+
+  const ctx: EmailCtx = { ar: doc, actorEmail: email, actorName: name, reason };
+  if (override) ctx.override = { reason, stepLabel: step.label };
+  if (advancedTo >= 0) {
+    await notifySafely("request_step_pending", { ...ctx, stepLabel: step.label });
+    return doc;
+  }
+  if (action === "approved") {
+    await Promise.all([
+      notifySafely("request_approved", ctx),
+      notifySafely("request_approved_fyi", ctx),
+      notifySafely("request_watcher_fyi", { ...ctx, watcherEvent: "approved" }),
+      notifySafely("request_travel_admin_fyi", ctx),
+    ]);
+    const allocated = await enterOpsQueue(doc, name);
+    if (allocated.assignedTo || allocated.flagged) return (await ApprovalRequest.findById(doc._id).exec()) || doc;
+  } else if (action === "declined") {
+    await Promise.all([
+      notifySafely("request_declined", ctx),
+      notifySafely("request_declined_fyi", ctx),
+      notifySafely("request_watcher_fyi", { ...ctx, watcherEvent: "declined" }),
+    ]);
+  } else {
+    await notifySafely("clarification_asked", ctx);
   }
   return doc;
 }

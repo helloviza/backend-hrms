@@ -31,7 +31,8 @@ export const REMINDER_WINDOW_MS = (MAX_REMINDERS + 1) * REMINDER_EVERY_MS;
 /** Never two reminders for one round closer together than this. */
 const MIN_GAP_MS = 23 * 3600_000;
 
-const REQUEST_SINCE_ACTIONS = new Set(["submitted", "resubmitted", "clarification_replied"]);
+// step_approved: an approval workflow moved to its next approver step — that step's clock starts now.
+const REQUEST_SINCE_ACTIONS = new Set(["submitted", "resubmitted", "clarification_replied", "step_approved", "email_step_approved"]);
 
 function latestAt(history: any[], match: (action: string) => boolean): Date | null {
   let best: Date | null = null;

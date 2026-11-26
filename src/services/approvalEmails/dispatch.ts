@@ -22,6 +22,21 @@ import { APPROVAL_EMAIL_MAP, type ApprovalEmailEvent, type EmailEventSpec, type 
 import { renderApprovalEmail, type EmailCtx } from "./templates.js";
 import { caseCode } from "./links.js";
 import { isPartnerLeadCase, PARTNER_INTAKE_EMAIL } from "../partnerLeadCase.js";
+import { hasWorkflow, linkRecipients } from "../approvalWorkflow/engine.js";
+import { activeWorkflowFor } from "../approvalWorkflow/store.js";
+import { eventEnabled } from "../approvalWorkflow/sender.js";
+
+/** The WATCHING steps' people whose step lists this event (D9). */
+function watchersFor(ar: AnyObj, event: string | undefined): string[] {
+  if (!hasWorkflow(ar) || !event) return [];
+  const out: string[] = [];
+  for (const s of ar.workflow.steps || []) {
+    if (s?.role !== "WATCHER" || s?.status !== "WATCHING") continue;
+    if (!(s.watcherEvents || []).includes(event)) continue;
+    for (const a of s.assignees || []) out.push(norm(a?.email));
+  }
+  return out;
+}
 
 type AnyObj = Record<string, any>;
 const norm = (v: any) => String(v ?? "").trim().toLowerCase();
@@ -40,7 +55,7 @@ export type NotifyResult = {
   results: OutboxResult[];
   /** True when every email of the event reached SMTP on the first try. */
   delivered: boolean;
-  skipped?: "disabled" | "no-trigger" | "no-recipients";
+  skipped?: "disabled" | "no-trigger" | "no-recipients" | "off-in-workflow";
 };
 
 async function resolveRole(role: EmailRole, spec: EmailEventSpec, ctx: EmailCtx, cache: Map<string, string[]>): Promise<string[]> {
@@ -72,6 +87,12 @@ async function resolveRole(role: EmailRole, spec: EmailEventSpec, ctx: EmailCtx,
       break;
     case "desk":
       out = [norm(DESK_EMAIL)];
+      break;
+    case "watchers":
+      out = watchersFor(ar, ctx.watcherEvent);
+      break;
+    case "travelAdmins":
+      out = hasWorkflow(ar) ? (ar.workflow.travelAdminEmails || []).map(norm) : [];
       break;
   }
   out = out.map(norm).filter(Boolean);
@@ -111,6 +132,16 @@ export async function recipientsFor(event: ApprovalEmailEvent, ctx: EmailCtx): P
   let to = uniq(await gather(spec.to));
   let cc = uniq(await gather(spec.cc)).filter((e) => !to.includes(e));
 
+  // Approval workflow (D3): a request decision LINK goes to the current step's
+  // assignees only — never a Workspace Leader, a watcher or anyone else the
+  // roles above named. The question's answer still reaches the step.
+  if (spec.link === "decision-request" && hasWorkflow(ctx.ar)) {
+    const allowed = linkRecipients(ctx.ar);
+    to = to.filter((e) => allowed.includes(e));
+    if (!to.length && event === "clarification_answered") to = allowed.filter((e) => !excluded.has(e));
+    cc = [];
+  }
+
   const dead = await inactiveEmails([...to, ...cc].filter((e) => e !== desk));
   to = to.filter((e) => !dead.has(e));
   cc = cc.filter((e) => !dead.has(e));
@@ -121,6 +152,10 @@ export async function notifyApproval(event: ApprovalEmailEvent, ctx: EmailCtx, o
   const spec: EmailEventSpec = APPROVAL_EMAIL_MAP[event];
   if (!spec.trigger) return { to: [], cc: [], results: [], delivered: false, skipped: "no-trigger" };
   if (DISABLE_EMAILS) return { to: [], cc: [], results: [], delivered: false, skipped: "disabled" };
+  // Approval workflow: the workspace switched this FYI event off (decision-link events can't be).
+  if (hasWorkflow(ctx.ar) && !eventEnabled(await activeWorkflowFor(ctx.ar.workspaceId), event)) {
+    return { to: [], cc: [], results: [], delivered: false, skipped: "off-in-workflow" };
+  }
 
   const { to, cc } = await recipientsFor(event, ctx);
   if (!to.length) return { to, cc, results: [], delivered: false, skipped: "no-recipients" };

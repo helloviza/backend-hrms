@@ -14,8 +14,10 @@ export function decisionLinkUrl(
   recipient: string,
   _ws?: AnyObj | null,
   intent?: string,
+  /** Approval workflow requests: the step claim the link is bound to. */
+  step?: string,
 ): string {
-  const token = signApprovalLink({ kind, id, email: recipient }, APPROVAL_LINK_EXPIRY_HOURS);
+  const token = signApprovalLink({ kind, id, email: recipient, ...(step ? { step } : {}) }, APPROVAL_LINK_EXPIRY_HOURS);
   if (!token) return "";
   return `${frontendBaseUrl()}/approval/email?token=${encodeURIComponent(token)}${
     intent ? `&intent=${encodeURIComponent(intent)}` : ""

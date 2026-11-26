@@ -20,12 +20,15 @@ import { cstepNotificationsEnabled, resolveCstepTransport } from "./cstepMailTra
 import logger from "../utils/logger.js";
 import { DESK_EMAIL } from "./actorNames.js";
 import { buildSendFailureAlertHtml } from "./approvalEmails/templates.js";
+import { customerSenderFor } from "./approvalWorkflow/sender.js";
 
 type AnyObj = Record<string, any>;
 
 /** S3 bytes, loaded lazily: utils/s3Upload reads config/env on import. */
+let s3Module: Promise<typeof import("../utils/s3Upload.js")> | null = null;
 async function s3Bytes(key: string): Promise<Buffer> {
-  const { getObjectBuffer } = await import("../utils/s3Upload.js");
+  // One import for every attachment (they are fetched in parallel).
+  const { getObjectBuffer } = await (s3Module ||= import("../utils/s3Upload.js"));
   return getObjectBuffer(key);
 }
 
@@ -102,10 +105,16 @@ async function trySend(row: AnyObj): Promise<{ ok: boolean; error: string; termi
   try {
     const to: string[] = row.to || [];
     let route: { smtp?: SmtpOverride; from?: string; replyTo?: string } = {};
+    let senderReplyTo = "";
     if (row.transport === "CSTEP") {
       const c = await cstepRoute(row);
       if (c.ok === false) return { ok: false, error: c.error, terminal: true };
       route = c;
+    } else {
+      // Approval workflow email level A, resolved now so a retry uses the current setting.
+      const s = await customerSenderFor(row).catch(() => null);
+      if (s?.from) route.from = s.from;
+      if (s?.replyTo) senderReplyTo = s.replyTo;
     }
     // An unreadable S3 file fails this try (and is retried), never sends without it.
     const attachments = await mailAttachments(row.attachments);
@@ -114,7 +123,7 @@ async function trySend(row: AnyObj): Promise<{ ok: boolean; error: string; termi
       from: route.from || row.from || undefined,
       to: to.length === 1 ? to[0] : to,
       cc: row.cc?.length ? row.cc : undefined,
-      replyTo: (route.smtp ? route.replyTo : row.replyTo) || undefined,
+      replyTo: (route.smtp ? route.replyTo : senderReplyTo || row.replyTo) || undefined,
       subject: row.subject,
       html: row.html,
       text: row.text || undefined,

@@ -30,6 +30,7 @@
 import fs from "fs";
 import mongoose from "mongoose";
 import ApprovalRequest from "../models/ApprovalRequest.js";
+import ManualBooking from "../models/ManualBooking.js";
 import { actorStamp } from "./actorNames.js";
 import { markRequestDone, notifyDocumentsReady, notifyRequesterProgress } from "./approvalProgress.js";
 import {
@@ -156,7 +157,51 @@ function mergedBookingDocs(meta: AnyObj, bookingId: string, docs: AnyObj[]): Any
   return [...existing.filter((d: AnyObj) => d.manualBookingId !== bookingId), ...docs.map((d) => ({ ...d, manualBookingId: bookingId }))];
 }
 
-export type SyncOutcome = "completed" | "documents_updated" | "in_progress" | "none";
+export type SyncOutcome = "completed" | "documents_updated" | "in_progress" | "partly_booked" | "none";
+
+/** Request item type → manual booking type (same map as the Book Now prefill, manualBookingPrefill.logic.ts). */
+export function bookingTypeOfRequestItem(type: any): string {
+  const t = str(type).toLowerCase();
+  if (t.includes("flight") || t === "air") return "FLIGHT";
+  if (t.includes("hotel") || t === "stay") return "HOTEL";
+  if (t.includes("visa")) return "VISA";
+  if (t === "cab" || t === "taxi" || t === "transfer") return "CAB";
+  if (t === "forex") return "FOREX";
+  if (t === "esim") return "ESIM";
+  if (t === "holiday" || t === "package") return "HOLIDAYS";
+  if (t === "mice" || t === "event" || t === "events") return "EVENTS";
+  if (t === "rail" || t === "train") return "TRAIN";
+  return "OTHER";
+}
+/** A booking's type as a service (a TRANSFER booking covers a cab item). */
+const serviceOfBooking = (type: any) => (str(type).toUpperCase() === "TRANSFER" ? "CAB" : str(type).toUpperCase());
+
+const SERVICE_NAME: Record<string, string> = {
+  FLIGHT: "Flight", HOTEL: "Hotel", CAB: "Cab", VISA: "Visa", FOREX: "Forex", ESIM: "eSIM", HOLIDAYS: "Holiday", EVENTS: "Event", TRAIN: "Train", OTHER: "Other",
+};
+export const serviceName = (s: string) => SERVICE_NAME[s] || s;
+
+/**
+ * Approval workflow completion ALL_SERVICES_BOOKED (D6): which requested
+ * services (by type, from the cart) already have a CONFIRMED / INVOICED Book
+ * Now booking, and which are still missing. `current` is the booking being
+ * synced (counted even if its save is not visible to this read yet).
+ */
+export async function serviceCoverage(doc: AnyObj, current: AnyObj): Promise<{ booked: string[]; missing: string[] }> {
+  const required = Array.from(new Set((Array.isArray(doc?.cartItems) ? doc.cartItems : []).map((i: AnyObj) => bookingTypeOfRequestItem(i?.type))));
+  const rows: AnyObj[] = await ManualBooking.find({
+    source: "ADMIN_QUEUE",
+    sourceBookingId: String(doc._id),
+    isActive: { $ne: false },
+    status: { $in: Array.from(DONE_STATUSES) },
+  })
+    .select("type status")
+    .lean()
+    .exec();
+  const have = new Set(rows.map((r) => serviceOfBooking(r.type)));
+  if (DONE_STATUSES.has(str(current?.status).toUpperCase())) have.add(serviceOfBooking(current?.type));
+  return { booked: required.filter((s) => have.has(s)), missing: required.filter((s) => !have.has(s)) };
+}
 
 /** The customer documents of a document list that can be emailed (an S3 file of a customer type). */
 const emailable = (list: AnyObj[]) =>
@@ -231,8 +276,49 @@ export async function syncRequestFromManualBooking(
       return "documents_updated";
     }
 
+    // Approval workflow, completion ALL_SERVICES_BOOKED (D6): done only when every
+    // requested service has a confirmed booking (or staff mark it done). Until
+    // then the request is "Partly booked" and each booking's documents go out
+    // as they are confirmed (the documents-ready email).
+    if (DONE_STATUSES.has(status) && doc.workflow?.completion === "ALL_SERVICES_BOOKED") {
+      const cover = await serviceCoverage(doc, booking);
+      if (cover.missing.length) {
+        const emailed = emailedIdsOf(doc.meta);
+        const fresh = notify ? emailable(merged).filter((d) => !emailed.has(str(d.attachmentId))) : [];
+        setDocs();
+        const before = JSON.stringify(doc.meta.partlyBooked?.booked || []);
+        doc.meta.partlyBooked = { booked: cover.booked, missing: cover.missing, at: new Date() };
+        doc.meta.documentsEmailed = [...emailed, ...fresh.map((d) => str(d.attachmentId))];
+        const startedNow = stage !== "BOOKING_IN_PROGRESS";
+        if (startedNow) {
+          doc.stage = "BOOKING_IN_PROGRESS";
+          doc.adminState = "in_progress";
+        }
+        if (before !== JSON.stringify(cover.booked)) {
+          doc.history = [
+            ...(doc.history || []),
+            {
+              action: "partly_booked",
+              at: new Date(),
+              by: str(actor?.sub || actor?._id) || "admin",
+              userEmail: str(actor?.email).toLowerCase(),
+              comment: `${cover.booked.map(serviceName).join(", ")} booked — still to book: ${cover.missing.map(serviceName).join(", ")}`,
+              ...actorStamp(actor, "staff"),
+            },
+          ];
+        }
+        await doc.save();
+        if (fresh.length) await notifyDocumentsReady(doc, emailAttachmentsOf(fresh), actorOf(actor));
+        return "partly_booked";
+      }
+    }
+
     if (DONE_STATUSES.has(status)) {
       setDocs();
+      if (doc.meta.partlyBooked) {
+        const all = Array.from(new Set((doc.cartItems || []).map((i: AnyObj) => bookingTypeOfRequestItem(i?.type))));
+        doc.meta.partlyBooked = { ...doc.meta.partlyBooked, booked: all, missing: [], completedAt: new Date() };
+      }
       const pricing = booking.pricing || {};
       const sell = Number(pricing.grandTotal) || Number(pricing.quotedPrice) || undefined;
       const cost = Number(pricing.actualPrice) || undefined;

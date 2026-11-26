@@ -84,6 +84,16 @@ import { inboxBucket, requesterProfiles } from "../services/approvalInbox.js";
 import { dateRangeOr400, withDateRange } from "../utils/dateRange.js";
 import { withRequestBookings } from "../services/requestBookings.js";
 import { CLOSE_REASONS } from "../services/closeReasons.js";
+import { activeWorkflowFor } from "../services/approvalWorkflow/store.js";
+import { checkPurpose } from "../services/approvalWorkflow/config.js";
+import {
+  buildWorkflowSnapshot,
+  WorkflowRoutingError,
+  hasWorkflow,
+  isWorkflowParticipant,
+  resubmitReset,
+  workflowViewFor,
+} from "../services/approvalWorkflow/engine.js";
 
 import {
   sumBookingAmount,
@@ -176,7 +186,21 @@ router.use(actorNamesOnResponse((req) => hasQueueView(req)));
 router.use(requireAnyFeature("approvalFlowEnabled", "approvalDirectEnabled"));
 
 // Live TBO search for the request form (price-free). Own gates inside.
-router.use("/search", approvalSearchRouter);
+// Approval workflow requestOnlyMode: no search at all for this workspace.
+router.use("/search", async (req: AnyObj, res, next) => {
+  try {
+    const wf = await activeWorkflowFor(req.workspaceObjectId);
+    if (wf?.requestOnlyMode) {
+      return res.status(403).json({
+        error: "Your company raises requests without searching. Describe what you need and the travel desk books it.",
+        code: "REQUEST_ONLY_MODE",
+      });
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
+}, approvalSearchRouter);
 // Travel Desk team settings + Assign picker (staff only, own guard inside).
 router.use("/travel-desk", travelDeskRouter);
 
@@ -518,12 +542,49 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
     });
     const { ws, leaderEmails } = picked;
 
-    const routing = resolveSubmitRouting({
-      approverEmail: picked.approverEmail,
-      leaderEmails,
-      actorEmail: email,
-      actorIsLeader: leaderEmails.includes(email) || (await actsAsWorkspaceLeader(req)),
-    });
+    // Approval workflow in force for this workspace (published + enabled)?
+    // None = today's routing below, unchanged.
+    const workflowVersion = await activeWorkflowFor(req.workspaceObjectId);
+    let workflowBuilt: Awaited<ReturnType<typeof buildWorkflowSnapshot>> | null = null;
+    if (workflowVersion) {
+      // D8: the trip's purpose, from the workspace's list.
+      const purpose = checkPurpose(workflowVersion, req.body?.purpose);
+      if (purpose.ok === false) {
+        const bad = purpose as Extract<typeof purpose, { ok: false }>;
+        return res.status(400).json({ error: bad.error, code: "PURPOSE_REQUIRED", field: "purpose" });
+      }
+      // Request-only mode: nothing was searched, so nothing can be picked.
+      if (workflowVersion.requestOnlyMode && snapshots.length) {
+        return res.status(400).json({ error: "Your company raises requests without picking a fare or hotel.", code: "REQUEST_ONLY_MODE" });
+      }
+      try {
+        workflowBuilt = await buildWorkflowSnapshot({
+          purpose: (purpose as any).purpose,
+          version: workflowVersion,
+          ws: ws || loginWs,
+          workspaceId: req.workspaceObjectId,
+          requester: { id: sub, email },
+          leaderEmails,
+          actorIsLeader: leaderEmails.includes(email) || (await actsAsWorkspaceLeader(req)),
+        });
+      } catch (e) {
+        if (e instanceof WorkflowRoutingError) return res.status(e.status).json({ error: e.message, code: e.code });
+        throw e;
+      }
+    }
+
+    const routing = workflowBuilt
+      ? {
+          approverEmail: workflowBuilt.autoApprove ? email : workflowBuilt.approver?.email || "",
+          autoApprove: workflowBuilt.autoApprove,
+          routedToLeader: false,
+        }
+      : resolveSubmitRouting({
+          approverEmail: picked.approverEmail,
+          leaderEmails,
+          actorEmail: email,
+          actorIsLeader: leaderEmails.includes(email) || (await actsAsWorkspaceLeader(req)),
+        });
     const approverEmail = routing.approverEmail;
     const isSelfApproval = routing.autoApprove;
 
@@ -609,6 +670,7 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       ...(isSelfApproval
         ? { approvedByEmail: approverEmail, approvedByName: managerName }
         : {}),
+      ...(workflowBuilt ? { workflow: workflowBuilt.workflow } : {}),
 
       meta: {
         ...(wsInternalId ? { customerWorkspaceId: wsInternalId } : {}),
@@ -661,12 +723,20 @@ router.post("/requests", requireAuth, requireWorkspace, requireTravelMode("APPRO
       // told, and it goes straight into the ops queue (auto-allocation + the
       // desk hears). Leaders get no "approval needed" — nothing to decide.
       await notifySafely("request_auto_approved", { ar: doc });
+      if (workflowBuilt) {
+        // Approval workflow: the watchers (D9) and the client's travel admins (D1) hear it is approved.
+        await Promise.all([
+          notifySafely("request_watcher_fyi", { ar: doc, watcherEvent: "approved", actorName: managerName }),
+          notifySafely("request_travel_admin_fyi", { ar: doc, actorName: managerName }),
+        ]);
+      }
       await enterOpsQueue(doc, managerName);
     } else {
       await Promise.all([
         notifySafely("request_submitted_approver", { ar: doc }),
         notifySafely("request_submitted_leaders", { ar: doc }),
         notifySafely("request_submitted_confirmation", { ar: doc }),
+        ...(workflowBuilt ? [notifySafely("request_watcher_fyi", { ar: doc, watcherEvent: "submitted" })] : []),
       ]);
     }
     if (DISABLE_EMAILS) {
@@ -727,6 +797,38 @@ router.get("/request-context", requireAuth, requireWorkspace, requireTravelMode(
     if (!loginWs?._id) return res.json({ ok: true, companyName: "", approver: { status: "none" } });
 
     const picked = await pickApproverEmail({ customerId: String(loginWs.customerId || loginWs._id), actorEmail: email });
+
+    // Approval workflow in force: the same resolution the submit will run (nothing is written).
+    const wfVersion = await activeWorkflowFor(req.workspaceObjectId);
+    if (wfVersion) {
+      const companyName = normStr((picked.ws as any)?.name || (picked.ws as any)?.displayName || loginWs.name || "");
+      const form = {
+        requestOnlyMode: !!wfVersion.requestOnlyMode,
+        purpose: { required: !!wfVersion.purpose?.required, options: wfVersion.purpose?.options || [] },
+      };
+      try {
+        const built = await buildWorkflowSnapshot({
+          version: wfVersion,
+          ws: picked.ws || loginWs,
+          workspaceId: req.workspaceObjectId,
+          requester: { id: String(req.user?.sub || req.user?._id || ""), email },
+          leaderEmails: picked.leaderEmails,
+          actorIsLeader: picked.leaderEmails.includes(email) || (await actsAsWorkspaceLeader(req)),
+        });
+        const first = built.workflow.steps[built.workflow.currentStep];
+        const approver = built.autoApprove
+          ? { status: "auto" }
+          : { status: "ok", name: built.approver?.name || "Your approver", step: first?.label, note: first?.routingNote || undefined };
+        const watchers = built.workflow.steps
+          .filter((s) => s.status === "WATCHING")
+          .map((s) => ({ label: s.label, names: s.assignees.map((a) => a.name || "") }));
+        return res.json({ ok: true, companyName, approver, workflow: { ...form, watchers } });
+      } catch (e) {
+        if (e instanceof WorkflowRoutingError) return res.json({ ok: true, companyName, approver: { status: "none", message: e.message }, workflow: form });
+        throw e;
+      }
+    }
+
     const routing = resolveSubmitRouting({
       approverEmail: picked.approverEmail,
       leaderEmails: picked.leaderEmails,
@@ -792,6 +894,37 @@ router.get("/requests/mine", requireAuth, requireWorkspace, requireTravelMode("A
   }
 });
 
+/**
+ * Approval workflow: the requests this caller WATCHES (e.g. as the reporting
+ * manager) — the inbox's FYI tab. View only: rows carry _workflow with
+ * canDecide false, and no decision is accepted from a watcher anywhere.
+ */
+async function watcherFyiRows(req: AnyObj, email: string, range: any) {
+  if (!email) return [];
+  const rows = await ApprovalRequest.find(
+    withDateRange(
+      { workspaceId: req.workspaceObjectId, "workflow.watcherEmails": email, frontlinerEmail: { $not: exactIRegex(email) } },
+      range,
+    ),
+  )
+    .sort({ updatedAt: -1, createdAt: -1 })
+    .limit(200)
+    .lean()
+    .exec();
+  const profiles = await requesterProfiles(req.workspaceObjectId, rows);
+  const out: AnyObj[] = [];
+  for (const r of rows as AnyObj[]) {
+    if (r?.meta?.revoked) continue;
+    out.push({
+      ...forViewer(r, req),
+      _bucket: "fyi",
+      _requester: profiles.get(String(r.frontlinerId || "")) || undefined,
+      _workflow: await workflowViewFor(r, email),
+    });
+  }
+  return out;
+}
+
 router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("APPROVAL_FLOW", "APPROVAL_DIRECT"), async (req: AnyObj, res, next) => {
   try {
     // Who sees what (SBT-user refusal, Workspace Leader = whole workspace,
@@ -803,6 +936,13 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
     // alone does not narrow the union)
     if (scope.ok === false) {
       const denied = scope as Extract<TravelInboxScope, { ok: false }>;
+      // A watcher whose membership has SBT on still sees what they are copied on (FYI only).
+      if (String(req.query?.view || "") === "all" && denied.body?.code === "SBT_USER_CANNOT_ACCESS_APPROVALS") {
+        const range = dateRangeOr400(req, res);
+        if (range === false) return;
+        const fyi = await watcherFyiRows(req, normEmail(req.user?.email), range);
+        if (fyi.length) return res.json({ rows: fyi });
+      }
       return res.status(denied.status).json(denied.body);
     }
     const { email, isWL: isWLInbox, notOwn, query: inboxQuery } = scope as Extract<TravelInboxScope, { ok: true }>;
@@ -822,7 +962,7 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
         : {
             $and: [
               { ...openStages, workspaceId: req.workspaceObjectId, ...notOwn },
-              { $or: [{ managerEmail: exactIRegex(email) }, { "meta.ccLeaders": exactIRegex(email) }] },
+              { $or: [{ managerEmail: exactIRegex(email) }, { "meta.ccLeaders": exactIRegex(email) }, { "workflow.pendingEmails": email }] },
             ],
           };
       const [open, decided] = await Promise.all([
@@ -860,6 +1000,17 @@ router.get("/requests/inbox", requireAuth, requireWorkspace, requireTravelMode("
           _bucket: bucket,
           _requester: profiles.get(String(r.frontlinerId || "")) || undefined,
         }));
+      // Approval workflow rows say what this viewer may do (decide / override / view only).
+      for (let i = 0; i < out.length; i++) {
+        if (!hasWorkflow(out[i])) continue;
+        const view = await workflowViewFor(out[i], email);
+        (out[i] as AnyObj)._workflow = view;
+        if (view?.role === "WATCHER") (out[i] as AnyObj)._bucket = "fyi";
+      }
+      // ...and the requests this caller watches (FYI tab).
+      for (const row of await watcherFyiRows(req, email, range)) {
+        if (!seen.has(String(row._id))) out.push(row as any);
+      }
       return res.json({ rows: out });
     }
 
@@ -888,11 +1039,16 @@ router.get("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
 
     const user = req.user;
     const canView =
-      hasQueueView(req) || isOwnerOfRequest(doc, user) || isManagerOrLeaderOfRequest(doc, user);
+      hasQueueView(req) ||
+      isOwnerOfRequest(doc, user) ||
+      isManagerOrLeaderOfRequest(doc, user) ||
+      // Approval workflow: anyone on the chain (an approver of any step, or a watcher) may view.
+      isWorkflowParticipant(doc, normEmail(user?.email));
 
     if (!canView) return res.status(403).json({ error: "Not allowed" });
 
-    res.json({ ok: true, request: forViewer(doc, req) });
+    if (!hasWorkflow(doc)) return res.json({ ok: true, request: forViewer(doc, req) });
+    res.json({ ok: true, request: { ...forViewer(doc, req), _workflow: await workflowViewFor(doc, normEmail(user?.email)) } });
   } catch (err) {
     next(err);
   }
@@ -961,6 +1117,18 @@ router.put("/requests/:id", requireAuth, async (req: AnyObj, res, next) => {
       if (e instanceof CartItemError) return sendCartItemError(res, e);
       if (e instanceof SelectionError) return sendSelectionError(res, e);
       throw e;
+    }
+
+    // Approval workflow: the purpose may be changed while the request is still editable (D8 rules).
+    if (hasWorkflow(doc) && req.body?.purpose !== undefined) {
+      const wfNow = await activeWorkflowFor(doc.workspaceId);
+      const purposeRule = wfNow || { purpose: { required: false, options: [] as string[] } };
+      const purpose = checkPurpose(purposeRule, req.body.purpose);
+      if (purpose.ok === false) return res.status(400).json({ error: (purpose as any).error, code: "PURPOSE_REQUIRED", field: "purpose" });
+      if ((purpose as any).purpose) {
+        doc.workflow = { ...doc.workflow, purpose: (purpose as any).purpose };
+        doc.markModified("workflow");
+      }
     }
 
     const hadOptionRefs = cartHasOptionRefs(doc.cartItems);
@@ -1916,6 +2084,20 @@ router.put("/requests/:id/resubmit", requireAuth, requireWorkspace, requireTrave
       if (e instanceof CartItemError) return sendCartItemError(res, e);
       if (e instanceof SelectionError) return sendSelectionError(res, e);
       throw e;
+    }
+
+    // Approval workflow: the same chain (D5 — never re-resolved), from its first approver step, in a new round.
+    if (hasWorkflow(doc)) {
+      const wf = resubmitReset(doc.toObject ? doc.toObject() : doc);
+      if (req.body?.purpose !== undefined) {
+        const wfNow = await activeWorkflowFor(doc.workspaceId);
+        const purpose = checkPurpose(wfNow || { purpose: { required: false, options: [] } }, req.body.purpose);
+        if (purpose.ok === false) return res.status(400).json({ error: (purpose as any).error, code: "PURPOSE_REQUIRED", field: "purpose" });
+        if ((purpose as any).purpose) wf.purpose = (purpose as any).purpose;
+      }
+      setFields.workflow = wf;
+      const first = wf.currentStep >= 0 ? wf.steps[wf.currentStep].assignees[0] : null;
+      if (first) Object.assign(setFields, { managerEmail: first.email, managerName: first.name || first.email, managerId: first.userId || undefined });
     }
 
     const updated: any = await ApprovalRequest.findOneAndUpdate(

@@ -1,0 +1,5682 @@
+[
+ {
+  "label": "f3.context",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "companyName": "Flow Three Co",
+   "approver": {
+    "status": "ok",
+    "name": "Arjun Approver"
+   }
+  },
+  "request": null,
+  "mails": []
+ },
+ {
+  "label": "f3.submit",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<riya@flow3.test>",
+    "frontlinerEmail": "riya@flow3.test",
+    "frontlinerName": "Riya Rao",
+    "managerId": "<approver@flow3.test>",
+    "managerEmail": "approver@flow3.test",
+    "managerName": "Arjun Approver",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     },
+     {
+      "type": "hotel",
+      "title": "Mumbai · 2 nights",
+      "qty": 1,
+      "meta": {
+       "city": "Mumbai",
+       "checkIn": "2027-03-12",
+       "checkOut": "2027-03-14",
+       "rooms": 1,
+       "adults": 1,
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "children": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorName": "Riya Rao",
+      "actorKind": "customer"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT"
+    },
+    "_id": "<oid>",
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "_documents": []
+   },
+   "message": "Submitted for approval"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<riya@flow3.test>",
+   "frontlinerEmail": "riya@flow3.test",
+   "frontlinerName": "Riya Rao",
+   "managerId": "<approver@flow3.test>",
+   "managerEmail": "approver@flow3.test",
+   "managerName": "Arjun Approver",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    },
+    {
+     "type": "hotel",
+     "title": "Mumbai · 2 nights",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "city": "Mumbai",
+      "checkIn": "2027-03-12",
+      "checkOut": "2027-03-14",
+      "rooms": 1,
+      "adults": 1,
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "children": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow3.test>",
+     "actorName": "Riya Rao",
+     "actorKind": "customer"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "014397575f1b0587"
+   },
+   {
+    "to": [
+     "leader@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "014397575f1b0587"
+   },
+   {
+    "to": [
+     "riya@flow3.test"
+    ],
+    "cc": [],
+    "subject": "We've received your travel request — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "ebdc790a986b1c74"
+   }
+  ]
+ },
+ {
+  "label": "f3.inbox.approver",
+  "status": 200,
+  "body": {
+   "rows": [
+    {
+     "_id": "<oid>",
+     "workspaceId": "<WS3>",
+     "customerId": "C3",
+     "customerName": "Flow Three Co",
+     "customerEmailDomain": "flow3.test",
+     "frontlinerId": "<riya@flow3.test>",
+     "frontlinerEmail": "riya@flow3.test",
+     "frontlinerName": "Riya Rao",
+     "managerId": "<approver@flow3.test>",
+     "managerEmail": "approver@flow3.test",
+     "managerName": "Arjun Approver",
+     "status": "pending",
+     "stage": "REQUEST_RAISED",
+     "comments": "Client visit",
+     "cartItems": [
+      {
+       "type": "flight",
+       "title": "BLR → BOM",
+       "qty": 1,
+       "meta": {
+        "origin": "BLR",
+        "destination": "BOM",
+        "tripType": "oneway",
+        "departDate": "2027-03-12",
+        "travellers": [
+         {
+          "travellerId": "m-<rand>",
+          "kind": "manual",
+          "firstName": "Asha",
+          "lastName": "Rao"
+         }
+        ],
+        "travelScope": "domestic",
+        "adults": 1,
+        "children": 0,
+        "infants": 0
+       }
+      },
+      {
+       "type": "hotel",
+       "title": "Mumbai · 2 nights",
+       "qty": 1,
+       "meta": {
+        "city": "Mumbai",
+        "checkIn": "2027-03-12",
+        "checkOut": "2027-03-14",
+        "rooms": 1,
+        "adults": 1,
+        "travellers": [
+         {
+          "travellerId": "m-<rand>",
+          "kind": "manual",
+          "firstName": "Asha",
+          "lastName": "Rao"
+         }
+        ],
+        "travelScope": "domestic",
+        "children": 0
+       }
+      }
+     ],
+     "history": [
+      {
+       "action": "submitted",
+       "at": "<date>",
+       "comment": "Client visit",
+       "userName": "Riya Rao",
+       "userEmail": "riya@flow3.test",
+       "actorName": "Riya Rao",
+       "actorKind": "customer"
+      }
+     ],
+     "meta": {
+      "customerWorkspaceId": "<WS3>",
+      "ccLeaders": [
+       "leader@flow3.test"
+      ],
+      "travelFlow": "APPROVAL_DIRECT"
+     },
+     "clarifications": [],
+     "createdAt": "<date>",
+     "updatedAt": "<date>",
+     "fsm": {
+      "current": "AWAITING_L2_REQUEST_APPROVAL",
+      "request": {
+       "stage": "AWAITING_L2_REQUEST_APPROVAL"
+      },
+      "proposal": {
+       "stage": "PROPOSAL_NONE"
+      },
+      "booking": {
+       "stage": "BOOKING_NOT_STARTED"
+      },
+      "updatedAt": "<date>",
+      "version": 1
+     },
+     "__v": 0,
+     "_documents": [],
+     "_bucket": "pending"
+    }
+   ]
+  },
+  "request": null,
+  "mails": []
+ },
+ {
+  "label": "f3.inbox.leader",
+  "status": 200,
+  "body": {
+   "rows": [
+    {
+     "_id": "<oid>",
+     "workspaceId": "<WS3>",
+     "customerId": "C3",
+     "customerName": "Flow Three Co",
+     "customerEmailDomain": "flow3.test",
+     "frontlinerId": "<riya@flow3.test>",
+     "frontlinerEmail": "riya@flow3.test",
+     "frontlinerName": "Riya Rao",
+     "managerId": "<approver@flow3.test>",
+     "managerEmail": "approver@flow3.test",
+     "managerName": "Arjun Approver",
+     "status": "pending",
+     "stage": "REQUEST_RAISED",
+     "comments": "Client visit",
+     "cartItems": [
+      {
+       "type": "flight",
+       "title": "BLR → BOM",
+       "qty": 1,
+       "meta": {
+        "origin": "BLR",
+        "destination": "BOM",
+        "tripType": "oneway",
+        "departDate": "2027-03-12",
+        "travellers": [
+         {
+          "travellerId": "m-<rand>",
+          "kind": "manual",
+          "firstName": "Asha",
+          "lastName": "Rao"
+         }
+        ],
+        "travelScope": "domestic",
+        "adults": 1,
+        "children": 0,
+        "infants": 0
+       }
+      },
+      {
+       "type": "hotel",
+       "title": "Mumbai · 2 nights",
+       "qty": 1,
+       "meta": {
+        "city": "Mumbai",
+        "checkIn": "2027-03-12",
+        "checkOut": "2027-03-14",
+        "rooms": 1,
+        "adults": 1,
+        "travellers": [
+         {
+          "travellerId": "m-<rand>",
+          "kind": "manual",
+          "firstName": "Asha",
+          "lastName": "Rao"
+         }
+        ],
+        "travelScope": "domestic",
+        "children": 0
+       }
+      }
+     ],
+     "history": [
+      {
+       "action": "submitted",
+       "at": "<date>",
+       "comment": "Client visit",
+       "userName": "Riya Rao",
+       "userEmail": "riya@flow3.test",
+       "actorName": "Riya Rao",
+       "actorKind": "customer"
+      }
+     ],
+     "meta": {
+      "customerWorkspaceId": "<WS3>",
+      "ccLeaders": [
+       "leader@flow3.test"
+      ],
+      "travelFlow": "APPROVAL_DIRECT"
+     },
+     "clarifications": [],
+     "createdAt": "<date>",
+     "updatedAt": "<date>",
+     "fsm": {
+      "current": "AWAITING_L2_REQUEST_APPROVAL",
+      "request": {
+       "stage": "AWAITING_L2_REQUEST_APPROVAL"
+      },
+      "proposal": {
+       "stage": "PROPOSAL_NONE"
+      },
+      "booking": {
+       "stage": "BOOKING_NOT_STARTED"
+      },
+      "updatedAt": "<date>",
+      "version": 1
+     },
+     "__v": 0,
+     "_documents": []
+    }
+   ]
+  },
+  "request": null,
+  "mails": []
+ },
+ {
+  "label": "f3.detail.approver",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<riya@flow3.test>",
+    "frontlinerEmail": "riya@flow3.test",
+    "frontlinerName": "Riya Rao",
+    "managerId": "<approver@flow3.test>",
+    "managerEmail": "approver@flow3.test",
+    "managerName": "Arjun Approver",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     },
+     {
+      "type": "hotel",
+      "title": "Mumbai · 2 nights",
+      "qty": 1,
+      "meta": {
+       "city": "Mumbai",
+       "checkIn": "2027-03-12",
+       "checkOut": "2027-03-14",
+       "rooms": 1,
+       "adults": 1,
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "children": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorName": "Riya Rao",
+      "actorKind": "customer"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT"
+    },
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "_documents": []
+   }
+  },
+  "request": null,
+  "mails": []
+ },
+ {
+  "label": "f3.resend",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<riya@flow3.test>",
+    "frontlinerEmail": "riya@flow3.test",
+    "frontlinerName": "Riya Rao",
+    "managerId": "<approver@flow3.test>",
+    "managerEmail": "approver@flow3.test",
+    "managerName": "Arjun Approver",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     },
+     {
+      "type": "hotel",
+      "title": "Mumbai · 2 nights",
+      "qty": 1,
+      "meta": {
+       "city": "Mumbai",
+       "checkIn": "2027-03-12",
+       "checkOut": "2027-03-14",
+       "rooms": 1,
+       "adults": 1,
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "children": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorName": "Riya Rao",
+      "actorKind": "customer"
+     },
+     {
+      "action": "resend_email",
+      "at": "<date>",
+      "comment": "Approval email resent by requester",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Riya Rao"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT",
+     "lastResentAt": "<date>",
+     "resendCount": 1
+    },
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 1,
+    "_documents": []
+   },
+   "message": "Resent approval email"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<riya@flow3.test>",
+   "frontlinerEmail": "riya@flow3.test",
+   "frontlinerName": "Riya Rao",
+   "managerId": "<approver@flow3.test>",
+   "managerEmail": "approver@flow3.test",
+   "managerName": "Arjun Approver",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    },
+    {
+     "type": "hotel",
+     "title": "Mumbai · 2 nights",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "city": "Mumbai",
+      "checkIn": "2027-03-12",
+      "checkOut": "2027-03-14",
+      "rooms": 1,
+      "adults": 1,
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "children": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow3.test>",
+     "actorName": "Riya Rao",
+     "actorKind": "customer"
+    },
+    {
+     "action": "resend_email",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Approval email resent by requester",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "lastResentAt": "<date>",
+    "resendCount": 1
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 1
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "560c914eb4fdd747"
+   },
+   {
+    "to": [
+     "leader@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "560c914eb4fdd747"
+   }
+  ]
+ },
+ {
+  "label": "f3.approve",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<riya@flow3.test>",
+    "frontlinerEmail": "riya@flow3.test",
+    "frontlinerName": "Riya Rao",
+    "managerId": "<approver@flow3.test>",
+    "managerEmail": "approver@flow3.test",
+    "managerName": "Arjun Approver",
+    "status": "approved",
+    "stage": "REQUEST_APPROVED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     },
+     {
+      "type": "hotel",
+      "title": "Mumbai · 2 nights",
+      "qty": 1,
+      "meta": {
+       "city": "Mumbai",
+       "checkIn": "2027-03-12",
+       "checkOut": "2027-03-14",
+       "rooms": 1,
+       "adults": 1,
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "children": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorName": "Riya Rao",
+      "actorKind": "customer"
+     },
+     {
+      "action": "resend_email",
+      "at": "<date>",
+      "comment": "Approval email resent by requester",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Riya Rao"
+     },
+     {
+      "action": "approved",
+      "at": "<date>",
+      "comment": "ok",
+      "userName": "Arjun Approver",
+      "userEmail": "approver@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Arjun Approver"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT",
+     "lastResentAt": "<date>",
+     "resendCount": 1
+    },
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "REQUEST_APPROVED_BY_L2",
+     "request": {
+      "stage": "REQUEST_APPROVED_BY_L2"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 2,
+    "adminState": "pending",
+    "approvedByEmail": "approver@flow3.test",
+    "approvedByName": "Arjun Approver",
+    "_documents": []
+   },
+   "message": "Updated"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<riya@flow3.test>",
+   "frontlinerEmail": "riya@flow3.test",
+   "frontlinerName": "Riya Rao",
+   "managerId": "<approver@flow3.test>",
+   "managerEmail": "approver@flow3.test",
+   "managerName": "Arjun Approver",
+   "status": "approved",
+   "stage": "REQUEST_APPROVED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    },
+    {
+     "type": "hotel",
+     "title": "Mumbai · 2 nights",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "city": "Mumbai",
+      "checkIn": "2027-03-12",
+      "checkOut": "2027-03-14",
+      "rooms": 1,
+      "adults": 1,
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "children": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow3.test>",
+     "actorName": "Riya Rao",
+     "actorKind": "customer"
+    },
+    {
+     "action": "resend_email",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Approval email resent by requester",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": ""
+    },
+    {
+     "action": "approved",
+     "at": "<date>",
+     "by": "<approver@flow3.test>",
+     "comment": "ok",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "lastResentAt": "<date>",
+    "resendCount": 1
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "REQUEST_APPROVED_BY_L2",
+    "request": {
+     "stage": "REQUEST_APPROVED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 2,
+   "adminState": "pending",
+   "approvedByEmail": "approver@flow3.test",
+   "approvedByName": "Arjun Approver"
+  },
+  "mails": [
+   {
+    "to": [
+     "leader@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Request approved — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "f7b9593e8ab126a1"
+   },
+   {
+    "to": [
+     "ops@plumtrips.com"
+    ],
+    "cc": [],
+    "subject": "New case — REQ-XXXXXX — Flow Three Co",
+    "replyTo": "",
+    "html": "cb0d66fabd250f0d"
+   },
+   {
+    "to": [
+     "riya@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Request approved — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "249331458ef44b37"
+   }
+  ]
+ },
+ {
+  "label": "f3.submit2",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<riya@flow3.test>",
+    "frontlinerEmail": "riya@flow3.test",
+    "frontlinerName": "Riya Rao",
+    "managerId": "<approver@flow3.test>",
+    "managerEmail": "approver@flow3.test",
+    "managerName": "Arjun Approver",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorName": "Riya Rao",
+      "actorKind": "customer"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT"
+    },
+    "_id": "<oid>",
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "_documents": []
+   },
+   "message": "Submitted for approval"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<riya@flow3.test>",
+   "frontlinerEmail": "riya@flow3.test",
+   "frontlinerName": "Riya Rao",
+   "managerId": "<approver@flow3.test>",
+   "managerEmail": "approver@flow3.test",
+   "managerName": "Arjun Approver",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow3.test>",
+     "actorName": "Riya Rao",
+     "actorKind": "customer"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "c4e7a5ba5bba90e9"
+   },
+   {
+    "to": [
+     "leader@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "c4e7a5ba5bba90e9"
+   },
+   {
+    "to": [
+     "riya@flow3.test"
+    ],
+    "cc": [],
+    "subject": "We've received your travel request — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "f6c30f3164feca2c"
+   }
+  ]
+ },
+ {
+  "label": "f3.link.view",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "link": {
+    "kind": "request",
+    "ticketId": "XXXXXX",
+    "requesterName": "Riya Rao",
+    "customerName": "Flow Three Co",
+    "tripSummary": "BLR → BOM",
+    "travellers": [
+     "Asha Rao"
+    ],
+    "comments": "Client visit",
+    "state": "OPEN",
+    "actions": [
+     "approve",
+     "decline",
+     "clarify"
+    ],
+    "clarifications": []
+   }
+  },
+  "request": null,
+  "mails": []
+ },
+ {
+  "label": "f3.link.decline",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "message": "Your decision has been recorded."
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<riya@flow3.test>",
+   "frontlinerEmail": "riya@flow3.test",
+   "frontlinerName": "Riya Rao",
+   "managerId": "<approver@flow3.test>",
+   "managerEmail": "approver@flow3.test",
+   "managerName": "Arjun Approver",
+   "status": "declined",
+   "stage": "REQUEST_DECLINED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow3.test>",
+     "actorName": "Riya Rao",
+     "actorKind": "customer"
+    },
+    {
+     "action": "email_declined",
+     "at": "<date>",
+     "by": "email:approver@flow3.test",
+     "comment": "Over budget",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "REQUEST_DECLINED_BY_L2",
+    "request": {
+     "stage": "REQUEST_DECLINED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 1,
+   "adminState": "cancelled",
+   "approvedByEmail": "approver@flow3.test",
+   "approvedByName": "Arjun Approver"
+  },
+  "mails": [
+   {
+    "to": [
+     "leader@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Request declined — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "46e9bf3809ab828d"
+   },
+   {
+    "to": [
+     "riya@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Your Travel Request Has Been Declined — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "8381466c4425ec0e"
+   }
+  ]
+ },
+ {
+  "label": "f3.link.reuse",
+  "status": 409,
+  "body": {
+   "ok": false,
+   "error": "This link has already been used.",
+   "code": "LINK_USED"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<riya@flow3.test>",
+   "frontlinerEmail": "riya@flow3.test",
+   "frontlinerName": "Riya Rao",
+   "managerId": "<approver@flow3.test>",
+   "managerEmail": "approver@flow3.test",
+   "managerName": "Arjun Approver",
+   "status": "declined",
+   "stage": "REQUEST_DECLINED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow3.test>",
+     "actorName": "Riya Rao",
+     "actorKind": "customer"
+    },
+    {
+     "action": "email_declined",
+     "at": "<date>",
+     "by": "email:approver@flow3.test",
+     "comment": "Over budget",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "REQUEST_DECLINED_BY_L2",
+    "request": {
+     "stage": "REQUEST_DECLINED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 1,
+   "adminState": "cancelled",
+   "approvedByEmail": "approver@flow3.test",
+   "approvedByName": "Arjun Approver"
+  },
+  "mails": []
+ },
+ {
+  "label": "f3.resubmit",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<riya@flow3.test>",
+    "frontlinerEmail": "riya@flow3.test",
+    "frontlinerName": "Riya Rao",
+    "managerId": "<approver@flow3.test>",
+    "managerEmail": "approver@flow3.test",
+    "managerName": "Arjun Approver",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorName": "Riya Rao",
+      "actorKind": "customer"
+     },
+     {
+      "action": "email_declined",
+      "at": "<date>",
+      "by": "email:approver@flow3.test",
+      "comment": "Over budget",
+      "userName": "Arjun Approver",
+      "userEmail": "approver@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Arjun Approver"
+     },
+     {
+      "action": "resubmitted",
+      "at": "<date>",
+      "comment": "Cheaper fare",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Riya Rao"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT",
+     "revoked": false
+    },
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "request": {
+      "stage": "REQUEST_DECLINED_BY_L2"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "current": "REQUEST_DECLINED_BY_L2",
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 1,
+    "approvedByEmail": "approver@flow3.test",
+    "approvedByName": "Arjun Approver",
+    "_documents": []
+   },
+   "message": "Resubmitted"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<riya@flow3.test>",
+   "frontlinerEmail": "riya@flow3.test",
+   "frontlinerName": "Riya Rao",
+   "managerId": "<approver@flow3.test>",
+   "managerEmail": "approver@flow3.test",
+   "managerName": "Arjun Approver",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow3.test>",
+     "actorName": "Riya Rao",
+     "actorKind": "customer"
+    },
+    {
+     "action": "email_declined",
+     "at": "<date>",
+     "by": "email:approver@flow3.test",
+     "comment": "Over budget",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": ""
+    },
+    {
+     "action": "resubmitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Cheaper fare",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "revoked": false
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "REQUEST_DECLINED_BY_L2",
+    "request": {
+     "stage": "REQUEST_DECLINED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 1,
+   "approvedByEmail": "approver@flow3.test",
+   "approvedByName": "Arjun Approver"
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed (Resubmitted) — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "0a3a55e95d28674f"
+   },
+   {
+    "to": [
+     "leader@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed (Resubmitted) — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "0a3a55e95d28674f"
+   }
+  ]
+ },
+ {
+  "label": "f3.leader.approve",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<riya@flow3.test>",
+    "frontlinerEmail": "riya@flow3.test",
+    "frontlinerName": "Riya Rao",
+    "managerId": "<approver@flow3.test>",
+    "managerEmail": "approver@flow3.test",
+    "managerName": "Arjun Approver",
+    "status": "approved",
+    "stage": "REQUEST_APPROVED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorName": "Riya Rao",
+      "actorKind": "customer"
+     },
+     {
+      "action": "email_declined",
+      "at": "<date>",
+      "by": "email:approver@flow3.test",
+      "comment": "Over budget",
+      "userName": "Arjun Approver",
+      "userEmail": "approver@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Arjun Approver"
+     },
+     {
+      "action": "resubmitted",
+      "at": "<date>",
+      "comment": "Cheaper fare",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Riya Rao"
+     },
+     {
+      "action": "approved",
+      "at": "<date>",
+      "userName": "Lata Leader",
+      "userEmail": "leader@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Lata Leader"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT",
+     "revoked": false
+    },
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "REQUEST_APPROVED_BY_L2",
+     "request": {
+      "stage": "REQUEST_APPROVED_BY_L2"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 2,
+    "approvedByEmail": "leader@flow3.test",
+    "approvedByName": "Lata Leader",
+    "adminState": "pending",
+    "_documents": []
+   },
+   "message": "Updated"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<riya@flow3.test>",
+   "frontlinerEmail": "riya@flow3.test",
+   "frontlinerName": "Riya Rao",
+   "managerId": "<approver@flow3.test>",
+   "managerEmail": "approver@flow3.test",
+   "managerName": "Arjun Approver",
+   "status": "approved",
+   "stage": "REQUEST_APPROVED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow3.test>",
+     "actorName": "Riya Rao",
+     "actorKind": "customer"
+    },
+    {
+     "action": "email_declined",
+     "at": "<date>",
+     "by": "email:approver@flow3.test",
+     "comment": "Over budget",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": ""
+    },
+    {
+     "action": "resubmitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Cheaper fare",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": ""
+    },
+    {
+     "action": "approved",
+     "at": "<date>",
+     "by": "<leader@flow3.test>",
+     "userName": "Lata Leader",
+     "userEmail": "leader@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "revoked": false
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "REQUEST_APPROVED_BY_L2",
+    "request": {
+     "stage": "REQUEST_APPROVED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 2,
+   "approvedByEmail": "leader@flow3.test",
+   "approvedByName": "Lata Leader",
+   "adminState": "pending"
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Request approved — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "1f1cc9562d57b802"
+   },
+   {
+    "to": [
+     "ops@plumtrips.com"
+    ],
+    "cc": [],
+    "subject": "New case — REQ-XXXXXX — Flow Three Co",
+    "replyTo": "",
+    "html": "75e5f4fabda77302"
+   },
+   {
+    "to": [
+     "riya@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Request approved — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "09ddc3314a18721a"
+   }
+  ]
+ },
+ {
+  "label": "f3.ownApprover.submit",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<approver@flow3.test>",
+    "frontlinerEmail": "approver@flow3.test",
+    "frontlinerName": "Arjun Approver",
+    "managerId": "<leader@flow3.test>",
+    "managerEmail": "leader@flow3.test",
+    "managerName": "Lata Leader",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Arjun Approver",
+      "userEmail": "approver@flow3.test",
+      "actorName": "Arjun Approver",
+      "actorKind": "customer"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT",
+     "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+    },
+    "_id": "<oid>",
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "_documents": []
+   },
+   "message": "Submitted for approval"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<approver@flow3.test>",
+   "frontlinerEmail": "approver@flow3.test",
+   "frontlinerName": "Arjun Approver",
+   "managerId": "<leader@flow3.test>",
+   "managerEmail": "leader@flow3.test",
+   "managerName": "Lata Leader",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<approver@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": "",
+     "actorId": "<approver@flow3.test>",
+     "actorName": "Arjun Approver",
+     "actorKind": "customer"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow3.test"
+    ],
+    "cc": [],
+    "subject": "We've received your travel request — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "4978ddc1d4331807"
+   },
+   {
+    "to": [
+     "leader@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "ffbf59d5365aa8fc"
+   }
+  ]
+ },
+ {
+  "label": "f3.self.act",
+  "status": 403,
+  "body": {
+   "error": "You cannot approve or decline your own request.",
+   "code": "SELF_APPROVAL_NOT_ALLOWED"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<approver@flow3.test>",
+   "frontlinerEmail": "approver@flow3.test",
+   "frontlinerName": "Arjun Approver",
+   "managerId": "<leader@flow3.test>",
+   "managerEmail": "leader@flow3.test",
+   "managerName": "Lata Leader",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<approver@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": "",
+     "actorId": "<approver@flow3.test>",
+     "actorName": "Arjun Approver",
+     "actorKind": "customer"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": []
+ },
+ {
+  "label": "f3.clarify",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<approver@flow3.test>",
+    "frontlinerEmail": "approver@flow3.test",
+    "frontlinerName": "Arjun Approver",
+    "managerId": "<leader@flow3.test>",
+    "managerEmail": "leader@flow3.test",
+    "managerName": "Lata Leader",
+    "status": "pending",
+    "stage": "REQUEST_NEEDS_CLARIFICATION",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Arjun Approver",
+      "userEmail": "approver@flow3.test",
+      "actorName": "Arjun Approver",
+      "actorKind": "customer"
+     },
+     {
+      "action": "clarification_requested",
+      "at": "<date>",
+      "comment": "Which project?",
+      "userName": "Lata Leader",
+      "userEmail": "leader@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Lata Leader"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT",
+     "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+    },
+    "clarifications": [
+     {
+      "kind": "question",
+      "text": "Which project?",
+      "at": "<date>",
+      "byEmail": "leader@flow3.test",
+      "byName": "Lata Leader",
+      "edited": false,
+      "actorKind": "customer",
+      "actorName": "Lata Leader"
+     }
+    ],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 1,
+    "_documents": []
+   },
+   "message": "Updated"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<approver@flow3.test>",
+   "frontlinerEmail": "approver@flow3.test",
+   "frontlinerName": "Arjun Approver",
+   "managerId": "<leader@flow3.test>",
+   "managerEmail": "leader@flow3.test",
+   "managerName": "Lata Leader",
+   "status": "pending",
+   "stage": "REQUEST_NEEDS_CLARIFICATION",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<approver@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": "",
+     "actorId": "<approver@flow3.test>",
+     "actorName": "Arjun Approver",
+     "actorKind": "customer"
+    },
+    {
+     "action": "clarification_requested",
+     "at": "<date>",
+     "by": "<leader@flow3.test>",
+     "comment": "Which project?",
+     "userName": "Lata Leader",
+     "userEmail": "leader@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+   },
+   "clarifications": [
+    {
+     "kind": "question",
+     "text": "Which project?",
+     "at": "<date>",
+     "byEmail": "leader@flow3.test",
+     "byName": "Lata Leader",
+     "edited": false
+    }
+   ],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 1
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Your approver has a question — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "92487e2e8cc7b3d4"
+   }
+  ]
+ },
+ {
+  "label": "f3.reply",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<approver@flow3.test>",
+    "frontlinerEmail": "approver@flow3.test",
+    "frontlinerName": "Arjun Approver",
+    "managerId": "<leader@flow3.test>",
+    "managerEmail": "leader@flow3.test",
+    "managerName": "Lata Leader",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Arjun Approver",
+      "userEmail": "approver@flow3.test",
+      "actorName": "Arjun Approver",
+      "actorKind": "customer"
+     },
+     {
+      "action": "clarification_requested",
+      "at": "<date>",
+      "comment": "Which project?",
+      "userName": "Lata Leader",
+      "userEmail": "leader@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Lata Leader"
+     },
+     {
+      "action": "clarification_replied",
+      "at": "<date>",
+      "comment": "Project Atlas",
+      "userName": "Arjun Approver",
+      "userEmail": "approver@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Arjun Approver"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT",
+     "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+    },
+    "clarifications": [
+     {
+      "kind": "question",
+      "text": "Which project?",
+      "at": "<date>",
+      "byEmail": "leader@flow3.test",
+      "byName": "Lata Leader",
+      "edited": false,
+      "actorKind": "customer",
+      "actorName": "Lata Leader"
+     },
+     {
+      "kind": "reply",
+      "text": "Project Atlas",
+      "at": "<date>",
+      "byEmail": "approver@flow3.test",
+      "byName": "Arjun Approver",
+      "edited": false,
+      "actorKind": "customer",
+      "actorName": "Arjun Approver"
+     }
+    ],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 2,
+    "_documents": []
+   },
+   "message": "Reply sent to your approver"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<approver@flow3.test>",
+   "frontlinerEmail": "approver@flow3.test",
+   "frontlinerName": "Arjun Approver",
+   "managerId": "<leader@flow3.test>",
+   "managerEmail": "leader@flow3.test",
+   "managerName": "Lata Leader",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<approver@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": "",
+     "actorId": "<approver@flow3.test>",
+     "actorName": "Arjun Approver",
+     "actorKind": "customer"
+    },
+    {
+     "action": "clarification_requested",
+     "at": "<date>",
+     "by": "<leader@flow3.test>",
+     "comment": "Which project?",
+     "userName": "Lata Leader",
+     "userEmail": "leader@flow3.test",
+     "tokenHash": ""
+    },
+    {
+     "action": "clarification_replied",
+     "at": "<date>",
+     "by": "<approver@flow3.test>",
+     "comment": "Project Atlas",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+   },
+   "clarifications": [
+    {
+     "kind": "question",
+     "text": "Which project?",
+     "at": "<date>",
+     "byEmail": "leader@flow3.test",
+     "byName": "Lata Leader",
+     "edited": false
+    },
+    {
+     "kind": "reply",
+     "text": "Project Atlas",
+     "at": "<date>",
+     "byEmail": "approver@flow3.test",
+     "byName": "Arjun Approver",
+     "edited": false
+    }
+   ],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 2
+  },
+  "mails": [
+   {
+    "to": [
+     "leader@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Reply received — Approval Needed — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "5c96254c172b53f5"
+   }
+  ]
+ },
+ {
+  "label": "f3.decline.noReason",
+  "status": 400,
+  "body": {
+   "error": "A reason is required to decline.",
+   "code": "REASON_REQUIRED"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<approver@flow3.test>",
+   "frontlinerEmail": "approver@flow3.test",
+   "frontlinerName": "Arjun Approver",
+   "managerId": "<leader@flow3.test>",
+   "managerEmail": "leader@flow3.test",
+   "managerName": "Lata Leader",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<approver@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": "",
+     "actorId": "<approver@flow3.test>",
+     "actorName": "Arjun Approver",
+     "actorKind": "customer"
+    },
+    {
+     "action": "clarification_requested",
+     "at": "<date>",
+     "by": "<leader@flow3.test>",
+     "comment": "Which project?",
+     "userName": "Lata Leader",
+     "userEmail": "leader@flow3.test",
+     "tokenHash": ""
+    },
+    {
+     "action": "clarification_replied",
+     "at": "<date>",
+     "by": "<approver@flow3.test>",
+     "comment": "Project Atlas",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+   },
+   "clarifications": [
+    {
+     "kind": "question",
+     "text": "Which project?",
+     "at": "<date>",
+     "byEmail": "leader@flow3.test",
+     "byName": "Lata Leader",
+     "edited": false
+    },
+    {
+     "kind": "reply",
+     "text": "Project Atlas",
+     "at": "<date>",
+     "byEmail": "approver@flow3.test",
+     "byName": "Arjun Approver",
+     "edited": false
+    }
+   ],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 2
+  },
+  "mails": []
+ },
+ {
+  "label": "f3.decline",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<approver@flow3.test>",
+    "frontlinerEmail": "approver@flow3.test",
+    "frontlinerName": "Arjun Approver",
+    "managerId": "<leader@flow3.test>",
+    "managerEmail": "leader@flow3.test",
+    "managerName": "Lata Leader",
+    "status": "declined",
+    "stage": "REQUEST_DECLINED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Arjun Approver",
+      "userEmail": "approver@flow3.test",
+      "actorName": "Arjun Approver",
+      "actorKind": "customer"
+     },
+     {
+      "action": "clarification_requested",
+      "at": "<date>",
+      "comment": "Which project?",
+      "userName": "Lata Leader",
+      "userEmail": "leader@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Lata Leader"
+     },
+     {
+      "action": "clarification_replied",
+      "at": "<date>",
+      "comment": "Project Atlas",
+      "userName": "Arjun Approver",
+      "userEmail": "approver@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Arjun Approver"
+     },
+     {
+      "action": "declined",
+      "at": "<date>",
+      "comment": "Not this quarter",
+      "userName": "Lata Leader",
+      "userEmail": "leader@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Lata Leader"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT",
+     "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+    },
+    "clarifications": [
+     {
+      "kind": "question",
+      "text": "Which project?",
+      "at": "<date>",
+      "byEmail": "leader@flow3.test",
+      "byName": "Lata Leader",
+      "edited": false,
+      "actorKind": "customer",
+      "actorName": "Lata Leader"
+     },
+     {
+      "kind": "reply",
+      "text": "Project Atlas",
+      "at": "<date>",
+      "byEmail": "approver@flow3.test",
+      "byName": "Arjun Approver",
+      "edited": false,
+      "actorKind": "customer",
+      "actorName": "Arjun Approver"
+     }
+    ],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "REQUEST_DECLINED_BY_L2",
+     "request": {
+      "stage": "REQUEST_DECLINED_BY_L2"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 3,
+    "adminState": "cancelled",
+    "approvedByEmail": "leader@flow3.test",
+    "approvedByName": "Lata Leader",
+    "_documents": []
+   },
+   "message": "Updated"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<approver@flow3.test>",
+   "frontlinerEmail": "approver@flow3.test",
+   "frontlinerName": "Arjun Approver",
+   "managerId": "<leader@flow3.test>",
+   "managerEmail": "leader@flow3.test",
+   "managerName": "Lata Leader",
+   "status": "declined",
+   "stage": "REQUEST_DECLINED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<approver@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": "",
+     "actorId": "<approver@flow3.test>",
+     "actorName": "Arjun Approver",
+     "actorKind": "customer"
+    },
+    {
+     "action": "clarification_requested",
+     "at": "<date>",
+     "by": "<leader@flow3.test>",
+     "comment": "Which project?",
+     "userName": "Lata Leader",
+     "userEmail": "leader@flow3.test",
+     "tokenHash": ""
+    },
+    {
+     "action": "clarification_replied",
+     "at": "<date>",
+     "by": "<approver@flow3.test>",
+     "comment": "Project Atlas",
+     "userName": "Arjun Approver",
+     "userEmail": "approver@flow3.test",
+     "tokenHash": ""
+    },
+    {
+     "action": "declined",
+     "at": "<date>",
+     "by": "<leader@flow3.test>",
+     "comment": "Not this quarter",
+     "userName": "Lata Leader",
+     "userEmail": "leader@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+   },
+   "clarifications": [
+    {
+     "kind": "question",
+     "text": "Which project?",
+     "at": "<date>",
+     "byEmail": "leader@flow3.test",
+     "byName": "Lata Leader",
+     "edited": false
+    },
+    {
+     "kind": "reply",
+     "text": "Project Atlas",
+     "at": "<date>",
+     "byEmail": "approver@flow3.test",
+     "byName": "Arjun Approver",
+     "edited": false
+    }
+   ],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "REQUEST_DECLINED_BY_L2",
+    "request": {
+     "stage": "REQUEST_DECLINED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 3,
+   "adminState": "cancelled",
+   "approvedByEmail": "leader@flow3.test",
+   "approvedByName": "Lata Leader"
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Your Travel Request Has Been Declined — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "550d195b6dbcace1"
+   }
+  ]
+ },
+ {
+  "label": "f3.leader.auto",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<leader@flow3.test>",
+    "frontlinerEmail": "leader@flow3.test",
+    "frontlinerName": "Lata Leader",
+    "managerId": "<leader@flow3.test>",
+    "managerEmail": "leader@flow3.test",
+    "managerName": "Lata Leader",
+    "status": "approved",
+    "adminState": "pending",
+    "stage": "REQUEST_APPROVED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "approvedByName": "Lata Leader",
+    "approvedByEmail": "leader@flow3.test",
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Lata Leader",
+      "userEmail": "leader@flow3.test",
+      "actorName": "Lata Leader",
+      "actorKind": "customer"
+     },
+     {
+      "action": "approved",
+      "at": "<date>",
+      "comment": "Auto-approved — requester is a Workspace Leader (no one above to approve).",
+      "userName": "Lata Leader",
+      "userEmail": "leader@flow3.test",
+      "actorName": "System",
+      "actorKind": "system"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT",
+     "selfApproved": true,
+     "selfApprovedReason": "WL_IS_REQUESTER"
+    },
+    "_id": "<oid>",
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "REQUEST_APPROVED_BY_L2",
+     "request": {
+      "stage": "REQUEST_APPROVED_BY_L2"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "_documents": []
+   },
+   "message": "Submitted for approval"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<leader@flow3.test>",
+   "frontlinerEmail": "leader@flow3.test",
+   "frontlinerName": "Lata Leader",
+   "managerId": "<leader@flow3.test>",
+   "managerEmail": "leader@flow3.test",
+   "managerName": "Lata Leader",
+   "status": "approved",
+   "adminState": "pending",
+   "stage": "REQUEST_APPROVED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "approvedByName": "Lata Leader",
+   "approvedByEmail": "leader@flow3.test",
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<leader@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Lata Leader",
+     "userEmail": "leader@flow3.test",
+     "tokenHash": "",
+     "actorId": "<leader@flow3.test>",
+     "actorName": "Lata Leader",
+     "actorKind": "customer"
+    },
+    {
+     "action": "approved",
+     "at": "<date>",
+     "by": "<leader@flow3.test>",
+     "comment": "Auto-approved — requester is a Workspace Leader (no one above to approve).",
+     "userName": "Lata Leader",
+     "userEmail": "leader@flow3.test",
+     "tokenHash": "",
+     "actorId": "",
+     "actorName": "System",
+     "actorKind": "system"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "selfApproved": true,
+    "selfApprovedReason": "WL_IS_REQUESTER"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "REQUEST_APPROVED_BY_L2",
+    "request": {
+     "stage": "REQUEST_APPROVED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": [
+   {
+    "to": [
+     "leader@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Request Approved — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "7f376d9bab26d55b"
+   },
+   {
+    "to": [
+     "ops@plumtrips.com"
+    ],
+    "cc": [],
+    "subject": "New case — REQ-XXXXXX — Flow Three Co",
+    "replyTo": "",
+    "html": "cf6903d6a49a0f3b"
+   }
+  ]
+ },
+ {
+  "label": "f3.submit3",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<riya@flow3.test>",
+    "frontlinerEmail": "riya@flow3.test",
+    "frontlinerName": "Riya Rao",
+    "managerId": "<approver@flow3.test>",
+    "managerEmail": "approver@flow3.test",
+    "managerName": "Arjun Approver",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorName": "Riya Rao",
+      "actorKind": "customer"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT"
+    },
+    "_id": "<oid>",
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "_documents": []
+   },
+   "message": "Submitted for approval"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<riya@flow3.test>",
+   "frontlinerEmail": "riya@flow3.test",
+   "frontlinerName": "Riya Rao",
+   "managerId": "<approver@flow3.test>",
+   "managerEmail": "approver@flow3.test",
+   "managerName": "Arjun Approver",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow3.test>",
+     "actorName": "Riya Rao",
+     "actorKind": "customer"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "c4e7a5ba5bba90e9"
+   },
+   {
+    "to": [
+     "leader@flow3.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Three Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "c4e7a5ba5bba90e9"
+   },
+   {
+    "to": [
+     "riya@flow3.test"
+    ],
+    "cc": [],
+    "subject": "We've received your travel request — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "f6c30f3164feca2c"
+   }
+  ]
+ },
+ {
+  "label": "f3.revoke",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS3>",
+    "customerId": "C3",
+    "customerName": "Flow Three Co",
+    "customerEmailDomain": "flow3.test",
+    "frontlinerId": "<riya@flow3.test>",
+    "frontlinerEmail": "riya@flow3.test",
+    "frontlinerName": "Riya Rao",
+    "managerId": "<approver@flow3.test>",
+    "managerEmail": "approver@flow3.test",
+    "managerName": "Arjun Approver",
+    "status": "declined",
+    "stage": "REQUEST_DECLINED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorName": "Riya Rao",
+      "actorKind": "customer"
+     },
+     {
+      "action": "revoked",
+      "at": "<date>",
+      "comment": "Trip off",
+      "userName": "Riya Rao",
+      "userEmail": "riya@flow3.test",
+      "actorKind": "customer",
+      "actorName": "Riya Rao"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3>",
+     "ccLeaders": [
+      "leader@flow3.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT",
+     "revoked": true
+    },
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "adminState": "cancelled",
+    "_documents": []
+   },
+   "message": "Request revoked"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3>",
+   "customerId": "C3",
+   "customerName": "Flow Three Co",
+   "customerEmailDomain": "flow3.test",
+   "frontlinerId": "<riya@flow3.test>",
+   "frontlinerEmail": "riya@flow3.test",
+   "frontlinerName": "Riya Rao",
+   "managerId": "<approver@flow3.test>",
+   "managerEmail": "approver@flow3.test",
+   "managerName": "Arjun Approver",
+   "status": "declined",
+   "stage": "REQUEST_DECLINED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Client visit",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow3.test>",
+     "actorName": "Riya Rao",
+     "actorKind": "customer"
+    },
+    {
+     "action": "revoked",
+     "at": "<date>",
+     "by": "<riya@flow3.test>",
+     "comment": "Trip off",
+     "userName": "Riya Rao",
+     "userEmail": "riya@flow3.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3>",
+    "ccLeaders": [
+     "leader@flow3.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT",
+    "revoked": true
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0,
+   "adminState": "cancelled"
+  },
+  "mails": []
+ },
+ {
+  "label": "f3.mine",
+  "status": 200,
+  "body": {
+   "rows": [
+    {
+     "_id": "<oid>",
+     "workspaceId": "<WS3>",
+     "customerId": "C3",
+     "customerName": "Flow Three Co",
+     "customerEmailDomain": "flow3.test",
+     "frontlinerId": "<riya@flow3.test>",
+     "frontlinerEmail": "riya@flow3.test",
+     "frontlinerName": "Riya Rao",
+     "managerId": "<approver@flow3.test>",
+     "managerEmail": "approver@flow3.test",
+     "managerName": "Arjun Approver",
+     "status": "approved",
+     "stage": "REQUEST_APPROVED",
+     "comments": "Client visit",
+     "cartItems": [
+      {
+       "type": "flight",
+       "title": "BLR → BOM",
+       "qty": 1,
+       "meta": {
+        "origin": "BLR",
+        "destination": "BOM",
+        "tripType": "oneway",
+        "departDate": "2027-03-12",
+        "travellers": [
+         {
+          "travellerId": "m-<rand>",
+          "kind": "manual",
+          "firstName": "Asha",
+          "lastName": "Rao"
+         }
+        ],
+        "travelScope": "domestic",
+        "adults": 1,
+        "children": 0,
+        "infants": 0
+       }
+      },
+      {
+       "type": "hotel",
+       "title": "Mumbai · 2 nights",
+       "qty": 1,
+       "meta": {
+        "city": "Mumbai",
+        "checkIn": "2027-03-12",
+        "checkOut": "2027-03-14",
+        "rooms": 1,
+        "adults": 1,
+        "travellers": [
+         {
+          "travellerId": "m-<rand>",
+          "kind": "manual",
+          "firstName": "Asha",
+          "lastName": "Rao"
+         }
+        ],
+        "travelScope": "domestic",
+        "children": 0
+       }
+      }
+     ],
+     "history": [
+      {
+       "action": "submitted",
+       "at": "<date>",
+       "comment": "Client visit",
+       "userName": "Riya Rao",
+       "userEmail": "riya@flow3.test",
+       "actorName": "Riya Rao",
+       "actorKind": "customer"
+      },
+      {
+       "action": "resend_email",
+       "at": "<date>",
+       "comment": "Approval email resent by requester",
+       "userName": "Riya Rao",
+       "userEmail": "riya@flow3.test",
+       "actorKind": "customer",
+       "actorName": "Riya Rao"
+      },
+      {
+       "action": "approved",
+       "at": "<date>",
+       "comment": "ok",
+       "userName": "Arjun Approver",
+       "userEmail": "approver@flow3.test",
+       "actorKind": "customer",
+       "actorName": "Arjun Approver"
+      }
+     ],
+     "meta": {
+      "customerWorkspaceId": "<WS3>",
+      "ccLeaders": [
+       "leader@flow3.test"
+      ],
+      "travelFlow": "APPROVAL_DIRECT",
+      "lastResentAt": "<date>",
+      "resendCount": 1
+     },
+     "clarifications": [],
+     "createdAt": "<date>",
+     "updatedAt": "<date>",
+     "fsm": {
+      "current": "REQUEST_APPROVED_BY_L2",
+      "request": {
+       "stage": "REQUEST_APPROVED_BY_L2"
+      },
+      "proposal": {
+       "stage": "PROPOSAL_NONE"
+      },
+      "booking": {
+       "stage": "BOOKING_NOT_STARTED"
+      },
+      "updatedAt": "<date>",
+      "version": 1
+     },
+     "__v": 2,
+     "adminState": "pending",
+     "approvedByEmail": "approver@flow3.test",
+     "approvedByName": "Arjun Approver",
+     "_documents": []
+    },
+    {
+     "_id": "<oid>",
+     "workspaceId": "<WS3>",
+     "customerId": "C3",
+     "customerName": "Flow Three Co",
+     "customerEmailDomain": "flow3.test",
+     "frontlinerId": "<riya@flow3.test>",
+     "frontlinerEmail": "riya@flow3.test",
+     "frontlinerName": "Riya Rao",
+     "managerId": "<approver@flow3.test>",
+     "managerEmail": "approver@flow3.test",
+     "managerName": "Arjun Approver",
+     "status": "approved",
+     "stage": "REQUEST_APPROVED",
+     "comments": "Client visit",
+     "cartItems": [
+      {
+       "type": "flight",
+       "title": "BLR → BOM",
+       "qty": 1,
+       "meta": {
+        "origin": "BLR",
+        "destination": "BOM",
+        "tripType": "oneway",
+        "departDate": "2027-03-12",
+        "travellers": [
+         {
+          "travellerId": "m-<rand>",
+          "kind": "manual",
+          "firstName": "Asha",
+          "lastName": "Rao"
+         }
+        ],
+        "travelScope": "domestic",
+        "adults": 1,
+        "children": 0,
+        "infants": 0
+       }
+      }
+     ],
+     "history": [
+      {
+       "action": "submitted",
+       "at": "<date>",
+       "comment": "Client visit",
+       "userName": "Riya Rao",
+       "userEmail": "riya@flow3.test",
+       "actorName": "Riya Rao",
+       "actorKind": "customer"
+      },
+      {
+       "action": "email_declined",
+       "at": "<date>",
+       "by": "email:approver@flow3.test",
+       "comment": "Over budget",
+       "userName": "Arjun Approver",
+       "userEmail": "approver@flow3.test",
+       "actorKind": "customer",
+       "actorName": "Arjun Approver"
+      },
+      {
+       "action": "resubmitted",
+       "at": "<date>",
+       "comment": "Cheaper fare",
+       "userName": "Riya Rao",
+       "userEmail": "riya@flow3.test",
+       "actorKind": "customer",
+       "actorName": "Riya Rao"
+      },
+      {
+       "action": "approved",
+       "at": "<date>",
+       "userName": "Lata Leader",
+       "userEmail": "leader@flow3.test",
+       "actorKind": "customer",
+       "actorName": "Lata Leader"
+      }
+     ],
+     "meta": {
+      "customerWorkspaceId": "<WS3>",
+      "ccLeaders": [
+       "leader@flow3.test"
+      ],
+      "travelFlow": "APPROVAL_DIRECT",
+      "revoked": false
+     },
+     "clarifications": [],
+     "createdAt": "<date>",
+     "updatedAt": "<date>",
+     "fsm": {
+      "current": "REQUEST_APPROVED_BY_L2",
+      "request": {
+       "stage": "REQUEST_APPROVED_BY_L2"
+      },
+      "proposal": {
+       "stage": "PROPOSAL_NONE"
+      },
+      "booking": {
+       "stage": "BOOKING_NOT_STARTED"
+      },
+      "updatedAt": "<date>",
+      "version": 1
+     },
+     "__v": 2,
+     "approvedByEmail": "leader@flow3.test",
+     "approvedByName": "Lata Leader",
+     "adminState": "pending",
+     "_documents": []
+    },
+    {
+     "_id": "<oid>",
+     "workspaceId": "<WS3>",
+     "customerId": "C3",
+     "customerName": "Flow Three Co",
+     "customerEmailDomain": "flow3.test",
+     "frontlinerId": "<riya@flow3.test>",
+     "frontlinerEmail": "riya@flow3.test",
+     "frontlinerName": "Riya Rao",
+     "managerId": "<approver@flow3.test>",
+     "managerEmail": "approver@flow3.test",
+     "managerName": "Arjun Approver",
+     "status": "declined",
+     "stage": "REQUEST_DECLINED",
+     "comments": "Client visit",
+     "cartItems": [
+      {
+       "type": "flight",
+       "title": "BLR → BOM",
+       "qty": 1,
+       "meta": {
+        "origin": "BLR",
+        "destination": "BOM",
+        "tripType": "oneway",
+        "departDate": "2027-03-12",
+        "travellers": [
+         {
+          "travellerId": "m-<rand>",
+          "kind": "manual",
+          "firstName": "Asha",
+          "lastName": "Rao"
+         }
+        ],
+        "travelScope": "domestic",
+        "adults": 1,
+        "children": 0,
+        "infants": 0
+       }
+      }
+     ],
+     "history": [
+      {
+       "action": "submitted",
+       "at": "<date>",
+       "comment": "Client visit",
+       "userName": "Riya Rao",
+       "userEmail": "riya@flow3.test",
+       "actorName": "Riya Rao",
+       "actorKind": "customer"
+      },
+      {
+       "action": "revoked",
+       "at": "<date>",
+       "comment": "Trip off",
+       "userName": "Riya Rao",
+       "userEmail": "riya@flow3.test",
+       "actorKind": "customer",
+       "actorName": "Riya Rao"
+      }
+     ],
+     "meta": {
+      "customerWorkspaceId": "<WS3>",
+      "ccLeaders": [
+       "leader@flow3.test"
+      ],
+      "travelFlow": "APPROVAL_DIRECT",
+      "revoked": true
+     },
+     "clarifications": [],
+     "createdAt": "<date>",
+     "updatedAt": "<date>",
+     "fsm": {
+      "current": "AWAITING_L2_REQUEST_APPROVAL",
+      "request": {
+       "stage": "AWAITING_L2_REQUEST_APPROVAL"
+      },
+      "proposal": {
+       "stage": "PROPOSAL_NONE"
+      },
+      "booking": {
+       "stage": "BOOKING_NOT_STARTED"
+      },
+      "updatedAt": "<date>",
+      "version": 1
+     },
+     "__v": 0,
+     "adminState": "cancelled",
+     "_documents": []
+    }
+   ]
+  },
+  "request": null,
+  "mails": []
+ },
+ {
+  "label": "f2.submit",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "workspaceId": "<WS2>",
+    "customerId": "C2",
+    "customerName": "Flow Two Co",
+    "customerEmailDomain": "flow2.test",
+    "frontlinerId": "<riya@flow2.test>",
+    "frontlinerEmail": "riya@flow2.test",
+    "frontlinerName": "Ravi Rao",
+    "managerId": "<approver@flow2.test>",
+    "managerEmail": "approver@flow2.test",
+    "managerName": "Anil Approver",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Ravi Rao",
+      "userEmail": "riya@flow2.test",
+      "actorName": "Ravi Rao",
+      "actorKind": "customer"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS2>",
+     "ccLeaders": [
+      "leader@flow2.test"
+     ],
+     "travelFlow": "APPROVAL_FLOW"
+    },
+    "_id": "<oid>",
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "_documents": []
+   },
+   "message": "Submitted for approval"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS2>",
+   "customerId": "C2",
+   "customerName": "Flow Two Co",
+   "customerEmailDomain": "flow2.test",
+   "frontlinerId": "<riya@flow2.test>",
+   "frontlinerEmail": "riya@flow2.test",
+   "frontlinerName": "Ravi Rao",
+   "managerId": "<approver@flow2.test>",
+   "managerEmail": "approver@flow2.test",
+   "managerName": "Anil Approver",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow2.test>",
+     "comment": "Client visit",
+     "userName": "Ravi Rao",
+     "userEmail": "riya@flow2.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow2.test>",
+     "actorName": "Ravi Rao",
+     "actorKind": "customer"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS2>",
+    "ccLeaders": [
+     "leader@flow2.test"
+    ],
+    "travelFlow": "APPROVAL_FLOW"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow2.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Two Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "b7dae5ebd2213521"
+   },
+   {
+    "to": [
+     "leader@flow2.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Two Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "b7dae5ebd2213521"
+   },
+   {
+    "to": [
+     "riya@flow2.test"
+    ],
+    "cc": [],
+    "subject": "We've received your travel request — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "473156e3aca25f61"
+   }
+  ]
+ },
+ {
+  "label": "f2.approve",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS2>",
+    "customerId": "C2",
+    "customerName": "Flow Two Co",
+    "customerEmailDomain": "flow2.test",
+    "frontlinerId": "<riya@flow2.test>",
+    "frontlinerEmail": "riya@flow2.test",
+    "frontlinerName": "Ravi Rao",
+    "managerId": "<approver@flow2.test>",
+    "managerEmail": "approver@flow2.test",
+    "managerName": "Anil Approver",
+    "status": "approved",
+    "stage": "PROPOSAL_PENDING",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Ravi Rao",
+      "userEmail": "riya@flow2.test",
+      "actorName": "Ravi Rao",
+      "actorKind": "customer"
+     },
+     {
+      "action": "approved",
+      "at": "<date>",
+      "userName": "Anil Approver",
+      "userEmail": "approver@flow2.test",
+      "actorKind": "customer",
+      "actorName": "Anil Approver"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS2>",
+     "ccLeaders": [
+      "leader@flow2.test"
+     ],
+     "travelFlow": "APPROVAL_FLOW"
+    },
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "PROPOSAL_POSTED",
+     "request": {
+      "stage": "REQUEST_APPROVED_BY_L2"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_POSTED"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 1,
+    "adminState": "pending",
+    "approvedByEmail": "approver@flow2.test",
+    "approvedByName": "Anil Approver",
+    "_documents": []
+   },
+   "message": "Updated"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS2>",
+   "customerId": "C2",
+   "customerName": "Flow Two Co",
+   "customerEmailDomain": "flow2.test",
+   "frontlinerId": "<riya@flow2.test>",
+   "frontlinerEmail": "riya@flow2.test",
+   "frontlinerName": "Ravi Rao",
+   "managerId": "<approver@flow2.test>",
+   "managerEmail": "approver@flow2.test",
+   "managerName": "Anil Approver",
+   "status": "approved",
+   "stage": "PROPOSAL_PENDING",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<riya@flow2.test>",
+     "comment": "Client visit",
+     "userName": "Ravi Rao",
+     "userEmail": "riya@flow2.test",
+     "tokenHash": "",
+     "actorId": "<riya@flow2.test>",
+     "actorName": "Ravi Rao",
+     "actorKind": "customer"
+    },
+    {
+     "action": "approved",
+     "at": "<date>",
+     "by": "<approver@flow2.test>",
+     "userName": "Anil Approver",
+     "userEmail": "approver@flow2.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS2>",
+    "ccLeaders": [
+     "leader@flow2.test"
+    ],
+    "travelFlow": "APPROVAL_FLOW"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "PROPOSAL_POSTED",
+    "request": {
+     "stage": "REQUEST_APPROVED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_POSTED"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 1,
+   "adminState": "pending",
+   "approvedByEmail": "approver@flow2.test",
+   "approvedByName": "Anil Approver"
+  },
+  "mails": [
+   {
+    "to": [
+     "leader@flow2.test"
+    ],
+    "cc": [],
+    "subject": "Request approved — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "3a59be3f39cd4fc9"
+   },
+   {
+    "to": [
+     "ops@plumtrips.com"
+    ],
+    "cc": [],
+    "subject": "New case — REQ-XXXXXX — Flow Two Co",
+    "replyTo": "",
+    "html": "677b9b025a9a317b"
+   },
+   {
+    "to": [
+     "riya@flow2.test"
+    ],
+    "cc": [],
+    "subject": "Request approved — Flow Two Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "8d35346a366c9d0a"
+   }
+  ]
+ },
+ {
+  "label": "f2.ownApprover",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "workspaceId": "<WS2>",
+    "customerId": "C2",
+    "customerName": "Flow Two Co",
+    "customerEmailDomain": "flow2.test",
+    "frontlinerId": "<approver@flow2.test>",
+    "frontlinerEmail": "approver@flow2.test",
+    "frontlinerName": "Anil Approver",
+    "managerId": "<leader@flow2.test>",
+    "managerEmail": "leader@flow2.test",
+    "managerName": "Lina Leader",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Anil Approver",
+      "userEmail": "approver@flow2.test",
+      "actorName": "Anil Approver",
+      "actorKind": "customer"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS2>",
+     "ccLeaders": [
+      "leader@flow2.test"
+     ],
+     "travelFlow": "APPROVAL_FLOW",
+     "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+    },
+    "_id": "<oid>",
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "_documents": []
+   },
+   "message": "Submitted for approval"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS2>",
+   "customerId": "C2",
+   "customerName": "Flow Two Co",
+   "customerEmailDomain": "flow2.test",
+   "frontlinerId": "<approver@flow2.test>",
+   "frontlinerEmail": "approver@flow2.test",
+   "frontlinerName": "Anil Approver",
+   "managerId": "<leader@flow2.test>",
+   "managerEmail": "leader@flow2.test",
+   "managerName": "Lina Leader",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<approver@flow2.test>",
+     "comment": "Client visit",
+     "userName": "Anil Approver",
+     "userEmail": "approver@flow2.test",
+     "tokenHash": "",
+     "actorId": "<approver@flow2.test>",
+     "actorName": "Anil Approver",
+     "actorKind": "customer"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS2>",
+    "ccLeaders": [
+     "leader@flow2.test"
+    ],
+    "travelFlow": "APPROVAL_FLOW",
+    "routedToLeaderReason": "REQUESTER_IS_APPROVER"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@flow2.test"
+    ],
+    "cc": [],
+    "subject": "We've received your travel request — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "92ac9832cbcc9c0c"
+   },
+   {
+    "to": [
+     "leader@flow2.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Flow Two Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "7ae4a8346688b9a7"
+   }
+  ]
+ },
+ {
+  "label": "f2.leader.auto",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "workspaceId": "<WS2>",
+    "customerId": "C2",
+    "customerName": "Flow Two Co",
+    "customerEmailDomain": "flow2.test",
+    "frontlinerId": "<leader@flow2.test>",
+    "frontlinerEmail": "leader@flow2.test",
+    "frontlinerName": "Lina Leader",
+    "managerId": "<leader@flow2.test>",
+    "managerEmail": "leader@flow2.test",
+    "managerName": "Lina Leader",
+    "status": "approved",
+    "adminState": "pending",
+    "stage": "PROPOSAL_PENDING",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "approvedByName": "Lina Leader",
+    "approvedByEmail": "leader@flow2.test",
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Lina Leader",
+      "userEmail": "leader@flow2.test",
+      "actorName": "Lina Leader",
+      "actorKind": "customer"
+     },
+     {
+      "action": "approved",
+      "at": "<date>",
+      "comment": "Auto-approved — requester is a Workspace Leader (no one above to approve).",
+      "userName": "Lina Leader",
+      "userEmail": "leader@flow2.test",
+      "actorName": "System",
+      "actorKind": "system"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS2>",
+     "ccLeaders": [
+      "leader@flow2.test"
+     ],
+     "travelFlow": "APPROVAL_FLOW",
+     "selfApproved": true,
+     "selfApprovedReason": "WL_IS_REQUESTER"
+    },
+    "_id": "<oid>",
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "PROPOSAL_POSTED",
+     "request": {
+      "stage": "REQUEST_APPROVED_BY_L2"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_POSTED"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "_documents": []
+   },
+   "message": "Submitted for approval"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS2>",
+   "customerId": "C2",
+   "customerName": "Flow Two Co",
+   "customerEmailDomain": "flow2.test",
+   "frontlinerId": "<leader@flow2.test>",
+   "frontlinerEmail": "leader@flow2.test",
+   "frontlinerName": "Lina Leader",
+   "managerId": "<leader@flow2.test>",
+   "managerEmail": "leader@flow2.test",
+   "managerName": "Lina Leader",
+   "status": "approved",
+   "adminState": "pending",
+   "stage": "PROPOSAL_PENDING",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "approvedByName": "Lina Leader",
+   "approvedByEmail": "leader@flow2.test",
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<leader@flow2.test>",
+     "comment": "Client visit",
+     "userName": "Lina Leader",
+     "userEmail": "leader@flow2.test",
+     "tokenHash": "",
+     "actorId": "<leader@flow2.test>",
+     "actorName": "Lina Leader",
+     "actorKind": "customer"
+    },
+    {
+     "action": "approved",
+     "at": "<date>",
+     "by": "<leader@flow2.test>",
+     "comment": "Auto-approved — requester is a Workspace Leader (no one above to approve).",
+     "userName": "Lina Leader",
+     "userEmail": "leader@flow2.test",
+     "tokenHash": "",
+     "actorId": "",
+     "actorName": "System",
+     "actorKind": "system"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS2>",
+    "ccLeaders": [
+     "leader@flow2.test"
+    ],
+    "travelFlow": "APPROVAL_FLOW",
+    "selfApproved": true,
+    "selfApprovedReason": "WL_IS_REQUESTER"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "PROPOSAL_POSTED",
+    "request": {
+     "stage": "REQUEST_APPROVED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_POSTED"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": [
+   {
+    "to": [
+     "leader@flow2.test"
+    ],
+    "cc": [],
+    "subject": "Request Approved — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "3babca87a95ffa02"
+   },
+   {
+    "to": [
+     "ops@plumtrips.com"
+    ],
+    "cc": [],
+    "subject": "New case — REQ-XXXXXX — Flow Two Co",
+    "replyTo": "",
+    "html": "42897eb912f4bd72"
+   }
+  ]
+ },
+ {
+  "label": "org.context",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "companyName": "Org Co",
+   "approver": {
+    "status": "ok",
+    "name": "Ola Approver"
+   }
+  },
+  "request": null,
+  "mails": []
+ },
+ {
+  "label": "org.submit",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "workspaceId": "<WS3_ORG>",
+    "customerId": "CO",
+    "customerName": "Org Co",
+    "customerEmailDomain": "org.test",
+    "frontlinerId": "<emp@org.test>",
+    "frontlinerEmail": "emp@org.test",
+    "frontlinerName": "Esha Employee",
+    "managerId": "<approver@org.test>",
+    "managerEmail": "approver@org.test",
+    "managerName": "Ola Approver",
+    "status": "pending",
+    "stage": "REQUEST_RAISED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Esha Employee",
+      "userEmail": "emp@org.test",
+      "actorName": "Esha Employee",
+      "actorKind": "customer"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3_ORG>",
+     "ccLeaders": [
+      "leader@org.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT"
+    },
+    "_id": "<oid>",
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "AWAITING_L2_REQUEST_APPROVAL",
+     "request": {
+      "stage": "AWAITING_L2_REQUEST_APPROVAL"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 0,
+    "_documents": []
+   },
+   "message": "Submitted for approval"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3_ORG>",
+   "customerId": "CO",
+   "customerName": "Org Co",
+   "customerEmailDomain": "org.test",
+   "frontlinerId": "<emp@org.test>",
+   "frontlinerEmail": "emp@org.test",
+   "frontlinerName": "Esha Employee",
+   "managerId": "<approver@org.test>",
+   "managerEmail": "approver@org.test",
+   "managerName": "Ola Approver",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<emp@org.test>",
+     "comment": "Client visit",
+     "userName": "Esha Employee",
+     "userEmail": "emp@org.test",
+     "tokenHash": "",
+     "actorId": "<emp@org.test>",
+     "actorName": "Esha Employee",
+     "actorKind": "customer"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3_ORG>",
+    "ccLeaders": [
+     "leader@org.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@org.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Org Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "06079a0e276128a0"
+   },
+   {
+    "to": [
+     "emp@org.test"
+    ],
+    "cc": [],
+    "subject": "We've received your travel request — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "3c6e0d7f5b763124"
+   },
+   {
+    "to": [
+     "leader@org.test"
+    ],
+    "cc": [],
+    "subject": "Approval Needed — Org Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "06079a0e276128a0"
+   }
+  ]
+ },
+ {
+  "label": "org.head.act",
+  "status": 403,
+  "body": {
+   "error": "You are no longer an approver for this request.",
+   "code": "NOT_AN_APPROVER"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3_ORG>",
+   "customerId": "CO",
+   "customerName": "Org Co",
+   "customerEmailDomain": "org.test",
+   "frontlinerId": "<emp@org.test>",
+   "frontlinerEmail": "emp@org.test",
+   "frontlinerName": "Esha Employee",
+   "managerId": "<approver@org.test>",
+   "managerEmail": "approver@org.test",
+   "managerName": "Ola Approver",
+   "status": "pending",
+   "stage": "REQUEST_RAISED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<emp@org.test>",
+     "comment": "Client visit",
+     "userName": "Esha Employee",
+     "userEmail": "emp@org.test",
+     "tokenHash": "",
+     "actorId": "<emp@org.test>",
+     "actorName": "Esha Employee",
+     "actorKind": "customer"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3_ORG>",
+    "ccLeaders": [
+     "leader@org.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "AWAITING_L2_REQUEST_APPROVAL",
+    "request": {
+     "stage": "AWAITING_L2_REQUEST_APPROVAL"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": []
+ },
+ {
+  "label": "org.head.detail",
+  "status": 403,
+  "body": {
+   "error": "Not allowed"
+  },
+  "request": null,
+  "mails": []
+ },
+ {
+  "label": "org.mgr.detail",
+  "status": 403,
+  "body": {
+   "error": "Not allowed"
+  },
+  "request": null,
+  "mails": []
+ },
+ {
+  "label": "org.leader.approve",
+  "status": 200,
+  "body": {
+   "ok": true,
+   "request": {
+    "_id": "<oid>",
+    "workspaceId": "<WS3_ORG>",
+    "customerId": "CO",
+    "customerName": "Org Co",
+    "customerEmailDomain": "org.test",
+    "frontlinerId": "<emp@org.test>",
+    "frontlinerEmail": "emp@org.test",
+    "frontlinerName": "Esha Employee",
+    "managerId": "<approver@org.test>",
+    "managerEmail": "approver@org.test",
+    "managerName": "Ola Approver",
+    "status": "approved",
+    "stage": "REQUEST_APPROVED",
+    "comments": "Client visit",
+    "cartItems": [
+     {
+      "type": "flight",
+      "title": "BLR → BOM",
+      "qty": 1,
+      "meta": {
+       "origin": "BLR",
+       "destination": "BOM",
+       "tripType": "oneway",
+       "departDate": "2027-03-12",
+       "travellers": [
+        {
+         "travellerId": "m-<rand>",
+         "kind": "manual",
+         "firstName": "Asha",
+         "lastName": "Rao"
+        }
+       ],
+       "travelScope": "domestic",
+       "adults": 1,
+       "children": 0,
+       "infants": 0
+      }
+     }
+    ],
+    "history": [
+     {
+      "action": "submitted",
+      "at": "<date>",
+      "comment": "Client visit",
+      "userName": "Esha Employee",
+      "userEmail": "emp@org.test",
+      "actorName": "Esha Employee",
+      "actorKind": "customer"
+     },
+     {
+      "action": "approved",
+      "at": "<date>",
+      "userName": "Leo Leader",
+      "userEmail": "leader@org.test",
+      "actorKind": "customer",
+      "actorName": "Leo Leader"
+     }
+    ],
+    "meta": {
+     "customerWorkspaceId": "<WS3_ORG>",
+     "ccLeaders": [
+      "leader@org.test"
+     ],
+     "travelFlow": "APPROVAL_DIRECT"
+    },
+    "clarifications": [],
+    "createdAt": "<date>",
+    "updatedAt": "<date>",
+    "fsm": {
+     "current": "REQUEST_APPROVED_BY_L2",
+     "request": {
+      "stage": "REQUEST_APPROVED_BY_L2"
+     },
+     "proposal": {
+      "stage": "PROPOSAL_NONE"
+     },
+     "booking": {
+      "stage": "BOOKING_NOT_STARTED"
+     },
+     "updatedAt": "<date>",
+     "version": 1
+    },
+    "__v": 1,
+    "adminState": "pending",
+    "approvedByEmail": "leader@org.test",
+    "approvedByName": "Leo Leader",
+    "_documents": []
+   },
+   "message": "Updated"
+  },
+  "request": {
+   "_id": "<oid>",
+   "workspaceId": "<WS3_ORG>",
+   "customerId": "CO",
+   "customerName": "Org Co",
+   "customerEmailDomain": "org.test",
+   "frontlinerId": "<emp@org.test>",
+   "frontlinerEmail": "emp@org.test",
+   "frontlinerName": "Esha Employee",
+   "managerId": "<approver@org.test>",
+   "managerEmail": "approver@org.test",
+   "managerName": "Ola Approver",
+   "status": "approved",
+   "stage": "REQUEST_APPROVED",
+   "comments": "Client visit",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → BOM",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "BOM",
+      "tripType": "oneway",
+      "departDate": "2027-03-12",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Asha",
+        "lastName": "Rao"
+       }
+      ],
+      "travelScope": "domestic",
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "<emp@org.test>",
+     "comment": "Client visit",
+     "userName": "Esha Employee",
+     "userEmail": "emp@org.test",
+     "tokenHash": "",
+     "actorId": "<emp@org.test>",
+     "actorName": "Esha Employee",
+     "actorKind": "customer"
+    },
+    {
+     "action": "approved",
+     "at": "<date>",
+     "by": "<leader@org.test>",
+     "userName": "Leo Leader",
+     "userEmail": "leader@org.test",
+     "tokenHash": ""
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<WS3_ORG>",
+    "ccLeaders": [
+     "leader@org.test"
+    ],
+    "travelFlow": "APPROVAL_DIRECT"
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "REQUEST_APPROVED_BY_L2",
+    "request": {
+     "stage": "REQUEST_APPROVED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 1,
+   "adminState": "pending",
+   "approvedByEmail": "leader@org.test",
+   "approvedByName": "Leo Leader"
+  },
+  "mails": [
+   {
+    "to": [
+     "approver@org.test"
+    ],
+    "cc": [],
+    "subject": "Request approved — REQ-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "08d896720539243c"
+   },
+   {
+    "to": [
+     "emp@org.test"
+    ],
+    "cc": [],
+    "subject": "Request approved — Org Co (REQ-XXXXXX)",
+    "replyTo": "ops@plumtrips.com",
+    "html": "59d0c74a40754480"
+   },
+   {
+    "to": [
+     "ops@plumtrips.com"
+    ],
+    "cc": [],
+    "subject": "New case — REQ-XXXXXX — Org Co",
+    "replyTo": "",
+    "html": "7d1e1ff2621440fd"
+   }
+  ]
+ },
+ {
+  "label": "noapp.submit",
+  "status": 400,
+  "body": {
+   "error": "Approver not configured. Please set defaultApproverEmails in customerworkspaces (or ensure a WORKSPACE_LEADER exists).",
+   "debug": {
+    "customerId": "CN",
+    "resolvedWorkspace": true,
+    "workspaceId": "<WS_NOAPP>",
+    "leaders": [],
+    "defaultApproverEmails": []
+   }
+  },
+  "request": null,
+  "mails": []
+ },
+ {
+  "label": "partner.submit",
+  "status": 201,
+  "body": {
+   "ok": true,
+   "caseNumber": "PL-XXXXXX"
+  },
+  "request": {
+   "_id": "<oid>",
+   "ticketId": "PL-XXXXXX",
+   "workspaceId": "<AMBER>",
+   "customerId": "<AMBER_CUSTOMER>",
+   "customerName": "Amber Student",
+   "frontlinerId": "<INTAKE_ID>",
+   "frontlinerEmail": "system-partner-intake@plumtrips.com",
+   "frontlinerName": "Partner Intake",
+   "managerId": "<INTAKE_ID>",
+   "managerEmail": "system-partner-intake@plumtrips.com",
+   "managerName": "Partner Intake",
+   "status": "approved",
+   "adminState": "pending",
+   "stage": "REQUEST_APPROVED",
+   "cartItems": [
+    {
+     "type": "flight",
+     "title": "BLR → DEL",
+     "qty": 1,
+     "price": 0,
+     "meta": {
+      "origin": "BLR",
+      "destination": "DEL",
+      "tripType": "oneway",
+      "departDate": "2027-04-02",
+      "travelScope": "domestic",
+      "travellers": [
+       {
+        "travellerId": "m-<rand>",
+        "kind": "manual",
+        "firstName": "Riya",
+        "lastName": "Sen",
+        "phone": "9876543210",
+        "email": "riya@student.test"
+       }
+      ],
+      "adults": 1,
+      "children": 0,
+      "infants": 0
+     }
+    }
+   ],
+   "approvedByName": "Partner Intake",
+   "approvedByEmail": "system-partner-intake@plumtrips.com",
+   "history": [
+    {
+     "action": "submitted",
+     "at": "<date>",
+     "by": "system:partner-intake",
+     "comment": "Case created — partner lead from Amber Student · homepage-banner",
+     "userName": "Partner Intake",
+     "userEmail": "system-partner-intake@plumtrips.com",
+     "tokenHash": "",
+     "actorId": "",
+     "actorName": "System",
+     "actorKind": "system"
+    },
+    {
+     "action": "approved",
+     "at": "<date>",
+     "by": "system:partner-intake",
+     "comment": "In Admin Queue — partner lead, customer approval not required",
+     "userName": "Partner Intake",
+     "userEmail": "system-partner-intake@plumtrips.com",
+     "tokenHash": "",
+     "actorId": "",
+     "actorName": "System",
+     "actorKind": "system"
+    }
+   ],
+   "meta": {
+    "customerWorkspaceId": "<AMBER>",
+    "ccLeaders": [],
+    "travelFlow": "APPROVAL_DIRECT",
+    "source": "PARTNER_LINK",
+    "partnerLead": {
+     "intakeRef": "partner:<uuid>",
+     "caseNumber": "PL-XXXXXX",
+     "linkId": "<oid>",
+     "code": "AmbR2026",
+     "placement": "homepage-banner",
+     "partnerWorkspaceId": "<AMBER>",
+     "partnerName": "Amber Student",
+     "embedMode": "tab",
+     "parentOrigin": "",
+     "referrer": "https://amberstudent.com/page",
+     "utm": {
+      "source": "amber",
+      "medium": "banner",
+      "campaign": "",
+      "content": "",
+      "term": ""
+     },
+     "contact": {
+      "name": "Riya Sen",
+      "email": "riya@student.test",
+      "phone": "+91 98765 43210"
+     },
+     "contactEmailHash": "<hex>",
+     "consent": {
+      "version": "2026-10",
+      "at": "<date>",
+      "textHash": "<hex>"
+     },
+     "submittedAt": "<date>",
+     "ipHash": "<hex>"
+    }
+   },
+   "clarifications": [],
+   "createdAt": "<date>",
+   "updatedAt": "<date>",
+   "fsm": {
+    "current": "REQUEST_APPROVED_BY_L2",
+    "request": {
+     "stage": "REQUEST_APPROVED_BY_L2"
+    },
+    "proposal": {
+     "stage": "PROPOSAL_NONE"
+    },
+    "booking": {
+     "stage": "BOOKING_NOT_STARTED"
+    },
+    "updatedAt": "<date>",
+    "version": 1
+   },
+   "__v": 0
+  },
+  "mails": [
+   {
+    "to": [
+     "ops@plumtrips.com"
+    ],
+    "cc": [],
+    "subject": "New case — PL-XXXXXX — Amber Student",
+    "replyTo": "",
+    "html": "e41079d21d4f493e"
+   },
+   {
+    "to": [
+     "riya@student.test"
+    ],
+    "cc": [],
+    "subject": "We have your travel request — PL-XXXXXX",
+    "replyTo": "ops@plumtrips.com",
+    "html": "7b6b1fa7b30d244f"
+   }
+  ]
+ }
+]

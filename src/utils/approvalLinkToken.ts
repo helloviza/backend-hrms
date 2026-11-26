@@ -22,6 +22,12 @@ export type ApprovalLinkPayload = {
   id: string;
   /** The recipient the link was sent to (lowercased). */
   email: string;
+  /**
+   * Approval workflow requests only: the step the link decides,
+   * "<round>.<index>.<key>" (services/approvalWorkflow/engine.ts stepClaim).
+   * A link whose step is no longer the current one is refused.
+   */
+  step?: string;
 };
 
 /**
@@ -59,7 +65,7 @@ export function approvalLinkExpiryHours(_ws?: any): number {
 
 /** Returns null when no link secret is configured (production without one). */
 export function signApprovalLink(
-  input: { kind: ApprovalLinkKind; id: string; email: string },
+  input: { kind: ApprovalLinkKind; id: string; email: string; step?: string },
   expiryHours: number,
 ): string | null {
   const secret = approvalLinkSecret();
@@ -69,6 +75,7 @@ export function signApprovalLink(
     kind: input.kind,
     id: String(input.id),
     email: String(input.email || "").trim().toLowerCase(),
+    ...(input.step ? { step: String(input.step) } : {}),
   };
   return jwt.sign(payload, secret, { expiresIn: `${expiryHours}h`, audience: "approval-link" });
 }
@@ -87,7 +94,7 @@ export function verifyApprovalLink(token: string): ApprovalLinkPayload {
     if (!p?.jti || !p?.id || !p?.email || (p.kind !== "request" && p.kind !== "proposal")) {
       throw new Error("bad payload");
     }
-    return { jti: p.jti, kind: p.kind, id: p.id, email: p.email };
+    return { jti: p.jti, kind: p.kind, id: p.id, email: p.email, ...(p.step ? { step: String(p.step) } : {}) };
   } catch (e: any) {
     if (e?.name === "TokenExpiredError") {
       throw new ApprovalLinkError(410, "LINK_EXPIRED", "This link has expired. Open Plumbox to review the request.");

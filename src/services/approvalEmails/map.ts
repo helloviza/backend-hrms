@@ -32,6 +32,11 @@
 //   agent          the Travel Desk agent the case is assigned to
 //   proposalStaff  the staff who drafted / submitted the proposal
 //   desk           the ops desk mailbox, DESK_EMAIL (ops@plumtrips.com)
+//   watchers       approval workflow only: the WATCHER steps' people (e.g.
+//                  the reporting manager), for the events their step lists
+//                  (D9); never a decision link
+//   travelAdmins   approval workflow only: the workspace's travel admins
+//                  (email.travelAdminEmails, D1)
 
 export type EmailRole =
   | "requester"
@@ -41,7 +46,9 @@ export type EmailRole =
   | "asker"
   | "agent"
   | "proposalStaff"
-  | "desk";
+  | "desk"
+  | "watchers"
+  | "travelAdmins";
 
 export type LinkType = "decision-request" | "decision-proposal" | "login" | "staff-login" | "none";
 
@@ -95,6 +102,16 @@ export const APPROVAL_EMAIL_MAP = {
     template: "approverRequestHtml",
     subject: "Approval Needed — {customer} ({code})",
     notes: "Leaders may decide too (\"either\" rule), so they get their own decision links. Not sent for an auto-approved request.",
+  },
+  request_step_pending: {
+    label: "Approval needed (next step of a workflow)",
+    flows: BOTH,
+    trigger: "An approver step of an approval workflow is approved and the chain has another approver step",
+    to: ["deciders"], cc: [], exclude: [], excludeActor: true, decidersOf: "request",
+    replyTo: "desk", audience: "customer", perRecipient: true, link: "decision-request",
+    template: "approverRequestHtml",
+    subject: "Approval Needed — {customer} ({code})",
+    notes: "Workflow requests only. Goes to the next step's assignees, each with their own step-bound links (a link for a step already decided is refused).",
   },
   request_submitted_confirmation: {
     label: "Request received (requester)",
@@ -201,6 +218,26 @@ export const APPROVAL_EMAIL_MAP = {
   },
 
   /* ───────────── ops queue ───────────── */
+  request_watcher_fyi: {
+    label: "For your information (watcher)",
+    flows: BOTH,
+    trigger: "Approval workflow requests: submitted, approved, declined, booking done — each only if the watcher step lists it",
+    to: ["watchers"], cc: [], exclude: ["requester"], excludeActor: true,
+    replyTo: "desk", audience: "customer", perRecipient: false, link: "login",
+    template: "workflowFyiHtml",
+    subject: "FYI: {requester}'s travel request {state} — {code}",
+    notes: "No decision links: a watcher can view the request but never decide it (in-app or by link).",
+  },
+  request_travel_admin_fyi: {
+    label: "Request approved (client travel admins)",
+    flows: BOTH,
+    trigger: "Approval workflow requests: the request is approved (last step, or a Workspace Leader override)",
+    to: ["travelAdmins"], cc: [], exclude: ["requester"], excludeActor: true,
+    replyTo: "desk", audience: "customer", perRecipient: false, link: "none",
+    template: "workflowFyiHtml",
+    subject: "Approved — {requester}'s travel request — {code}",
+    notes: "D1: the workspace's email.travelAdminEmails. They are also copied on Booking processed and Documents ready.",
+  },
   ops_new_case: {
     label: "New case in the ops queue",
     flows: BOTH,
@@ -342,7 +379,7 @@ export const APPROVAL_EMAIL_MAP = {
     label: "Booking processed",
     flows: BOTH,
     trigger: "Ops mark the booking done (queue or proposal page)",
-    to: ["requester"], cc: ["approver", "leaders"], exclude: [], excludeActor: false,
+    to: ["requester"], cc: ["approver", "leaders", "travelAdmins"], exclude: [], excludeActor: false,
     replyTo: "desk", audience: "customer", perRecipient: false, link: "none",
     template: "bookingDoneHtml",
     subject: "Your Booking has been Processed — {customer} ({code})",
@@ -352,7 +389,7 @@ export const APPROVAL_EMAIL_MAP = {
     label: "Documents ready",
     flows: BOTH,
     trigger: "A customer document (ticket / voucher / document) is added to a booking whose request is already booked",
-    to: ["requester"], cc: ["approver", "leaders"], exclude: [], excludeActor: false,
+    to: ["requester"], cc: ["approver", "leaders", "travelAdmins"], exclude: [], excludeActor: false,
     replyTo: "desk", audience: "customer", perRecipient: false, link: "none",
     template: "documentsReadyHtml",
     subject: "Your travel documents — {customer} ({code})",
@@ -393,6 +430,8 @@ export const ROLE_LABEL: Record<EmailRole, string> = {
   agent: "Assigned Travel Desk agent",
   proposalStaff: "Proposal drafter / submitter (staff)",
   desk: "Ops desk (ops@plumtrips.com)",
+  watchers: "Watchers (approval workflow, e.g. the reporting manager)",
+  travelAdmins: "Client travel admins (approval workflow)",
 };
 
 /** The five people/mailboxes the per-role tables are written for. */
@@ -402,4 +441,6 @@ export const ROLE_VIEWS: Array<{ title: string; roles: EmailRole[] }> = [
   { title: "Workspace Leader", roles: ["leaders", "deciders", "asker"] },
   { title: "Assigned ops agent", roles: ["agent", "proposalStaff"] },
   { title: "Ops desk (ops@plumtrips.com)", roles: ["desk"] },
+  { title: "Watcher (approval workflow)", roles: ["watchers"] },
+  { title: "Client travel admin (approval workflow)", roles: ["travelAdmins"] },
 ];

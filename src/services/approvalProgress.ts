@@ -198,6 +198,8 @@ export async function markRequestDone(opts: {
     },
     onFailed: { action: "admin_notify_failed", ...row, comment: "Booking email could not be delivered after retries" },
   });
+  // Approval workflow: the watchers whose step lists "booking_done" (D9). No documents, no link.
+  if (doc.workflow) await notifySafely("request_watcher_fyi", { ar: ctx.ar, watcherEvent: "booking_done" });
 
   let message = "Marked done";
   if (!sent || sent.skipped === "no-recipients") {

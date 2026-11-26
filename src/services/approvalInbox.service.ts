@@ -81,7 +81,8 @@ export async function travelRequestInboxQuery(req: any): Promise<TravelInboxScop
             ...notOwn,
           },
           {
-            $or: [{ managerEmail: exactIRegex(email) }, { "meta.ccLeaders": exactIRegex(email) }],
+            // workflow.pendingEmails: a workflow request's current step assignees.
+            $or: [{ managerEmail: exactIRegex(email) }, { "meta.ccLeaders": exactIRegex(email) }, { "workflow.pendingEmails": email }],
           },
         ],
       };

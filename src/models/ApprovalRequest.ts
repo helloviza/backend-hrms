@@ -181,6 +181,8 @@ export interface ApprovalRequestDocument extends Document {
   /** Staff only (select:false): every full-passport reveal in the ops drawer. */
   passportReveals?: PassportRevealEntry[];
   meta?: any;
+  /** Approval-workflow snapshot (services/approvalWorkflow/engine.ts WorkflowSnapshot); absent = today's routing. */
+  workflow?: any;
 
   // pricing (admin write; viewer sanitization happens in routes)
   bookingAmount?: number; // customer-facing amount
@@ -513,6 +515,11 @@ const ApprovalRequestSchema = new Schema<ApprovalRequestDocument>(
     // ✅ CRITICAL: meta must always exist (attachments, ccLeaders, revoked, etc.)
     meta: { type: Schema.Types.Mixed, default: {} },
 
+    // The approval-workflow snapshot, written once at submit when the
+    // workspace has a workflow in force (services/approvalWorkflow/). Absent on
+    // every other request — absent = today's routing.
+    workflow: { type: Schema.Types.Mixed, default: undefined },
+
     // pricing
     bookingAmount: { type: Number },
     actualBookingPrice: { type: Number },
@@ -635,6 +642,11 @@ for (const op of ["updateOne", "updateMany", "findOneAndUpdate", "replaceOne"] a
 
 ApprovalRequestSchema.plugin(workspaceScopePlugin);
 ApprovalRequestSchema.index({ workspaceId: 1, status: 1, updatedAt: -1 });
+// Approval workflow (services/approvalWorkflow/engine.ts): the inbox reads the
+// current step's assignees, the FYI bucket the watchers. Sparse: only
+// requests raised under a workflow carry them.
+ApprovalRequestSchema.index({ "workflow.pendingEmails": 1 }, { sparse: true });
+ApprovalRequestSchema.index({ "workflow.watcherEmails": 1 }, { sparse: true });
 
 const ApprovalRequest: Model<ApprovalRequestDocument> =
   mongoose.models.ApprovalRequest ||

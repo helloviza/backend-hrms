@@ -330,6 +330,8 @@ vi.mock("../models/EmailOutbox.js", () => ({
 vi.mock("../models/ApprovalLinkUse.js", () => ({
   default: { findOne: () => chain(() => null), create: async () => ({}) },
 }));
+// No approval workflow in force (in-memory stubs, no DB): today's routing.
+vi.mock("../services/approvalWorkflow/store.js", () => ({ activeWorkflowFor: async () => null }));
 // Models here are in-memory stubs (no DB); Travel Desk allocation is covered by
 // approvals.travelDesk.test.ts — here it is simply off.
 vi.mock("../services/travelDesk.js", async (orig) => ({

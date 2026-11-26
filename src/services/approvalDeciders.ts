@@ -10,6 +10,7 @@ import CustomerMember from "../models/CustomerMember.js";
 import User from "../models/User.js";
 import WorkspaceMembership from "../models/WorkspaceMembership.js";
 import { isOwnCompany } from "./activeMembership.js";
+import { hasWorkflow, workflowDeciders, workflowProposalDeciders } from "./approvalWorkflow/engine.js";
 
 type AnyObj = Record<string, any>;
 
@@ -83,10 +84,14 @@ export async function inactiveEmails(emails: string[]): Promise<Set<string>> {
  * Who may decide this request now: the assigned approver while still a
  * workspace approver (defaultApproverEmails) or leader, plus every active
  * Workspace Leader. The requester is never on the list.
+ *
+ * A request raised under an approval workflow (ar.workflow) follows its chain
+ * instead: services/approvalWorkflow/engine.ts workflowDeciders.
  */
 export async function requestDeciders(ar: AnyObj): Promise<string[]> {
   const ws = await workspaceOf(ar);
   const leaders = await activeLeaderEmails(ws, ar);
+  if (hasWorkflow(ar)) return workflowDeciders(ar, leaders);
   const approvers: string[] = (Array.isArray(ws?.defaultApproverEmails) ? ws!.defaultApproverEmails : []).map(norm);
   const manager = norm(ar?.managerEmail);
   const requester = norm(ar?.frontlinerEmail);
@@ -105,6 +110,7 @@ export async function requestDeciders(ar: AnyObj): Promise<string[]> {
 export async function proposalDeciders(ar: AnyObj): Promise<string[]> {
   const ws = await workspaceOf(ar);
   const leaders = await activeLeaderEmails(ws, ar);
+  if (hasWorkflow(ar)) return workflowProposalDeciders(ar, leaders);
   const approvers: string[] = (Array.isArray(ws?.defaultApproverEmails) ? ws!.defaultApproverEmails : []).map(norm);
   const manager = norm(ar?.managerEmail);
   const requester = norm(ar?.frontlinerEmail);
