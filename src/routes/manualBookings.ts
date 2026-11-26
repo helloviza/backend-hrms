@@ -15,6 +15,9 @@ import ManualBooking, {
   MANUAL_BOOKING_TYPES,
   ALL_SUB_STATUSES,
 } from "../models/ManualBooking.js";
+import { lockedPricingChanges, PRICE_LOCKED_CODE, PriceLockedError } from "../utils/sbtLinkLock.js";
+import { findSbtPnrMatches, duplicateResponse, SBT_PNR_DUPLICATE } from "../services/sbtPnrGuard.js";
+import { ensureLinkedManualBooking, sbtLinkPricing } from "../services/sbtManualLink.js";
 import SBTBooking from "../models/SBTBooking.js";
 import SBTHotelBooking from "../models/SBTHotelBooking.js";
 import Customer from "../models/Customer.js";
@@ -306,6 +309,11 @@ const PASSENGER_INPUT_FIELDS = ["name", "email", "phone", "panNo", "passportNo",
 // Sources a client may claim on create. SBT / SBT_AUTO rows are written by
 // the import-from-sbt handler and the SBT auto-mirror, never by this body.
 const CLIENT_CREATABLE_SOURCES = ["MANUAL", "ADMIN_QUEUE"];
+
+// A booking linked to an SBT booking is cancelled in SBT (the supplier
+// cancellation), never by an edit or the cancel button here (spec §3.3).
+export const SBT_LINKED_CANCEL_MESSAGE =
+  "This booking was made online in SBT — cancel it in SBT. The cancellation and refund are noted on this booking automatically.";
 
 // Statuses a client may set. INVOICED is written by the invoice flow only
 // (routes/invoices.ts) — and PUT already refuses to touch an INVOICED row.
@@ -865,6 +873,31 @@ export const PROSPECT_COMPANY_MAX = 200;
 router.post("/", requirePermission("manualBookings", "WRITE"), (req: any, res: any) => createBooking(req, res, false));
 router.post("/enquiry", requirePermission("manualBookings", "WRITE"), (req: any, res: any) => createBooking(req, res, true));
 
+/**
+ * Duplicate PNR guard (spec §3.4) for create / PUT. `refusal` = the 409 body
+ * to send; `ack` = the record to store when the operator saved anyway
+ * (body.acknowledgeSbtDuplicate === true). Neither = no match.
+ */
+async function sbtDuplicateCheck(
+  req: any,
+  pnr: unknown,
+  travelDate: unknown,
+  excludeBookingId?: unknown,
+): Promise<{ refusal?: ReturnType<typeof duplicateResponse>; ack?: Record<string, unknown> }> {
+  if (!String(pnr ?? "").trim()) return {};
+  const matches = await findSbtPnrMatches(pnr, { travelDate, excludeBookingId });
+  if (!matches.length) return {};
+  if (req.body?.acknowledgeSbtDuplicate !== true) return { refusal: duplicateResponse(matches) };
+  return {
+    ack: {
+      at: new Date(),
+      by: req.user?._id,
+      byName: req.user?.name || req.user?.email || undefined,
+      matches,
+    },
+  };
+}
+
 async function createBooking(req: any, res: any, enquiry: boolean) {
   try {
     const attErr = rejectClientAttachments(req.body);
@@ -996,6 +1029,10 @@ async function createBooking(req: any, res: any, enquiry: boolean) {
     const gateErr = attachmentGateError(null, { ...body, source, status, attachments: [] });
     if (gateErr) return res.status(400).json({ error: gateErr, code: "ATTACHMENT_REQUIRED" });
 
+    // Duplicate guard (spec §3.4): the PNR is already an SBT booking.
+    const dup = await sbtDuplicateCheck(req, body.supplierPNR, body.travelDate);
+    if (dup.refusal) return res.status(409).json(dup.refusal);
+
     const bookedFromCity = await resolveBookedFromCity(req);
 
     const booking = await ManualBooking.create({
@@ -1016,6 +1053,7 @@ async function createBooking(req: any, res: any, enquiry: boolean) {
       ...(enquiry ? { metadata: { channel: ADMIN_ENQUIRY_CHANNEL, loggedAt: new Date() } } : {}),
       // Enquiry route only (see PROSPECT_COMPANY_REQUIRED above).
       ...(prospectCompanyName ? { prospectCompanyName } : {}),
+      ...(dup.ack ? { duplicateAck: dup.ack } : {}),
     });
 
     // Task automation hook for pending bookings
@@ -1343,127 +1381,110 @@ router.get("/export", requirePermission("manualBookings", "FULL"), async (req: a
   }
 });
 
-/* ── SBT Queue ───────────────────────────────────────────────────── */
+/* ── SBT Queue = the link repair view (spec §3.1, P1) ─────────────── */
 
 // GET /api/admin/manual-bookings/sbt-queue
+//
+// Confirmed SBT flights and hotels with NO linked Manual Booking: the ones
+// automatic linking has not (yet) covered — switched off, a link failure, or
+// made before the switch went on. Linked bookings (sbtLink, or an old import
+// row: source SBT + sourceBookingId) are left out. Each row carries the last
+// link error and attempt count when there were any. Test and demo bookings
+// never appear; cancelled / pending / held ones are not sales and can't be
+// linked (POST /import-from-sbt refuses them).
 router.get("/sbt-queue", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
   try {
-    // Fetch already-imported IDs (include all, flag with alreadyImported instead of excluding)
-    const [importedRaw, importedHotelRaw] = await Promise.all([
-      ManualBooking.find({ source: "SBT", type: { $ne: "HOTEL" }, isDemo: { $ne: true } }).distinct("sourceBookingId"),
-      ManualBooking.find({ source: "SBT", type: "HOTEL", isDemo: { $ne: true } }).distinct("sourceBookingId"),
-    ]);
-    const importedSet = new Set(importedRaw.map((id: any) => id.toString()));
-    const importedHotelSet = new Set(importedHotelRaw.map((id: any) => id.toString()));
-
+    const live = { status: "CONFIRMED", isDemo: { $ne: true }, isTest: { $ne: true } };
     const [flights, hotels] = await Promise.all([
-      // CANCELLED is left out — it cannot be imported (see /import-from-sbt).
-      SBTBooking.find({
-        status: { $in: ["CONFIRMED", "PENDING"] },
-        isDemo: { $ne: true },
-        isTest: { $ne: true }, // internal test bookings are never invoiced
-      })
-        .populate("workspaceId", "name companyName customerId")
-        .sort({ createdAt: -1 })
-        .limit(200)
-        .lean(),
-      SBTHotelBooking.find({
-        status: { $in: ["CONFIRMED", "PENDING", "HELD"] },
-        isDemo: { $ne: true },
-        isTest: { $ne: true },
-      })
-        .populate("workspaceId", "name companyName customerId")
-        .sort({ createdAt: -1 })
-        .limit(200)
-        .lean(),
+      SBTBooking.find(live).sort({ createdAt: -1 }).limit(500).lean(),
+      SBTHotelBooking.find(live).sort({ createdAt: -1 }).limit(500).lean(),
     ]);
 
-    // Build CWS id → CWS doc map for name resolution
-    const cwsIds = [
-      ...flights.map((b: any) => b.workspaceId?._id || b.workspaceId),
-      ...hotels.map((b: any) => b.workspaceId?._id || b.workspaceId),
-    ].filter(Boolean);
+    const allIds = [...flights, ...hotels].map((b: any) => b._id);
+    const linkedRows: any[] = allIds.length
+      ? await ManualBooking.find({
+          $or: [
+            { "sbtLink.bookingId": { $in: allIds } },
+            { sourceBookingId: { $in: allIds }, source: { $in: ["SBT", "SBT_AUTO"] } },
+          ],
+        }).select("sbtLink.bookingId sourceBookingId").lean()
+      : [];
+    const linked = new Set(linkedRows.map((m) => String(m.sbtLink?.bookingId ?? m.sourceBookingId)));
+    const open = (b: any) => !linked.has(String(b._id));
+    const openFlights = (flights as any[]).filter(open);
+    const openHotels = (hotels as any[]).filter(open);
 
-    const cwsDocs = await CustomerWorkspace.find({ _id: { $in: cwsIds } })
-      .select("customerId name companyName")
-      .lean();
+    // CustomerWorkspace → Customer, for the client name and Customer._id.
+    const cwsIds = [...openFlights, ...openHotels].map((b: any) => b.workspaceId).filter(Boolean);
+    const cwsDocs: any[] = await CustomerWorkspace.find({ _id: { $in: cwsIds } }).select("customerId name companyName").lean();
+    const cwsMap = new Map(cwsDocs.map((c) => [String(c._id), c]));
+    const customerIds = cwsDocs.map((c) => c.customerId).filter((id: any) => id && mongoose.Types.ObjectId.isValid(String(id)));
+    const customerDocs: any[] = await Customer.find({ _id: { $in: customerIds } }).select("legalName name companyName").lean();
+    const customerMap = new Map(customerDocs.map((c) => [String(c._id), c.legalName || c.name || c.companyName || ""]));
 
-    const cwsMap: Record<string, any> = {};
-    (cwsDocs as any[]).forEach((cws) => {
-      cwsMap[cws._id.toString()] = cws;
-    });
-
-    // Resolve Customer docs for accurate legalName via CWS.customerId
-    const customerIds = (cwsDocs as any[])
-      .map((cws: any) => cws.customerId)
-      .filter(Boolean);
-
-    const validCustomerIds = customerIds.filter((id: any) => {
-      try { return mongoose.Types.ObjectId.isValid(id); } catch { return false; }
-    });
-
-    const customerDocs = await Customer.find({ _id: { $in: validCustomerIds } })
-      .select("legalName name companyName")
-      .lean();
-
-    const customerMap: Record<string, string> = {};
-    (customerDocs as any[]).forEach((c: any) => {
-      customerMap[c._id.toString()] = c.legalName || c.name || c.companyName || "";
-    });
-
-    const mappedFlights = (flights as any[]).map((b) => {
-      const cwsId = (b.workspaceId?._id || b.workspaceId)?.toString() ?? "";
-      const cws = cwsMap[cwsId];
-      const customerId = cws?.customerId?.toString();
-      const clientName = customerId
-        ? (customerMap[customerId] || cws?.companyName || cws?.name || "")
-        : (cws?.companyName || cws?.name || "");
+    const client = (b: any) => {
+      const cws: any = cwsMap.get(String(b.workspaceId));
+      const customerId = cws?.customerId ? String(cws.customerId) : "";
       return {
-        _id: b._id.toString(),
+        workspaceId: customerId || String(b.workspaceId || ""),
+        clientName: (customerId && customerMap.get(customerId)) || cws?.companyName || cws?.name || "",
+      };
+    };
+    const linkState = (b: any) => ({
+      alreadyImported: false,
+      linkError: b.manualLinkError || null,
+      linkAttempts: Number(b.manualLinkAttempts) || 0,
+      linkAttemptAt: b.manualLinkAttemptAt || null,
+    });
+
+    const items = [
+      ...openFlights.map((b: any) => ({
+        _id: String(b._id),
         sourceType: "SBT",
         bookingType: "FLIGHT",
         bookingRef: b.pnr || b.bookingId || "",
         route: `${b.origin?.city || ""} → ${b.destination?.city || ""}`,
         passengerName: `${b.passengers?.[0]?.firstName || ""} ${b.passengers?.[0]?.lastName || ""}`.trim(),
         travelDate: b.departureTime || "",
-        quotedPrice: b.displayAmount || b.totalFare || 0,
+        quotedPrice: b.totalFare || b.displayAmount || 0,
         status: b.status,
-        workspaceId: customerId || cwsId,
-        clientName,
-        alreadyImported: importedSet.has(b._id.toString()),
-      };
-    });
-
-    const mappedHotels = (hotels as any[]).map((b) => {
-      const cwsId = (b.workspaceId?._id || b.workspaceId)?.toString() ?? "";
-      const cws = cwsMap[cwsId];
-      const customerId = cws?.customerId?.toString();
-      const clientName = customerId
-        ? (customerMap[customerId] || cws?.companyName || cws?.name || "")
-        : (cws?.companyName || cws?.name || "");
-      return {
-        _id: b._id.toString(),
+        ...client(b),
+        ...linkState(b),
+      })),
+      ...openHotels.map((b: any) => ({
+        _id: String(b._id),
         sourceType: "SBT",
         bookingType: "HOTEL",
         bookingRef: b.confirmationNo || b.bookingRefNo || b.bookingId || "",
         route: b.hotelName || b.cityName || "",
         passengerName: `${b.guests?.[0]?.FirstName || ""} ${b.guests?.[0]?.LastName || ""}`.trim(),
         travelDate: b.checkIn || "",
-        quotedPrice: b.displayAmount || b.totalFare || 0,
+        quotedPrice: b.totalFare || b.displayAmount || 0,
         status: b.status,
-        workspaceId: customerId || cwsId,
-        clientName,
-        alreadyImported: importedHotelSet.has(b._id.toString()),
-      };
-    });
-
-    const items = [...mappedFlights, ...mappedHotels].sort(
-      (a, b) => new Date(b.travelDate).getTime() - new Date(a.travelDate).getTime(),
-    );
+        ...client(b),
+        ...linkState(b),
+      })),
+    ].sort((a, b) => new Date(b.travelDate).getTime() - new Date(a.travelDate).getTime());
 
     res.json({ items, total: items.length });
   } catch (err: any) {
     console.error("[ManualBookings sbt-queue]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/manual-bookings/pnr-check?pnr=&travelDate=&bookingId=
+// The form's inline duplicate warning (spec §3.4) — the same matches the
+// create / PUT guard would refuse with. bookingId = the booking being edited.
+router.get("/pnr-check", requirePermission("manualBookings", "READ"), async (req: any, res: any) => {
+  try {
+    const matches = await findSbtPnrMatches(req.query.pnr, {
+      travelDate: req.query.travelDate,
+      excludeBookingId: req.query.bookingId,
+    });
+    res.json({ ok: true, matches, code: matches.length ? SBT_PNR_DUPLICATE : null });
+  } catch (err: any) {
+    console.error("[ManualBookings pnr-check]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1723,7 +1744,7 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
       "hotelname", "roomtype", "roomcount", "description", "passengername", "passengertype",
       "phone", "pan",
       "actualprice", "quotedprice", "gstmode", "gstpercent",
-      "suppliername", "supplierpnr", "notes",
+      "suppliername", "supplierpnr", "notes", "ackduplicate",
     ].forEach((h) => { COLS[h] = rawHeaders.indexOf(h); });
 
     function cell(row: any[], key: string): string {
@@ -1773,7 +1794,7 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
     }
 
     type RowErr = { field: string; error: string };
-    type RowResult = { rowNumber: number; valid: boolean; data?: any; errors?: RowErr[] };
+    type RowResult = { rowNumber: number; valid: boolean; data?: any; errors?: RowErr[]; warnings?: RowErr[]; code?: string };
     const results: RowResult[] = [];
 
     for (let i = 1; i < rows.length; i++) {
@@ -1917,6 +1938,25 @@ router.post("/import", requirePermission("manualBookings", "WRITE"), xlsxUpload.
           createdByDemoUser: req.user?.isDemoUser === true,
         },
       });
+    }
+
+    // Duplicate guard (spec §3.4): a row whose PNR is already an SBT booking is
+    // skipped unless its ackDuplicate column says YES.
+    for (const row of results) {
+      if (!row.valid || !row.data?.supplierPNR) continue;
+      const matches = await findSbtPnrMatches(row.data.supplierPNR, { travelDate: row.data.travelDate });
+      if (!matches.length) continue;
+      const src = rows[row.rowNumber - 1] as any[];
+      const ack = String(cell(src || [], "ackduplicate")).trim().toUpperCase() === "YES";
+      const what = matches.map((m) => `${m.kind === "HOTEL" ? "hotel" : "flight"} ${m.pnr}${m.linkedBookingRef ? ` (${m.linkedBookingRef})` : ""}`).join(", ");
+      if (ack) {
+        row.warnings = [...(row.warnings || []), { field: "supplierPNR", error: `PNR matches SBT booking ${what} — imported anyway (ackDuplicate = YES)` }];
+        row.data.duplicateAck = { at: new Date(), by: req.user?._id, byName: req.user?.name || req.user?.email, matches };
+      } else {
+        row.valid = false;
+        row.errors = [...(row.errors || []), { field: "supplierPNR", error: `PNR matches SBT booking ${what} — the trip would count twice. Set ackDuplicate = YES to import it anyway.` }];
+        row.code = SBT_PNR_DUPLICATE;
+      }
     }
 
     const validRows = results.filter((r) => r.valid);
@@ -2335,11 +2375,32 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
     }
     const partnerCase = await partnerCaseForBooking(booking);
 
+    // Linked SBT booking (spec §3.3): its cancellation comes from SBT, never
+    // from an edit here.
+    if ((booking as any).sbtLink && body.status === "CANCELLED" && booking.status !== "CANCELLED") {
+      return res.status(400).json({ error: SBT_LINKED_CANCEL_MESSAGE, code: "SBT_LINKED_CANCEL" });
+    }
+
     // Snapshot the pre-update document so we can tell which required fields
     // were already present (Option B: enforce only those — don't force legacy
     // bookings to backfill fields they never had).
     const before = booking.toObject();
     Object.assign(booking, body);
+
+    // Price lock (spec §3.3): the edit may not move a locked figure. The model
+    // refuses it too (pre-save); this is the readable answer.
+    const lockedChanged = lockedPricingChanges(booking);
+    if (lockedChanged.length) {
+      return res.status(400).json({ error: new PriceLockedError(lockedChanged).message, code: PRICE_LOCKED_CODE, fields: lockedChanged });
+    }
+
+    // Duplicate guard (spec §3.4) — only when the PNR changes.
+    const pnrChanged = String(before.supplierPNR ?? "").trim().toUpperCase() !== String(booking.supplierPNR ?? "").trim().toUpperCase();
+    if (pnrChanged) {
+      const dup = await sbtDuplicateCheck(req, booking.supplierPNR, booking.travelDate, booking._id);
+      if (dup.refusal) return res.status(409).json(dup.refusal);
+      if (dup.ack) (booking as any).duplicateAck = dup.ack;
+    }
 
     // Not Contactable lead: the basics only. Moving OFF an NC sub status: the
     // full create rules, not Option B — an NC lead was allowed to skip fields
@@ -2380,6 +2441,9 @@ router.put("/:id", requirePermission("manualBookings", "WRITE"), async (req: any
       : null;
     res.json({ ok: true, booking, requestSync, paymentLinks });
   } catch (err: any) {
+    if (err?.code === PRICE_LOCKED_CODE) {
+      return res.status(400).json({ error: err.message, code: PRICE_LOCKED_CODE, fields: err.fields });
+    }
     console.error("[ManualBookings PUT]", err.message);
     res.status(500).json({ error: err.message });
   }
@@ -2476,6 +2540,7 @@ router.post("/:id/cancel", requirePermission("manualBookings", "FULL"), async (r
 
     if (booking.status === "CANCELLED") return res.status(400).json({ error: "Already cancelled" });
     if (booking.isActive === false) return res.status(400).json({ error: "Cannot cancel a deleted booking" });
+    if (booking.sbtLink) return res.status(400).json({ error: SBT_LINKED_CANCEL_MESSAGE, code: "SBT_LINKED_CANCEL" });
 
     const invoiceCount = await Invoice.countDocuments({
       bookingIds: booking._id,
@@ -2975,33 +3040,30 @@ router.post(
   },
 );
 
-/* ── Import from SBT ─────────────────────────────────────────────── */
+/* ── Import from SBT = link now (spec §3.1, P1) ──────────────────── */
 
 /**
- * Invoice pricing for an imported SBT booking. A booking priced by the margin
- * engine carries the margin its quote recorded (marginSource set): the client
- * paid totalFare, of which marginAmount is our markup — so cost = paid − markup
- * and the GST-on-markup is on exactly that markup (none when it is ≤ 0).
- * Older bookings keep the stored net / display figures.
+ * Invoice pricing for an SBT booking — kept for callers of the old import
+ * helper; the figures are services/sbtManualLink.ts sbtLinkPricing's: cost =
+ * paid − the recorded margin (add-ons at cost), quoted = the charge; without a
+ * margin record, cost = the supplier net (+ extras).
  */
 export function sbtImportPricing(sbtDoc: any) {
-  const recorded = typeof sbtDoc.marginSource === "string" && sbtDoc.marginSource !== "";
-  const paid = Number(sbtDoc.totalFare) || 0;
-  return {
-    actualPrice: recorded ? paid - (Number(sbtDoc.marginAmount) || 0) : sbtDoc.netAmount || sbtDoc.totalFare || 0,
-    quotedPrice: recorded ? paid : sbtDoc.displayAmount || sbtDoc.totalFare || 0,
-    gstMode: "ON_MARKUP",
-    gstPercent: 18,
-    currency: "INR",
-  };
+  const { actualPrice, quotedPrice } = sbtLinkPricing(sbtDoc);
+  return { actualPrice, quotedPrice, gstMode: "ON_MARKUP", gstPercent: 18, currency: "INR" };
 }
 
 // POST /api/admin/manual-bookings/import-from-sbt
+//
+// Staff "link this one now" from the repair view. The SAME service as the
+// automatic link (services/sbtManualLink.ts), so the mapping, the price lock
+// and the idempotency are identical — two staff (or staff and the hook)
+// importing at once get one booking (unique index on sbtLink.bookingId).
+// Works with the automatic switch off. Refuses test, cancelled and
+// not-yet-confirmed bookings. Response shape unchanged.
 router.post("/import-from-sbt", requirePermission("manualBookings", "FULL"), async (req: any, res: any) => {
   try {
     const { bookingIds } = req.body as { bookingIds: string[] };
-    const sourceType = (req.body.sourceType as string) || "SBT";
-
     if (!Array.isArray(bookingIds) || !bookingIds.length) {
       return res.status(400).json({ error: "bookingIds array is required" });
     }
@@ -3010,149 +3072,37 @@ router.post("/import-from-sbt", requirePermission("manualBookings", "FULL"), asy
     let skipped = 0;
     let failed = 0;
     const details: { bookingId: string; status: string; bookingRef?: string; error?: string }[] = [];
+    const fail = (bookingId: string, error: string) => {
+      failed++;
+      details.push({ bookingId, status: "failed", error });
+    };
 
     for (const bookingId of bookingIds) {
-      // Check if already imported
-      const exists = await ManualBooking.findOne({ sourceBookingId: bookingId }).lean();
-      if (exists) {
-        skipped++;
-        details.push({ bookingId, status: "skipped" });
-        continue;
+      if (!mongoose.isValidObjectId(bookingId)) { fail(String(bookingId), "source booking not found"); continue; }
+      let model: "SBTBooking" | "SBTHotelBooking" = "SBTBooking";
+      let sbtDoc: any = await SBTBooking.findById(bookingId).lean();
+      if (!sbtDoc) {
+        sbtDoc = await SBTHotelBooking.findById(bookingId).lean();
+        model = "SBTHotelBooking";
       }
+      if (!sbtDoc) { fail(bookingId, "source booking not found"); continue; }
+      // Internal test bookings are never imported (and so never invoiced).
+      if (sbtDoc.isTest === true) { fail(bookingId, "test booking — not imported"); continue; }
+      // A cancelled SBT booking is not a sale.
+      const st = String(sbtDoc.status || "").toUpperCase();
+      if (st === "CANCELLED" || st === "CANCEL_PENDING") { fail(bookingId, "cancelled booking — not imported"); continue; }
 
-      try {
-        let sbtDoc: any = null;
-        let bookingKind: "FLIGHT" | "HOTEL" = "FLIGHT";
-
-        sbtDoc = await SBTBooking.findById(bookingId).lean();
-        if (!sbtDoc) {
-          const hotelDoc = await SBTHotelBooking.findById(bookingId).lean();
-          if (hotelDoc) {
-            sbtDoc = hotelDoc;
-            bookingKind = "HOTEL";
-          }
-        }
-
-        if (!sbtDoc) {
-          failed++;
-          details.push({ bookingId, status: "failed", error: "source booking not found" });
-          continue;
-        }
-        // Internal test bookings are never imported (and so never invoiced).
-        if (sbtDoc.isTest === true) {
-          failed++;
-          details.push({ bookingId, status: "failed", error: "test booking — not imported" });
-          continue;
-        }
-        // A cancelled SBT booking is not a sale: importing it used to write a
-        // full-fare CONFIRMED ManualBooking. Refused, like a test booking.
-        if (String(sbtDoc.status || "").toUpperCase() === "CANCELLED") {
-          failed++;
-          details.push({ bookingId, status: "failed", error: "cancelled booking — not imported" });
-          continue;
-        }
-
-        // SBTBooking.workspaceId is a CustomerWorkspace._id.
-        // Resolve to Customer._id so ManualBooking.workspaceId is consistent
-        // with the rest of the system (which uses Customer._id, not CWS._id).
-        const cws = await CustomerWorkspace.findById(sbtDoc.workspaceId)
-          .select("customerId")
-          .lean() as any;
-        const workspaceId = cws?.customerId || sbtDoc.workspaceId;
-
-        let data: any;
-
-        if (bookingKind === "FLIGHT") {
-          data = {
-            workspaceId,
-            type: "FLIGHT",
-            source: "SBT",
-            sourceBookingId: sbtDoc._id,
-            sourceBookingRef: sbtDoc.pnr || sbtDoc.bookingId || String(sbtDoc._id),
-            bookingDate: new Date(),
-            travelDate: new Date(sbtDoc.departureTime),
-            sector: `${sbtDoc.origin?.city || ""}-${sbtDoc.destination?.city || ""}`,
-            itinerary: {
-              origin: sbtDoc.origin?.city || "",
-              destination: sbtDoc.destination?.city || "",
-              airline: sbtDoc.airlineName || "",
-              flightNo: sbtDoc.flightNumber || "",
-              description: `${sbtDoc.origin?.city || ""} → ${sbtDoc.destination?.city || ""}`,
-            },
-            passengers: (sbtDoc.passengers || []).map((p: any) => ({
-              name: `${p.firstName || ""} ${p.lastName || ""}`.trim(),
-              type:
-                p.paxType === "CHILD" || p.paxType === 2
-                  ? "CHILD"
-                  : p.paxType === "INFANT" || p.paxType === 3
-                    ? "INFANT"
-                    : "ADULT",
-            })),
-            pricing: sbtImportPricing(sbtDoc),
-            supplierName: sbtDoc.airlineName || "TBO",
-            supplierPNR: sbtDoc.pnr || sbtDoc.bookingId,
-            status: "CONFIRMED",
-            bookedBy: req.user._id,
-            notes: `Imported from SBT on ${new Date().toLocaleDateString()}`,
-            // Demo Platform — SBT→Manual import inherits the SBT booking's demo flag
-            isDemo: !!sbtDoc.isDemo || req.user?.isDemoUser === true,
-            createdByDemoUser: req.user?.isDemoUser === true,
-          };
-        } else {
-          const nights = Math.max(
-            1,
-            Math.round(
-              (new Date(sbtDoc.checkOut).getTime() - new Date(sbtDoc.checkIn).getTime()) / 86400000,
-            ),
-          );
-          data = {
-            workspaceId,
-            type: "HOTEL",
-            source: "SBT",
-            sourceBookingId: sbtDoc._id,
-            sourceBookingRef:
-              sbtDoc.confirmationNo || sbtDoc.bookingRefNo || sbtDoc.bookingId || String(sbtDoc._id),
-            bookingDate: new Date(),
-            travelDate: new Date(sbtDoc.checkIn),
-            returnDate: new Date(sbtDoc.checkOut),
-            sector: sbtDoc.cityName || "",
-            itinerary: {
-              hotelName: sbtDoc.hotelName || "",
-              roomType: sbtDoc.roomName || "",
-              destination: sbtDoc.cityName || "",
-              nights,
-              description: sbtDoc.hotelName || "",
-            },
-            passengers: (sbtDoc.guests || []).map((g: any) => ({
-              name: `${g.FirstName || ""} ${g.LastName || ""}`.trim(),
-              type: "ADULT",
-            })),
-            pricing: sbtImportPricing(sbtDoc),
-            supplierName: "TBO",
-            supplierPNR: sbtDoc.confirmationNo || sbtDoc.bookingRefNo || sbtDoc.bookingId,
-            status: "CONFIRMED",
-            bookedBy: req.user._id,
-            notes: `Imported from SBT Hotels on ${new Date().toLocaleDateString()}`,
-            // Demo Platform — SBT→Manual import inherits the SBT booking's demo flag
-            isDemo: !!sbtDoc.isDemo || req.user?.isDemoUser === true,
-            createdByDemoUser: req.user?.isDemoUser === true,
-          };
-        }
-
-        const importErrors = validateImportRequired(data);
-        if (importErrors.length) {
-          failed++;
-          details.push({ bookingId, status: "failed", error: importErrors.join("; ") });
-          continue;
-        }
-
-        const doc = new ManualBooking(data);
-        await doc.save();
+      const r = await ensureLinkedManualBooking(model, sbtDoc, { via: "IMPORT", actor: { _id: req.user?._id, email: req.user?.email } });
+      if (r.status === "created") {
         imported++;
-        details.push({ bookingId, status: "imported", bookingRef: doc.bookingRef });
-      } catch (saveErr: any) {
-        failed++;
-        details.push({ bookingId, status: "failed", error: saveErr.message });
+        details.push({ bookingId, status: "imported", bookingRef: r.booking.bookingRef });
+      } else if (r.status === "exists") {
+        skipped++;
+        details.push({ bookingId, status: "skipped", bookingRef: r.booking.bookingRef });
+      } else if (r.status === "skipped") {
+        fail(bookingId, r.reason === "NOT_CONFIRMED" ? "not confirmed yet — not imported" : "not imported");
+      } else {
+        fail(bookingId, r.error);
       }
     }
 

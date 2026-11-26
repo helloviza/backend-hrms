@@ -2,6 +2,7 @@ import { Schema, model, type Document } from "mongoose";
 import { workspaceScopePlugin } from "../plugins/workspaceScope.plugin.js";
 import TravelBooking from "./TravelBooking.js";
 import { attachMirrorResyncHooks } from "../utils/mirrorResyncHooks.js";
+import { queueManualLink, queueManualLinks } from "../services/sbtManualLinkTrigger.js";
 import { travelCanonicalCity as canonicalCity, travelCountryFor as countryFor } from "../data/destinationLookup.js";
 import { internationalFrom, sbtFlightAnalytics } from "../services/travelMirrorAnalytics.js";
 import { sbtCabin } from "../services/ticketFallback.js";
@@ -130,6 +131,13 @@ export interface ISBTBooking extends Document {
   cancelledAt?: Date;
   isDemo?: boolean;
   createdByDemoUser?: boolean;
+  // SBT → Manual Booking link (services/sbtManualLink.ts, spec §3.1). The
+  // back-pointer is written once, by the link service only.
+  manualBookingId?: Schema.Types.ObjectId | null;
+  manualLinkError?: string | null;
+  manualLinkAttempts?: number;
+  manualLinkAttemptAt?: Date | null;
+  manualLinkAlertedAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -271,6 +279,11 @@ const SBTBookingSchema = new Schema(
     // Demo Platform — booking authored under impersonation / seeded for a demo workspace
     isDemo: { type: Boolean, default: false, index: true },
     createdByDemoUser: { type: Boolean, default: false, index: true },
+    manualBookingId: { type: Schema.Types.ObjectId, ref: "ManualBooking", default: undefined },
+    manualLinkError: { type: String, default: undefined },
+    manualLinkAttempts: { type: Number, default: undefined },
+    manualLinkAttemptAt: { type: Date, default: undefined },
+    manualLinkAlertedAt: { type: Date, default: undefined },
   },
   { timestamps: true },
 );
@@ -358,6 +371,8 @@ SBTBookingSchema.post("save", async function (doc: any) {
   } catch (e) {
     console.warn("TravelBooking sync failed:", (e as any)?.message);
   }
+  // Linked Manual Booking (spec §3.1): queued, never awaited, never throws.
+  queueManualLink("SBTBooking", doc);
 });
 
 /** Paths syncSBTBookingToMirror reads. A findOneAndUpdate / updateOne / updateMany that
@@ -386,7 +401,11 @@ export async function resyncSBTBookingMirrors(ids: unknown[]): Promise<{ synced:
 attachMirrorResyncHooks(SBTBookingSchema, {
   label: "sbt-flight",
   mirrorPaths: SBT_BOOKING_MIRROR_PATHS,
-  resync: (ids) => resyncSBTBookingMirrors(ids),
+  resync: async (ids) => {
+    const out = await resyncSBTBookingMirrors(ids);
+    queueManualLinks("SBTBooking", ids);
+    return out;
+  },
 });
 
 const SBTBookingModel = model<ISBTBooking>("SBTBooking", SBTBookingSchema);

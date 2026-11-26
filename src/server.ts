@@ -1391,6 +1391,11 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
       const { ensureInvoiceReissueIndexes } = await import("./bootstrap/ensureInvoiceReissueIndexes.js");
       await ensureInvoiceReissueIndexes().catch((e: unknown) => logger.error("[INVOICE INDEXES] ensure failed", { e }));
 
+      // SBT → Manual Booking link: the one-booking-per-SBT-booking unique
+      // index; linking fails closed while it is missing.
+      const { ensureSbtManualLinkIndexes } = await import("./bootstrap/ensureSbtManualLinkIndexes.js");
+      await ensureSbtManualLinkIndexes().catch((e: unknown) => logger.error("[SBT-LINK INDEX] ensure failed", { e }));
+
       // Travel Policy: one-draft-per-workspace + versionNumber uniqueness.
       const { ensureTravelPolicyIndexes } = await import("./bootstrap/ensureTravelPolicyIndexes.js");
       await ensureTravelPolicyIndexes().catch((e: unknown) => logger.warn("[TRAVEL POLICY INDEXES] ensure failed", { e }));
@@ -1478,6 +1483,10 @@ if (process.env.NODE_ENV !== "test" && process.env.VITEST !== "true") {
         // SBT checkout backstop: paid-but-not-booked → refund + ops alert (every 5 min)
         const { startSbtCheckoutSweepCron } = await import("./jobs/sbt-checkout-sweep.js");
         startSbtCheckoutSweepCron();
+
+        // SBT → Manual Booking link backstop (every 10 min; no-op while the switch is off)
+        const { startSbtManualLinkSweepCron } = await import("./jobs/sbt-manual-link-sweep.js");
+        startSbtManualLinkSweepCron();
 
         // Approval flows: reminders for undecided requests/proposals (every 15 min)
         const { startApprovalRemindersCron } = await import("./jobs/approval-reminders.js");

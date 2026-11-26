@@ -34,6 +34,7 @@ import {
 import { parseISTStart, parseISTEnd } from "../utils/dateIST.js";
 import { escapeRegex } from "../utils/escapeRegex.js";
 import { enumFilter } from "../utils/filterParams.js";
+import { SELF_BOOKED_KEY } from "../services/manualBookingTeamSummary.js";
 import { BOOKING_STATUSES, demoClause } from "../utils/bookingMetrics.js";
 
 const BOOKING_SOURCES = ["MANUAL", "SBT", "ADMIN_QUEUE", "SBT_AUTO"] as const;
@@ -78,13 +79,21 @@ export function buildSearchFilter(query: Record<string, any>, user?: any) {
 
   const assignmentF = enumFilter(query.assignmentStatus, ASSIGNMENT_STATUSES);
   if (assignmentF !== undefined) filter.assignmentStatus = assignmentF;
+  // Client self-booked SBT rows are never "waiting for an assignee" (spec §3.2):
+  // the Unassigned filter leaves them out.
+  if (query.assignmentStatus === "PENDING_TO_ASSIGN") filter.clientSelfBooked = { $ne: true };
 
   // assignPerson is a User._id. An unparseable id matches nothing rather than
   // being dropped — same fail-closed choice as workspaceId above.
   // "none" = no assignee at all (the Team Summary's "Unassigned" row links
   // here). `{assignPerson: null}` matches both a missing and a null field.
-  if (query.assignPerson === "none") {
+  // SELF_BOOKED_KEY = the Team Summary's "Client self-booked (SBT)" row, which
+  // "none" (Unassigned) then excludes.
+  if (query.assignPerson === SELF_BOOKED_KEY) {
+    filter.clientSelfBooked = true;
+  } else if (query.assignPerson === "none") {
     filter.assignPerson = null;
+    filter.clientSelfBooked = { $ne: true };
   } else if (query.assignPerson) {
     filter.assignPerson = mongoose.Types.ObjectId.isValid(String(query.assignPerson))
       ? new mongoose.Types.ObjectId(String(query.assignPerson))
@@ -100,8 +109,11 @@ export function buildSearchFilter(query: Record<string, any>, user?: any) {
 
   // createdBy is stored as a plain string (String(user._id))
   // "none" = no recorded creator (the Team Summary's created-by "No creator" row).
-  if (query.createdBy === "none") filter.createdBy = { $in: [null, ""] };
-  else if (query.createdBy) filter.createdBy = String(query.createdBy);
+  if (query.createdBy === SELF_BOOKED_KEY) filter.clientSelfBooked = true;
+  else if (query.createdBy === "none") {
+    filter.createdBy = { $in: [null, ""] };
+    filter.clientSelfBooked = { $ne: true };
+  } else if (query.createdBy) filter.createdBy = String(query.createdBy);
 
   // Filter bookingDate (what the UI column shows). YYYY-MM-DD inputs are
   // interpreted as IST calendar days; full last day is included.

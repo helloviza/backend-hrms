@@ -3,7 +3,8 @@ import TravelBooking from "./TravelBooking.js";
 import CustomerWorkspace from "./CustomerWorkspace.js";
 import { resolveManualDestination, internationalFrom, isManualFlightType, manualFlightAnalytics } from "../services/travelMirrorAnalytics.js";
 import { returnJourneyStart } from "../services/flightLegs.js";
-import { attachMirrorResyncHooks } from "../utils/mirrorResyncHooks.js";
+import { attachMirrorResyncHooks, updatedTopLevelPaths } from "../utils/mirrorResyncHooks.js";
+import { SBT_LINK_INDEX_NAME, PriceLockedError, lockedPricingChanges } from "../utils/sbtLinkLock.js";
 import { travelLookup } from "../data/destinationLookup.js";
 import { loadTicketRows, ticketDeparture, ticketCabin, realCabin, firstStop } from "../services/ticketFallback.js";
 
@@ -122,6 +123,42 @@ export interface ManualBookingLeg {
   cabinClass?: string;
   /** Layover printed AFTER this leg (e.g. "2h 15m"); present ⇒ the next leg is a connection. */
   layover?: string;
+}
+
+export const SBT_LINK_MODELS = ["SBTBooking", "SBTHotelBooking"] as const;
+export type SbtLinkModel = (typeof SBT_LINK_MODELS)[number];
+
+export interface ManualBookingSbtLink {
+  model: SbtLinkModel;
+  bookingId: Schema.Types.ObjectId;
+  paymentId?: string;
+  multiCityGroupId?: string;
+  legIndex?: number;
+  returnPnr?: string;
+  paymentMode?: "official" | "personal";
+  /** Wallet billing mode at checkout (P4 fills it; null until then). */
+  walletMode?: "PREPAID" | "POSTPAID" | null;
+  /** Last SBT status this booking was told about. */
+  sbtStatus?: string;
+  refundedAmount?: number;
+  cancellationCharge?: number;
+  syncedAt?: Date;
+  createdVia: "AUTO" | "IMPORT" | "BACKFILL";
+  /** MARGIN_RECORD = totalFare − recorded margin; NET_FALLBACK = no margin record. */
+  pricingBasis: "MARGIN_RECORD" | "NET_FALLBACK";
+}
+
+export interface ManualBookingPricingLock {
+  at: Date;
+  by: string; // "SYSTEM" or a User id
+  reason: string;
+  actualPrice: number;
+  quotedPrice: number;
+  gstMode: "ON_FULL" | "ON_MARKUP";
+  gstPercent: number;
+  currency: string;
+  type: string;
+  history?: { at: Date; by: string; action: string; reason: string; before?: Record<string, unknown>; after?: Record<string, unknown> }[];
 }
 
 export interface IManualBooking extends Document {
@@ -313,6 +350,24 @@ export interface IManualBooking extends Document {
   };
   isDemo?: boolean;
   createdByDemoUser?: boolean;
+  /**
+   * SBT → Manual Booking link (docs/specs/sbt-to-manual-booking-spec.md §3.1).
+   * Written ONLY by services/sbtManualLink.ts. `bookingId` carries a unique
+   * partial index, so one SBT booking has at most one linked ManualBooking.
+   * Absent on every other booking, and on rows imported before the link
+   * existed (those are adopted by the P2 backfill).
+   */
+  sbtLink?: ManualBookingSbtLink;
+  /** Booked by the client in SBT, not by Plumtrips staff (Team Summary bucket, list badge). */
+  clientSelfBooked?: boolean;
+  /**
+   * The price came from the supplier API and the SBT charge (§3.3). While set,
+   * no write may change actualPrice / quotedPrice / gstMode / gstPercent /
+   * currency / type, or add line items (pre-save and query guards below).
+   */
+  pricingLocked?: ManualBookingPricingLock;
+  /** Saved although its PNR matched an SBT booking (§3.4). */
+  duplicateAck?: { at: Date; by?: Schema.Types.ObjectId; byName?: string; matches: Record<string, unknown>[] };
   // Free-form bag (Demo Platform uses metadata.demoRef for seed idempotency;
   // travel-intake uses metadata.intakeRef for dedup — see routes/intake.travel.ts).
   metadata?: Record<string, unknown>;
@@ -570,6 +625,76 @@ const ManualBookingSchema = new Schema<IManualBooking>(
     // Demo Platform — booking authored under impersonation / seeded for a demo workspace
     isDemo: { type: Boolean, default: false, index: true },
     createdByDemoUser: { type: Boolean, default: false, index: true },
+    // SBT link (see IManualBooking.sbtLink). default undefined: absent on
+    // every booking that is not linked, so the partial index skips them.
+    sbtLink: {
+      type: new Schema(
+        {
+          model: { type: String, enum: SBT_LINK_MODELS, required: true },
+          bookingId: { type: Schema.Types.ObjectId, required: true },
+          paymentId: String,
+          multiCityGroupId: String,
+          legIndex: Number,
+          returnPnr: String,
+          paymentMode: { type: String, enum: ["official", "personal"] },
+          walletMode: { type: String, enum: ["PREPAID", "POSTPAID", null], default: null },
+          sbtStatus: String,
+          refundedAmount: Number,
+          cancellationCharge: Number,
+          syncedAt: Date,
+          createdVia: { type: String, enum: ["AUTO", "IMPORT", "BACKFILL"], required: true },
+          pricingBasis: { type: String, enum: ["MARGIN_RECORD", "NET_FALLBACK"], required: true },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
+    clientSelfBooked: { type: Boolean, default: undefined },
+    pricingLocked: {
+      type: new Schema(
+        {
+          at: { type: Date, required: true },
+          by: { type: String, required: true },
+          reason: { type: String, required: true },
+          actualPrice: { type: Number, required: true },
+          quotedPrice: { type: Number, required: true },
+          gstMode: { type: String, enum: ["ON_FULL", "ON_MARKUP"], required: true },
+          gstPercent: { type: Number, required: true },
+          currency: { type: String, required: true },
+          type: { type: String, required: true },
+          history: {
+            type: [
+              new Schema(
+                {
+                  at: { type: Date, required: true },
+                  by: { type: String, required: true },
+                  action: { type: String, required: true },
+                  reason: { type: String, required: true },
+                  before: Schema.Types.Mixed,
+                  after: Schema.Types.Mixed,
+                },
+                { _id: false },
+              ),
+            ],
+            default: undefined,
+          },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
+    duplicateAck: {
+      type: new Schema(
+        {
+          at: { type: Date, required: true },
+          by: { type: Schema.Types.ObjectId, ref: "User" },
+          byName: String,
+          matches: { type: [Schema.Types.Mixed], default: [] },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+    },
     // Free-form bag — Demo Platform uses metadata.demoRef for seed idempotency;
     // travel-intake uses metadata.intakeRef for dedup.
     metadata: { type: Schema.Types.Mixed },
@@ -610,6 +735,13 @@ const ManualBookingSchema = new Schema<IManualBooking>(
 ManualBookingSchema.index({ workspaceId: 1, status: 1 });
 ManualBookingSchema.index({ workspaceId: 1, travelDate: -1 });
 ManualBookingSchema.index({ bookingRef: 1 });
+// One SBT booking → at most one ManualBooking (spec §3.1). Built and VERIFIED
+// at boot by bootstrap/ensureSbtManualLinkIndexes.ts; automatic linking fails
+// closed while it is missing. Keep name + options in step with that file.
+ManualBookingSchema.index(
+  { "sbtLink.bookingId": 1 },
+  { unique: true, partialFilterExpression: { "sbtLink.bookingId": { $exists: true } }, name: SBT_LINK_INDEX_NAME },
+);
 
 /**
  * NEW-MODEL DISCRIMINATOR — by data, never by date.
@@ -768,7 +900,10 @@ ManualBookingSchema.pre("save", async function (next) {
       bookingRef: { $regex: `^${prefix}` },
     });
 
-    this.bookingRef = `${prefix}${String(count + 1).padStart(4, "0")}`;
+    // saveWithBookingRefRetry (below) bumps this after a duplicate-key loss,
+    // so two creates in the same second don't keep drawing the same number.
+    const bump = Number((this as any).$locals?.bookingRefBump) || 0;
+    this.bookingRef = `${prefix}${String(count + 1 + bump).padStart(4, "0")}`;
   }
 
   // Recalculate pricing fields every save
@@ -943,6 +1078,24 @@ ManualBookingSchema.pre("save", function (next) {
   if ((this as any).status === "CONFIRMED" && !(this as any).confirmedAt) {
     (this as any).confirmedAt = new Date();
   }
+  next();
+});
+
+/* ── Price lock (SBT link, spec §3.3) ──────────────────────────────────
+ * Runs AFTER the pricing hook above, so it compares the figures as they will
+ * be stored (alias resolution included). A locked booking may not change its
+ * price inputs, its type, or gain line items through ANY .save() — routes give
+ * a friendly 400 first; this is the backstop for every other writer. The only
+ * sanctioned writer sets $locals.allowLockedPricingWrite (services/
+ * sbtManualLink.ts, and later the SuperAdmin unlock), and records why in
+ * pricingLocked.history.
+ */
+// lockedPricingChanges / PriceLockedError live in utils/sbtLinkLock.ts.
+ManualBookingSchema.pre("save", function (next) {
+  const self: any = this;
+  if (self.isNew || !self.pricingLocked || self.$locals?.allowLockedPricingWrite === true) return next();
+  const changed = lockedPricingChanges(self);
+  if (changed.length) return next(new PriceLockedError(changed));
   next();
 });
 
@@ -1271,5 +1424,21 @@ attachMirrorResyncHooks(ManualBookingSchema, {
   resync: (ids) => resyncManualBookingMirrors(ids),
 });
 
+/* Price lock, query writes (updateOne / updateMany / findOneAndUpdate): an
+ * update that writes pricing, lineItems or type is refused when it would
+ * reach a locked booking. Same opt-out as the save guard, as a query option. */
+const LOCKED_TOP_LEVEL_PATHS = new Set(["pricing", "lineItems", "type"]);
+ManualBookingSchema.pre(["updateOne", "updateMany", "findOneAndUpdate"] as any, { document: false, query: true }, async function (this: any) {
+  if (this.getOptions()?.allowLockedPricingWrite === true) return;
+  const paths = updatedTopLevelPaths(this.getUpdate(), { upsert: !!this.getOptions()?.upsert });
+  const touches = paths === null || paths.some((p) => LOCKED_TOP_LEVEL_PATHS.has(p));
+  if (!touches) return;
+  const locked = await this.model.countDocuments({ $and: [this.getFilter(), { pricingLocked: { $exists: true } }] })
+    .session(this.getOptions()?.session ?? null);
+  if (locked > 0) throw new PriceLockedError(paths === null ? ["pricing"] : paths.filter((p) => LOCKED_TOP_LEVEL_PATHS.has(p)));
+});
+
 const ManualBookingModel = model<IManualBooking>("ManualBooking", ManualBookingSchema);
+// The bookingRef collision retry (saveWithBookingRefRetry) is in utils/sbtLinkLock.ts.
+
 export default ManualBookingModel;

@@ -87,12 +87,22 @@ export function parseGroupBy(raw: unknown): SummaryGroupBy {
   return raw === "creator" ? "creator" : "assignee";
 }
 
+/**
+ * Bookings the client made online in SBT (ManualBooking.clientSelfBooked,
+ * linked by services/sbtManualLink.ts) group under ONE row of their own —
+ * "Client self-booked (SBT)" — in both groupings, so they are never counted as
+ * an unknown person nor as Unassigned / pending to assign (spec §3.2). The key
+ * is also the list filter value (routes/manualBookings.filters.ts).
+ */
+export const SELF_BOOKED_KEY = "sbt-self";
+export const SELF_BOOKED_NAME = "Client self-booked (SBT)";
+
 /** The group key as a string (or null) inside an aggregation. */
 function keyExpr(groupBy: SummaryGroupBy) {
-  if (groupBy === "assignee") {
-    return { $cond: [{ $ifNull: ["$assignPerson", false] }, { $toString: "$assignPerson" }, null] };
-  }
-  return { $cond: [{ $in: [{ $ifNull: ["$createdBy", ""] }, ["", null]] }, null, { $toString: "$createdBy" }] };
+  const person = groupBy === "assignee"
+    ? { $cond: [{ $ifNull: ["$assignPerson", false] }, { $toString: "$assignPerson" }, null] }
+    : { $cond: [{ $in: [{ $ifNull: ["$createdBy", ""] }, ["", null]] }, null, { $toString: "$createdBy" }] };
+  return { $cond: [{ $eq: ["$clientSelfBooked", true] }, SELF_BOOKED_KEY, person] };
 }
 
 const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 1000) / 10 : 0);
@@ -217,13 +227,16 @@ export async function buildTeamSummary(opts: {
     const pending = pendingOnly + wip;
     const completed = confirmed + invoiced;
     const total = pending + completed;
-    const name = k
-      ? String(u?.name || [u?.firstName, u?.lastName].filter(Boolean).join(" ") || u?.email || "Unknown user")
-      : nullName;
+    const selfBooked = k === SELF_BOOKED_KEY;
+    const name = selfBooked
+      ? SELF_BOOKED_NAME
+      : k
+        ? String(u?.name || [u?.firstName, u?.lastName].filter(Boolean).join(" ") || u?.email || "Unknown user")
+        : nullName;
     return {
       key: k,
       name,
-      role: k ? roleOf(u) : "",
+      role: selfBooked ? "Booked online" : k ? roleOf(u) : "",
       total,
       completed,
       pending,
@@ -240,8 +253,10 @@ export async function buildTeamSummary(opts: {
       lastBookingAt: iso(lastOf.get(k)),
     };
   });
+  // Unassigned / No creator first, then the client self-booked row, then people.
+  const rank = (r: SummaryRow) => (r.key === null ? 0 : r.key === SELF_BOOKED_KEY ? 1 : 2);
   rows.sort((a, b) =>
-    a.key === null ? -1 : b.key === null ? 1 : b.total - a.total || b.pending - a.pending || a.name.localeCompare(b.name),
+    rank(a) - rank(b) || b.total - a.total || b.pending - a.pending || a.name.localeCompare(b.name),
   );
 
   const sum = (f: (r: SummaryRow) => number) => rows.reduce((s, r) => s + f(r), 0);
@@ -265,7 +280,7 @@ export async function buildTeamSummary(opts: {
   ];
 
   const top5 = rows
-    .filter((r) => r.key !== null && r.total > 0)
+    .filter((r) => r.key !== null && r.key !== SELF_BOOKED_KEY && r.total > 0)
     .slice()
     .sort((a, b) => b.total - a.total || a.name.localeCompare(b.name))
     .slice(0, 5)

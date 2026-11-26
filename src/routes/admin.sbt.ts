@@ -194,6 +194,45 @@ router.patch("/config", async (req: any, res: any) => {
   }
 });
 
+/* ─────────────── SBT → Manual Booking link switch (SUPERADMIN only) ───────────────
+ * docs/specs/sbt-to-manual-booking-spec.md P1. GET reads, PUT {enabled}
+ * flips it. The first switch-on stamps manualLinkEnabledAt: only SBT
+ * bookings made since then link automatically (older ones = the P2 backfill).
+ * Takes effect within 30 s on every instance (services/sbtManualLink.ts cache).
+ */
+router.get("/manual-link", requireSuperAdmin, async (_req: any, res: any) => {
+  try {
+    const doc: any = await SBTConfig.findOne({ key: "global" }).select("manualLinkEnabled manualLinkEnabledAt updatedBy").lean();
+    res.json({ ok: true, enabled: doc?.manualLinkEnabled === true, enabledAt: doc?.manualLinkEnabledAt ?? null });
+  } catch (err: any) {
+    console.error("[Admin SBT manual-link GET]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put("/manual-link", requireSuperAdmin, async (req: any, res: any) => {
+  try {
+    if (typeof req.body?.enabled !== "boolean") return res.status(400).json({ error: "enabled (boolean) is required" });
+    const userId = String(req.user?._id ?? req.user?.id ?? req.user?.sub ?? "");
+    await SBTConfig.updateOne(
+      { key: "global" },
+      { $set: { manualLinkEnabled: req.body.enabled, updatedBy: userId } },
+      { upsert: true },
+    );
+    if (req.body.enabled) {
+      await SBTConfig.updateOne({ key: "global", manualLinkEnabledAt: null }, { $set: { manualLinkEnabledAt: new Date() } });
+    }
+    const { resetManualLinkSettingsCache } = await import("../services/sbtManualLink.js");
+    resetManualLinkSettingsCache();
+    const doc: any = await SBTConfig.findOne({ key: "global" }).select("manualLinkEnabled manualLinkEnabledAt").lean();
+    console.log(`[Admin SBT manual-link] ${req.body.enabled ? "ON" : "OFF"} by ${userId}`);
+    res.json({ ok: true, enabled: doc?.manualLinkEnabled === true, enabledAt: doc?.manualLinkEnabledAt ?? null });
+  } catch (err: any) {
+    console.error("[Admin SBT manual-link PUT]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* ───────────────────────── margins (SUPERADMIN only) ─────────────────────────
  * Plumtrips' markup on every customer's fares: the defaults (master switch +
  * four percents, versioned), one optional override per company, and an
