@@ -1706,6 +1706,10 @@ router.put("/:id", validateObjectId("id"), requireAuth, requireWorkspace, async 
        * would let an ordinary profile save silently (re)activate someone. */
       status: _status,
       isActive: _isActive,
+      /* Per-user visible Header groups: written ONLY by the SUPERADMIN,
+       * audit-logged services/navPreference.service.ts. Without this, the
+       * Object.assign below would let any admin set it here, unaudited. */
+      visibleNavGroups: _visibleNavGroups,
       ...safeBody
     } = body;
 

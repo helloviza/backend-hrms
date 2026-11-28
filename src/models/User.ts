@@ -57,6 +57,11 @@ const UserSchema = new Schema(
     // My Space accent swatch (routes/users.ts MY_SPACE_ACCENTS). Separate from
     // uiThemePreset, which belongs to the Travel Spend palette picker.
     mySpaceAccent: { type: String, trim: true, enum: ["orange", "black", "navy", "plum", "terracotta", "emerald"], default: "orange" },
+    // Per-user visible Header groups (config/navGroups.ts). DISPLAY ONLY, not
+    // a permission. Written ONLY by services/navPreference.service.ts
+    // (SUPERADMIN endpoint / script, audit-logged); PUT /employees/:id strips
+    // it. `default: undefined` so existing documents never gain an [].
+    visibleNavGroups: { type: [String], default: undefined },
 
     phone: { type: String, trim: true },
     personalContact: { type: String, trim: true }, // personal mobile

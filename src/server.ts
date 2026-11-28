@@ -905,6 +905,13 @@ app.use("/api/admin/consumers", adminConsumersRouter);
 import adminConsumerErasureRouter from "./routes/admin.consumerErasure.js";
 app.use("/api/admin/consumer-erasure", adminConsumerErasureRouter);
 
+/* Per-user visible Header groups — /api/admin/nav-preferences. A DISPLAY
+ * preference (User.visibleNavGroups), not a permission: SUPERADMIN-only set /
+ * clear / read, every change audit-logged. See routes/adminNavPreferences.ts
+ * and docs/audits/nav-visible-groups-audit.md. */
+import adminNavPreferencesRouter from "./routes/adminNavPreferences.js";
+app.use("/api/admin/nav-preferences", adminNavPreferencesRouter);
+
 // Visa module (2026-08-09) — the cross-workspace ROSTER: every customer
 // workspace with its real KPIs, and a drill-in to any one workspace's
 // full traveller roster. A fifth router at the same prefix, gated on the

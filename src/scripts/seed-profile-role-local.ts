@@ -23,6 +23,8 @@
 //   employee     EMPLOYEE     HOUSE  L1
 //   tenantadmin  TENANT_ADMIN SaaS   L0
 //   sbtonly      EMPLOYEE     HOUSE  L1, sbtEnabled + sbtRole L1 → /sbt/flights
+//   plumbox      SUPERADMIN   HOUSE  L8, visibleNavGroups = Travel Analytics,
+//                                    Travelbox.ai, Spendbox.ai, Helloviza.ai
 //
 // Run (from apps/backend, against a local mongod only):
 //   MONGO_URI=mongodb://127.0.0.1:27027/plumbox_profile_role \
@@ -101,6 +103,11 @@ const PERSONAS: Person[] = [
   // Shaped like admin@plumtrips.com on prod (bugs a + b): SUPERADMIN, no leave
   // entitlement, attendance that swings −52.4 pts vs the previous 30 days.
   { key: "prodsa", first: "Plumtrips", last: "Owner", dept: "Technology", designation: "Super Admin", roles: ["SUPERADMIN"], ws: HOUSE, joined: "2020-01-06", today: "absent", level: "L8", persona: true },
+  // Shaped like plumbox@plumtrips.com (docs/audits/nav-visible-groups-audit.md):
+  // a real SUPERADMIN (L8; the HOUSE grant also sets sbtEnabled) whose Header
+  // shows only Travel Analytics, Travelbox.ai, Spendbox.ai and Helloviza.ai.
+  { key: "plumbox", first: "Plum", last: "Box", dept: "Technology", designation: "Demo Account", roles: ["SUPERADMIN"], ws: HOUSE, joined: "2026-11-28", today: "absent", level: "L8", persona: true,
+    extra: { hrmsAccessRole: "SUPERADMIN", sbtEnabled: true, canRaiseRequest: false, visibleNavGroups: ["travelAnalytics", "travelbox", "spendbox", "helloviza"] } },
 ];
 
 // 19 more HOUSE staff → 25 HOUSE in total across the 5 departments.
