@@ -10,7 +10,7 @@ const router = Router();
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
-function isHrAdmin(user: any): boolean {
+export function isHrAdmin(user: any): boolean {
   if (!user) return false;
   const roles: string[] = [
     ...(Array.isArray(user.roles) ? user.roles : []),

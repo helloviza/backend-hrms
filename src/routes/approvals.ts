@@ -336,7 +336,7 @@ function adminStateIn(list: Array<string | null>) {
   return { $in: list };
 }
 
-function adminQueueFilter(kind: "approved_active" | "pending" | "done" | "rejected") {
+export function adminQueueFilter(kind: "approved_active" | "pending" | "done" | "rejected") {
   if (kind === "pending") {
     return {
       status: "approved",

@@ -710,29 +710,39 @@ export async function requestInQueueScope(req: any, requestId: any): Promise<boo
   return !!(await ApprovalRequest.exists({ _id: String(requestId), ...queueCaseScope(req) }));
 }
 
+/**
+ * The decision requireApprovalsAdminRead makes for an ALREADY-AUTHENTICATED
+ * request, without answering it: hydrates req.user, stamps the admin-queue
+ * access (adminQueueAccess) and, for a Workspace Leader, req.__leaderCustomerIds
+ * — the same request state the middleware leaves for the route. Reads only.
+ */
+export async function approvalsAdminReadDecision(req: AnyObj): Promise<{ ok: boolean; user: AnyObj }> {
+  let user = (req as AnyObj).user;
+  user = await hydrateUserFromDb(user);
+  (req as AnyObj).user = user;
+
+  if ((await adminQueueAccess(req)).view) return { ok: true, user };
+
+  const leaderCustomerIds = await leaderCustomerIdsForSession(req, user?.email);
+  if (!leaderCustomerIds.length) return { ok: false, user };
+
+  (req as AnyObj).__leaderCustomerIds = leaderCustomerIds;
+  return { ok: true, user };
+}
+
 export async function requireApprovalsAdminRead(req: AnyObj, res: any, next: any) {
   try {
     return requireAuth(req as any, res as any, async () => {
-      let user = (req as AnyObj).user;
-      user = await hydrateUserFromDb(user);
-      (req as AnyObj).user = user;
-
-      if ((await adminQueueAccess(req)).view) return next();
-
-      const leaderCustomerIds = await leaderCustomerIdsForSession(req, user?.email);
-      if (!leaderCustomerIds.length) {
-        return res.status(403).json({
-          error: "Your account doesn’t have permission to view this page.",
-          reason: "NOT_ADMIN_OR_WORKSPACE_LEADER",
-          debug:
-            process.env.NODE_ENV !== "production"
-              ? { email: user?.email, roles: collectRoles(user), sub: user?.sub }
-              : undefined,
-        });
-      }
-
-      (req as AnyObj).__leaderCustomerIds = leaderCustomerIds;
-      return next();
+      const { ok, user } = await approvalsAdminReadDecision(req);
+      if (ok) return next();
+      return res.status(403).json({
+        error: "Your account doesn’t have permission to view this page.",
+        reason: "NOT_ADMIN_OR_WORKSPACE_LEADER",
+        debug:
+          process.env.NODE_ENV !== "production"
+            ? { email: user?.email, roles: collectRoles(user), sub: user?.sub }
+            : undefined,
+      });
     });
   } catch (err) {
     if (process.env.NODE_ENV !== "production") {

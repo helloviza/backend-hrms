@@ -24,44 +24,56 @@ export const requireFeature = (featureKey: keyof WorkspaceFeatures) =>
  * flows share one surface (approvals: Flow 2 approvalFlowEnabled, Flow 3
  * approvalDirectEnabled).
  */
+export type FeatureRefusal = { status: 403; body: { success: false; error: string } };
+
+/**
+ * The decision requireAnyFeature makes, without answering the request:
+ * null = admitted, otherwise the 403 it would send. Side-effect free.
+ */
+export function featureGateRefusal(req: Request, featureKeys: Array<keyof WorkspaceFeatures>): FeatureRefusal | null {
+  // ── SUPERADMIN bypass ──
+  if (isSuperAdmin(req)) return null;
+
+  // ── TBO certification bypass ──
+  const userEmail = ((req as any).user?.email || "").toLowerCase();
+  if (userEmail === "tbocertification@plumtrips.com") return null;
+
+  // HOUSE workspace bypass: Plumtrips internal staff are entitled to
+  // every feature by definition. Subjecting them to feature flags is
+  // architecturally incorrect and creates silent breakage when HOUSE
+  // workspace's stored features drift from defaults.
+  const wsId = String(
+    (req as any).workspaceId ||
+    (req as any).workspace?._id ||
+    ""
+  );
+  if (wsId === PLUMTRIPS_HOUSE_WORKSPACE_ID) return null;
+
+  // Workspace already resolved by requireWorkspace middleware
+  const workspace = (req as any).workspace as CustomerWorkspaceDocument | null;
+
+  if (!workspace || workspace.status !== "ACTIVE") {
+    return { status: 403, body: { success: false, error: "Workspace not active" } };
+  }
+
+  const features = workspace.config?.features;
+  if (!featureKeys.some((key) => features?.[key])) {
+    return {
+      status: 403,
+      body: { success: false, error: `Feature '${featureKeys.join("' or '")}' not enabled for this workspace` },
+    };
+  }
+  return null;
+}
+
 export const requireAnyFeature = (...featureKeys: Array<keyof WorkspaceFeatures>) =>
   async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    // ── SUPERADMIN bypass ──
-    if (isSuperAdmin(req)) return next();
-
-    // ── TBO certification bypass ──
-    const userEmail = ((req as any).user?.email || "").toLowerCase();
-    if (userEmail === "tbocertification@plumtrips.com") return next();
-
-    // HOUSE workspace bypass: Plumtrips internal staff are entitled to
-    // every feature by definition. Subjecting them to feature flags is
-    // architecturally incorrect and creates silent breakage when HOUSE
-    // workspace's stored features drift from defaults.
-    const wsId = String(
-      (req as any).workspaceId ||
-      (req as any).workspace?._id ||
-      ""
-    );
-    if (wsId === PLUMTRIPS_HOUSE_WORKSPACE_ID) return next();
-
     try {
-      // Workspace already resolved by requireWorkspace middleware
-      const workspace = (req as any).workspace as CustomerWorkspaceDocument | null;
-
-      if (!workspace || workspace.status !== "ACTIVE") {
-        res.status(403).json({ success: false, error: "Workspace not active" });
+      const refusal = featureGateRefusal(req, featureKeys);
+      if (refusal) {
+        res.status(refusal.status).json(refusal.body);
         return;
       }
-
-      const features = workspace.config?.features;
-      if (!featureKeys.some((key) => features?.[key])) {
-        res.status(403).json({
-          success: false,
-          error: `Feature '${featureKeys.join("' or '")}' not enabled for this workspace`,
-        });
-        return;
-      }
-
       next();
     } catch (err) {
       next(err);

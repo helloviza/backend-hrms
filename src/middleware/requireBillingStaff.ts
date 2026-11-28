@@ -19,7 +19,7 @@
 // untouched.
 import type { Request, Response, NextFunction } from "express";
 import { isSuperAdmin } from "./isSuperAdmin.js";
-import { requireAdmin } from "./rbac.js";
+import { requireAdmin, isAdminRequest } from "./rbac.js";
 
 const HOUSE_WORKSPACE_ID = "69679a7628330a58d29f2254";
 
@@ -51,6 +51,11 @@ export function isExternalAccount(user: any): boolean {
 function isHouseStaff(req: any): boolean {
   const ws = String(req.workspaceObjectId ?? req.workspaceId ?? req.user?.workspaceId ?? "");
   return ws === HOUSE_WORKSPACE_ID && !isExternalAccount(req.user);
+}
+
+/** The decision requireBillingStaff makes, as a side-effect-free predicate. */
+export function isBillingStaffRequest(req: Request): boolean {
+  return isSuperAdmin(req) || isHouseStaff(req) || isAdminRequest(req);
 }
 
 export function requireBillingStaff(req: Request, res: Response, next: NextFunction) {

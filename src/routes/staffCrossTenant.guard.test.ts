@@ -135,7 +135,22 @@ describe("ops queue access comes from the Admin Queue grant, never from roles al
     expect(sec).toMatch(/work: hasAccess\(grant\.access, "WRITE"\)/);
     expect(sec).toMatch(/scope: grant\.scope === "OWN" \? "own" : "all"/);
     expect(sec).toMatch(/=== PLUMTRIPS_HOUSE_WORKSPACE_ID\)/);
-    expect(sec, "read gate").toMatch(/if \(\(await adminQueueAccess\(req\)\)\.view\) return next\(\);/);
+    // Read gate = approvalsAdminReadDecision (pure decider) + the middleware
+    // that answers it. The decider's only admissions are adminQueueAccess
+    // .view and the pre-existing Workspace Leader path (own companies only);
+    // the middleware's only next() is on that decision. Behaviour is pinned in
+    // approvals.adminReadGate.test.ts.
+    const secLf = sec.replace(/\r\n/g, "\n");
+    const decider = secLf.match(/export async function approvalsAdminReadDecision\([\s\S]*?\n\}\n/)?.[0] || "";
+    expect(decider, "read gate decider").toMatch(/if \(\(await adminQueueAccess\(req\)\)\.view\) return \{ ok: true, user \};/);
+    expect(decider.match(/ok: true/g)?.length, "read gate decider: no other admission").toBe(2);
+    expect(decider, "read gate decider: leader admission needs leader companies").toMatch(
+      /const leaderCustomerIds = await leaderCustomerIdsForSession\(req, user\?\.email\);\s*if \(!leaderCustomerIds\.length\) return \{ ok: false, user \};\s*\(req as AnyObj\)\.__leaderCustomerIds = leaderCustomerIds;\s*return \{ ok: true, user \};\s*\}\n$/,
+    );
+    expect(decider, "read gate decider: no role test").not.toMatch(/collectRoles|roles\.includes|isStaffAdmin|requireRoles/);
+    const mw = secLf.match(/export async function requireApprovalsAdminRead\([\s\S]*?\n\}\n/)?.[0] || "";
+    expect(mw, "read gate middleware delegates").toMatch(/const \{ ok, user \} = await approvalsAdminReadDecision\(req\);\s*if \(ok\) return next\(\);/);
+    expect(mw.match(/next\(\)/g)?.length, "read gate middleware: one next()").toBe(1);
     expect(sec, "write gate").toMatch(/if \(!\(await adminQueueAccess\(req\)\)\.work\) \{/);
     expect(sec, "lists are scoped").toMatch(/if \(hasQueueView\(req\)\) \{\s*const scope = queueCaseScope\(req\);/);
     const prop = src("proposals.ts");

@@ -30,13 +30,14 @@ function hasAnyRole(user: any, allowed: string[]) {
   return roles.some((r) => wanted.includes(r));
 }
 
-export function requireAdmin(req: Request, res: Response, next: NextFunction) {
-  if (isSuperAdmin(req)) return next();
+/** The decision requireAdmin makes, as a side-effect-free predicate. */
+export function isAdminRequest(req: Request): boolean {
+  if (isSuperAdmin(req)) return true;
 
   const user: any = (req as any).user;
 
   // ✅ treat these as admin/staff privileged roles
-  const ok = hasAnyRole(user, [
+  return hasAnyRole(user, [
     "ADMIN",
     "SUPERADMIN",
     "SUPER_ADMIN",
@@ -47,8 +48,10 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction) {
     "TENANT_ADMIN",
     "WORKSPACE_ADMIN",
   ]);
+}
 
-  if (!ok) {
+export function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  if (!isAdminRequest(req)) {
     return res.status(403).json({ message: "Admin access required" });
   }
 

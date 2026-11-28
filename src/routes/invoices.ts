@@ -376,7 +376,7 @@ async function invoiceOwnGate(req: any): Promise<Record<string, any> | null> {
  * must still be confined to the caller's tenant (and, for OWN, to their own
  * invoices). Pushes onto `$and`; never reassigns it.
  */
-async function invoiceReadScope(req: any): Promise<(base?: Record<string, any>) => Record<string, any>> {
+export async function invoiceReadScope(req: any): Promise<(base?: Record<string, any>) => Record<string, any>> {
   const gates = [invoiceTenantClause(req), await invoiceOwnGate(req)].filter(Boolean) as Record<string, any>[];
   return (base: Record<string, any> = {}) =>
     gates.length ? { ...base, $and: [...(base.$and ?? []), ...gates] } : base;

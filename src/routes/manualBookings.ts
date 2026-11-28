@@ -2099,7 +2099,7 @@ router.get("/creators", requirePermission("manualBookings", "READ"), async (req:
  * business). Only the summary's own filters (type / client / source) are
  * forwarded to the list filter builder — the date range is applied per bucket.
  */
-async function teamSummaryForRequest(req: any) {
+export async function teamSummaryForRequest(req: any) {
   const q: Record<string, any> = {};
   for (const k of ["type", "workspaceId", "source", "prospect"]) if (req.query[k]) q[k] = req.query[k];
   const base = buildSearchFilter(q, req.user);

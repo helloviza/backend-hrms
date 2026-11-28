@@ -106,79 +106,98 @@ export async function hasModulePermission(
   return hasAccess(mod.access, minAccess)
 }
 
+/**
+ * The decision requirePermission makes, without answering the request or
+ * logging: { ok: true, context } admits (context = what the middleware stamps
+ * on req), { ok: false } carries the exact status + body it would send.
+ * Reads UserPermission; writes nothing.
+ */
+export type PermissionDecision =
+  | {
+      ok: true
+      via: 'superadmin' | 'superadmin-role' | 'grant'
+      context: { permissionScope: any; permissionAccess: any; permissionLevel?: string }
+    }
+  | { ok: false; status: 401 | 403; body: Record<string, any> }
+
+export async function decideModulePermission(
+  req: Request,
+  module: string,
+  minAccess: 'READ' | 'WRITE' | 'FULL'
+): Promise<PermissionDecision> {
+  // L8 SuperAdmin — always bypass
+  if (isSuperAdmin(req)) {
+    return { ok: true, via: 'superadmin', context: { permissionScope: 'ALL', permissionAccess: 'FULL' } }
+  }
+
+  const user = (req as any).user
+  const userId = String(user?._id || user?.id || user?.sub || '')
+  if (!userId) {
+    return { ok: false, status: 401, body: { success: false, message: 'Not authenticated' } }
+  }
+
+  // Belt-and-suspenders SUPERADMIN bypass — grants full access without a
+  // UserPermission record. isSuperAdmin() above covers most cases; this
+  // catches any edge where role normalization hasn't propagated to the
+  // isSuperAdmin check (e.g. old JWTs with non-array role field).
+  if (Array.isArray(user.roles) && user.roles.includes('SUPERADMIN')) {
+    return { ok: true, via: 'superadmin-role', context: { permissionScope: 'ALL', permissionAccess: 'FULL' } }
+  }
+
+  const perm = await UserPermission.findOne({ userId }).lean()
+
+  if (!perm) {
+    return { ok: false, status: 403, body: { success: false, message: 'Access not granted', module, required: minAccess } }
+  }
+
+  const mod = (perm.modules as any)[module]
+  if (!mod || mod.access === 'NONE') {
+    return { ok: false, status: 403, body: { success: false, message: 'Module access not granted', module, required: minAccess } }
+  }
+
+  if (!hasAccess(mod.access, minAccess)) {
+    return {
+      ok: false,
+      status: 403,
+      body: { success: false, message: 'Insufficient access level', module, required: minAccess, actual: mod.access },
+    }
+  }
+
+  return {
+    ok: true,
+    via: 'grant',
+    context: { permissionScope: mod.scope, permissionAccess: mod.access, permissionLevel: perm.level?.code || 'L1' },
+  }
+}
+
+/** Stamp an admitted decision's context on req, exactly as requirePermission does. */
+export function applyPermissionContext(req: Request, d: Extract<PermissionDecision, { ok: true }>): void {
+  req.permissionScope = d.context.permissionScope
+  req.permissionAccess = d.context.permissionAccess
+  if (d.context.permissionLevel !== undefined) req.permissionLevel = d.context.permissionLevel
+}
+
 export function requirePermission(
   module: string,
   minAccess: 'READ' | 'WRITE' | 'FULL'
 ) {
   return async (req: Request, res: Response, next: NextFunction) => {
-    // L8 SuperAdmin — always bypass
-    if (isSuperAdmin(req)) {
-      req.permissionScope  = 'ALL'
-      req.permissionAccess = 'FULL'
-      return next()
+    const d = await decideModulePermission(req, module, minAccess)
+    if (!d.ok) {
+      const refused = d as Extract<PermissionDecision, { ok: false }>
+      return res.status(refused.status).json(refused.body)
     }
-
-    const user = (req as any).user
-    const userId = String(user?._id || user?.id || user?.sub || '')
-    if (!userId) {
-      return res.status(401).json({
-        success: false,
-        message: 'Not authenticated',
-      })
-    }
-
-    // Belt-and-suspenders SUPERADMIN bypass — grants full access without a
-    // UserPermission record. isSuperAdmin() above covers most cases; this
-    // catches any edge where role normalization hasn't propagated to the
-    // isSuperAdmin check (e.g. old JWTs with non-array role field).
-    if (Array.isArray(user.roles) && user.roles.includes('SUPERADMIN')) {
+    if (d.via === 'superadmin-role') {
+      const user = (req as any).user
       logger.info('SUPERADMIN bypass: permission check skipped', {
-        userId,
+        userId: String(user?._id || user?.id || user?.sub || ''),
         module,
         minAccess,
         email: user.email,
       })
-      req.permissionScope  = 'ALL'
-      req.permissionAccess = 'FULL'
-      return next()
     }
-
-    const perm = await UserPermission.findOne({ userId }).lean()
-
-    if (!perm) {
-      return res.status(403).json({
-        success: false,
-        message: 'Access not granted',
-        module,
-        required: minAccess,
-      })
-    }
-
-    const mod = (perm.modules as any)[module]
-    if (!mod || mod.access === 'NONE') {
-      return res.status(403).json({
-        success: false,
-        message: 'Module access not granted',
-        module,
-        required: minAccess,
-      })
-    }
-
-    if (!hasAccess(mod.access, minAccess)) {
-      return res.status(403).json({
-        success: false,
-        message: 'Insufficient access level',
-        module,
-        required: minAccess,
-        actual: mod.access,
-      })
-    }
-
     // Attach permission context to request
-    req.permissionScope  = mod.scope
-    req.permissionAccess = mod.access
-    req.permissionLevel  = perm.level?.code || 'L1'
-
+    applyPermissionContext(req, d as Extract<PermissionDecision, { ok: true }>)
     next()
   }
 }

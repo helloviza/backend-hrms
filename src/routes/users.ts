@@ -34,7 +34,9 @@ import { personName } from "../services/actorNames.js";
 const r = Router();
 
 /** My Space accent swatch ids — the ONLY values POST /profile/update accepts. */
-export const MY_SPACE_ACCENTS = new Set(["black", "navy", "plum", "terracotta", "emerald"]);
+export const MY_SPACE_ACCENTS = new Set(["orange", "black", "navy", "plum", "terracotta", "emerald"]);
+/** The accent a user who never picked one gets (the /profile/me dashboard primary). */
+export const DEFAULT_MY_SPACE_ACCENT = "orange";
 
 /**
  * Tenant isolation (multi-domain / multi-account safe)
@@ -297,7 +299,7 @@ r.get(
         // /profile/avatar/confirm enforce (requirePermission("people","WRITE")),
         // so the UI never offers an edit the server will refuse.
         canEditProfile: await hasModulePermission(req, "people", "WRITE"),
-        mySpaceAccent:  u.mySpaceAccent || "black",
+        mySpaceAccent:  u.mySpaceAccent || DEFAULT_MY_SPACE_ACCENT,
       });
     } catch (err) {
       next(err);

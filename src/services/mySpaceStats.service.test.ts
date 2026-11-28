@@ -125,12 +125,18 @@ describe("computeDashboardStats — attendance (rolling 30 IST days)", () => {
     const s = await computeDashboardStats({ userId: String(USER), workspaceObjectId: WS, now: NOW });
     expect(s.attendance30.prevPct).not.toBeNull();
     expect(s.attendance30.prevPct!).toBeGreaterThan(0);
+    // the previous window's own counts come with it (1 punch over its working days)
+    expect(s.attendance30.prevPresent).toBe(1);
+    expect(s.attendance30.prevWorkingDays).toBeGreaterThan(15);
+    expect(s.attendance30.prevPct).toBe(Math.round((1 / s.attendance30.prevWorkingDays!) * 1000) / 10);
   });
 
   it("no punch at all in the previous window → no baseline, prevPct null", async () => {
     await punchIn("2026-11-06");
     const s = await computeDashboardStats({ userId: String(USER), workspaceObjectId: WS, now: NOW });
     expect(s.attendance30.prevPct).toBeNull();
+    expect(s.attendance30.prevPresent).toBeNull();
+    expect(s.attendance30.prevWorkingDays).toBeNull();
   });
 
   it("keeps the legacy fields ProfilePerformance reads", async () => {

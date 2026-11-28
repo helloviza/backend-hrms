@@ -13,6 +13,13 @@ import { audit } from "../middleware/audit.js";
 import dayjs from "dayjs";
 import { todayIST, addDaysIST } from "../utils/dateIST.js";
 import { activeUserFilter } from "../utils/userActiveStatus.js";
+import {
+  buildWorkingDays,
+  countLeaveDaysByUser,
+  monthLeaveWindow,
+  resolveAttendanceRules,
+  summariseUserMonth,
+} from "../services/attendanceMonth.service.js";
 
 const r = Router();
 
@@ -553,15 +560,11 @@ r.get(
         .lean();
       const holidaySet = new Set(holidays.map((h: any) => h.date));
 
-      const workingDays: string[] = [];
-      for (let d = 1; d <= daysInMonth; d++) {
-        const dt = new Date(year, mon - 1, d);
-        const dow = dt.getDay();
-        const dateStr = dayjs(dt).format("YYYY-MM-DD");
-        if (dow !== 0 && dow !== 6 && !holidaySet.has(dateStr)) {
-          workingDays.push(dateStr);
-        }
-      }
+      // Per-user rules live in services/attendanceMonth.service.ts (shared with
+      // GET /api/my-space/month-summary). "server-local" keeps this route's
+      // existing behaviour exactly — pinned by
+      // attendance.payrollSummary.characterisation.test.ts.
+      const workingDays = buildWorkingDays(month, holidaySet);
 
       // Get users in scope
       let userQuery: any = { workspaceId, ...activeUserFilter() };
@@ -587,8 +590,7 @@ r.get(
       }
 
       // Fetch approved leaves for this month
-      const fromDate = new Date(`${month}-01`);
-      const toDate = new Date(year, mon, 0);
+      const { fromDate, toDate } = monthLeaveWindow(month, "server-local");
       const leaveRequests: any[] = await LeaveRequest.find({
         userId: { $in: userIds },
         status: "APPROVED",
@@ -598,35 +600,11 @@ r.get(
       }).lean();
 
       // Build leave days per user in this month
-      const leaveDaysMap: Record<string, number> = {};
-      for (const lr of leaveRequests) {
-        const uid = String(lr.userId);
-        const lFrom = new Date(Math.max(new Date(lr.from).getTime(), fromDate.getTime()));
-        const lTo = new Date(Math.min(new Date(lr.to).getTime(), toDate.getTime()));
-        let count = 0;
-        const cur = new Date(lFrom);
-        while (cur <= lTo) {
-          const ds = dayjs(cur).format("YYYY-MM-DD");
-          if (workingDays.includes(ds)) {
-            count += lr.dayLength === "HALF" ? 0.5 : 1;
-          }
-          cur.setDate(cur.getDate() + 1);
-        }
-        leaveDaysMap[uid] = (leaveDaysMap[uid] || 0) + count;
-      }
+      const leaveDaysMap = countLeaveDaysByUser(leaveRequests, month, workingDays, "server-local");
 
       // Fetch workspace attendance config
       const workspace: any = await CustomerWorkspace.findById(workspaceId).select("attendanceConfig").lean();
-      const attCfg = workspace?.attendanceConfig || {};
-      const shiftStartStr: string = attCfg.shiftStart || '09:30';
-      const shiftEndStr: string = attCfg.shiftEnd || '18:30';
-      const [ssH, ssM] = shiftStartStr.split(':').map(Number);
-      const [seH, seM] = shiftEndStr.split(':').map(Number);
-      const shiftStart = ssH + ssM / 60;
-      const graceMinutes = attCfg.graceMinutes ?? 15;
-      const shiftHours = (seH + seM / 60) - shiftStart;
-      const halfDayHours = attCfg.halfDayHours ?? 4.5;
-      const minHoursForPresent = attCfg.minHoursForPresent ?? 2;
+      const rules = resolveAttendanceRules(workspace?.attendanceConfig);
 
       const summary = users.map((u: any) => {
         const uid = String(u._id);
@@ -635,76 +613,31 @@ r.get(
             ? `${u.firstName} ${u.lastName}`
             : u.name || u.email || UNKNOWN_USER; // never the id
 
-        let present = 0;
-        let halfDay = 0;
-        let late = 0;
-        let overtime = 0;
-        let totalHours = 0;
-
-        for (const dateStr of workingDays) {
-          const att = attMap[`${uid}_${dateStr}`];
-          if (!att || !att.punches || !att.punches.length) continue;
-
-          const punches = att.punches.sort(
-            (a: any, b: any) => new Date(a.ts).getTime() - new Date(b.ts).getTime(),
-          );
-
-          // Compute hours: pair IN/OUT
-          let dayHrs = 0;
-          const ins = punches.filter((p: any) => p.type === "IN");
-          const outs = punches.filter((p: any) => p.type === "OUT");
-          if (ins.length && outs.length) {
-            const firstIn = new Date(ins[0].ts).getTime();
-            const lastOut = new Date(outs[outs.length - 1].ts).getTime();
-            if (lastOut > firstIn) {
-              dayHrs = (lastOut - firstIn) / (1000 * 60 * 60);
-            }
-          }
-
-          totalHours += dayHrs;
-
-          if (dayHrs >= minHoursForPresent && dayHrs < halfDayHours) {
-            halfDay++;
-          } else if (dayHrs >= halfDayHours) {
-            present++;
-          }
-
-          // Late check
-          if (ins.length) {
-            const firstInDate = new Date(ins[0].ts);
-            const inHour = firstInDate.getHours();
-            const inMin = firstInDate.getMinutes();
-            const inMinutes = inHour * 60 + inMin;
-            const graceEnd = ssH * 60 + ssM + graceMinutes;
-            if (inMinutes > graceEnd) late++;
-          }
-
-          // Overtime
-          if (dayHrs > shiftHours + 1) overtime++;
-        }
-
-        const leaveDays = leaveDaysMap[uid] || 0;
-        const absent = Math.max(0, workingDays.length - present - halfDay - leaveDays);
-        const lopDays = Math.max(0, absent);
-        const avgDailyHours = present > 0 ? +(totalHours / present).toFixed(1) : 0;
+        const s = summariseUserMonth({
+          workingDays,
+          attendanceByDate: (dateStr) => attMap[`${uid}_${dateStr}`],
+          leaveDays: leaveDaysMap[uid] || 0,
+          rules,
+          tz: "server-local",
+        });
 
         let payrollNote = "Clean";
-        if (lopDays > 0) payrollNote = `${lopDays} LOP day${lopDays > 1 ? "s" : ""}`;
+        if (s.lopDays > 0) payrollNote = `${s.lopDays} LOP day${s.lopDays > 1 ? "s" : ""}`;
 
         return {
           userId: uid,
           userName,
           employeeId: u.employeeCode || "",
-          workingDays: workingDays.length,
-          present: present + halfDay * 0.5,
-          absent,
-          halfDay,
-          late,
-          overtime,
-          leaveDays,
-          lopDays,
-          totalHours: +totalHours.toFixed(1),
-          avgDailyHours,
+          workingDays: s.workingDays,
+          present: s.present,
+          absent: s.absent,
+          halfDay: s.halfDay,
+          late: s.late,
+          overtime: s.overtime,
+          leaveDays: s.leaveDays,
+          lopDays: s.lopDays,
+          totalHours: s.totalHours,
+          avgDailyHours: s.avgDailyHours,
           payrollNote,
         };
       });

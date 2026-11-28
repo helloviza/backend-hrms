@@ -50,6 +50,9 @@ export type DashboardStats = {
     workingDays: number;
     pct: number | null;
     prevPct: number | null;
+    /** the previous window's own counts (null with prevPct) — so a client can tell a real trend from a tiny sample */
+    prevPresent: number | null;
+    prevWorkingDays: number | null;
     from: string;
     to: string;
   };
@@ -241,7 +244,16 @@ export async function computeDashboardStats(args: {
     hasAttendanceHistory: !!anyAttendance,
     attendance: cur.days.map((d) => ({ label: d.date, value: d.state === "present" ? 1 : 0 })),
     leaveMix: Array.from(leaveMixMap.entries()).map(([type, value]) => ({ type, value })),
-    attendance30: { present: cur.present, workingDays: cur.workingDays, pct, prevPct, from, to: today },
+    attendance30: {
+      present: cur.present,
+      workingDays: cur.workingDays,
+      pct,
+      prevPct,
+      prevPresent: prevPct === null ? null : prev.present,
+      prevWorkingDays: prevPct === null ? null : prev.workingDays,
+      from,
+      to: today,
+    },
     days: cur.days,
     nextHoliday,
     holidaysResolved: !!workspaceObjectId,
